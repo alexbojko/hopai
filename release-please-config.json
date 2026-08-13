@@ -11,10 +11,7 @@
       "draft": false,
       "prerelease": false,
       "extra-files": [
-        {
-          "type": "python",
-          "path": "hopai/__init__.py"
-        }
+        "hopai/__init__.py"
       ],
       "changelog-sections": [
         {"type": "feat", "section": "Features"},

@@ -66,8 +66,27 @@ class TestReleaseConfig:
         pyproject.toml and leaves hopai/__init__.py behind, which is
         exactly the drift test_module_matches_pyproject would then catch
         -- one release too late."""
-        paths = {entry["path"] for entry in config.get("extra-files", [])}
+        paths = {entry if isinstance(entry, str) else entry["path"]
+                 for entry in config.get("extra-files", [])}
         assert "hopai/__init__.py" in paths
+
+    def test_extra_files_use_a_supported_updater(self, config):
+        """`{"type": "python"}` is not a thing: release-please v4 rejects
+        the whole config with `unsupported extraFile type: python`, and
+        the release job dies before opening a PR. A bare string selects
+        the generic updater, which is the one that handles a
+        `__version__` line."""
+        for entry in config.get("extra-files", []):
+            assert isinstance(entry, str) or entry.get("type") in {
+                "json", "yaml", "toml", "xml", "generic"}, entry
+
+    def test_the_module_carries_the_generic_updater_annotation(self):
+        """The generic updater rewrites only lines marked with this
+        comment. Miss it and nothing fails -- the file is simply never
+        touched, and the package ships reporting the previous version."""
+        source = (ROOT / "hopai" / "__init__.py").read_text()
+        line = next(l for l in source.splitlines() if l.startswith("__version__"))
+        assert "x-release-please-version" in line, line
 
 
 class TestDistributionMetadata:
