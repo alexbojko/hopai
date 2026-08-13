@@ -18,16 +18,29 @@ name: Release
 # token for an upload token. If you rename this file or the environment,
 # update the publisher on PyPI or the upload will start failing.
 
+# A GitHub Release created with GITHUB_TOKEN does NOT fire the `release`
+# event, so publishing cannot be triggered by "release published" -- it
+# has to be chained onto the same run. The workflow_dispatch input is the
+# way back in when that chain does not run: re-publishing a tag whose
+# upload failed, or publishing a tag that was made by hand.
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      publish_tag:
+        description: "Existing tag to build and publish (e.g. v0.0.1). Leave empty to only run release-please."
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
   release-please:
+    if: github.event_name == 'push' || inputs.publish_tag == ''
     runs-on: ubuntu-latest
     permissions:
       contents: write        # to create the release commit, tag and Release
@@ -45,7 +58,14 @@ jobs:
 
   publish:
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    # Runs when release-please just cut a release, or when a tag was
+    # named by hand. `always()` is needed because the release-please job
+    # is skipped on the manual path, and a skipped dependency would
+    # otherwise skip this one too.
+    if: >-
+      always() &&
+      (needs.release-please.outputs.release_created == 'true' ||
+       inputs.publish_tag != '')
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -59,7 +79,7 @@ jobs:
           # The release commit is already on main by the time this runs;
           # check out the tag so the artifact is built from exactly what
           # was released, not from whatever landed a minute later.
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.release-please.outputs.tag_name || inputs.publish_tag }}
 
       - uses: actions/setup-python@v5
         with:
@@ -80,16 +100,19 @@ jobs:
         # disagree, and the upload would silently claim the wrong
         # version. Cheap to check, impossible to undo on PyPI.
         env:
-          EXPECTED: ${{ needs.release-please.outputs.version }}
+          EXPECTED: ${{ needs.release-please.outputs.version || inputs.publish_tag }}
         run: |
           set -euo pipefail
           BUILT=$(ls dist/*.tar.gz | sed -E 's/.*hopai-(.*)\.tar\.gz/\1/')
-          echo "tag says ${EXPECTED}, artifact says ${BUILT}"
-          test "${BUILT}" = "${EXPECTED}"
+          # The manual path passes a tag (v0.0.1); the release-please
+          # path passes a bare version (0.0.1). Compare like with like.
+          WANT="${EXPECTED#v}"
+          echo "expected ${WANT}, artifact says ${BUILT}"
+          test "${BUILT}" = "${WANT}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ needs.release-please.outputs.version }}
+          name: dist-${{ needs.release-please.outputs.version || inputs.publish_tag }}
           path: dist/
 
       - name: Publish to PyPI

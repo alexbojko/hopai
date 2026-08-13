@@ -69,7 +69,7 @@ from .ingest import INGEST_TOOL_SCHEMA, IngestResult
 from .json_api import TRAVERSE_TOOL_SCHEMA, spec_to_traversal, traverse_json
 from .models import Edge, Node
 
-__version__ = "0.0.1"
+__version__ = "0.0.0"
 
 __all__ = [
     "Graph", "Subgraph", "Start", "Hop",
