@@ -245,20 +245,18 @@ class Ingestor:
         )
         return [row[0] for row in result]
 
-    def merge_nodes(self, rows: list, on: list, replace: bool = False, connection=None,
-                    return_ids: bool = False):
+    def merge_nodes(self, rows: list, on: list, replace: bool = False, connection=None) -> int:
         table = self.g.nodes_tbl
         id_column = self._node_id_col()
         payload, explicit_ids = self._node_payload(rows)
         if not payload:
-            return [] if return_ids else 0
+            return 0
 
         with self._transaction(connection) as conn:
-            ids = self._merge_payload(conn, table, payload, on, replace, "node",
-                                      returning=id_column if return_ids else None)
+            self._merge_payload(conn, table, payload, on, replace, "node")
             if explicit_ids:
                 self._sync_identity_sequence(conn, table, id_column)
-        return ids if return_ids else len(payload)
+        return len(payload)
 
     # -- edges ----------------------------------------------------------
 
@@ -403,6 +401,14 @@ class Ingestor:
             if returning is not None:
                 # DO UPDATE, unlike DO NOTHING, returns a row whether it
                 # inserted or matched -- so this is the id either way.
+                #
+                # ONLY SAFE ONE ROW AT A TIME. There is no
+                # sort_by_parameter_order for ON CONFLICT, and PostgreSQL
+                # does not specify the RETURNING order when some rows
+                # insert and others update -- so a batch would hand back
+                # ids that pair with the wrong input rows, with matching
+                # lengths and no error. _merge_with_sets passes one row;
+                # keep it that way, or match the ids back by their keys.
                 statement = statement.returning(returning)
             try:
                 result = connection.execute(statement)
