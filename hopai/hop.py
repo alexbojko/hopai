@@ -26,6 +26,12 @@ HopCount = Union[int, tuple]  # an int means "exactly N hops"; a tuple means (mi
 
 
 def _normalize_hops(hops: HopCount) -> tuple:
+    # The three messages below are asserted verbatim by
+    # tests/test_query_shape.py, not just their exception types. That is
+    # not fussiness: mutation testing replaced each of them with None and
+    # the whole suite still passed, which meant nothing was stopping a
+    # refactor from leaving a caller with a bare ValueError and no idea
+    # which rule they broke. If you reword one, update its test.
     if isinstance(hops, int):
         if hops < 1:
             raise ValueError(f"hops must be >= 1, got {hops}")

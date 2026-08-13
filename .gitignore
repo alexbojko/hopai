@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# mutmut writes its mutated copy of the tree here
+mutants/

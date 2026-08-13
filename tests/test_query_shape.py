@@ -334,14 +334,24 @@ class TestHopValidationEdges:
         h = Hop(hops=value)
         assert (h.min_hops, h.max_hops) == expected
 
-    @pytest.mark.parametrize("bad", [0, -1, (0, 3), (5, 2), (-1, 1)])
-    def test_rejected_hop_counts(self, bad):
-        with pytest.raises(ValueError):
+    @pytest.mark.parametrize("bad,message", [
+        (0, "hops must be >= 1"),
+        (-1, "hops must be >= 1"),
+        ((0, 3), "1 <= min <= max"),
+        ((5, 2), "1 <= min <= max"),
+        ((-1, 1), "1 <= min <= max"),
+    ])
+    def test_rejected_hop_counts(self, bad, message):
+        """Asserting the message, not just the type: an error that does
+        not say which rule was broken sends the caller back to the source
+        to find out. Surviving mutants replaced each of these strings
+        with None and nothing failed."""
+        with pytest.raises(ValueError, match=message):
             Hop(hops=bad)
 
     @pytest.mark.parametrize("bad", [(1, 2, 3), (1,), "3", 1.5, None, [1, 2]])
     def test_rejected_hop_types(self, bad):
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError, match="int or a .min, max. tuple"):
             Hop(hops=bad)
 
     @pytest.mark.parametrize("bad", ["Forward", "up", "", None, "backwards"])
