@@ -73,5 +73,3 @@ class Hop:
         self.min_hops, self.max_hops = _normalize_hops(self.hops)
         if self.direction not in ("forward", "backward"):
             raise ValueError(f"direction must be 'forward' or 'backward', got {self.direction!r}")
-
-# (probe) touched to exercise the CI mutation leg; reverted in the next commit
