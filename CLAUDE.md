@@ -80,6 +80,54 @@ the same class of reason — on macOS libpq's Kerberos probe goes through XPC,
 which is not fork-safe, and mutmut's forked children segfault before reaching
 Postgres.
 
+## Commit messages are load-bearing
+
+Releases are cut by **release-please** from **Conventional Commits**, so the subject
+line of every commit to `main` is an input to the version number and the changelog —
+not prose. Use `type: summary`, and `type(scope): summary` when a scope helps:
+
+| Prefix | Changelog | Bump while below 1.0 |
+| --- | --- | --- |
+| `feat:` | Features | patch (`0.0.1` → `0.0.2`) |
+| `fix:` | Bug Fixes | patch |
+| `perf:` `docs:` `refactor:` | own heading | patch |
+| `test:` `ci:` `build:` `chore:` | hidden | none |
+| `feat!:` or a `BREAKING CHANGE:` footer | Features | minor while below 1.0 |
+
+An unprefixed subject releases nothing and appears nowhere. That is the failure mode
+to watch for: the work merges, CI is green, and the release PR silently does not
+mention it.
+
+**Everything is a patch bump on purpose while the version is `0.0.x`** — that series
+says "anything may change". `bump-patch-for-minor-pre-major` in
+`release-please-config.json` is what does it; flip it to `bump-minor-pre-major` when
+the API is worth promising, or land a `feat!:` to move to `0.1.0`.
+
+**Never edit `version` in `pyproject.toml`, `hopai/__init__.py` or
+`.release-please-manifest.json` by hand.** release-please owns all three;
+`tests/test_packaging.py` fails if they drift apart. `0.0.0` in the manifest means
+nothing has been published yet — the first release PR turns it into `0.0.1`.
+
+## Releasing
+
+1. Merge normal PRs to `main` with conventional-commit subjects.
+2. release-please keeps one open PR titled `chore(main): release x.y.z` with the
+   bump and the CHANGELOG entry. Review it like any other PR.
+3. **Merging that PR is the release.** It tags the commit, creates the GitHub
+   Release, and the same workflow builds and publishes to PyPI via Trusted
+   Publishing (OIDC — there is no API token anywhere in this repo).
+
+The publish job checks out the *tag*, runs `twine check --strict`, and asserts the
+built artifact's version equals the tag before uploading. A PyPI upload cannot be
+undone or replaced, so those checks come first.
+
+If the upload itself fails, re-run it from Actions → Release → *Run workflow* with
+`publish_tag: v0.0.1`. That path exists because a GitHub Release created with
+`GITHUB_TOKEN` does not fire the `release` event, so publishing can only be chained
+onto the run that created it — and a chain that has already failed needs a door back
+in. Note that PyPI will reject a re-upload of a version that already landed; bump
+instead.
+
 ## Coverage and mutation testing
 
 **Coverage gates; mutation informs. Neither may be skimmed.**
