@@ -61,6 +61,58 @@ Fixtures: `graph` is the seeded 7-node read fixture; `fresh_graph` is an empty
 graph in its own schema, rebuilt per test (constraints outlive TRUNCATE, so write
 tests need a real drop); `offline_graph` needs no database at all.
 
+```bash
+pytest tests/ --cov=hopai --cov-report=term-missing    # coverage; CI requires >= 85%
+
+pip install -e ".[dev,mutation]"
+pytest tests/ --cov=hopai --cov-report=          # mutmut needs a .coverage file first
+mutmut run hopai/hop.py                          # one module — the usual local loop
+mutmut results                                   # survivors
+mutmut show <mutant-id>                          # the diff of one survivor
+```
+
+Config is `setup.cfg` (mutmut's only config surface). Two settings there exist
+because of bugs, not taste: `hopai` is in `also_copy` as well as `source_paths`
+(a narrowed scope otherwise leaves the package without its `__init__.py` in the
+mutants tree, and every test dies on an import error), and `scripts` is copied
+because a test imports from it. The test engines set `gssencmode=disable` for
+the same class of reason — on macOS libpq's Kerberos probe goes through XPC,
+which is not fork-safe, and mutmut's forked children segfault before reaching
+Postgres.
+
+## Coverage and mutation testing
+
+**Coverage gates; mutation informs. Neither may be skimmed.**
+
+Line coverage must stay **at or above 85%**, enforced by CI after the PR comment
+is posted, so a failing PR still says by how much it fell short. Coverage answers
+"did any test execute this line" — nothing more.
+
+**Mutation testing never blocks a merge, and that exempts the merge, not the
+triage.** A surviving mutant is a change to the source that the entire suite
+accepted in silence: the line was executed and nothing asserted on it. That is
+precisely the gap coverage cannot see, and it is the reason to read the report
+rather than note its colour. On any PR whose sticky comment lists survivors,
+sort **every** one into exactly one class:
+
+1. **Real gap** — write the test that kills it, in the same PR. This is the
+   default; assume a survivor is real until shown otherwise.
+2. **Equivalent mutant** — the change cannot alter behaviour (a reordering with
+   no observable effect, a constant only used in a message nobody depends on).
+   Record the one-line proof in the PR. "Probably fine" is not a proof.
+3. **Out of scope** — the mutated line belongs to a path this PR did not touch
+   and a follow-up is genuinely warranted. Say so explicitly; do not let it pass
+   unmentioned.
+
+The first survivor this repo ever produced was class 1: three mutants replaced
+`ValueError(...)` messages in `_normalize_hops` with `None` and nothing failed,
+because the tests asserted the exception type and not the message. The fix was
+to assert the message — which the "errors name the fix" principle above already
+required. That is the normal outcome; treat class 2 as the rare one.
+
+A run reporting `0 checked`, or every mutant `segfault`, is a broken harness and
+not a clean sweep — investigate it rather than reading it as a pass.
+
 No linter, formatter, or type checker is configured — don't invent one, and don't reformat files
 you aren't otherwise changing.
 

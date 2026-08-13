@@ -16,6 +16,7 @@ import os
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.pool import NullPool
 
 DSN = os.environ.get(
     "HOPAI_TEST_DSN",
@@ -69,9 +70,29 @@ INSERT INTO {SCHEMA}.edges (start_id, end_id, properties) VALUES
 """
 
 
+def _engine(schema: str):
+    """A test engine that holds no connection between uses.
+
+    NullPool, not the default QueuePool, because mutmut runs each mutant
+    in a FORKED child. A pooled libpq connection inherited across fork is
+    shared by two processes and segfaults the moment both touch it --
+    which showed up as three mutants "segfault" rather than as any honest
+    verdict. Nothing is pooled here, so a child always opens its own.
+
+    gssencmode=disable for the same reason, and this one is macOS-only:
+    libpq probes the Kerberos credential cache while connecting, that
+    probe goes through XPC, and XPC is not fork-safe on Darwin -- the
+    child dies in `pg_GSS_have_cred_cache` before it ever reaches
+    Postgres. Linux has no XPC and never saw it. Nothing here
+    authenticates with GSSAPI, so turning the probe off costs nothing."""
+    return create_engine(DSN, poolclass=NullPool,
+                         connect_args={"options": f"-c search_path={schema}",
+                                       "gssencmode": "disable"})
+
+
 @pytest.fixture(scope="session")
 def engine():
-    eng = create_engine(DSN, connect_args={"options": f"-c search_path={SCHEMA}"})
+    eng = _engine(SCHEMA)
     try:
         eng.connect().close()
     except OperationalError as exc:
@@ -114,7 +135,7 @@ WRITE_SCHEMA = "hopai_write"
 @pytest.fixture(scope="session")
 def write_engine(engine):
     """A second engine pointed at a schema the write tests own outright."""
-    eng = create_engine(DSN, connect_args={"options": f"-c search_path={WRITE_SCHEMA}"})
+    eng = _engine(WRITE_SCHEMA)
     yield eng
     eng.dispose()
 
