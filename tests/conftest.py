@@ -15,10 +15,13 @@ import os
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 
 DSN = os.environ.get(
     "HOPAI_TEST_DSN",
-    "postgresql+psycopg2://postgres:testpass@localhost:5432/ageexp",
+    # Matches docker-compose.yml, so `docker compose up -d && pytest` works
+    # with no configuration at all.
+    "postgresql+psycopg2://postgres:testpass@localhost:5432/hopai",
 )
 SCHEMA = "hopai_test"
 
@@ -69,6 +72,22 @@ INSERT INTO {SCHEMA}.edges (start_id, end_id, properties) VALUES
 @pytest.fixture(scope="session")
 def engine():
     eng = create_engine(DSN, connect_args={"options": f"-c search_path={SCHEMA}"})
+    try:
+        eng.connect().close()
+    except OperationalError as exc:
+        # A large part of this suite -- the whole translation and
+        # query-shape layer -- needs no database, and a contributor
+        # without one should still get a useful run rather than a wall of
+        # connection errors. Set HOPAI_REQUIRE_DB=1 in CI so a missing
+        # database fails loudly instead of quietly skipping.
+        if os.environ.get("HOPAI_REQUIRE_DB"):
+            raise
+        eng.dispose()
+        pytest.skip(
+            f"no PostgreSQL at {DSN} ({exc.orig.__class__.__name__}) -- set HOPAI_TEST_DSN, "
+            f"or HOPAI_REQUIRE_DB=1 to make this an error",
+            allow_module_level=True,
+        )
     with eng.begin() as conn:
         for stmt in SETUP_SQL.strip().split(";"):
             if stmt.strip():
@@ -87,3 +106,15 @@ def engine():
 def graph(engine):
     from hopai import Graph
     return Graph(engine)
+
+
+@pytest.fixture(scope="session")
+def offline_graph():
+    """A Graph bound to a DSN nothing listens on.
+
+    create_engine() does not connect, and query building never executes,
+    so everything up to and including the compiled SQL can be tested with
+    no database at all -- which is how the suite covers query shape,
+    filter compilation and the Cypher translator on any machine."""
+    from hopai import Graph
+    return Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline")

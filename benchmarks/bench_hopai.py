@@ -42,7 +42,7 @@ def load_data(engine, data_dir: Path, schema: str):
         with open(data_dir / "nodes.csv") as f:
             cur.copy_expert(f"COPY {schema}.nodes(id, properties) FROM STDIN WITH (FORMAT csv)", f)
         cur2 = raw.cursor()
-        cur2.execute(f"CREATE TEMP TABLE stage_edges(start_id bigint, end_id bigint, tag text)")
+        cur2.execute("CREATE TEMP TABLE stage_edges(start_id bigint, end_id bigint, tag text)")
         with open(data_dir / "edges.csv") as f:
             cur2.copy_expert("COPY stage_edges FROM STDIN WITH (FORMAT csv)", f)
         cur2.execute(f"""
@@ -63,7 +63,7 @@ def load_data(engine, data_dir: Path, schema: str):
 
 
 def run_suite(graph, hub_id: int):
-    from hopai import AND, BETWEEN, GT, NOT, Hop, Start
+    from hopai import AND, GT, NOT, Hop, Start
 
     suite = [
         ("forward_1hop", [Start(where={"type": "leaf"}), Hop(where={"flag": 1}, hops=1)]),
@@ -96,7 +96,7 @@ def run_suite(graph, hub_id: int):
         start_hop, *rest = hops
         times = []
         r = None
-        for i in range(2):
+        for _ in range(2):  # first pass cold, second warm
             t0 = time.perf_counter()
             r = graph.traverse(start_hop, *rest)
             times.append((time.perf_counter() - t0) * 1000)

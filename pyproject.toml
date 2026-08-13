@@ -13,7 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 networkx = ["networkx>=3.0"]
-dev = ["pytest>=8.0", "networkx>=3.0"]
+dev = ["pytest>=8.0", "networkx>=3.0", "ruff>=0.6"]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -21,3 +21,35 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["hopai*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning:hopai.*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "W",    # warnings
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "C4",   # comprehensions
+    "SIM",  # simplify
+]
+ignore = [
+    "E501",    # long lines are capped by line-length above, not flagged per line
+    "B008",    # call-in-default is how SQLAlchemy columns are declared
+    "SIM108",  # a ternary is not always clearer than an if/else
+    # The codebase spells optionals `Optional[X]` throughout. That is a
+    # consistent choice, not an oversight, and churning every signature to
+    # `X | None` would touch far more than it improves.
+    "UP007", "UP045",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on construction and re-import inside test bodies on purpose.
+"tests/*" = ["B011", "E731"]

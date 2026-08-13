@@ -34,9 +34,9 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
 
 from sqlalchemy import String, and_, cast, create_engine, distinct, func, literal, select
+from sqlalchemy import union as sa_union
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -225,10 +225,11 @@ class Graph:
                 seed.join(nt, node_id_col == seed.c.node_id)
             )
 
-        all_edge_ids = hop_edge_ctes[0].select()
-        for c in hop_edge_ctes[1:]:
-            all_edge_ids = all_edge_ids.union(c.select())
-        all_edges_cte = all_edge_ids.cte("all_edges")
+        # One union() over all the hops, NOT a fold of .union() calls:
+        # Select.union() returns a CompoundSelect, which has no .union()
+        # of its own, so folding raised AttributeError on the third hop
+        # and every chain longer than two was unrunnable.
+        all_edges_cte = sa_union(*(c.select() for c in hop_edge_ctes)).cte("all_edges")
 
         edge_rows = (
             select(

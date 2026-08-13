@@ -1,0 +1,154 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+`hopai` compiles multi-hop graph traversals into a single recursive CTE against two ordinary
+PostgreSQL tables (`nodes`, `edges`, each with a JSONB `properties` bag). No graph database, no
+extension.
+
+## The goal this project is measured against
+
+**Let a developer building an AI project keep a real knowledge graph in the database they already
+run — no Neo4j, no graph extension, no new operational dependency — and make every interface
+obvious to an LLM and a human on first read.**
+
+That goal is not decoration; it decides arguments. When a design question comes up, these are the
+tiebreakers, in order:
+
+1. **No new dependency, ever.** Postgres and SQLAlchemy are the whole stack. A feature that needs
+   an extension, a sidecar service, or a background worker is the wrong feature — find the version
+   that a well-indexed table can do. Optional extras (`networkx`) may only ever be optional.
+2. **An LLM must get it right with no custom instructions.** Prefer a protocol a model has already
+   seen ten thousand times — Cypher, JSON node/edge lists, JSON Schema tool definitions, networkx,
+   SQLAlchemy's own idioms — over anything invented here, even when the invention is tidier. If
+   using the API correctly would require a paragraph of prompt explaining our conventions, the API
+   is wrong. Ship a JSON Schema alongside anything an agent is meant to call.
+3. **Obvious to a human on first read.** The same property, from the other side: names that say
+   what they do, one way to do each thing, errors that name the fix. This library is meant to be
+   handed to teammates and recommended to other teams; "you have to know that..." is a defect.
+4. **Refuse, don't approximate.** Where our semantics differ from what a caller likely expects,
+   raise and name the rewrite. A silently different answer is the worst outcome this library can
+   produce, and the hardest for an agent to notice.
+5. **Postgres features are the advantage — use them.** Constraints (unique, composite unique,
+   partial, CHECK) are enterprise-only in Neo4j and free for us. Anything Postgres gives us that a
+   graph database charges for or lacks is worth surfacing as a first-class feature.
+6. **No performance regression.** Traversal speed is the reason to believe the premise. Any change
+   that could touch the query path needs its SQL inspected (see `build_query` below) and, for
+   anything structural, a benchmark run before and after. "Probably fine" is not a measurement.
+
+## Commands
+
+```bash
+pip install -e ".[dev]"
+
+# Most tests need a live PostgreSQL — anything taking the `graph` fixture. The
+# session fixture DROPs and recreates the `hopai_test` schema on every run.
+export HOPAI_TEST_DSN="postgresql+psycopg2://user:pass@localhost/db"   # default: postgres:testpass@localhost:5432/ageexp
+pytest tests/ -v
+pytest "tests/test_hopai.py::TestCoreTraversal::test_simple_forward_hop" -v   # one test
+pytest tests/ -k "optional or cycle"                                          # by keyword
+
+# These 7 take no `graph` fixture, so they run with no database at all:
+pytest tests/test_hopai.py::TestHopValidation                                 # hop/direction validation
+pytest tests/test_hopai.py -k "parse_filter"                                  # JSON filter parsing
+```
+
+No linter, formatter, or type checker is configured — don't invent one, and don't reformat files
+you aren't otherwise changing.
+
+**Inspecting generated SQL needs no database.** `create_engine` doesn't connect, so query building
+works fully offline — the fastest way to check a change to `build_query` when no Postgres is around:
+
+```python
+from sqlalchemy.dialects import postgresql
+from hopai import Graph, Start, Hop
+g = Graph("postgresql+psycopg2://u:p@localhost/db")          # never connects
+print(g.build_query(Start(where={"type": "person"}), [Hop(hops=(1, 3))])
+       .compile(dialect=postgresql.dialect()))
+```
+
+Benchmarks need a large generated dataset and their own database; see `benchmarks/README.md`.
+
+## Architecture
+
+The pipeline spans three modules and is easier to follow as one flow than file by file:
+
+1. **`hop.py`** — `Start(where=)` and `Hop(where=, via=, hops=, direction=, optional=)` are plain
+   dataclasses. `Hop.__post_init__` normalizes `hops` (an int or `(min, max)`) into `min_hops` /
+   `max_hops`, which is what `core.py` actually reads.
+2. **`filters.py`** — `resolve(column, filt)` compiles the filter DSL into a SQLAlchemy boolean
+   expression. Equality is JSONB containment (`@>`), not `->>` comparison. `parse_filter()` turns
+   the JSON operator form into the same Python objects, and `cypher.py` produces those same
+   objects too, so **all three front ends compile through the one `resolve()`** — never add a
+   second compilation path.
+3. **`core.py:build_query`** — per hop `i`, emits a recursive CTE `walk_i` (anchored on the `seed`
+   CTE for the first hop, on `match_{i-1}` after that), then two CTEs derived from it: `match_i`
+   (distinct reached nodes that pass
+   `where`, feeding the next hop) and `hop_edges_i` (every real edge id used). All `hop_edges_*` are
+   unioned into `all_edges` → `edge_rows`, and the final statement returns tagged
+   `(kind, id)` rows — `"node"` / `"edge"` — in one round trip.
+4. **`core.py:traverse`** — splits those rows by `kind` and issues two follow-up `SELECT`s to
+   hydrate properties. `elapsed_ms` on the returned `Subgraph` times all three queries.
+
+### Invariants — breaking any of these reintroduces a bug the tests were written for
+
+- **Path tracking is per-hop, not per-chain.** Each `walk_i` carries its own `local_path` array,
+  reset at the hop boundary. A global path per destination node silently drops fan-in when two
+  parents feed one intermediate node. Guarded by `test_fan_in_both_parents_preserved`.
+- **"Which nodes continue the walk" and "which edges to report" are separate queries** (`match_i` vs
+  `hop_edges_i`). Conflating them is what caused the above.
+- **Reported nodes are derived from the edges found, never from the seed set.** That is what prunes
+  dead ends automatically, with no separate pass. Guarded by
+  `test_dead_end_excluded_when_edge_kind_filtered`.
+- **A hop can span several real edges, so all of them must be reconstructed** — not one fabricated
+  edge between hop endpoints. Guarded by `test_multi_hop_edge_reconstruction`.
+- **`optional=True` is rejected anywhere but the last hop**, at `build_query` entry. Mid-chain
+  support means every downstream hop tolerating a missing anchor — a real feature, not a flag.
+- **`NOT` negates a containment test on purpose**, so rows *missing* the key are included. Naive
+  `<> value` treats a missing key as SQL `NULL` and drops it under negation. Guarded by
+  `test_not_includes_missing_key`.
+- **A bare top-level list raises `TypeError`.** It reads as "AND these" but would mean OR; callers
+  must write `OR(...)`.
+
+### Two gotchas that surprise readers of the result
+
+- **Ids come back as strings.** `build_query` casts them to `String` so node and edge ids can share
+  one union'd result column, and `traverse` keeps them that way — assertions compare `{"1", "2"}`,
+  not `{1, 2}`. The hydration queries then cast the indexed BIGINT to text to match; removing that
+  cast as an optimization breaks the string-id contract the tests assert on.
+- **Table and column names are configurable** via `Graph(engine, node_table=…, edge_start_col=…)`.
+  Query building must go through `self.node_id_col` / `self.edge_start_col` / etc. and the
+  `nodes_tbl` / `edges_tbl` attributes — never hardcode `Node.__table__` or a literal `"start_id"`.
+  The SQLModel classes in `models.py` are the default, not a dependency of the engine.
+
+## Where the reasoning lives
+
+Every module opens with a docstring explaining *why* it is shaped that way, written against bugs
+actually hit during development. Read the relevant one before changing behavior:
+
+| Read this | For |
+| --- | --- |
+| `hopai/core.py` header | Why local paths, split queries, edge-derived nodes, last-hop-only `optional` |
+| `hopai/filters.py` header | The full DSL in both forms, and why `OR`/`AND`/`NOT` are explicit classes |
+| `hopai/hop.py` header | Why `Start` and `Hop` are separate types rather than one |
+| `hopai/models.py` header | The expected DDL, and the typed-columns / JSONB-bag split |
+| `hopai/cypher.py` header | The translatable Cypher subset, and why each refusal is a refusal |
+| `tests/conftest.py` | The 7-node fixture graph — it deliberately contains a dead end, a fan-in, and a cycle |
+| `README.md` "What this doesn't do" | Committed-to limitations: one linear chain, sync only, path-array cost past ~10 hops |
+| `benchmarks/README.md` | Measured numbers, including where raw CTEs beat this library 2-5x |
+
+## Conventions
+
+- Comments here explain *why*, and cite the bug or trade-off behind a decision. Match that when
+  touching non-obvious code; skip it for mechanical changes.
+- New tests belong to an existing `TestX` class in `tests/test_hopai.py` and get a docstring saying
+  what would break without the fix.
+- `json_api.py` is a translation layer only. Anything it needs to *decide* belongs in `filters.py`
+  or `core.py`, and `TRAVERSE_TOOL_SCHEMA` must stay in step with what `spec_to_traversal` accepts.
+- `cypher.py` is the same: a front end that emits `(Start, [Hop])` and holds no query logic. Its
+  rule is **refuse, don't approximate** — a Cypher construct with no hopai equivalent, or with a
+  *different meaning* in hopai (`<>` and `NOT x = y` versus containment-based `NOT`), raises
+  `CypherError` naming the rewrite. Widening the subset means adding a translation, never
+  loosening one of those refusals into a near-enough mapping.

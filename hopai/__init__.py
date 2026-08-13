@@ -26,6 +26,7 @@ handler, config-driven traversal):
 """
 
 from .core import Graph, Subgraph
+from .cypher import CypherError, cypher_to_traversal, traverse_cypher
 from .filters import AND, BETWEEN, GT, GTE, LT, LTE, NOT, OR, parse_filter
 from .hop import Hop, Start
 from .json_api import TRAVERSE_TOOL_SCHEMA, spec_to_traversal, traverse_json
@@ -37,5 +38,6 @@ __all__ = [
     "Graph", "Subgraph", "Start", "Hop",
     "OR", "AND", "NOT", "GT", "GTE", "LT", "LTE", "BETWEEN", "parse_filter",
     "traverse_json", "spec_to_traversal", "TRAVERSE_TOOL_SCHEMA",
+    "traverse_cypher", "cypher_to_traversal", "CypherError",
     "Node", "Edge",
 ]

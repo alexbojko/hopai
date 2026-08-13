@@ -125,6 +125,51 @@ Filters accept the same grammar, spelled as JSON operators:
 `hopai.TRAVERSE_TOOL_SCHEMA` is a ready-to-use JSON Schema for wiring
 this into an LLM function-calling definition directly.
 
+## Cypher as input syntax
+
+For callers who already think in Cypher:
+
+```python
+from hopai import traverse_cypher
+
+traverse_cypher(graph, """
+    MATCH (a:person)-[:friend*1..4]->(b {active: true})
+    WHERE b.age > 18
+    RETURN b
+""")
+```
+
+`cypher_to_traversal(query)` returns the `(Start, [Hop, ...])` pair
+instead, if you want to inspect or adjust the translation before running
+it.
+
+hopai has no label concept, so labels compile to property tests:
+`(a:person)` → `{"type": "person"}`, `[:friend]` → `{"kind": "friend"}`.
+Change the keys with `node_label_key=` / `edge_type_key=`, or pass
+`None` to ignore labels entirely.
+
+Translates: linear `MATCH` chains (including several `MATCH` clauses
+joined end to end), `*min..max`, `->` / `<-` per hop, `[:A|B]`, inline
+property maps, `WHERE` with `AND`/`OR`/comparisons/`IN`/`IS NULL`,
+`all(r IN relationships(p) WHERE ...)` → `via`, and `OPTIONAL MATCH` as
+the last clause.
+
+Everything else raises `CypherError` naming the rewrite, rather than
+translating into something that answers a different question:
+
+- **`RETURN` has no target.** A traversal returns the whole matching
+  subgraph, so projections are parsed and ignored — and aggregations
+  (`RETURN count(a)`) raise, since the caller clearly wanted a number.
+- **`x.k <> v` and `NOT x.k = v` raise.** Cypher evaluates these to
+  `NULL` when `k` is missing and drops the row; hopai's containment-based
+  `NOT` keeps it. Same spelling, different result set. Write the
+  NULL-safe idiom `x.k IS NULL OR x.k <> v`, which maps exactly onto
+  `NOT({"k": v})`.
+- Also refused: cross-variable `OR` (`a.x = 1 OR b.y = 2`), unbounded
+  `*` (pass `max_var_length=N` to cap it), undirected `-[]-`,
+  comma-separated patterns, `WITH` / `ORDER BY` / `LIMIT`, and
+  `OPTIONAL MATCH` anywhere but last.
+
 ## What this doesn't do (yet)
 
 - No disjoint multi-pattern matching (`MATCH (a)-[]->(b), (c)-[]->(d)`

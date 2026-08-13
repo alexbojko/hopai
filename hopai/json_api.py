@@ -29,7 +29,6 @@ array [min, max].
 
 from __future__ import annotations
 
-from typing import Any, Optional
 
 from .core import Graph, Subgraph
 from .filters import parse_filter

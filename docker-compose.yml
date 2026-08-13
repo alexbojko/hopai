@@ -1,0 +1,40 @@
+# A throwaway PostgreSQL for running the test suite.
+#
+#   docker compose up -d          # start it
+#   pytest tests/                 # the default DSN points here already
+#   docker compose down           # stop it; nothing is kept
+#
+# Storage is tmpfs and durability is switched off: this database exists
+# for the length of a test run, and the suite recreates the `hopai_test`
+# schema from scratch on every session anyway. Do not point anything you
+# care about at it.
+#
+# Benchmarks are a different job -- generate_graph.py makes a million
+# nodes and wants a real disk. Run those against your own instance and
+# pass --dsn, see benchmarks/README.md.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: hopai-test-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: hopai
+    ports:
+      - "5432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hopai"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
