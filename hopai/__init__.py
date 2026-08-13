@@ -1,28 +1,51 @@
 """
-hopai -- graph traversal on plain PostgreSQL.
+hopai -- a knowledge graph in the PostgreSQL you already run.
 
-    from hopai import Graph, Start, Hop, OR, AND, NOT, GT, GTE, LT, LTE, BETWEEN
+Traversal, ingestion and real constraints on two ordinary tables. No
+graph database, no extension, no new operational dependency.
+
+SET UP -- idempotent, so both calls belong in your start-up path:
+
+    from hopai import Graph, Unique, Required, PropertyType
 
     graph = Graph("postgresql+psycopg2://user:pass@host/db")
+    graph.create_schema()
+    graph.define_constraints(nodes=[Required("type"), Unique("email"),
+                                    PropertyType("age", "number")])
 
-    result = graph.traverse(
+WRITE -- a row with a `properties` key is nested; any other row is flat,
+and every key that is not an identity key is a property:
+
+    graph.add_nodes([{"id": 1, "type": "person", "email": "a@x.com"}])
+    graph.add_edges([{"start_id": 1, "end": {"email": "b@x.com"}, "kind": "knows"}])
+    graph.merge_nodes([{"type": "person", "email": "a@x.com"}], on=["email"])
+
+READ -- the same traversal in three interchangeable notations:
+
+    from hopai import Start, Hop, traverse_json, traverse_cypher
+
+    graph.traverse(                                     # Python
         Start(where={"type": "person"}),
         Hop(where={"active": True}, via={"kind": "friend"}, hops=(1, 4)),
-        Hop(where={"type": "company"}, hops=3),
     )
+    traverse_json(graph, {                              # JSON in, JSON out
+        "start": {"where": {"type": "person"}},
+        "hops": [{"where": {"active": True}, "via": {"kind": "friend"},
+                  "hops": [1, 4]}],
+    })
+    traverse_cypher(graph, '''
+        MATCH (a:person)-[:friend*1..4]->(b {active: true}) RETURN b
+    ''')
+
+A result carries every node and edge on a matching chain:
 
     result.nodes           # list[{"id": ..., "properties": {...}}]
     result.edges           # list[{"start_id": ..., "end_id": ..., "properties": {...}}]
     result.to_networkx()   # in-memory graph, if you have networkx installed
 
-For callers that want JSON in, JSON out (LLM tool calls, an HTTP
-handler, config-driven traversal):
-
-    from hopai import traverse_json
-    traverse_json(graph, {
-        "start": {"where": {"type": "person"}},
-        "hops": [{"where": {"active": True}, "hops": [1, 4]}],
-    })
+FOR TOOL-CALLING MODELS: TRAVERSE_TOOL_SCHEMA and INGEST_TOOL_SCHEMA are
+JSON Schemas ready to hand to a function-calling definition, covering
+reading and writing respectively.
 """
 
 from .constraints import (
