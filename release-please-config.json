@@ -6,6 +6,7 @@
       "package-name": "hopai",
       "changelog-path": "CHANGELOG.md",
       "include-component-in-tag": false,
+      "initial-version": "0.0.1",
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
       "draft": false,
