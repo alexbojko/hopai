@@ -241,21 +241,50 @@ this into an LLM function-calling definition directly.
 
 ## Cypher as input syntax
 
-For callers who already think in Cypher:
+For callers who already think in Cypher — reading and writing:
 
 ```python
-from hopai import traverse_cypher
+graph.cypher("""
+    CREATE (a:person {email: 'a@x.com'})-[:friend]->(b:person {email: 'b@x.com'})
+""")
 
-traverse_cypher(graph, """
+graph.cypher("""
+    MERGE (a:person {email: 'a@x.com'})
+    ON CREATE SET a.name = 'Alice'
+    ON MATCH SET  a.last_seen = 2026
+""")
+
+graph.cypher("""
     MATCH (a:person)-[:friend*1..4]->(b {active: true})
     WHERE b.age > 18
     RETURN b
 """)
 ```
 
-`cypher_to_traversal(query)` returns the `(Start, [Hop, ...])` pair
-instead, if you want to inspect or adjust the translation before running
-it.
+`graph.cypher()` returns a `Subgraph` for a query that reads and an
+`IngestResult` for one that writes; `traverse_cypher` and `write_cypher`
+are the same thing when you'd rather be explicit. `cypher_to_traversal`
+and `graph.cypher_operations` show the translation — a `(Start, [Hop])`
+pair, or the ingestion plan — without running anything.
+
+Writes compile to the same `add_nodes` / `merge_nodes` / `add_edges` the
+Python API calls, in one transaction, with ids from the insert wiring the
+edges. Three places writes stop short of Cypher:
+
+- **`MERGE` on a whole path is refused.** Cypher's
+  `MERGE (a {…})-[:x]->(b {…})` matches the *entire* pattern and creates
+  all of it when it doesn't match, duplicating nodes that already exist.
+  Bind the endpoints first, then `MERGE (a)-[:x]->(b)`.
+- **`MERGE` needs a unique index** over every property in the pattern —
+  those are the keys Cypher matches on. Anything that shouldn't take part
+  in matching goes in `ON CREATE SET`. (Cypher needs no index and races
+  instead; the error here names the `Unique(...)` to declare.)
+- **`MATCH` before a write binds single nodes** by property, one lookup
+  each. It doesn't traverse.
+
+`SET` on matched rows, `DELETE` and `DETACH DELETE` are unsupported:
+there's no update-by-query or delete API here yet, in Cypher or in
+Python.
 
 hopai has no label concept, so labels compile to property tests:
 `(a:person)` → `{"type": "person"}`, `[:friend]` → `{"kind": "friend"}`.

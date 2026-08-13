@@ -1,17 +1,48 @@
 """
 hopai.cypher
 
-Cypher as an input syntax. Translates a subset of Cypher's MATCH into the
-same `(Start, [Hop, ...])` pair `hopai.json_api.spec_to_traversal()`
-produces -- a third way to describe a traversal, compiling through the
-identical `resolve()` path, with no query logic of its own.
+Cypher as an input syntax, for reading and for writing.
 
-    from hopai import traverse_cypher
-    traverse_cypher(graph, '''
-        MATCH (a:person)-[:friend*1..4]->(b {active: true})
-        WHERE b.age > 18
-        RETURN b
-    ''')
+MATCH translates into the same `(Start, [Hop, ...])` pair
+`hopai.json_api.spec_to_traversal()` produces. CREATE and MERGE translate
+into the same add_nodes/merge_nodes/add_edges operations the Python API
+calls. Neither has query logic of its own -- this module is a front end,
+and there is exactly one traversal engine and one write path underneath.
+
+    graph.cypher("MATCH (a:person)-[:friend*1..4]->(b {active: true}) RETURN b")
+    graph.cypher("CREATE (a:person {email: 'a@x.com'})-[:friend]->(b:person {email: 'b@x.com'})")
+    graph.cypher("MERGE (a:person {email: 'a@x.com'}) ON CREATE SET a.name = 'Alice'")
+
+`graph.cypher()` returns a Subgraph for a query that reads and an
+IngestResult for one that writes; traverse_cypher() and write_cypher()
+are the same thing when you would rather be explicit, and
+`graph.cypher_operations()` shows a write's plan without running it.
+
+WRITES, and the three places they stop short of Cypher:
+
+  MERGE on a whole path.  Cypher's `MERGE (a {..})-[:x]->(b {..})`
+                          matches the ENTIRE pattern and creates all of
+                          it when it does not match -- duplicating nodes
+                          that already exist independently. That is a
+                          famous footgun, so a relationship MERGE here
+                          requires both endpoints to be bound already:
+                          MATCH or MERGE the nodes, then the edge.
+  MERGE needs an index.   The conflict keys are every property in the
+                          pattern (which is what Cypher matches on), and
+                          a unique index must cover exactly them.
+                          Anything that should not take part in matching
+                          belongs in ON CREATE SET. Cypher itself needs
+                          no index and races instead; the error here
+                          names the Unique() to declare.
+  MATCH before a write.   Binds single nodes by their properties, one
+                          lookup each. It does not traverse -- a write
+                          driven by a multi-hop match is a different
+                          feature.
+
+SET on matched rows, DELETE and DETACH DELETE are not supported at all:
+there is no update-by-query or delete API here yet, in Cypher or in
+Python, and offering half of one through this door only would be a way
+to lose data quietly.
 
 THE RULE THIS MODULE IS BUILT ON: refuse, don't approximate. Cypher can
 say things hopai cannot, and a few things it says in a shape hopai
@@ -58,7 +89,7 @@ Pass node_label_key=None to ignore labels entirely.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from sqlalchemy import not_ as _sa_not
@@ -174,6 +205,18 @@ class _MatchClause:
     where: Any
     optional: bool
     path_var: Optional[str]
+    #: Patterns after the first comma. A traversal is one linear chain and
+    #: refuses these; a write treats each as an independent lookup, which
+    #: is what `MATCH (a {...}), (b {...}) CREATE (a)-[:x]->(b)` needs.
+    extra_patterns: list = field(default_factory=list)
+
+
+@dataclass
+class _WriteClause:
+    kind: str            # 'create' | 'merge'
+    patterns: list       # [(nodes, rels), ...]
+    on_create: dict = field(default_factory=dict)   # var -> {key: value}
+    on_match: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -224,21 +267,27 @@ class _AllRels:
 
 _AGGREGATES = {"count", "sum", "avg", "min", "max", "collect", "stdev", "percentiledisc",
                "percentilecont"}
+_SUBGRAPH = ("hopai returns the whole subgraph of every node and edge on a matching "
+             "chain, so there is nothing for this clause to act on")
+_NO_DELETE = ("hopai has no delete API yet, in Cypher or in Python -- remove rows with SQL "
+              "for now")
+
+#: Complete sentences: each is raised as-is, because "X is not supported"
+#: with a generic suffix reads wrong once the reasons differ this much.
 _UNSUPPORTED_CLAUSES = {
-    "WITH": "WITH (hopai runs one traversal, with no intermediate projection)",
-    "UNWIND": "UNWIND",
-    "CREATE": "writes (hopai is read-only)",
-    "MERGE": "writes (hopai is read-only)",
-    "SET": "writes (hopai is read-only)",
-    "DELETE": "writes (hopai is read-only)",
-    "REMOVE": "writes (hopai is read-only)",
-    "DETACH": "writes (hopai is read-only)",
-    "CALL": "CALL",
-    "FOREACH": "FOREACH",
-    "UNION": "UNION",
-    "ORDER": "ORDER BY (hopai returns an unordered subgraph)",
-    "SKIP": "SKIP",
-    "LIMIT": "LIMIT (hopai returns the whole matching subgraph)",
+    "WITH": f"WITH is not supported: {_SUBGRAPH}, and no intermediate projection to carry",
+    "UNWIND": f"UNWIND is not supported: {_SUBGRAPH}",
+    "SET": "a bare SET (updating rows a MATCH found) is not supported. Only "
+           "`MERGE ... ON CREATE SET` and `ON MATCH SET` are",
+    "DELETE": f"DELETE is not supported: {_NO_DELETE}",
+    "DETACH": f"DETACH DELETE is not supported: {_NO_DELETE}",
+    "REMOVE": f"REMOVE is not supported: {_NO_DELETE}",
+    "CALL": "CALL is not supported",
+    "FOREACH": "FOREACH is not supported",
+    "UNION": f"UNION is not supported: {_SUBGRAPH}",
+    "ORDER": f"ORDER BY is not supported: {_SUBGRAPH}, unordered",
+    "SKIP": f"SKIP is not supported: {_SUBGRAPH}",
+    "LIMIT": f"LIMIT is not supported: {_SUBGRAPH}",
 }
 
 
@@ -308,17 +357,19 @@ class _Parser:
                 self._next()
                 self._expect_kw("MATCH")
                 clauses.append(self._parse_match(optional=True))
+            elif self._at_kw("CREATE"):
+                self._next()
+                clauses.append(self._parse_write("create"))
+            elif self._at_kw("MERGE"):
+                self._next()
+                clauses.append(self._parse_write("merge"))
             elif self._at_kw("RETURN"):
                 self._next()
                 self._parse_return()
             elif self._at_name():
                 word = self._peek().value.upper()
                 if word in _UNSUPPORTED_CLAUSES:
-                    raise CypherError(
-                        f"{_UNSUPPORTED_CLAUSES[word]} is not supported -- hopai returns "
-                        f"a subgraph of every node and edge on a matching chain, so there "
-                        f"is nothing for this clause to act on"
-                    )
+                    raise CypherError(_UNSUPPORTED_CLAUSES[word])
                 raise CypherError(f"unexpected {self._peek().value!r} at position {self._peek().pos}")
             else:
                 t = self._peek()
@@ -336,10 +387,7 @@ class _Parser:
             if t.kind == "name":
                 word = t.value.upper()
                 if word in _UNSUPPORTED_CLAUSES:
-                    raise CypherError(
-                        f"{_UNSUPPORTED_CLAUSES[word]} is not supported -- hopai returns "
-                        f"a subgraph of every node and edge on a matching chain"
-                    )
+                    raise CypherError(_UNSUPPORTED_CLAUSES[word])
                 if t.value.lower() in _AGGREGATES and self._peek(1).kind == "punct" \
                         and self._peek(1).value == "(":
                     raise CypherError(
@@ -356,18 +404,52 @@ class _Parser:
         if self._at_name() and self._peek(1).kind == "punct" and self._peek(1).value == "=":
             path_var = self._next().value
             self._next()  # '='
-        nodes, rels = self._parse_pattern()
-        if self._at_punct(","):
-            raise CypherError(
-                "comma-separated patterns describe disjoint matches joined on shared "
-                "variables, which hopai does not support -- it traverses one linear chain"
-            )
+        patterns = self._parse_pattern_list()
         where = None
         if self._at_kw("WHERE"):
             self._next()
             where = self._parse_or()
+        nodes, rels = patterns[0]
         return _MatchClause(nodes=nodes, rels=rels, where=where, optional=optional,
-                            path_var=path_var)
+                            path_var=path_var, extra_patterns=patterns[1:])
+
+    def _parse_pattern_list(self) -> list:
+        patterns = [self._parse_pattern()]
+        while self._at_punct(","):
+            self._next()
+            patterns.append(self._parse_pattern())
+        return patterns
+
+    def _parse_write(self, kind: str) -> _WriteClause:
+        clause = _WriteClause(kind=kind, patterns=self._parse_pattern_list())
+        if kind == "merge":
+            while self._at_kw("ON"):
+                self._next()
+                if self._at_kw("CREATE"):
+                    target = clause.on_create
+                elif self._at_kw("MATCH"):
+                    target = clause.on_match
+                else:
+                    tok = self._peek()
+                    raise CypherError(f"expected CREATE or MATCH after ON at position {tok.pos}")
+                self._next()
+                self._expect_kw("SET")
+                for var, assignments in self._parse_set_assignments().items():
+                    target.setdefault(var, {}).update(assignments)
+        return clause
+
+    def _parse_set_assignments(self) -> dict:
+        """`a.x = 1, a.y = 'two'` -- the only SET form there is here.
+        `a += {...}` and `a = {...}` replace or merge whole maps, which
+        would need semantics this does not have."""
+        assignments: dict = {}
+        while True:
+            var, key = self._parse_property_ref()
+            self._expect_punct("=")
+            assignments.setdefault(var, {})[key] = self._parse_literal()
+            if not self._at_punct(","):
+                return assignments
+            self._next()
 
     def _parse_pattern(self) -> tuple:
         nodes = [self._parse_node()]
@@ -820,6 +902,13 @@ class _Translator:
 
     def _build_chain(self, clauses: list) -> None:
         for ci, clause in enumerate(clauses):
+            if clause.extra_patterns:
+                raise CypherError(
+                    "comma-separated patterns describe disjoint matches joined on shared "
+                    "variables, which hopai does not support -- it traverses one linear "
+                    "chain. (Before a CREATE or MERGE they are allowed, since there each "
+                    "is just a lookup.)"
+                )
             if clause.optional:
                 if ci != len(clauses) - 1:
                     raise CypherError(
@@ -978,6 +1067,250 @@ class _Translator:
 
 
 # ---------------------------------------------------------------------
+# Writes: CREATE and MERGE
+# ---------------------------------------------------------------------
+
+class _WriteTranslator:
+    """Turn CREATE/MERGE clauses into an ordered list of ingestion
+    operations -- the same add_nodes/merge_nodes/add_edges the Python API
+    calls, never a second write path.
+
+    Variables are the whole problem. An edge needs its endpoints' ids,
+    and those come from three places: a node this query just created
+    (the insert returns them), a node this query merged (the upsert
+    returns them), or a node a MATCH found (looked up by its properties).
+    Every operation therefore binds its variables, and edges are emitted
+    referring to variable names, resolved at execution."""
+
+    def __init__(self, opts: _Options):
+        self.o = opts
+        self.operations: list = []
+        self.bound: set = set()
+
+    # -- shared with the read path --------------------------------------
+
+    def _node_properties(self, pat: _NodePat) -> dict:
+        properties = {}
+        if pat.labels:
+            if len(pat.labels) > 1:
+                raise CypherError(
+                    f"node {pat.var or '(anonymous)'} has multiple labels "
+                    f"({':'.join(pat.labels)}) -- they would map onto the single property "
+                    f"{self.o.node_label_key!r}, and a property has one value"
+                )
+            if self.o.node_label_key is not None:
+                key = self.o.node_label_key
+                if key in pat.props and pat.props[key] != pat.labels[0]:
+                    raise CypherError(
+                        f"node {pat.var or '(anonymous)'} sets {key}={pat.props[key]!r} and "
+                        f"also carries the label :{pat.labels[0]}, which maps onto the same "
+                        f"property. Drop one, or pass node_label_key=None"
+                    )
+                properties[key] = pat.labels[0]
+        properties.update(pat.props)
+        return properties
+
+    def _rel_properties(self, pat: _RelPat) -> dict:
+        properties = {}
+        if pat.types:
+            if len(pat.types) > 1:
+                raise CypherError(
+                    "a relationship being written has one type, not several -- "
+                    f"`[:{'|'.join(pat.types)}]` is a pattern to match, not to create"
+                )
+            if self.o.edge_type_key is not None:
+                properties[self.o.edge_type_key] = pat.types[0]
+        properties.update(pat.props)
+        return properties
+
+    @staticmethod
+    def _check_writable_rel(pat: _RelPat) -> None:
+        if (pat.lo, pat.hi) != (1, 1):
+            raise CypherError(
+                "a variable-length relationship cannot be written -- `*` says how far to "
+                "walk, and there is no such thing as creating half an edge"
+            )
+
+    # -- clauses ---------------------------------------------------------
+
+    def _bind_matched(self, clause: _MatchClause) -> None:
+        """A MATCH before a write exists only to name existing nodes, so
+        each of its patterns must be a lone node with something to find it
+        by. Traversal in a write query would be a different feature."""
+        for nodes, rels in [(clause.nodes, clause.rels), *clause.extra_patterns]:
+            if rels:
+                raise CypherError(
+                    "a MATCH that precedes CREATE or MERGE may only bind single nodes, "
+                    "not traverse -- write `MATCH (a {...}), (b {...}) CREATE (a)-[:x]->(b)`"
+                )
+            pat = nodes[0]
+            if pat.var is None:
+                raise CypherError("a MATCH before a write must name what it binds, e.g. (a {...})")
+            properties = self._node_properties(pat)
+            if clause.where is not None:
+                raise CypherError(
+                    "WHERE is not supported before a write -- identify the node with a "
+                    "property map, `MATCH (a {email: '...'})`"
+                )
+            if not properties:
+                raise CypherError(
+                    f"MATCH ({pat.var}) has nothing to find the node by; give it properties"
+                )
+            self.operations.append({"op": "match", "var": pat.var, "where": properties})
+            self.bound.add(pat.var)
+
+    def _create(self, clause: _WriteClause) -> None:
+        rows, variables, edges = [], [], []
+        for nodes, rels in clause.patterns:
+            for pat in nodes:
+                created = self._new_node(pat)
+                if created is not None:
+                    rows.append(created)
+                    variables.append(pat.var)
+            for index, rel in enumerate(rels):
+                self._check_writable_rel(rel)
+                left, right = nodes[index], nodes[index + 1]
+                if rel.direction == "backward":
+                    left, right = right, left      # `<-` reverses the edge
+                edges.append({"start_var": self._require_var(left),
+                              "end_var": self._require_var(right),
+                              "properties": self._rel_properties(rel)})
+        if rows:
+            self.operations.append({"op": "create_nodes", "rows": rows, "vars": variables})
+        if edges:
+            self.operations.append({"op": "create_edges", "rows": edges})
+
+    @staticmethod
+    def _require_var(pat: _NodePat) -> str:
+        if pat.var is None:
+            raise CypherError(
+                "a node an edge connects has to be named, so the edge can refer to it -- "
+                "write `CREATE (a {...})-[:x]->(b {...})`, not `({...})-[:x]->({...})`"
+            )
+        return pat.var
+
+    def _new_node(self, pat: _NodePat) -> Optional[dict]:
+        """The node's properties, or None when this is a re-mention of an
+        already-bound variable such as `MATCH (a {...}) CREATE (a)-[:x]->(b {...})`."""
+        if pat.var is not None and pat.var in self.bound:
+            if pat.labels or pat.props:
+                raise CypherError(
+                    f"{pat.var!r} is already bound, so `({pat.var} {{...}})` would be "
+                    f"redefining it -- refer to it as `({pat.var})`"
+                )
+            return None
+        if pat.var is not None:
+            self.bound.add(pat.var)
+        return self._node_properties(pat)
+
+    def _merge(self, clause: _WriteClause) -> None:
+        if len(clause.patterns) > 1:
+            raise CypherError("MERGE takes one pattern at a time")
+        nodes, rels = clause.patterns[0]
+
+        if not rels:
+            self._merge_node(nodes[0], clause)
+            return
+
+        # A relationship MERGE is only unambiguous when both ends already
+        # exist. Cypher's own `MERGE (a {..})-[:x]->(b {..})` matches the
+        # WHOLE path and creates the whole thing when it does not match --
+        # duplicating nodes that already exist on their own. That is a
+        # well-known footgun, and quietly reproducing it here would be
+        # worse than refusing.
+        if len(rels) > 1:
+            raise CypherError("MERGE writes one relationship at a time")
+        for pat in (nodes[0], nodes[1]):
+            if pat.var is None or pat.var not in self.bound:
+                raise CypherError(
+                    "MERGE on a relationship needs both endpoints already bound, because "
+                    "matching a whole path and creating it when absent would duplicate "
+                    "nodes that already exist -- MATCH or MERGE the nodes first, then "
+                    "`MERGE (a)-[:x]->(b)`"
+                )
+        rel = rels[0]
+        self._check_writable_rel(rel)
+        if clause.on_create or clause.on_match:
+            raise CypherError("ON CREATE SET / ON MATCH SET are supported on node MERGE only")
+        properties = self._rel_properties(rel)
+        if not properties:
+            raise CypherError(
+                "MERGE on a relationship needs something to match it by -- give it a type, "
+                "`MERGE (a)-[:knows]->(b)`"
+            )
+        left, right = nodes[0], nodes[1]
+        if rel.direction == "backward":
+            left, right = right, left
+        self.operations.append({
+            "op": "merge_edges",
+            "rows": [{"start_var": left.var, "end_var": right.var, "properties": properties}],
+            "on": sorted(properties),
+        })
+
+    def _merge_node(self, pat: _NodePat, clause: _WriteClause) -> None:
+        if pat.var is not None and pat.var in self.bound:
+            raise CypherError(f"{pat.var!r} is already bound; MERGE would redefine it")
+        properties = self._node_properties(pat)
+        if not properties:
+            raise CypherError(
+                "MERGE needs properties to match on -- `MERGE (a:person {email: '...'})`"
+            )
+        for label, group in (("ON CREATE SET", clause.on_create),
+                             ("ON MATCH SET", clause.on_match)):
+            unknown = set(group) - ({pat.var} if pat.var else set())
+            if unknown:
+                raise CypherError(
+                    f"{label} refers to {sorted(unknown)}, which this MERGE does not bind")
+        self.operations.append({
+            "op": "merge_nodes",
+            "rows": [properties],
+            # Cypher matches on every property in the pattern, so those are
+            # the conflict keys -- and a unique index must cover exactly
+            # them. Properties that should not take part in matching belong
+            # in ON CREATE SET.
+            "on": sorted(properties),
+            "on_create": clause.on_create.get(pat.var, {}) if pat.var else {},
+            "on_match": clause.on_match.get(pat.var, {}) if pat.var else {},
+            "vars": [pat.var],
+        })
+        if pat.var is not None:
+            self.bound.add(pat.var)
+
+    def translate(self, clauses: list) -> list:
+        for clause in clauses:
+            if isinstance(clause, _MatchClause):
+                if clause.optional:
+                    raise CypherError("OPTIONAL MATCH has no meaning before a write")
+                self._bind_matched(clause)
+            elif clause.kind == "create":
+                self._create(clause)
+            else:
+                self._merge(clause)
+        return self.operations
+
+
+def cypher_to_operations(
+    query: str,
+    *,
+    node_label_key: Optional[str] = "type",
+    edge_type_key: Optional[str] = "kind",
+) -> list:
+    """Translate a Cypher CREATE/MERGE into ordered ingestion operations.
+
+    Returns plain dicts, so the plan can be inspected, logged or shown to
+    a caller before it runs -- `graph.write_cypher()` is what executes
+    them. Raises CypherError for a read-only query."""
+    opts = _Options(node_label_key=node_label_key, edge_type_key=edge_type_key)
+    clauses = _Parser(_tokenize(query)).parse()
+    if not any(isinstance(c, _WriteClause) for c in clauses):
+        raise CypherError(
+            "this query only reads -- run it with graph.traverse_cypher() (or "
+            "graph.cypher(), which picks for you)"
+        )
+    return _WriteTranslator(opts).translate(clauses)
+
+
+# ---------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------
 
@@ -1012,6 +1345,11 @@ def cypher_to_traversal(
     opts = _Options(node_label_key=node_label_key, edge_type_key=edge_type_key,
                     max_var_length=max_var_length)
     clauses = _Parser(_tokenize(query)).parse()
+    if any(isinstance(c, _WriteClause) for c in clauses):
+        raise CypherError(
+            "this query writes -- run it with graph.write_cypher() (or graph.cypher(), "
+            "which picks for you)"
+        )
     translator = _Translator(opts)
     translator._build_chain(clauses)
     translator._attach_where(clauses)

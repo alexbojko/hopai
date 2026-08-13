@@ -396,6 +396,42 @@ class Graph:
         makes -- see INGEST_TOOL_SCHEMA."""
         return self._ingestor.ingest(document, merge_nodes_on, merge_edges_on)
 
+    def write_cypher(self, query: str, **options):
+        """Run a Cypher CREATE/MERGE. Returns an IngestResult.
+
+            graph.write_cypher('''
+                CREATE (a:person {email: 'a@x.com'})-[:knows]->(b:person {email: 'b@x.com'})
+            ''')
+
+        The whole query is one transaction, and it compiles down to the
+        same add_nodes/merge_nodes/add_edges the Python API calls --
+        `graph.cypher_operations(query)` shows the plan without running
+        it. Accepts the same node_label_key / edge_type_key options as
+        the read side."""
+        from .cypher import cypher_to_operations
+        return self._ingestor.execute_operations(cypher_to_operations(query, **options))
+
+    def cypher_operations(self, query: str, **options) -> list:
+        """The ingestion plan a Cypher write compiles to, without running
+        it -- for review, logging, or showing an agent what it is about
+        to change."""
+        from .cypher import cypher_to_operations
+        return cypher_to_operations(query, **options)
+
+    def cypher(self, query: str, **options):
+        """Run any supported Cypher, reading or writing.
+
+        Returns a Subgraph for a query that matches, an IngestResult for
+        one that creates or merges. Which one it is is visible in the
+        query, and this is the entry point anyone arriving from a Neo4j
+        driver reaches for first; traverse_cypher() and write_cypher()
+        are the same thing when you would rather be explicit."""
+        from .cypher import _Parser, _tokenize, _WriteClause, traverse_cypher
+        clauses = _Parser(_tokenize(query)).parse()
+        if any(isinstance(c, _WriteClause) for c in clauses):
+            return self.write_cypher(query, **options)
+        return traverse_cypher(self, query, **options)
+
     def add_networkx(self, nx_graph):
         """Load a networkx graph. Node keys become ids, and node/edge
         attribute dicts become properties -- the inverse of

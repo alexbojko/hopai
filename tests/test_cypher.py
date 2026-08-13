@@ -294,11 +294,18 @@ class TestSemanticRefusals:
         "MATCH (a)-[]->(b) RETURN b LIMIT 10",
         "MATCH (a)-[]->(b) WITH b MATCH (b)-[]->(c) RETURN c",
         "MATCH (a)-[]->(b) RETURN b UNION MATCH (c)-[]->(d) RETURN d",
-        "CREATE (a) RETURN a",
+        "MATCH (a) SET a.x = 1",
+        "MATCH (a) DETACH DELETE a",
     ])
     def test_unsupported_clauses_refused(self, query):
         with pytest.raises(CypherError, match="not supported"):
             tr(query)
+
+    def test_a_write_query_is_refused_by_the_read_translator(self):
+        """Reading and writing return different things, so the wrong
+        entry point says so rather than half-working."""
+        with pytest.raises(CypherError, match="this query writes"):
+            tr("CREATE (a:person {email: 'a@x.com'})")
 
     def test_disjoint_comma_patterns_refused(self):
         with pytest.raises(CypherError, match="disjoint"):

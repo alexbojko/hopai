@@ -145,7 +145,7 @@ actually hit during development. Read the relevant one before changing behavior:
 | `hopai/filters.py` header | The full DSL in both forms, and why `OR`/`AND`/`NOT` are explicit classes |
 | `hopai/hop.py` header | Why `Start` and `Hop` are separate types rather than one |
 | `hopai/models.py` header | The expected DDL, and the typed-columns / JSONB-bag split |
-| `hopai/cypher.py` header | The translatable Cypher subset, and why each refusal is a refusal |
+| `hopai/cypher.py` header | The translatable Cypher subset (read and write), and why each refusal is a refusal |
 | `hopai/ingest.py` header | The two row spellings, edge-by-property references, and merge semantics |
 | `hopai/constraints.py` header | What each constraint compiles to, and the two SQL semantics that surprise people |
 | `tests/conftest.py` | The 7-node fixture graph — it deliberately contains a dead end, a fan-in, and a cycle |
@@ -160,8 +160,12 @@ actually hit during development. Read the relevant one before changing behavior:
   what would break without the fix.
 - `json_api.py` is a translation layer only. Anything it needs to *decide* belongs in `filters.py`
   or `core.py`, and `TRAVERSE_TOOL_SCHEMA` must stay in step with what `spec_to_traversal` accepts.
-- `cypher.py` is the same: a front end that emits `(Start, [Hop])` and holds no query logic. Its
-  rule is **refuse, don't approximate** — a Cypher construct with no hopai equivalent, or with a
-  *different meaning* in hopai (`<>` and `NOT x = y` versus containment-based `NOT`), raises
-  `CypherError` naming the rewrite. Widening the subset means adding a translation, never
+- `cypher.py` is the same: a front end that emits `(Start, [Hop])` for reads and a list of
+  ingestion operations for writes, holding no query logic of its own. Its rule is **refuse, don't
+  approximate** — a Cypher construct with no hopai equivalent, or with a *different meaning* here
+  (`<>` and `NOT x = y` versus containment-based `NOT`; whole-path `MERGE` versus per-row upsert),
+  raises `CypherError` naming the rewrite. Widening the subset means adding a translation, never
   loosening one of those refusals into a near-enough mapping.
+- Writes are one transaction per call, batching and multi-clause Cypher included. Half-committing
+  is the worst failure mode this library has: the caller is told it failed, retries, and the retry
+  collides with rows that landed. `tests/test_ingest.py::TestAtomicity` guards this.

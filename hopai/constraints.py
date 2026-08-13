@@ -100,6 +100,12 @@ class Col:
     start_id and the property kind, and nothing has to guess."""
     name: str
 
+    def __repr__(self) -> str:
+        # Error messages quote the keys back so they can be pasted into a
+        # define_constraints() call; the generated dataclass repr would
+        # spell that Col(name='start_id').
+        return f"Col({self.name!r})"
+
 
 Key = Union[str, Col]
 

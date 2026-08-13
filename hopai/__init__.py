@@ -20,6 +20,11 @@ and every key that is not an identity key is a property:
     graph.add_edges([{"start_id": 1, "end": {"email": "b@x.com"}, "kind": "knows"}])
     graph.merge_nodes([{"type": "person", "email": "a@x.com"}], on=["email"])
 
+...or the same thing in Cypher:
+
+    graph.cypher("CREATE (a:person {email: 'a@x.com'})-[:knows]->(b:person {email: 'b@x.com'})")
+    graph.cypher("MERGE (a:person {email: 'a@x.com'}) ON CREATE SET a.name = 'Alice'")
+
 READ -- the same traversal in three interchangeable notations:
 
     from hopai import Start, Hop, traverse_json, traverse_cypher
@@ -33,9 +38,12 @@ READ -- the same traversal in three interchangeable notations:
         "hops": [{"where": {"active": True}, "via": {"kind": "friend"},
                   "hops": [1, 4]}],
     })
-    traverse_cypher(graph, '''
+    graph.cypher('''                                    # Cypher
         MATCH (a:person)-[:friend*1..4]->(b {active: true}) RETURN b
     ''')
+
+graph.cypher() returns a Subgraph for a query that reads and an
+IngestResult for one that writes.
 
 A result carries every node and edge on a matching chain:
 
@@ -52,7 +60,9 @@ from .constraints import (
     Check, Col, ConstraintViolation, Index, PropertyType, Required, Unique,
 )
 from .core import Graph, Subgraph
-from .cypher import CypherError, cypher_to_traversal, traverse_cypher
+from .cypher import (
+    CypherError, cypher_to_operations, cypher_to_traversal, traverse_cypher,
+)
 from .filters import AND, BETWEEN, GT, GTE, LT, LTE, NOT, OR, parse_filter
 from .hop import Hop, Start
 from .ingest import INGEST_TOOL_SCHEMA, IngestResult
@@ -65,7 +75,7 @@ __all__ = [
     "Graph", "Subgraph", "Start", "Hop",
     "OR", "AND", "NOT", "GT", "GTE", "LT", "LTE", "BETWEEN", "parse_filter",
     "traverse_json", "spec_to_traversal", "TRAVERSE_TOOL_SCHEMA",
-    "traverse_cypher", "cypher_to_traversal", "CypherError",
+    "traverse_cypher", "cypher_to_traversal", "cypher_to_operations", "CypherError",
     "Unique", "Required", "Check", "Index", "PropertyType", "Col", "ConstraintViolation",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",

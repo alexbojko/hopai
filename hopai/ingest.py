@@ -60,12 +60,13 @@ uniqueness, not validity.
 
 from __future__ import annotations
 
+import json as _json
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional
 
-from sqlalchemy import bindparam, func, insert, or_, select, text
+from sqlalchemy import bindparam, cast, func, insert, literal, or_, select, text
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.exc import IntegrityError, ProgrammingError
 
@@ -210,35 +211,54 @@ class Ingestor:
             _require_uniform(payload, id_column.name, "node")
         return payload, explicit_ids
 
-    def add_nodes(self, rows: list, connection=None) -> int:
+    def add_nodes(self, rows: list, connection=None, return_ids: bool = False):
         table = self.g.nodes_tbl
         id_column = self._node_id_col()
         payload, explicit_ids = self._node_payload(rows)
         if not payload:
-            return 0
+            return [] if return_ids else 0
 
+        ids: list = []
         with self._transaction(connection) as conn:
             try:
                 for chunk in _chunks(payload):
-                    conn.execute(insert(table), chunk)
+                    if return_ids:
+                        ids.extend(self._insert_returning(conn, table, id_column, chunk))
+                    else:
+                        conn.execute(insert(table), chunk)
             except IntegrityError as exc:
                 raise _translate(exc, "node") from exc
             if explicit_ids:
                 self._sync_identity_sequence(conn, table, id_column)
-        return len(payload)
+        return ids if return_ids else len(payload)
 
-    def merge_nodes(self, rows: list, on: list, replace: bool = False, connection=None) -> int:
+    @staticmethod
+    def _insert_returning(connection, table, id_column, chunk) -> list:
+        """Insert and get the ids back, in the order the rows were given.
+
+        sort_by_parameter_order is what makes row N of the result row N of
+        the input -- without it PostgreSQL may return them in any order,
+        and a caller wiring edges to those ids would connect the wrong
+        nodes without ever seeing an error."""
+        result = connection.execute(
+            insert(table).returning(id_column, sort_by_parameter_order=True), chunk
+        )
+        return [row[0] for row in result]
+
+    def merge_nodes(self, rows: list, on: list, replace: bool = False, connection=None,
+                    return_ids: bool = False):
         table = self.g.nodes_tbl
         id_column = self._node_id_col()
         payload, explicit_ids = self._node_payload(rows)
         if not payload:
-            return 0
+            return [] if return_ids else 0
 
         with self._transaction(connection) as conn:
-            self._merge_payload(conn, table, payload, on, replace, "node")
+            ids = self._merge_payload(conn, table, payload, on, replace, "node",
+                                      returning=id_column if return_ids else None)
             if explicit_ids:
                 self._sync_identity_sequence(conn, table, id_column)
-        return len(payload)
+        return ids if return_ids else len(payload)
 
     # -- edges ----------------------------------------------------------
 
@@ -347,9 +367,10 @@ class Ingestor:
 
     # -- merge ----------------------------------------------------------
 
-    def _merge_payload(self, connection, table, payload, on, replace, what) -> int:
+    def _merge_payload(self, connection, table, payload, on, replace, what, returning=None,
+                       update_properties=None):
         if not payload:
-            return 0
+            return []
         if not on:
             raise ValueError(
                 f"merge_{what}s(on=[...]) needs the keys that identify a row -- "
@@ -365,15 +386,28 @@ class Ingestor:
         target = _Target(table, what)
         index_elements = [text(key_sql(target, key)) for key in on]
 
+        ids: list = []
         for chunk in _chunks(payload):
             statement = pg_insert(table).values(chunk)
-            merged = (statement.excluded.properties if replace
-                      else table.c.properties.op("||")(statement.excluded.properties))
+            if update_properties is not None:
+                # ON MATCH SET: a matched row gets these, not whatever the
+                # incoming row happened to carry (which includes anything
+                # ON CREATE SET added, and must not leak into an update).
+                incoming = cast(literal(_json.dumps(update_properties)), JSONB)
+            else:
+                incoming = statement.excluded.properties
+            merged = incoming if replace else table.c.properties.op("||")(incoming)
             statement = statement.on_conflict_do_update(
                 index_elements=index_elements, set_={"properties": merged}
             )
+            if returning is not None:
+                # DO UPDATE, unlike DO NOTHING, returns a row whether it
+                # inserted or matched -- so this is the id either way.
+                statement = statement.returning(returning)
             try:
-                connection.execute(statement)
+                result = connection.execute(statement)
+                if returning is not None:
+                    ids.extend(row[0] for row in result)
             except IntegrityError as exc:
                 raise _translate(exc, what) from exc
             except ProgrammingError as exc:
@@ -385,7 +419,7 @@ class Ingestor:
                     f"those keys to detect a conflict, and there is none. Declare it "
                     f"first: graph.define_constraints({what}s=[Unique({keys})])"
                 ) from exc
-        return len(payload)
+        return ids
 
     # -- documents ------------------------------------------------------
 
@@ -419,6 +453,75 @@ class Ingestor:
         return IngestResult(nodes=written_nodes, edges=written_edges,
                             elapsed_ms=(time.perf_counter() - started) * 1000)
 
+    def execute_operations(self, operations: list, connection=None) -> IngestResult:
+        """Run a plan from hopai.cypher.cypher_to_operations().
+
+        Everything lands in one transaction, and a table of variable ->
+        node id is threaded through it: a created node's id comes back
+        from the INSERT, a merged node's from the upsert's RETURNING, and
+        a matched node's from a property lookup. Edges then refer to
+        variables rather than to ids nobody knew when the query was
+        written."""
+        started = time.perf_counter()
+        bound: dict = {}
+        nodes = edges = 0
+
+        with self._transaction(connection) as conn:
+            for operation in operations:
+                kind = operation["op"]
+
+                if kind == "match":
+                    resolved = self._resolve_references([operation["where"]], conn)
+                    bound[operation["var"]] = resolved[_reference_key(operation["where"])]
+
+                elif kind == "create_nodes":
+                    ids = self.add_nodes(operation["rows"], connection=conn, return_ids=True)
+                    nodes += len(ids)
+                    _bind(bound, operation["vars"], ids)
+
+                elif kind == "merge_nodes":
+                    ids = self._merge_with_sets(conn, operation)
+                    nodes += len(ids)
+                    _bind(bound, operation["vars"], ids)
+
+                elif kind in ("create_edges", "merge_edges"):
+                    rows = [{"start_id": _lookup(bound, row["start_var"]),
+                             "end_id": _lookup(bound, row["end_var"]),
+                             "properties": row["properties"]}
+                            for row in operation["rows"]]
+                    if kind == "create_edges":
+                        edges += self.add_edges(rows, connection=conn)
+                    else:
+                        from .constraints import Col
+                        edges += self.merge_edges(
+                            rows, on=[Col(self.g.edge_start_col), Col(self.g.edge_end_col),
+                                      *operation["on"]],
+                            connection=conn)
+
+                else:  # pragma: no cover - the translator emits nothing else
+                    raise ValueError(f"unknown operation {kind!r}")
+
+        return IngestResult(nodes=nodes, edges=edges,
+                            elapsed_ms=(time.perf_counter() - started) * 1000)
+
+    def _merge_with_sets(self, connection, operation) -> list:
+        """MERGE, honouring ON CREATE SET and ON MATCH SET.
+
+        Cypher matches on every property in the pattern, so those are the
+        conflict keys. ON CREATE SET adds properties to the inserted row
+        only; ON MATCH SET replaces what an existing row gets, which is
+        why the update cannot simply reuse the incoming row."""
+        pattern = operation["rows"][0]
+        on_create, on_match = operation["on_create"], operation["on_match"]
+        payload = [{"properties": {**pattern, **on_create}}]
+        update = None
+        if on_create or on_match:
+            update = {**pattern, **on_match}
+        return self._merge_payload(
+            connection, self.g.nodes_tbl, payload, operation["on"], False, "node",
+            returning=self._node_id_col(), update_properties=update,
+        )
+
     def add_networkx(self, nx_graph) -> IngestResult:
         nodes = [{"id": n, "properties": dict(data)} for n, data in nx_graph.nodes(data=True)]
         edges = [{"start_id": u, "end_id": v, "properties": dict(data)}
@@ -428,6 +531,18 @@ class Ingestor:
 
 def _reference_key(reference: dict) -> tuple:
     return tuple(sorted(reference.items()))
+
+
+def _bind(bound: dict, variables: list, ids: list) -> None:
+    for variable, node_id in zip(variables, ids, strict=True):
+        if variable is not None:
+            bound[variable] = node_id
+
+
+def _lookup(bound: dict, variable: str):
+    if variable not in bound:
+        raise ValueError(f"{variable!r} is not bound to a node")
+    return bound[variable]
 
 
 def _qualified(table) -> str:
