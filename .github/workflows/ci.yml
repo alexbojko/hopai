@@ -160,6 +160,14 @@ jobs:
 
       - name: Render report
         id: report
+        # The note reaches the script through the environment, never
+        # through `${{ }}` inside the script body. Interpolating it
+        # produced `No files under  changed` -- the backticks around
+        # `hopai/` were read by the shell as command substitution, which
+        # is a mangled comment in the benign case and arbitrary execution
+        # in the general one.
+        env:
+          MUTATION_NOTE: ${{ steps.scope.outputs.note }}
         run: |
           set -euo pipefail
           python scripts/pr_report.py \
@@ -167,7 +175,7 @@ jobs:
             --threshold "${COVERAGE_THRESHOLD}" \
             --mutmut-stats mutants/mutmut-cicd-stats.json \
             --mutmut-results survivors.txt \
-            --mutation-note "${{ steps.scope.outputs.note }}" \
+            --mutation-note "${MUTATION_NOTE}" \
             --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
