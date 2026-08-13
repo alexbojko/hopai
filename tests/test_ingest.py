@@ -16,7 +16,7 @@ import json
 import pytest
 
 from hopai import (
-    INGEST_TOOL_SCHEMA, ConstraintViolation, Hop, IngestResult, Start, Unique,
+    INGEST_TOOL_SCHEMA, ConstraintViolation, Hop, IngestResult, Required, Start, Unique,
 )
 from hopai.ingest import BATCH_SIZE, split_row
 
@@ -323,10 +323,77 @@ class TestToolSchema:
 # Scale and safety
 # ---------------------------------------------------------------------
 
+class TestAtomicity:
+    """A write is one transaction, batching and documents included.
+
+    Half-committing is the worst possible failure for an agent: it is
+    told the call failed, retries, and the retry now collides with rows
+    that did land. Every test here fails loudly if a transaction is ever
+    opened per batch or per half-document again."""
+
+    def test_a_failing_late_batch_rolls_back_the_earlier_ones(self, fresh_graph):
+        fresh_graph.define_constraints(nodes=[Unique("n")])
+        rows = [{"n": i} for i in range(BATCH_SIZE + 10)]
+        rows[-1]["n"] = 0  # collides with the first row, in a later chunk
+        with pytest.raises(ConstraintViolation):
+            fresh_graph.add_nodes(rows)
+        assert count(fresh_graph) == 0
+
+    def test_a_failing_late_merge_batch_rolls_back_the_earlier_ones(self, fresh_graph):
+        fresh_graph.define_constraints(nodes=[Unique("n"), Required("kind")])
+        rows = [{"n": i, "kind": "ok"} for i in range(BATCH_SIZE + 10)]
+        del rows[-1]["kind"]  # fails Required, in a later chunk
+        with pytest.raises(ConstraintViolation):
+            fresh_graph.merge_nodes(rows, on=["n"])
+        assert count(fresh_graph) == 0
+
+    def test_failing_edges_roll_back_the_documents_nodes(self, fresh_graph):
+        """A document is one unit. Its nodes must not survive its edges
+        failing."""
+        with pytest.raises(ConstraintViolation):
+            fresh_graph.ingest({
+                "nodes": [{"id": 1, "type": "person"}, {"id": 2, "type": "person"}],
+                "edges": [{"start_id": 1, "end_id": 2}, {"start_id": 1, "end_id": 999}],
+            })
+        assert count(fresh_graph) == 0 and count(fresh_graph, "edges") == 0
+
+    def test_an_unresolvable_edge_reference_rolls_back_the_nodes(self, fresh_graph):
+        with pytest.raises(ValueError, match="no node matches"):
+            fresh_graph.ingest({
+                "nodes": [{"email": "a@x.com"}],
+                "edges": [{"start": {"email": "a@x.com"}, "end": {"email": "ghost@x.com"}}],
+            })
+        assert count(fresh_graph) == 0
+
+    def test_edges_resolve_against_nodes_from_the_same_document(self, fresh_graph):
+        """The other half of sharing one transaction: a reference must see
+        the uncommitted nodes written moments earlier in the same call."""
+        result = fresh_graph.ingest({
+            "nodes": [{"email": "a@x.com"}, {"email": "b@x.com"}],
+            "edges": [{"start": {"email": "a@x.com"}, "end": {"email": "b@x.com"}}],
+        })
+        assert (result.nodes, result.edges) == (2, 1)
+
+    def test_merge_with_explicit_ids_still_advances_the_sequence(self, fresh_graph):
+        """The sequence resync has to happen inside the merge's own
+        transaction, not a second one opened after it."""
+        fresh_graph.define_constraints(nodes=[Unique("n")])
+        fresh_graph.merge_nodes([{"id": 50, "n": 1}], on=["n"])
+        fresh_graph.add_nodes([{"n": 2}])
+        assert count(fresh_graph) == 2
+
+
 class TestScaleAndSafety:
     def test_batches_larger_than_one_statement(self, fresh_graph):
         rows = [{"n": i} for i in range(BATCH_SIZE + 250)]
         assert fresh_graph.add_nodes(rows) == len(rows)
+        assert count(fresh_graph) == len(rows)
+
+    def test_a_large_merge_spanning_batches(self, fresh_graph):
+        fresh_graph.define_constraints(nodes=[Unique("n")])
+        rows = [{"n": i} for i in range(BATCH_SIZE + 250)]
+        fresh_graph.merge_nodes(rows, on=["n"])
+        fresh_graph.merge_nodes(rows, on=["n"])
         assert count(fresh_graph) == len(rows)
 
     @pytest.mark.parametrize("payload", [

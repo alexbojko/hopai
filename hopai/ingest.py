@@ -61,6 +61,7 @@ uniqueness, not validity.
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional
 
@@ -156,6 +157,21 @@ class Ingestor:
 
     # -- helpers --------------------------------------------------------
 
+    @contextmanager
+    def _transaction(self, connection=None):
+        """One transaction per call, and one shared by a whole document.
+
+        Every write goes through here, batching included. A per-batch
+        transaction would let a 2500-row write half-commit, and an agent
+        retrying after that failure hits unique violations on the rows it
+        believes never landed. Passing an existing connection joins the
+        caller's transaction instead of opening a second one."""
+        if connection is not None:
+            yield connection
+        else:
+            with self.g.engine.begin() as opened:
+                yield opened
+
     def _node_id_col(self):
         return getattr(self.g.nodes_tbl.c, self.g.node_id_col)
 
@@ -180,8 +196,7 @@ class Ingestor:
 
     # -- nodes ----------------------------------------------------------
 
-    def add_nodes(self, rows: list) -> int:
-        table = self.g.nodes_tbl
+    def _node_payload(self, rows: list) -> tuple:
         id_column = self._node_id_col()
         payload, explicit_ids = [], False
         for row in rows:
@@ -191,44 +206,68 @@ class Ingestor:
                 record[id_column.name] = identity["id"]
                 explicit_ids = True
             payload.append(record)
+        if payload:
+            _require_uniform(payload, id_column.name, "node")
+        return payload, explicit_ids
+
+    def add_nodes(self, rows: list, connection=None) -> int:
+        table = self.g.nodes_tbl
+        id_column = self._node_id_col()
+        payload, explicit_ids = self._node_payload(rows)
         if not payload:
             return 0
-        _require_uniform(payload, id_column.name, "node")
 
-        with self.g.engine.begin() as connection:
+        with self._transaction(connection) as conn:
             try:
                 for chunk in _chunks(payload):
-                    connection.execute(insert(table), chunk)
+                    conn.execute(insert(table), chunk)
             except IntegrityError as exc:
                 raise _translate(exc, "node") from exc
             if explicit_ids:
-                self._sync_identity_sequence(connection, table, id_column)
+                self._sync_identity_sequence(conn, table, id_column)
         return len(payload)
 
-    def merge_nodes(self, rows: list, on: list, replace: bool = False) -> int:
-        return self._merge(self.g.nodes_tbl, rows, on, replace, _NODE_KEYS, "node",
-                           self._node_id_col())
+    def merge_nodes(self, rows: list, on: list, replace: bool = False, connection=None) -> int:
+        table = self.g.nodes_tbl
+        id_column = self._node_id_col()
+        payload, explicit_ids = self._node_payload(rows)
+        if not payload:
+            return 0
+
+        with self._transaction(connection) as conn:
+            self._merge_payload(conn, table, payload, on, replace, "node")
+            if explicit_ids:
+                self._sync_identity_sequence(conn, table, id_column)
+        return len(payload)
 
     # -- edges ----------------------------------------------------------
 
-    def add_edges(self, rows: list) -> int:
+    def add_edges(self, rows: list, connection=None) -> int:
         table = self.g.edges_tbl
-        payload = self._edge_payload(rows)
-        if not payload:
-            return 0
-        with self.g.engine.begin() as connection:
+        with self._transaction(connection) as conn:
+            # Resolving references inside the write transaction, not
+            # before it: a reference checked on another connection can be
+            # deleted (breaking the foreign key) or duplicated (making the
+            # id already chosen the wrong one) before the insert lands.
+            payload = self._edge_payload(rows, conn)
+            if not payload:
+                return 0
             try:
                 for chunk in _chunks(payload):
-                    connection.execute(insert(table), chunk)
+                    conn.execute(insert(table), chunk)
             except IntegrityError as exc:
                 raise _translate(exc, "edge") from exc
         return len(payload)
 
-    def merge_edges(self, rows: list, on: list, replace: bool = False) -> int:
-        payload = self._edge_payload(rows)
-        return self._merge_payload(self.g.edges_tbl, payload, on, replace, "edge")
+    def merge_edges(self, rows: list, on: list, replace: bool = False, connection=None) -> int:
+        with self._transaction(connection) as conn:
+            payload = self._edge_payload(rows, conn)
+            if not payload:
+                return 0
+            self._merge_payload(conn, self.g.edges_tbl, payload, on, replace, "edge")
+        return len(payload)
 
-    def _edge_payload(self, rows: list) -> list:
+    def _edge_payload(self, rows: list, connection) -> list:
         """Normalize edge rows, resolving any property references to node
         ids in one batched lookup rather than one query per edge."""
         start_col = self.g.edge_start_col
@@ -247,7 +286,7 @@ class Ingestor:
                         identity[f"{side}_id"] = row[side]
             split.append((row, identity, properties))
 
-        resolved = self._resolve_references(references)
+        resolved = self._resolve_references(references, connection)
 
         payload = []
         for row, identity, properties in split:
@@ -267,7 +306,7 @@ class Ingestor:
             payload.append(record)
         return payload
 
-    def _resolve_references(self, references: list) -> dict:
+    def _resolve_references(self, references: list, connection) -> dict:
         """Map each distinct property reference to exactly one node id.
 
         One query for the whole batch: an OR of containment tests, which
@@ -286,8 +325,7 @@ class Ingestor:
             or_(*(table.c.properties.op("@>")(
                 bindparam(None, reference, type_=JSONB)) for reference in distinct.values()))
         )
-        with self.g.engine.connect() as connection:
-            matches = connection.execute(query).all()
+        matches = connection.execute(query).all()
 
         resolved: dict = {}
         for key, reference in distinct.items():
@@ -309,23 +347,7 @@ class Ingestor:
 
     # -- merge ----------------------------------------------------------
 
-    def _merge(self, table, rows, on, replace, identity_keys, what, id_column) -> int:
-        payload = []
-        explicit_ids = False
-        for row in rows:
-            identity, properties = split_row(row, identity_keys, what)
-            record = {"properties": properties}
-            if "id" in identity:
-                record[id_column.name] = identity["id"]
-                explicit_ids = True
-            payload.append(record)
-        written = self._merge_payload(table, payload, on, replace, what)
-        if explicit_ids and written:
-            with self.g.engine.begin() as connection:
-                self._sync_identity_sequence(connection, table, id_column)
-        return written
-
-    def _merge_payload(self, table, payload, on, replace, what) -> int:
+    def _merge_payload(self, connection, table, payload, on, replace, what) -> int:
         if not payload:
             return 0
         if not on:
@@ -350,20 +372,19 @@ class Ingestor:
             statement = statement.on_conflict_do_update(
                 index_elements=index_elements, set_={"properties": merged}
             )
-            with self.g.engine.begin() as connection:
-                try:
-                    connection.execute(statement)
-                except IntegrityError as exc:
-                    raise _translate(exc, what) from exc
-                except ProgrammingError as exc:
-                    if "no unique or exclusion constraint" not in str(exc.orig):
-                        raise
-                    keys = ", ".join(repr(k) for k in on)
-                    raise ConstraintViolation(
-                        f"merge_{what}s(on=[{keys}]) needs a unique index over exactly "
-                        f"those keys to detect a conflict, and there is none. Declare it "
-                        f"first: graph.define_constraints({what}=[Unique({keys})])"
-                    ) from exc
+            try:
+                connection.execute(statement)
+            except IntegrityError as exc:
+                raise _translate(exc, what) from exc
+            except ProgrammingError as exc:
+                if "no unique or exclusion constraint" not in str(exc.orig):
+                    raise
+                keys = ", ".join(repr(k) for k in on)
+                raise ConstraintViolation(
+                    f"merge_{what}s(on=[{keys}]) needs a unique index over exactly "
+                    f"those keys to detect a conflict, and there is none. Declare it "
+                    f"first: graph.define_constraints({what}s=[Unique({keys})])"
+                ) from exc
         return len(payload)
 
     # -- documents ------------------------------------------------------
@@ -381,12 +402,20 @@ class Ingestor:
         started = time.perf_counter()
         nodes = document.get("nodes") or []
         edges = document.get("edges") or []
-        # Nodes first, always: an edge given as start={...} can only
-        # resolve against nodes that already exist.
-        written_nodes = (self.merge_nodes(nodes, on=merge_nodes_on) if merge_nodes_on
-                         else self.add_nodes(nodes))
-        written_edges = (self.merge_edges(edges, on=merge_edges_on) if merge_edges_on
-                         else self.add_edges(edges))
+
+        # One transaction for the whole document. Nodes first, always, so
+        # an edge given as start={...} can resolve against a node created
+        # by the same call -- and if the edges turn out to violate a
+        # constraint, the nodes roll back with them. Committing half a
+        # document would leave a retry hitting unique violations on rows
+        # the caller was told had failed.
+        with self._transaction() as connection:
+            written_nodes = (self.merge_nodes(nodes, on=merge_nodes_on, connection=connection)
+                             if merge_nodes_on
+                             else self.add_nodes(nodes, connection=connection))
+            written_edges = (self.merge_edges(edges, on=merge_edges_on, connection=connection)
+                             if merge_edges_on
+                             else self.add_edges(edges, connection=connection))
         return IngestResult(nodes=written_nodes, edges=written_edges,
                             elapsed_ms=(time.perf_counter() - started) * 1000)
 
