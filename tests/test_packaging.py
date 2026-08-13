@@ -109,7 +109,7 @@ class TestReleaseConfig:
         comment. Miss it and nothing fails -- the file is simply never
         touched, and the package ships reporting the previous version."""
         source = (ROOT / "hopai" / "__init__.py").read_text()
-        line = next(l for l in source.splitlines() if l.startswith("__version__"))
+        line = next(row for row in source.splitlines() if row.startswith("__version__"))
         assert "x-release-please-version" in line, line
 
 
