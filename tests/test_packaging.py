@@ -80,6 +80,30 @@ class TestReleaseConfig:
             assert isinstance(entry, str) or entry.get("type") in {
                 "json", "yaml", "toml", "xml", "generic"}, entry
 
+    def test_release_as_is_removed_once_it_has_done_its_job(self, config):
+        """`release-as` pins EVERY release to that version until deleted.
+
+        It is here because nothing else produced 0.0.1: from a 0.0.0
+        baseline release-please proposes 0.1.0 for a feature, and neither
+        `initial-version` nor the pre-1.0 bump flags changed that (checked
+        against `release-please manifest-pr --dry-run`, which is the mode
+        the action runs).
+
+        So it is allowed only while it still matches where the project
+        is: before the first release (manifest 0.0.0), and on the release
+        PR itself (manifest == release-as). The moment anything is
+        released past it, this fails -- which is the first PR where
+        leaving it in would silently re-release the same version."""
+        pinned = config.get("release-as")
+        if pinned is None:
+            return
+        released = manifest_version()
+        assert released in ("0.0.0", pinned), (
+            f"release-as is pinned to {pinned} but {released} is already released; "
+            f"remove `release-as` from release-please-config.json or every future "
+            f"release will claim {pinned} again"
+        )
+
     def test_the_module_carries_the_generic_updater_annotation(self):
         """The generic updater rewrites only lines marked with this
         comment. Miss it and nothing fails -- the file is simply never

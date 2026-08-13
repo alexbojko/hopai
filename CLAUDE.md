@@ -108,6 +108,25 @@ the API is worth promising, or land a `feat!:` to move to `0.1.0`.
 `tests/test_packaging.py` fails if they drift apart. `0.0.0` in the manifest means
 nothing has been published yet — the first release PR turns it into `0.0.1`.
 
+`hopai/__init__.py` is updated by release-please's **generic** updater, which only
+rewrites lines carrying the `x-release-please-version` comment. There is no `python`
+extra-files type — passing one aborts the whole release job with
+`unsupported extraFile type: python`, which is how the first attempt failed.
+
+**`release-as: "0.0.1"` is temporary and must be deleted after the first release.**
+It exists because nothing else produced 0.0.1: from a `0.0.0` baseline release-please
+proposes `0.1.0` for a feature, and neither `initial-version` nor the pre-1.0 bump
+flags changed that (verified with `release-please manifest-pr --dry-run`, the mode
+the action runs). Left in place it would pin every future release to 0.0.1;
+`test_release_as_is_removed_once_it_has_done_its_job` fails the moment that becomes
+true. To check any config change before merging it:
+
+```bash
+npx release-please@16 manifest-pr --repo-url=https://github.com/alexbojko/hopai \
+  --target-branch=<your-branch> --config-file=release-please-config.json \
+  --manifest-file=.release-please-manifest.json --token="$(gh auth token)" --dry-run
+```
+
 ## Releasing
 
 1. Merge normal PRs to `main` with conventional-commit subjects.
