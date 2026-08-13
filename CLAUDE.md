@@ -80,6 +80,41 @@ the same class of reason — on macOS libpq's Kerberos probe goes through XPC,
 which is not fork-safe, and mutmut's forked children segfault before reaching
 Postgres.
 
+## Commit messages are load-bearing
+
+Releases are cut by **release-please** from **Conventional Commits**, so the subject
+line of every commit to `main` is an input to the version number and the changelog —
+not prose. Use `type: summary`, and `type(scope): summary` when a scope helps:
+
+| Prefix | Effect on the next release |
+| --- | --- |
+| `feat:` | minor bump (`0.1.0` → `0.2.0`), listed under Features |
+| `fix:` | patch bump, listed under Bug Fixes |
+| `perf:` `docs:` `refactor:` | patch bump, listed under their own heading |
+| `test:` `ci:` `build:` `chore:` | no bump, hidden from the changelog |
+| `feat!:` or a `BREAKING CHANGE:` footer | major bump |
+
+An unprefixed subject releases nothing and appears nowhere. That is the failure mode
+to watch for: the work merges, CI is green, and the release PR silently does not
+mention it.
+
+**Never edit `version` in `pyproject.toml`, `hopai/__init__.py` or
+`.release-please-manifest.json` by hand.** release-please owns all three;
+`tests/test_packaging.py` fails if they drift apart.
+
+## Releasing
+
+1. Merge normal PRs to `main` with conventional-commit subjects.
+2. release-please keeps one open PR titled `chore(main): release x.y.z` with the
+   bump and the CHANGELOG entry. Review it like any other PR.
+3. **Merging that PR is the release.** It tags the commit, creates the GitHub
+   Release, and the same workflow builds and publishes to PyPI via Trusted
+   Publishing (OIDC — there is no API token anywhere in this repo).
+
+The publish job checks out the *tag*, runs `twine check --strict`, and asserts the
+built artifact's version equals the tag before uploading. A PyPI upload cannot be
+undone or replaced, so those checks come first.
+
 ## Coverage and mutation testing
 
 **Coverage gates; mutation informs. Neither may be skimmed.**

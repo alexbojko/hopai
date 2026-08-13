@@ -219,3 +219,8 @@ __marimo__/
 
 # mutmut writes its mutated copy of the tree here
 mutants/
+
+# build artifacts
+dist/
+build/
+*.egg-info/

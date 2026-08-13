@@ -5,6 +5,10 @@ ingestion, and real constraints — with a Python API, a JSON one, and
 Cypher, so an agent and a developer can both use it without being taught
 anything new. No graph database required.
 
+```bash
+pip install hopai
+```
+
 ```python
 from sqlalchemy import create_engine
 from hopai import Graph, Start, Hop, OR, AND, NOT, GT, BETWEEN

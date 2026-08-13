@@ -1,15 +1,44 @@
 [project]
 name = "hopai"
-version = "0.1.0"
-description = "Graph traversal on plain PostgreSQL. Bounded and unbounded multi-hop queries, AND/OR/NOT/range filters, and a JSON interface for tool-calling agents -- no separate graph database required."
+# Managed by release-please -- do not bump by hand. A commit whose
+# subject starts `feat:` moves the minor, `fix:` the patch, and
+# `feat!:` (or a `BREAKING CHANGE:` footer) the major. See CLAUDE.md.
+version = "0.0.1"
+description = "A knowledge graph in the PostgreSQL you already run: multi-hop traversal, ingestion and real constraints, with Python, JSON and Cypher interfaces -- no graph database required."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
+authors = [{name = "Oleksandr Boiko", email = "django.develop@gmail.com"}]
+keywords = [
+    "graph", "knowledge-graph", "postgresql", "postgres", "cypher",
+    "graph-database", "sqlalchemy", "traversal", "llm", "agents", "rag",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: SQL",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 dependencies = [
     "sqlmodel>=0.0.39",
     "sqlalchemy>=2.0",
     "psycopg2-binary>=2.9",
 ]
+
+[project.urls]
+Homepage = "https://github.com/alexbojko/hopai"
+Repository = "https://github.com/alexbojko/hopai"
+Issues = "https://github.com/alexbojko/hopai/issues"
+Changelog = "https://github.com/alexbojko/hopai/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 networkx = ["networkx>=3.0"]
