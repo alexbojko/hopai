@@ -35,7 +35,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from sqlalchemy import String, and_, cast, create_engine, distinct, func, literal, select
+from typing import Optional
+
+from sqlalchemy import String, and_, cast, create_engine, distinct, func, literal, select, text
 from sqlalchemy import union as sa_union
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
@@ -43,6 +45,12 @@ from sqlalchemy.orm import Session
 from .filters import resolve
 from .hop import Hop, Start
 from .models import Edge, Node
+
+
+def _qualify(table) -> str:
+    if table.schema:
+        return f'"{table.schema}"."{table.name}"'
+    return f'"{table.name}"'
 
 
 @dataclass
@@ -253,6 +261,146 @@ class Graph:
             )
 
         return node_selects[0].union(*node_selects[1:], *edge_selects)
+
+    # -- schema ---------------------------------------------------------
+
+    def create_schema(self) -> None:
+        """Create the two tables and the indexes traversal depends on.
+
+        Idempotent, so it is safe to call on every start-up -- which is
+        the point: a project should not need a migration tool or a
+        hand-copied DDL block to get a working graph.
+
+        The baseline indexes are not optional decoration. Without the
+        btree indexes on the edge endpoints every hop is a sequential
+        scan, and without the GIN indexes every property filter is."""
+        self.nodes_tbl.create(self.engine, checkfirst=True)
+        self.edges_tbl.create(self.engine, checkfirst=True)
+
+        nodes, edges = _qualify(self.nodes_tbl), _qualify(self.edges_tbl)
+        statements = [
+            f'CREATE INDEX IF NOT EXISTS "ix_{self.edges_tbl.name}_{self.edge_start_col}" '
+            f'ON {edges} ("{self.edge_start_col}")',
+            f'CREATE INDEX IF NOT EXISTS "ix_{self.edges_tbl.name}_{self.edge_end_col}" '
+            f'ON {edges} ("{self.edge_end_col}")',
+            f'CREATE INDEX IF NOT EXISTS "ix_{self.nodes_tbl.name}_properties" '
+            f'ON {nodes} USING GIN (properties)',
+            f'CREATE INDEX IF NOT EXISTS "ix_{self.edges_tbl.name}_properties" '
+            f'ON {edges} USING GIN (properties)',
+        ]
+        with self.engine.begin() as connection:
+            for statement in statements:
+                connection.execute(text(statement))
+
+    def drop_schema(self) -> None:
+        """Drop both tables and everything on them. Edges first, for the
+        foreign key."""
+        self.edges_tbl.drop(self.engine, checkfirst=True)
+        self.nodes_tbl.drop(self.engine, checkfirst=True)
+
+    # -- constraints ----------------------------------------------------
+
+    def _targets(self, nodes: Optional[list], edges: Optional[list]) -> list:
+        from .constraints import _Target
+        pairs = []
+        if nodes:
+            pairs.append((_Target(self.nodes_tbl, "nodes"), nodes))
+        if edges:
+            pairs.append((_Target(self.edges_tbl, "edges"), edges))
+        return pairs
+
+    def constraint_ddl(self, nodes: Optional[list] = None, edges: Optional[list] = None) -> list:
+        """The exact SQL define_constraints() would run, without running
+        it. For review, for a migration file, or for showing an agent what
+        it is about to change."""
+        from .constraints import compile_constraint
+        return [ddl for target, group in self._targets(nodes, edges)
+                for _, _, ddl in (compile_constraint(c, target) for c in group)]
+
+    def define_constraints(self, nodes: Optional[list] = None,
+                           edges: Optional[list] = None) -> list:
+        """Declare constraints on node and edge properties. Idempotent:
+        an existing constraint of the same name is left alone, so this
+        belongs next to create_schema() in your start-up path.
+
+        Returns the names created or already present, in order."""
+        from .constraints import compile_constraint, constraint_exists
+
+        applied = []
+        with self.engine.begin() as connection:
+            for target, group in self._targets(nodes, edges):
+                for constraint in group:
+                    kind, name, ddl = compile_constraint(constraint, target)
+                    if kind == "check" and constraint_exists(connection, target, name):
+                        applied.append(name)
+                        continue
+                    connection.execute(text(ddl))
+                    applied.append(name)
+        return applied
+
+    def drop_constraints(self, nodes: Optional[list] = None,
+                         edges: Optional[list] = None) -> list:
+        """Drop the constraints these declarations describe. Missing ones
+        are ignored, so this is the exact inverse of define_constraints()."""
+        from .constraints import compile_constraint
+
+        dropped = []
+        with self.engine.begin() as connection:
+            for target, group in self._targets(nodes, edges):
+                for constraint in group:
+                    kind, name, _ = compile_constraint(constraint, target)
+                    if kind == "index":
+                        connection.execute(text(f'DROP INDEX IF EXISTS "{name}"'))
+                    else:
+                        connection.execute(text(
+                            f'ALTER TABLE {target.qualified} DROP CONSTRAINT IF EXISTS "{name}"'))
+                    dropped.append(name)
+        return dropped
+
+    # -- writing --------------------------------------------------------
+
+    @property
+    def _ingestor(self):
+        from .ingest import Ingestor
+        if not hasattr(self, "_ingestor_cache"):
+            self._ingestor_cache = Ingestor(self)
+        return self._ingestor_cache
+
+    def add_nodes(self, rows: list) -> int:
+        """Insert nodes. Each row is `{"id": ..., **properties}` or
+        `{"id": ..., "properties": {...}}`; `id` may be omitted and
+        generated. Returns the number written."""
+        return self._ingestor.add_nodes(rows)
+
+    def add_edges(self, rows: list) -> int:
+        """Insert edges. Endpoints are given as `start_id`/`end_id`, or as
+        `start`/`end` property dicts matching exactly one existing node
+        each. Returns the number written."""
+        return self._ingestor.add_edges(rows)
+
+    def merge_nodes(self, rows: list, on: list, replace: bool = False) -> int:
+        """Insert nodes, updating any that already match on `on`.
+        Requires a unique index over those keys -- see Unique()."""
+        return self._ingestor.merge_nodes(rows, on=on, replace=replace)
+
+    def merge_edges(self, rows: list, on: list, replace: bool = False) -> int:
+        """Insert edges, updating any that already match on `on`."""
+        return self._ingestor.merge_edges(rows, on=on, replace=replace)
+
+    def ingest(self, document: dict, merge_nodes_on: Optional[list] = None,
+               merge_edges_on: Optional[list] = None):
+        """Write a whole `{"nodes": [...], "edges": [...]}` document.
+
+        Nodes are written before edges, so an edge in the same document
+        may reference a node created by it. This is the call an agent
+        makes -- see INGEST_TOOL_SCHEMA."""
+        return self._ingestor.ingest(document, merge_nodes_on, merge_edges_on)
+
+    def add_networkx(self, nx_graph):
+        """Load a networkx graph. Node keys become ids, and node/edge
+        attribute dicts become properties -- the inverse of
+        Subgraph.to_networkx()."""
+        return self._ingestor.add_networkx(nx_graph)
 
     # -- execution ------------------------------------------------------
 

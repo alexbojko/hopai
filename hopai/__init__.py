@@ -25,10 +25,14 @@ handler, config-driven traversal):
     })
 """
 
+from .constraints import (
+    Check, Col, ConstraintViolation, Index, PropertyType, Required, Unique,
+)
 from .core import Graph, Subgraph
 from .cypher import CypherError, cypher_to_traversal, traverse_cypher
 from .filters import AND, BETWEEN, GT, GTE, LT, LTE, NOT, OR, parse_filter
 from .hop import Hop, Start
+from .ingest import INGEST_TOOL_SCHEMA, IngestResult
 from .json_api import TRAVERSE_TOOL_SCHEMA, spec_to_traversal, traverse_json
 from .models import Edge, Node
 
@@ -39,5 +43,7 @@ __all__ = [
     "OR", "AND", "NOT", "GT", "GTE", "LT", "LTE", "BETWEEN", "parse_filter",
     "traverse_json", "spec_to_traversal", "TRAVERSE_TOOL_SCHEMA",
     "traverse_cypher", "cypher_to_traversal", "CypherError",
+    "Unique", "Required", "Check", "Index", "PropertyType", "Col", "ConstraintViolation",
+    "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",
 ]

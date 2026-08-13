@@ -43,17 +43,23 @@ tiebreakers, in order:
 ```bash
 pip install -e ".[dev]"
 
-# Most tests need a live PostgreSQL — anything taking the `graph` fixture. The
-# session fixture DROPs and recreates the `hopai_test` schema on every run.
-export HOPAI_TEST_DSN="postgresql+psycopg2://user:pass@localhost/db"   # default: postgres:testpass@localhost:5432/ageexp
+# Database-backed tests skip cleanly when nothing is listening; this starts one
+# matching the default DSN, so no configuration is needed.
+docker compose up -d
 pytest tests/ -v
 pytest "tests/test_hopai.py::TestCoreTraversal::test_simple_forward_hop" -v   # one test
 pytest tests/ -k "optional or cycle"                                          # by keyword
+ruff check .
 
-# These 7 take no `graph` fixture, so they run with no database at all:
-pytest tests/test_hopai.py::TestHopValidation                                 # hop/direction validation
-pytest tests/test_hopai.py -k "parse_filter"                                  # JSON filter parsing
+# Points at your own instead: export HOPAI_TEST_DSN=postgresql+psycopg2://...
+# HOPAI_REQUIRE_DB=1 turns a missing database into an error rather than skips.
+# CI sets it, because a suite that skips everything is a suite that passes
+# having tested nothing.
 ```
+
+Fixtures: `graph` is the seeded 7-node read fixture; `fresh_graph` is an empty
+graph in its own schema, rebuilt per test (constraints outlive TRUNCATE, so write
+tests need a real drop); `offline_graph` needs no database at all.
 
 No linter, formatter, or type checker is configured — don't invent one, and don't reformat files
 you aren't otherwise changing.
@@ -91,6 +97,11 @@ The pipeline spans three modules and is easier to follow as one flow than file b
    `(kind, id)` rows — `"node"` / `"edge"` — in one round trip.
 4. **`core.py:traverse`** — splits those rows by `kind` and issues two follow-up `SELECT`s to
    hydrate properties. `elapsed_ms` on the returned `Subgraph` times all three queries.
+
+Writes are a separate path: `Graph` exposes them, `ingest.py` and `constraints.py` implement
+them, and `core.py` stays the traversal engine. The one place they meet is
+`constraints.key_sql()`, which renders both `CREATE INDEX` and the `ON CONFLICT` target — index
+inference only works when the two are spelled identically, so they must come from one function.
 
 ### Invariants — breaking any of these reintroduces a bug the tests were written for
 
@@ -135,6 +146,8 @@ actually hit during development. Read the relevant one before changing behavior:
 | `hopai/hop.py` header | Why `Start` and `Hop` are separate types rather than one |
 | `hopai/models.py` header | The expected DDL, and the typed-columns / JSONB-bag split |
 | `hopai/cypher.py` header | The translatable Cypher subset, and why each refusal is a refusal |
+| `hopai/ingest.py` header | The two row spellings, edge-by-property references, and merge semantics |
+| `hopai/constraints.py` header | What each constraint compiles to, and the two SQL semantics that surprise people |
 | `tests/conftest.py` | The 7-node fixture graph — it deliberately contains a dead end, a fan-in, and a cycle |
 | `README.md` "What this doesn't do" | Committed-to limitations: one linear chain, sync only, path-array cost past ~10 hops |
 | `benchmarks/README.md` | Measured numbers, including where raw CTEs beat this library 2-5x |

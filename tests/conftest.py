@@ -108,6 +108,34 @@ def graph(engine):
     return Graph(engine)
 
 
+WRITE_SCHEMA = "hopai_write"
+
+
+@pytest.fixture(scope="session")
+def write_engine(engine):
+    """A second engine pointed at a schema the write tests own outright."""
+    eng = create_engine(DSN, connect_args={"options": f"-c search_path={WRITE_SCHEMA}"})
+    yield eng
+    eng.dispose()
+
+
+@pytest.fixture()
+def fresh_graph(write_engine):
+    """An empty graph with hopai's own schema, rebuilt for every test.
+
+    Constraints are schema-level and outlive a TRUNCATE, so tests that
+    declare them would leak into the next test. Dropping the schema is
+    the only isolation that actually holds."""
+    from hopai import Graph
+
+    with write_engine.begin() as conn:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {WRITE_SCHEMA} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {WRITE_SCHEMA}"))
+    graph = Graph(write_engine)
+    graph.create_schema()
+    return graph
+
+
 @pytest.fixture(scope="session")
 def offline_graph():
     """A Graph bound to a DSN nothing listens on.
