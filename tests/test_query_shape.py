@@ -18,6 +18,7 @@ from a slow one that returns the same answer.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -135,6 +136,44 @@ class TestQueryStructure:
         edges past the first are unfiltered."""
         sql = norm(offline_graph.build_query(Start(), [Hop(via={"kind": "knows"}, hops=(1, 3))]))
         assert sql.count("properties @> CAST") >= 2
+
+
+class TestHydrationUsesTheIndex:
+    """The second half of a traversal fetches properties by id. How that
+    predicate is written decides whether it is an index scan or a scan of
+    the whole table, and the difference does not show up on a fixture
+    with seven rows."""
+
+    def test_the_id_predicate_does_not_cast_the_column(self, offline_graph):
+        """`CAST(id AS VARCHAR) = ANY(...)` cannot use an index on `id`.
+        On a million nodes that was a parallel sequential scan, twice per
+        traversal -- 62ms to fetch three rows, against 0.094ms once the
+        cast moved. PostgreSQL coerces the string literals to the
+        column's type by itself, so the string ids callers receive are
+        unaffected.
+
+        Found by benchmarking, not by reading: every test graph is small
+        enough for a sequential scan to look instant."""
+        from sqlalchemy import String, cast, select
+
+        nt = offline_graph.nodes_tbl
+        node_id = getattr(nt.c, offline_graph.node_id_col)
+        query = select(cast(node_id, String).label("id"), nt.c.properties).where(
+            node_id.in_(["1", "2"])
+        )
+        sql = norm(query)
+        assert "CAST(nodes.id AS VARCHAR) AS id" in sql   # the output contract stays
+        assert "WHERE nodes.id IN" in sql                 # the predicate is bare
+
+    def test_traverse_hydration_is_written_that_way(self):
+        """Reads the source rather than the SQL, because the hydration
+        queries are built inside traverse() and only run with a
+        database. A cast added back here would be invisible until the
+        next benchmark."""
+        source = (Path(__file__).resolve().parents[1] / "hopai" / "core.py").read_text()
+        hydration = source[source.index("def traverse("):]
+        assert "cast(node_id_col, String).in_(" not in hydration
+        assert "cast(edge_id_col, String).in_(" not in hydration
 
 
 class TestCustomSchema:

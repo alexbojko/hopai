@@ -172,24 +172,37 @@ def overhead(row: dict) -> float | None:
 
 
 def _table(results: list) -> str:
+    """Every measurement, including the ones that are not measurements.
+
+    A DNF row keeps its place in the table with its outcome spelled out
+    rather than a number: dropping it would hide a query, and printing a
+    budget in the timing column would let non-completion read as a
+    latency."""
     has_raw = any(r.get("raw_sql_ms") for r in results)
-    columns = ["Query", "Cold (ms)", "Warm (ms), median + range"]
+    columns = ["ID", "Query", "Feature", "Cold (ms)", "Warm (ms), median + range"]
     if has_raw:
         columns += ["Raw SQL (ms)", "Overhead"]
-    columns += ["Nodes", "Edges"]
+    columns += ["Rows"]
     header = ("| " + " | ".join(columns) + " |\n"
-              "| --- |" + " ---: |" * (len(columns) - 1))
+              "| --- | --- | --- |" + " ---: |" * (len(columns) - 3))
+
     rows = []
     for r in results:
+        cells = [r.get("id", ""), r.get("query", ""), f"`{r.get('feature', '')}`"]
+        if r.get("dnf"):
+            outcome = f"**DNF** (>{r.get('budget_s', 0):.0f}s)"
+            cells += [outcome, outcome] + (["-", "-"] if has_raw else []) + ["-"]
+            rows.append("| " + " | ".join(cells) + " |")
+            continue
+
         warm = f"{r.get('warm_ms', 0):,.1f}"
         if r.get("warm_min_ms") is not None and r.get("samples", 0) > 1:
             warm += f" <sub>{r['warm_min_ms']:,.1f}-{r['warm_max_ms']:,.1f}</sub>"
-        cells = [f"`{r['query']}`", f"{r.get('cold_ms', 0):,.1f}", warm]
+        cells += [f"{r.get('cold_ms', 0):,.1f}", warm]
         if has_raw:
             ratio = overhead(r)
-            cells += [f"{r.get('raw_sql_ms', 0):,.1f}",
-                      f"{ratio:.1f}x" if ratio else "-"]
-        cells += [f"{r.get('nodes', 0):,}", f"{r.get('edges', 0):,}"]
+            cells += [f"{r.get('raw_sql_ms', 0):,.1f}", f"{ratio:.1f}x" if ratio else "-"]
+        cells += [f"{r.get('nodes') or 0:,}"]
         rows.append("| " + " | ".join(cells) + " |")
     return "\n".join([header, *rows]) if rows else "(no measurements)"
 
@@ -202,6 +215,140 @@ def _profile_table(profile: dict) -> str:
     rows = [f"| {labels.get(k, f'`{k}`')} | {v} |"
             for k, v in profile.items() if v not in (None, "")]
     return "\n".join(["| | |", "| --- | --- |", *rows])
+
+
+import math
+
+
+def log_bar(value: float, low: float, high: float, width: int = 34) -> str:
+    """A bar on a LOG scale.
+
+    Traversal timings span orders of magnitude -- single-digit
+    milliseconds for a property filter, seconds for a deep walk. On a
+    linear scale every fast query collapses to one indistinguishable
+    pixel and the chart only shows the outlier. Log keeps all of them
+    readable, which is the entire reason to draw a chart instead of
+    reading the table."""
+    if value <= 0 or high <= low:
+        return "·" * width
+    span = math.log10(high) - math.log10(low)
+    if span <= 0:
+        return "█" * width
+    filled = max(1, round((math.log10(max(value, low)) - math.log10(low)) / span * width))
+    return "█" * min(filled, width) + "·" * max(0, width - filled)
+
+
+def grouped_chart(results: list, series: list, width: int = 34) -> str:
+    """One block per query, one bar per system, log scale.
+
+    `series` is [(key, label)]. A row whose value is missing is skipped;
+    a row marked dnf is drawn full width and labelled, because "never
+    finished" is a different outcome from "slow" and must not read as a
+    number."""
+    measured = [v for r in results for k, _ in series
+                if (v := r.get(k)) and v > 0]
+    if not measured:
+        return "(no measurements)"
+    low, high = min(measured), max(measured)
+    label_width = max(len(label) for _, label in series)
+
+    blocks = []
+    for r in results:
+        head = f"{r.get('id', '')} {r.get('query', '')}".strip()
+        lines = [f"{head}   [{r.get('feature', '')}]"]
+        for key, label in series:
+            value = r.get(key)
+            if value is None:
+                continue
+            if r.get("dnf") and key in ("warm_ms", "cold_ms"):
+                lines.append(f"  {label:<{label_width}}  {'▓' * width}  "
+                             f"DNF (>{r.get('budget_s', 0):.0f}s)")
+                continue
+            lines.append(f"  {label:<{label_width}}  {log_bar(value, low, high, width)}  "
+                         f"{value:>10,.1f} ms")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def headline(results: list) -> list:
+    """The four numbers a reader should leave with.
+
+    Derived, never hand-written: a headline that drifts from the table
+    beneath it is worse than no headline."""
+    ran = [r for r in results if not r.get("dnf") and r.get("warm_ms")]
+    dnf = [r for r in results if r.get("dnf")]
+    stats = []
+    if ran:
+        slowest = max(ran, key=lambda r: r["warm_ms"])
+        fastest = min(ran, key=lambda r: r["warm_ms"])
+        under_1s = sum(1 for r in ran if r["warm_ms"] < 1000)
+        stats += [
+            f"| **{slowest['warm_ms']:,.0f} ms** | slowest: `{slowest['id']}` "
+            f"{slowest['query']} |",
+            f"| **{fastest['warm_ms']:,.1f} ms** | fastest: `{fastest['id']}` "
+            f"{fastest['query']} |",
+            f"| **{under_1s} / {len(results)}** | queries answering in under a second |",
+        ]
+    stats.append(
+        f"| **{len(dnf)}** | queries that did not finish"
+        + (": " + ", ".join(f"`{r['id']}`" for r in dnf) if dnf else "") + " |")
+    return ["| | |", "| ---: | --- |", *stats]
+
+
+def findings(results: list) -> list:
+    """Observations the data supports, stated only when it does.
+
+    Every one is conditional on the measurement: no finding is printed
+    for a phenomenon that did not occur in this run."""
+    out = []
+    ran = [r for r in results if not r.get("dnf")]
+
+    worst = [r for r in ran if overhead(r) is not None]
+    if worst:
+        top = max(worst, key=overhead)
+        out += [
+            f"**Where the library layer costs most.** `{top['id']}` "
+            f"({top['query']}) ran {overhead(top):.1f}x the raw statement "
+            f"({top['warm_ms']:,.1f} ms vs {top['raw_sql_ms']:,.1f} ms) over "
+            f"{top.get('nodes') or 0:,} nodes. The gap is result mapping and property "
+            f"hydration, and it is roughly fixed per call -- so it dominates a small "
+            f"answer and shrinks against a large one. Read it next to the row count, "
+            f"never alone.",
+            "",
+        ]
+
+    empty = empty_queries(ran)
+    if empty:
+        out += [
+            "**Queries that measured nothing.** " + ", ".join(f"`{q}`" for q in empty)
+            + " returned zero rows. Finding nothing is always fast, so these timings "
+              "describe the dataset, not the engine.",
+            "",
+        ]
+
+    dnf = [r for r in results if r.get("dnf")]
+    if dnf:
+        out += [
+            "**Did not finish.** " + ", ".join(f"`{r['id']}` ({r['query']})" for r in dnf)
+            + f" exceeded the {dnf[0].get('budget_s', 0):.0f}s budget and were cancelled "
+              "by the server. Non-completion is reported as its own outcome rather than "
+              "as a large number, which would let it average in with the rest.",
+            "",
+        ]
+
+    spread = [r for r in ran if r.get("warm_max_ms") and r.get("warm_min_ms")
+              and r["warm_min_ms"] > 0
+              and r["warm_max_ms"] / r["warm_min_ms"] > 1.5]
+    if spread:
+        out += [
+            "**Noisy measurements.** " + ", ".join(f"`{r['id']}`" for r in spread)
+            + " varied by more than 50% between warm runs. Their medians are not "
+              "comparable across commits; re-run on a quiet machine before drawing a "
+              "conclusion from them.",
+            "",
+        ]
+    return out or ["Nothing notable: every query finished, returned rows, and was stable "
+                   "across runs.", ""]
 
 
 def _floor_section(results: list) -> list:
@@ -229,63 +376,81 @@ def _floor_section(results: list) -> list:
 
 def render(results: list, profile: dict, dataset: dict | None = None,
            generated_at: str | None = None) -> str:
-    """The whole report. Deterministic given its inputs, so it is
-    testable without a database or a stopwatch."""
+    """The whole report, in the order a reader needs it: what happened,
+    then the evidence, then the caveats. Deterministic given its inputs,
+    so it is testable without a database or a stopwatch."""
     stamp = generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    dataset = dataset or {}
+    ran = [r for r in results if not r.get("dnf")]
+    series = [("warm_ms", "hopai"), ("raw_sql_ms", "raw SQL")]
+    has_raw = any(r.get("raw_sql_ms") for r in results)
+
     parts = [
-        "# Benchmark results",
+        "# hopai benchmark",
+        "",
+        f"{len(results)} queries covering every capability the library claims — forward, "
+        "backward and mixed direction, bounded and deep multi-hop, compound chains, "
+        "AND/OR/NOT, range comparisons, edge-property filtering and OPTIONAL — run "
+        "against identical data.",
         "",
         f"Generated by `benchmarks/bench_hopai.py` on {stamp}.",
         "",
-        "> **This file is rewritten on every run.** Do not edit it by hand, and do not",
-        "> compare rows across machines -- the profile below is part of the measurement,",
-        "> not decoration.",
+        "> **Rewritten on every run.** Do not edit by hand, and do not compare rows",
+        "> across machines — the profile below is part of the measurement.",
         "",
-        "## Machine",
+        "## 01 — Headline",
+        "",
+        *headline(results),
+        "",
+        "## 02 — Every query",
+        "",
+        "Log scale: these timings span orders of magnitude, and on a linear scale every",
+        "fast query collapses into one indistinguishable mark. Bars are comparable across",
+        "the whole chart; the numbers beside them are exact.",
+        "",
+        "```",
+        grouped_chart(results, [(k, l) for k, l in series if k != "raw_sql_ms" or has_raw]),
+        "```",
+        "",
+        "## 03 — Full results",
+        "",
+        _table(results),
+        "",
+    ]
+    if has_raw:
+        parts += [
+            "`raw SQL` is hopai's own statement executed straight through the driver — no",
+            "result mapping, no property hydration, no `Subgraph`. The overhead column is",
+            "what the API costs, measured rather than estimated, from one statement rather",
+            "than two hand-written queries that would drift apart.",
+            "",
+        ]
+    parts += [
+        "## 04 — Findings",
+        "",
+        *findings(results),
+        "## 05 — Environment",
         "",
         _profile_table(profile),
         "",
     ]
     if dataset:
         parts += [
-            "## Dataset",
-            "",
-            "\n".join(f"- **{k}**: {v:,}" if isinstance(v, int) else f"- **{k}**: {v}"
-                      for k, v in dataset.items()),
-            "",
-        ]
-    empty = empty_queries(results)
-    if empty:
-        parts += [
-            "> ⚠️ **Measured nothing:** " + ", ".join(f"`{q}`" for q in empty) + ".",
-            "> These returned zero rows, so their timings say how fast it is to find",
-            "> nothing on this dataset -- not how fast the query is. Fix the data or the",
-            "> query before quoting them.",
+            "Dataset: "
+            + ", ".join(f"**{v:,}** {k}" if isinstance(v, int) else f"{k} `{v}`"
+                        for k, v in dataset.items())
+            + ".",
             "",
         ]
     parts += [
-        "## Warm latency",
+        f"Every timing is wall-clock around actual query execution. Warm figures are the "
+        f"median of {ran[0].get('samples', 1) if ran else 1} runs with the cache primed; "
+        f"cold is the first run after load. Queries exceeding the per-query budget are "
+        f"cancelled by the server and reported as DNF, never as a large number.",
         "",
-        "Median of the warm runs, cache primed -- the number a live system",
-        "actually experiences. The spread is in the table; a single sample on a",
-        "shared machine moves further than most regressions worth catching.",
-        "",
-        "```",
-        chart(results, "warm_ms"),
-        "```",
-        "",
-        "## Cold latency",
-        "",
-        "First run after the data is loaded, nothing cached.",
-        "",
-        "```",
-        chart(results, "cold_ms"),
-        "```",
-        "",
-        *_floor_section(results),
-        "## All measurements",
-        "",
-        _table(results),
+        "Synthetic data: a sparse random background DAG plus a deliberately structured hub "
+        "subgraph with real fan-in across several depth levels — the shape that stresses a "
+        "traversal engine, which a purely random graph does not.",
         "",
     ]
     return "\n".join(parts)

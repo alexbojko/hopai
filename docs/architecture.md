@@ -52,8 +52,12 @@ One pair of tables holds every graph, discriminated by `graph_id`.
 ## Two gotchas in the results
 
 - **Ids come back as strings.** `build_query` casts them so node and edge ids share one
-  union'd column. The hydration queries then cast the indexed BIGINT to text to match;
-  removing that cast as an optimization breaks the contract the tests assert on.
+  union'd column. Keep that cast on the SELECT — but **never on the WHERE**. Casting the
+  column in the predicate (`CAST(id AS VARCHAR) = ANY(...)`) cannot use the primary key:
+  on a million nodes that was a parallel sequential scan twice per traversal, and removing
+  it made small-result queries 20-29x faster. PostgreSQL coerces the string literals to
+  the column type itself, so the contract is unaffected. Guarded by
+  `TestHydrationUsesTheIndex`.
 - **Table and column names are configurable.** Query building must go through
   `self.node_id_col` / `self.edge_start_col` / `self.graph_col` and the `nodes_tbl` /
   `edges_tbl` attributes — never a hardcoded `"start_id"`.

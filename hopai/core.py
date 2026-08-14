@@ -508,8 +508,16 @@ class Graph:
 
             nodes = []
             if node_ids:
+                # The cast stays on the SELECT (ids come back as strings)
+                # and is gone from the WHERE. Casting the column there
+                # made the predicate `CAST(id AS VARCHAR) = ANY(...)`,
+                # which no index on `id` can serve -- on a million rows
+                # that was a parallel sequential scan per traversal,
+                # twice. PostgreSQL coerces the string literals to the
+                # column's type itself, so the contract is unchanged and
+                # the primary key is used again.
                 q = select(cast(node_id_col, String).label("id"), nt.c.properties).where(
-                    and_(self._scoped(nt), cast(node_id_col, String).in_(node_ids))
+                    and_(self._scoped(nt), node_id_col.in_(node_ids))
                 )
                 nodes = [{"id": r.id, "properties": r.properties} for r in session.execute(q).all()]
 
@@ -519,7 +527,7 @@ class Graph:
                     cast(getattr(et.c, self.edge_start_col), String).label("start_id"),
                     cast(getattr(et.c, self.edge_end_col), String).label("end_id"),
                     et.c.properties,
-                ).where(and_(self._scoped(et), cast(edge_id_col, String).in_(edge_ids)))
+                ).where(and_(self._scoped(et), edge_id_col.in_(edge_ids)))
                 edges = [
                     {"start_id": r.start_id, "end_id": r.end_id, "properties": r.properties}
                     for r in session.execute(q).all()

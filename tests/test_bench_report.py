@@ -2,11 +2,14 @@
 Tests for the benchmark report renderer.
 
 A benchmark report is read once, believed, and quoted for months. These
-pin the parts that would make it quietly misleading: a chart whose bars
-do not reflect the numbers beside them, a missing machine profile, or a
-report that reads as if it were appended to rather than regenerated.
+pin the parts that would make it quietly misleading: bars that do not
+reflect the numbers beside them, a headline that drifts from its own
+table, a query that never finished being averaged in as a large number,
+or a report that reads as if it were appended to rather than regenerated.
 
-No database, no stopwatch -- render() is deterministic given its inputs.
+No database and no stopwatch -- render() is deterministic given its
+inputs, which is why the report is built from data rather than printed
+as it goes.
 """
 
 from __future__ import annotations
@@ -19,157 +22,176 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
 
 from report import (  # noqa: E402
-    UNKNOWN, bar, chart, empty_queries, machine_profile, overhead, render,
+    UNKNOWN, bar, chart, empty_queries, findings, grouped_chart, headline,
+    log_bar, machine_profile, overhead, render,
 )
 
 RESULTS = [
-    {"query": "forward_1hop", "cold_ms": 100.0, "warm_ms": 50.0, "nodes": 10, "edges": 9},
-    {"query": "backward_bounded_3hop", "cold_ms": 400.0, "warm_ms": 200.0,
-     "nodes": 2000, "edges": 1999},
-    {"query": "range_gt", "cold_ms": 20.0, "warm_ms": 10.0, "nodes": 5, "edges": 0},
+    {"id": "Q1", "query": "Forward 1-hop", "feature": "direction",
+     "cold_ms": 100.0, "warm_ms": 50.0, "warm_min_ms": 48.0, "warm_max_ms": 52.0,
+     "samples": 5, "raw_sql_ms": 10.0, "nodes": 10, "edges": 9},
+    {"id": "Q2", "query": "Backward bounded", "feature": "multi-hop",
+     "cold_ms": 400.0, "warm_ms": 200.0, "warm_min_ms": 195.0, "warm_max_ms": 205.0,
+     "samples": 5, "raw_sql_ms": 25.0, "nodes": 2000, "edges": 1999},
+    {"id": "Q3", "query": "GT range", "feature": "range",
+     "cold_ms": 20.0, "warm_ms": 10.0, "warm_min_ms": 9.0, "warm_max_ms": 11.0,
+     "samples": 5, "raw_sql_ms": 5.0, "nodes": 5, "edges": 0},
 ]
+DNF = {"id": "Q4", "query": "Deep backward", "feature": "deep multi-hop",
+       "dnf": True, "budget_s": 150.0, "cold_ms": 150000.0, "warm_ms": 150000.0,
+       "nodes": None, "edges": None}
 PROFILE = {"cpu": "Apple M1", "cores": 8, "memory": "16.0 GiB", "postgres": "16.6"}
 
 
-class TestBar:
-    def test_the_peak_fills_the_width(self):
-        assert bar(100, 100, width=10) == "█" * 10
-
-    def test_length_is_proportional_to_the_value(self):
+class TestBars:
+    def test_linear_bar_is_proportional(self):
         assert bar(50, 100, width=10).count("█") == 5
-        assert bar(25, 100, width=10).count("█") == 2   # 2.5 rounds to 2
 
-    def test_every_bar_is_the_same_total_width(self):
-        """Ragged right edges make a chart unreadable at a glance."""
-        assert {len(bar(v, 100, width=20)) for v in (0, 1, 50, 99, 100)} == {20}
+    def test_every_bar_is_the_same_width(self):
+        assert {len(bar(v, 100, width=20)) for v in (0, 1, 50, 100)} == {20}
 
-    def test_a_tiny_nonzero_value_still_shows(self):
-        """Rounding 0.4 to an empty bar would render a real measurement
-        as if nothing had been measured."""
-        assert bar(0.4, 1000, width=40).startswith("█")
+    def test_log_bar_keeps_small_values_visible(self):
+        """The reason the chart is log scale: on a linear one, 1ms next
+        to 60,000ms is an empty line, and the chart shows one query."""
+        assert log_bar(1, 1, 60000, width=30).count("█") >= 1
+        assert log_bar(60000, 1, 60000, width=30).count("█") == 30
 
-    def test_zero_and_degenerate_peaks_do_not_divide_by_zero(self):
-        assert bar(0, 100, width=5) == "░" * 5
-        assert bar(5, 0, width=5) == "░" * 5
+    def test_log_bar_orders_by_magnitude(self):
+        widths = [log_bar(v, 1, 10000, width=30).count("█")
+                  for v in (1, 10, 100, 1000, 10000)]
+        assert widths == sorted(widths)
+        assert len(set(widths)) == 5      # each order of magnitude is distinguishable
+
+    def test_log_bar_survives_degenerate_ranges(self):
+        assert len(log_bar(5, 5, 5, width=8)) == 8
+        assert len(log_bar(0, 1, 100, width=8)) == 8
 
 
-class TestChart:
-    def test_slowest_first(self):
-        lines = chart(RESULTS, "warm_ms").splitlines()
-        assert lines[0].startswith("backward_bounded_3hop")
-        assert lines[-1].startswith("range_gt")
+class TestGroupedChart:
+    SERIES = [("warm_ms", "hopai"), ("raw_sql_ms", "raw SQL")]
 
-    def test_the_number_is_printed_beside_the_bar(self):
-        """The bar is for shape; the number is the measurement. A chart
-        without both invites eyeballing a ratio off a terminal."""
-        assert "200.0 ms" in chart(RESULTS, "warm_ms")
-        assert "50.0 ms" in chart(RESULTS, "warm_ms")
+    def test_one_block_per_query_with_a_bar_per_system(self):
+        body = grouped_chart(RESULTS, self.SERIES)
+        for row in RESULTS:
+            assert row["id"] in body and row["query"] in body
+        assert body.count("hopai") == len(RESULTS)
+        assert body.count("raw SQL") == len(RESULTS)
 
-    def test_labels_are_aligned(self):
-        starts = {line.index("█") if "█" in line else line.index("░")
-                  for line in chart(RESULTS, "warm_ms").splitlines()}
-        assert len(starts) == 1
+    def test_shows_the_feature_each_query_exercises(self):
+        """Breadth is the point of the suite; a chart that only shows
+        timings hides what was actually covered."""
+        assert "[direction]" in grouped_chart(RESULTS, self.SERIES)
+        assert "[range]" in grouped_chart(RESULTS, self.SERIES)
 
-    def test_the_longest_bar_belongs_to_the_largest_number(self):
-        lines = chart(RESULTS, "cold_ms").splitlines()
-        counts = [line.count("█") for line in lines]
-        assert counts == sorted(counts, reverse=True)
+    def test_a_dnf_is_labelled_not_drawn_as_a_number(self):
+        """Reporting non-completion as its slowest-observed time would
+        let it average in with real measurements."""
+        body = grouped_chart([*RESULTS, DNF], self.SERIES)
+        assert "DNF (>150s)" in body
+        assert "150,000.0 ms" not in body
 
     def test_no_measurements_says_so(self):
-        assert "no measurements" in chart([], "warm_ms")
+        assert "no measurements" in grouped_chart([], self.SERIES)
 
 
-class TestEmptyQueries:
-    """A traversal that returns nothing did no work. Its timing is real
-    and meaningless, and it will always look like the fastest query in
-    the run -- so the report must not let it pass as one."""
+class TestHeadline:
+    def test_names_the_slowest_and_fastest_query(self):
+        body = "\n".join(headline(RESULTS))
+        assert "Q2" in body and "slowest" in body
+        assert "Q3" in body and "fastest" in body
 
-    def test_finds_queries_that_matched_nothing(self):
-        results = RESULTS + [{"query": "forward_1hop_broken", "warm_ms": 1.0,
-                              "cold_ms": 2.0, "nodes": 0, "edges": 0}]
-        assert empty_queries(results) == ["forward_1hop_broken"]
+    def test_counts_sub_second_queries(self):
+        assert "3 / 3" in "\n".join(headline(RESULTS))
 
-    def test_a_healthy_run_flags_nothing(self):
-        assert empty_queries(RESULTS) == []
+    def test_counts_and_names_queries_that_did_not_finish(self):
+        body = "\n".join(headline([*RESULTS, DNF]))
+        assert "**1**" in body and "`Q4`" in body
 
-    def test_the_chart_marks_them_inline(self):
-        results = [{"query": "empty", "warm_ms": 1.0, "nodes": 0, "edges": 0}]
-        assert "NO ROWS" in chart(results, "warm_ms")
+    def test_a_dnf_is_never_the_slowest_measurement(self):
+        """It has no measurement. Letting it win 'slowest' would report a
+        budget as a timing."""
+        body = "\n".join(headline([*RESULTS, DNF]))
+        assert "Q2" in body.split("slowest")[1][:40]
 
-    def test_the_report_warns_at_the_top(self):
-        results = RESULTS + [{"query": "dud", "warm_ms": 1.0, "cold_ms": 1.0,
-                              "nodes": 0, "edges": 0}]
-        body = render(results, PROFILE, generated_at="fixed")
-        assert "Measured nothing" in body and "`dud`" in body
-        assert "not how fast the query is" in body
+    def test_survives_a_run_where_everything_failed(self):
+        assert headline([DNF])
 
 
-class TestRawSqlFloor:
-    """The raw-SQL column answers "what does the library layer cost?".
-    It is only honest if the ratio is computed, not eyeballed."""
+class TestFindings:
+    def test_names_where_the_library_layer_costs_most(self):
+        body = "\n".join(findings(RESULTS))
+        assert "Q2" in body and "8.0x" in body      # 200 / 25
+        assert "next to the row count" in body
 
-    WITH_RAW = [{"query": "q1", "cold_ms": 200.0, "warm_ms": 100.0,
-                 "raw_sql_ms": 25.0, "nodes": 5, "edges": 4}]
+    def test_calls_out_queries_that_returned_nothing(self):
+        empty = [{**RESULTS[0], "id": "Q9", "query": "dud", "nodes": 0}]
+        body = "\n".join(findings(empty))
+        assert "measured nothing" in body.lower() and "`dud`" in body
 
-    def test_overhead_is_warm_over_raw(self):
-        assert overhead(self.WITH_RAW[0]) == pytest.approx(4.0)
+    def test_calls_out_non_completion_separately(self):
+        body = "\n".join(findings([*RESULTS, DNF]))
+        assert "Did not finish" in body and "150s budget" in body
 
-    def test_overhead_is_none_when_the_floor_was_not_measured(self):
+    def test_calls_out_noisy_measurements(self):
+        noisy = [{**RESULTS[0], "warm_min_ms": 10.0, "warm_max_ms": 100.0}]
+        body = "\n".join(findings(noisy))
+        assert "Noisy" in body and "not comparable across commits" in body
+
+    def test_says_nothing_notable_rather_than_inventing_a_finding(self):
+        body = "\n".join(findings(RESULTS))
+        assert "Noisy" not in body and "Did not finish" not in body
+
+
+class TestOverhead:
+    def test_is_warm_over_raw(self):
+        assert overhead(RESULTS[1]) == pytest.approx(8.0)
+
+    def test_is_none_when_the_floor_was_not_measured(self):
         assert overhead({"warm_ms": 10.0}) is None
         assert overhead({"raw_sql_ms": 10.0}) is None
-
-    def test_the_table_grows_the_columns_only_when_measured(self):
-        with_raw = render(self.WITH_RAW, PROFILE, generated_at="fixed")
-        assert "Raw SQL (ms)" in with_raw and "4.0x" in with_raw
-        without = render(RESULTS, PROFILE, generated_at="fixed")
-        assert "Raw SQL (ms)" not in without
-
-    def test_the_floor_gets_its_own_chart_when_measured(self):
-        assert "The floor" in render(self.WITH_RAW, PROFILE, generated_at="fixed")
-        assert "The floor" not in render(RESULTS, PROFILE, generated_at="fixed")
 
 
 class TestRender:
     @pytest.fixture()
     def body(self) -> str:
-        return render(RESULTS, PROFILE, {"nodes": 1_000_000, "edges": 1_799_431},
+        return render([*RESULTS, DNF], PROFILE,
+                      {"nodes": 1_000_000, "edges": 818_695},
                       generated_at="2026-01-01 00:00 UTC")
 
+    def test_has_every_section_in_order(self, body):
+        order = ["# hopai benchmark", "## 01 — Headline", "## 02 — Every query",
+                 "## 03 — Full results", "## 04 — Findings", "## 05 — Environment"]
+        positions = [body.index(section) for section in order]
+        assert positions == sorted(positions)
+
     def test_says_it_is_regenerated_not_appended(self, body):
-        """Someone will otherwise hand-edit it, and the next run will
-        silently throw their edit away."""
-        assert "rewritten on every run" in body
-        assert "Do not edit it by hand" in body
+        assert "Rewritten on every run" in body and "Do not edit by hand" in body
 
     def test_carries_the_machine_profile(self, body):
         for value in ("Apple M1", "16.0 GiB", "16.6"):
             assert value in body
 
     def test_carries_the_dataset_size_with_separators(self, body):
-        """`1000000` and `1,000,000` are the same number and not the same
-        at a glance."""
-        assert "1,000,000" in body and "1,799,431" in body
+        assert "1,000,000" in body and "818,695" in body
 
-    def test_has_both_cold_and_warm_charts(self, body):
-        assert "## Warm latency" in body and "## Cold latency" in body
-        assert body.count("```") == 4        # two fenced charts
-
-    def test_has_a_table_of_every_measurement(self, body):
+    def test_carries_every_query_and_its_feature(self, body):
         for row in RESULTS:
-            assert f"`{row['query']}`" in body
+            assert row["id"] in body and row["feature"] in body
+
+    def test_states_how_warm_was_measured(self, body):
+        assert "median of 5 runs" in body
 
     def test_is_deterministic(self):
         first = render(RESULTS, PROFILE, generated_at="fixed")
         assert first == render(RESULTS, PROFILE, generated_at="fixed")
 
     def test_an_empty_run_still_renders(self):
-        """A benchmark that measured nothing must produce a report saying
-        so, not a traceback."""
-        body = render([], PROFILE, generated_at="fixed")
-        assert "no measurements" in body
+        assert "no measurements" in render([], PROFILE, generated_at="fixed")
 
-    def test_the_timestamp_is_shown(self, body):
-        assert "2026-01-01 00:00 UTC" in body
+    def test_the_raw_sql_column_appears_only_when_measured(self):
+        without = [{k: v for k, v in r.items() if k != "raw_sql_ms"} for r in RESULTS]
+        assert "Raw SQL" not in render(without, PROFILE, generated_at="fixed")
+        assert "Raw SQL" in render(RESULTS, PROFILE, generated_at="fixed")
 
 
 class TestMachineProfile:
@@ -180,10 +202,18 @@ class TestMachineProfile:
         assert profile["architecture"] != UNKNOWN
 
     def test_degrades_instead_of_raising_without_a_connection(self):
-        """The report is worth having even where a probe is unavailable;
-        a missing CPU model must not cost you the measurements."""
         assert machine_profile(None)["postgres"] == UNKNOWN
 
     def test_memory_is_human_readable_or_unknown(self):
         memory = machine_profile()["memory"]
         assert memory == UNKNOWN or memory.endswith("GiB")
+
+
+class TestLegacyHelpers:
+    """chart() and empty_queries() still back the single-series views."""
+
+    def test_chart_is_slowest_first(self):
+        assert chart(RESULTS, "warm_ms").splitlines()[0].startswith("Backward")
+
+    def test_empty_queries_finds_zero_row_results(self):
+        assert empty_queries([{**RESULTS[0], "query": "dud", "nodes": 0}]) == ["dud"]

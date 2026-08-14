@@ -78,32 +78,53 @@ def load_data(engine, data_dir: Path, schema: str):
 
 
 def build_suite():
-    from hopai import AND, GT, NOT, Hop, Start
+    """Fourteen queries, one per capability the library claims.
+
+    The point of the breadth is that a two-query benchmark proves
+    nothing about a traversal engine: cost is driven by which side of a
+    pattern anchors the walk, how deep it goes, and whether the filter
+    is on nodes or edges. Each entry carries the feature it exercises so
+    the report can say what was covered rather than just how fast it was.
+    """
+    from hopai import AND, BETWEEN, GT, NOT, OR, Hop, Start
 
     return [
-        ("forward_1hop", [Start(where={"type": "leaf"}), Hop(where={"flag": 1}, hops=1)]),
-        ("backward_1hop", [Start(where={"type": "hub"}), Hop(hops=1, direction="backward")]),
-        ("forward_bounded_4hop", [Start(where={"type": "leaf"}), Hop(where={"flag": 1}, hops=(1, 4))]),
-        ("backward_bounded_3hop", [Start(where={"type": "hub"}), Hop(hops=(1, 3), direction="backward")]),
-        ("compound_2segment", [
-            Start(where={"type": "leaf"}),
-            Hop(where={"flag": 1}, hops=(1, 4)),
-            Hop(where={"type": "hub"}, hops=(1, 3)),
-        ]),
-        ("edge_or_tag", [
-            Start(where={"type": "leaf"}),
-            Hop(where={"flag": 1}, via={"tag": ["p1", "p2"]}, hops=(1, 4)),
-        ]),
-        ("not_filter", [
-            Start(where={"type": "hub"}),
-            Hop(where=NOT({"type": "leaf"}), hops=(1, 3), direction="backward"),
-        ]),
-        ("range_gt", [Start(where=AND({"type": "leaf"}, GT("priority", 5)))]),
-        ("optional_last_hop", [
-            Start(where={"type": "hub"}),
-            Hop(where=NOT({"type": "leaf"}), hops=1, direction="backward"),
-            Hop(where={"type": "leaf"}, hops=1, optional=True),
-        ]),
+        ("Q1", "Forward 1-hop, equality", "direction",
+         [Start(where={"type": "leaf"}), Hop(where={"flag": 1}, hops=1)]),
+        ("Q2", "Backward 1-hop, equality", "direction",
+         [Start(where={"type": "hub"}), Hop(hops=1, direction="backward")]),
+        ("Q3", "Forward bounded <=4 hops", "multi-hop",
+         [Start(where={"type": "leaf"}), Hop(where={"flag": 1}, hops=(1, 4))]),
+        ("Q4", "Backward bounded <=3 hops", "multi-hop",
+         [Start(where={"type": "hub"}), Hop(hops=(1, 3), direction="backward")]),
+        ("Q5", "2-segment compound chain", "compound",
+         [Start(where={"type": "leaf"}),
+          Hop(where={"flag": 1}, hops=(1, 4)),
+          Hop(where={"type": "hub"}, hops=(1, 3))]),
+        ("Q6", "Mixed backward -> forward", "direction",
+         [Start(where={"type": "hub"}),
+          Hop(hops=1, direction="backward"),
+          Hop(hops=1, direction="forward")]),
+        ("Q7", "Edge OR (tag p1|p2)", "OR: edge",
+         [Start(where={"type": "leaf"}),
+          Hop(where={"flag": 1}, via={"tag": ["p1", "p2"]}, hops=(1, 4))]),
+        ("Q8", "Node OR, explicit", "OR: node",
+         [Start(where=OR({"type": "leaf"}, {"type": "hub"})), Hop(hops=1)]),
+        ("Q9", "NOT (missing-key semantics)", "NOT",
+         [Start(where={"type": "hub"}),
+          Hop(where=NOT({"type": "leaf"}), hops=(1, 3), direction="backward")]),
+        ("Q10", "GT range comparison", "range",
+         [Start(where=AND({"type": "leaf"}, GT("priority", 5)))]),
+        ("Q11", "BETWEEN range comparison", "range",
+         [Start(where=AND({"type": "leaf"}, BETWEEN("priority", 5, 15)))]),
+        ("Q12", "AND(OR(...), {...})", "composition",
+         [Start(where=AND(OR({"type": "leaf"}, {"type": "hub"}), {"type": "leaf"}))]),
+        ("Q13", "OPTIONAL last hop", "OPTIONAL",
+         [Start(where={"type": "hub"}),
+          Hop(where=NOT({"type": "leaf"}), hops=1, direction="backward"),
+          Hop(where={"type": "leaf"}, hops=1, optional=True)]),
+        ("Q14", "Deep bounded backward <=12", "deep multi-hop",
+         [Start(where={"type": "hub"}), Hop(hops=(1, 12), direction="backward")]),
     ]
 
 
@@ -133,48 +154,81 @@ def time_raw_sql(graph, start_hop, rest) -> float:
     return elapsed
 
 
-def run_suite(graph, hub_id: int, baseline: bool = True, repeat: int = 5):
-    suite = build_suite()
-    results = []
-    for name, hops in suite:
-        start_hop, *rest = hops
-        # First call is cold. Everything after is warm, and the MEDIAN of
-        # those is what gets reported: a single warm sample on a shared
-        # machine moves 10-20% between runs, which is wider than most
-        # regressions worth catching -- so a one-shot number cannot tell
-        # a real change from the laptop breathing.
-        t0 = time.perf_counter()
-        r = graph.traverse(start_hop, *rest)
-        cold = (time.perf_counter() - t0) * 1000
+def run_suite(graph, hub_id: int, baseline: bool = True, repeat: int = 5,
+              budget_s: float = 150.0):
+    """Time every query, marking any that blow the time budget as DNF.
 
-        warm_samples = []
+    A query that never returns is not a slow query, it is a different
+    outcome -- reporting it as a large number would let it average in
+    with the rest. It is recorded as `dnf` with the budget it exceeded.
+    """
+    results = []
+    for qid, label, feature, hops in build_suite():
+        start_hop, *rest = hops
+        row = {"id": qid, "query": label, "feature": feature}
+
+        try:
+            t0 = time.perf_counter()
+            r = _with_timeout(graph, budget_s, start_hop, rest)
+            cold = (time.perf_counter() - t0) * 1000
+        except TimeoutError:
+            row.update({"dnf": True, "budget_s": budget_s, "cold_ms": budget_s * 1000,
+                        "warm_ms": budget_s * 1000, "nodes": None, "edges": None})
+            results.append(row)
+            print(f"{qid:4s} {label:30s} DID NOT FINISH within {budget_s:.0f}s")
+            continue
+
+        # First call is cold. Everything after is warm, and the MEDIAN of
+        # those is reported: a single warm sample on a shared machine
+        # moves 10-20% between runs, wider than most regressions worth
+        # catching, so one shot cannot tell a real change from noise.
+        warm = []
         for _ in range(repeat):
             t0 = time.perf_counter()
             r = graph.traverse(start_hop, *rest)
-            warm_samples.append((time.perf_counter() - t0) * 1000)
+            warm.append((time.perf_counter() - t0) * 1000)
 
-        row = {
-            "query": name,
+        row.update({
             "cold_ms": round(cold, 1),
-            "warm_ms": round(statistics.median(warm_samples), 1),
-            "warm_min_ms": round(min(warm_samples), 1),
-            "warm_max_ms": round(max(warm_samples), 1),
+            "warm_ms": round(statistics.median(warm), 1),
+            "warm_min_ms": round(min(warm), 1),
+            "warm_max_ms": round(max(warm), 1),
             "samples": repeat,
             "nodes": len(r.nodes),
             "edges": len(r.edges),
-        }
+        })
         if baseline:
             time_raw_sql(graph, start_hop, rest)          # warm it the same way
             row["raw_sql_ms"] = round(
                 statistics.median(time_raw_sql(graph, start_hop, rest)
                                   for _ in range(repeat)), 1)
         results.append(row)
-        extra = f" raw={row['raw_sql_ms']:9.1f}ms" if baseline else ""
-        print(f"{name:28s} cold={cold:9.1f}ms warm={row['warm_ms']:9.1f}ms"
-              f" [{row['warm_min_ms']:.1f}-{row['warm_max_ms']:.1f}]{extra} "
-              f"nodes={len(r.nodes):8d} edges={len(r.edges):8d}")
-
+        extra = f" raw={row['raw_sql_ms']:8.1f}ms" if baseline else ""
+        print(f"{qid:4s} {label:30s} cold={cold:9.1f}ms warm={row['warm_ms']:9.1f}ms"
+              f" [{row['warm_min_ms']:.1f}-{row['warm_max_ms']:.1f}]{extra}"
+              f" rows={len(r.nodes):8d}")
     return results
+
+
+def _with_timeout(graph, budget_s: float, start_hop, rest):
+    """Run one traversal, letting the SERVER cancel it if it overruns.
+
+    The budget is set as `statement_timeout` on the engine's connections
+    (see __main__), not with SET LOCAL here -- traverse() checks out its
+    own connection from the pool, so a session setting applied to some
+    other connection would simply not apply to the query being timed. A
+    client-side give-up would also leave the query running and hold a
+    backend for the rest of the suite; the server cancelling it is what
+    actually stops the work.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    try:
+        return graph.traverse(start_hop, *rest)
+    except OperationalError as exc:
+        if "statement timeout" in str(exc).lower() or "canceling statement" in str(exc).lower():
+            raise TimeoutError from exc
+        raise
 
 
 if __name__ == "__main__":
@@ -190,6 +244,8 @@ if __name__ == "__main__":
     ap.add_argument("--hub-id", type=int, default=None,
                      help="defaults to nodes/2, matching generate_graph.py's default")
     ap.add_argument("--skip-load", action="store_true", help="reuse already-loaded data")
+    ap.add_argument("--budget", type=float, default=150.0,
+                    help="per-query time budget in seconds; overruns are reported DNF")
     ap.add_argument("--repeat", type=int, default=5,
                     help="warm runs per query; the median is reported (default 5)")
     ap.add_argument("--no-baseline", action="store_true",
@@ -201,12 +257,17 @@ if __name__ == "__main__":
         print("Loading data...")
         load_data(engine, Path(args.data_dir), args.schema)
 
-    engine_scoped = create_engine(args.dsn, connect_args={"options": f"-c search_path={args.schema}"})
+    # The time budget lives on the connection, so every query the suite
+    # runs is under it -- including the ones that would otherwise hold a
+    # backend for minutes.
+    engine_scoped = create_engine(args.dsn, connect_args={
+        "options": f"-c search_path={args.schema} "
+                   f"-c statement_timeout={int(args.budget * 1000)}"})
     graph = Graph(engine_scoped)
 
-    print(f"\n{'Query':28s} {'Cold':>13s} {'Warm':>13s} {'Nodes':>10s} {'Edges':>10s}")
-    print("-" * 90)
-    results = run_suite(graph, args.hub_id or 0, baseline=not args.no_baseline, repeat=args.repeat)
+    print(f"\n{'ID':4s} {'Query':30s} {'Cold':>14s} {'Warm':>14s}")
+    print("-" * 110)
+    results = run_suite(graph, args.hub_id or 0, baseline=not args.no_baseline, repeat=args.repeat, budget_s=args.budget)
 
     from report import machine_profile, render
 
