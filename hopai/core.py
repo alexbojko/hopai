@@ -44,7 +44,7 @@ from sqlalchemy.orm import Session
 
 from .filters import resolve
 from .hop import Hop, Start
-from .models import Edge, Node
+from .models import DEFAULT_GRAPH, Edge, Node
 
 
 def _qualify(table) -> str:
@@ -100,25 +100,65 @@ class Graph:
     def __init__(
         self,
         dsn_or_engine,
+        graph: str = DEFAULT_GRAPH,
         node_table=None,
         edge_table=None,
         node_id_col: str = "id",
         edge_id_col: str = "id",
         edge_start_col: str = "start_id",
         edge_end_col: str = "end_id",
+        graph_col: Optional[str] = "graph_id",
     ):
         self.engine: Engine = (
             dsn_or_engine if isinstance(dsn_or_engine, Engine) else create_engine(dsn_or_engine)
         )
+        if not isinstance(graph, str) or not graph:
+            raise ValueError(f"graph must be a non-empty string, got {graph!r}")
+        self.graph = graph
         self.nodes_tbl = node_table if node_table is not None else Node.__table__
         self.edges_tbl = edge_table if edge_table is not None else Edge.__table__
         self.node_id_col = node_id_col
         self.edge_id_col = edge_id_col
         self.edge_start_col = edge_start_col
         self.edge_end_col = edge_end_col
+        self.graph_col = graph_col
+        if graph_col is not None:
+            for table in (self.nodes_tbl, self.edges_tbl):
+                if graph_col not in table.c:
+                    raise ValueError(
+                        f"table {table.name!r} has no {graph_col!r} column, so graphs cannot "
+                        f"be kept apart in it. Add the column (see create_schema), or pass "
+                        f"graph_col=None to run a single unscoped graph against these tables"
+                    )
 
     def __repr__(self) -> str:
-        return f"Graph({self.engine.url!r})"
+        return f"Graph({self.engine.url!r}, graph={self.graph!r})"
+
+    # -- graph scoping ---------------------------------------------------
+
+    def in_graph(self, graph: str) -> Graph:
+        """The same tables and engine, scoped to a different graph.
+
+        `Graph` is a cheap handle, so this is how you move between graphs
+        rather than building a second engine and pool for each."""
+        return Graph(self.engine, graph=graph, node_table=self.nodes_tbl,
+                     edge_table=self.edges_tbl, node_id_col=self.node_id_col,
+                     edge_id_col=self.edge_id_col, edge_start_col=self.edge_start_col,
+                     edge_end_col=self.edge_end_col, graph_col=self.graph_col)
+
+    def _scoped(self, table):
+        """`graph_id = <this graph>` for one table, or an alias of it.
+
+        Every read and every write goes through this. A query that
+        forgets it does not fail -- it silently returns or writes another
+        graph's rows, which is the one bug this design can produce.
+
+        graph_col=None means the caller brought their own tables with no
+        discriminator: there is only one graph, and the predicate is a
+        no-op rather than an error."""
+        if self.graph_col is None:
+            return literal(True)
+        return table.c[self.graph_col] == self.graph
 
     # -- query building -----------------------------------------------
 
@@ -150,7 +190,7 @@ class Graph:
 
         seed = (
             select(node_id_col.label("node_id"))
-            .where(resolve(nt.c.properties, start.where))
+            .where(and_(self._scoped(nt), resolve(nt.c.properties, start.where)))
             .cte("seed")
         )
         prev_match = seed
@@ -175,7 +215,7 @@ class Graph:
                     array([edge_id_col]).label("local_edges"),
                 )
                 .select_from(et.join(prev_match, join_col == prev_match.c.node_id))
-                .where(resolve(et.c.properties, hop.via))
+                .where(and_(self._scoped(et), resolve(et.c.properties, hop.via)))
             )
             walk = walk_base.cte(f"walk_{i}", recursive=True)
             w = walk.alias()
@@ -197,6 +237,7 @@ class Graph:
                 .where(
                     and_(
                         w.c.depth < hop.max_hops,
+                        self._scoped(e),
                         resolve(e.c.properties, hop.via),
                         sa_not_(e_move == sa_any_(w.c.local_path)),
                     )
@@ -208,7 +249,8 @@ class Graph:
                 select(distinct(full_walk.c.to_id).label("node_id"))
                 .select_from(
                     full_walk.join(
-                        nt, and_(node_id_col == full_walk.c.to_id, resolve(nt.c.properties, hop.where))
+                        nt, and_(node_id_col == full_walk.c.to_id, self._scoped(nt),
+                                 resolve(nt.c.properties, hop.where))
                     )
                 )
                 .where(full_walk.c.depth >= hop.min_hops)
@@ -229,9 +271,9 @@ class Graph:
             prev_match = match_i
 
         if not hop_edge_ctes:
-            return select(literal("node").label("kind"), cast(node_id_col, String).label("id")).select_from(
-                seed.join(nt, node_id_col == seed.c.node_id)
-            )
+            return select(
+                literal("node").label("kind"), cast(node_id_col, String).label("id")
+            ).select_from(seed.join(nt, and_(node_id_col == seed.c.node_id, self._scoped(nt))))
 
         # One union() over all the hops, NOT a fold of .union() calls:
         # Select.union() returns a CompoundSelect, which has no .union()
@@ -245,7 +287,8 @@ class Graph:
                 edge_start_col.label("a"),
                 edge_end_col.label("b"),
             )
-            .select_from(et.join(all_edges_cte, all_edges_cte.c.edge_id == edge_id_col))
+            .select_from(et.join(all_edges_cte, and_(all_edges_cte.c.edge_id == edge_id_col,
+                                                     self._scoped(et))))
             .cte("edge_rows")
         )
 
@@ -278,11 +321,17 @@ class Graph:
         self.edges_tbl.create(self.engine, checkfirst=True)
 
         nodes, edges = _qualify(self.nodes_tbl), _qualify(self.edges_tbl)
+        g = self.graph_col
+        # graph_id LEADS both endpoint indexes. Every hop filters on it,
+        # so a trailing position would make the index useless the moment
+        # a second graph exists -- and the cost of the discriminator is
+        # only acceptable because it is indexed away.
         statements = [
-            f'CREATE INDEX IF NOT EXISTS "ix_{self.edges_tbl.name}_{self.edge_start_col}" '
-            f'ON {edges} ("{self.edge_start_col}")',
-            f'CREATE INDEX IF NOT EXISTS "ix_{self.edges_tbl.name}_{self.edge_end_col}" '
-            f'ON {edges} ("{self.edge_end_col}")',
+            f'CREATE INDEX IF NOT EXISTS "ix_{self.edges_tbl.name}_graph_{self.edge_start_col}" '
+            f'ON {edges} ("{g}", "{self.edge_start_col}")',
+            f'CREATE INDEX IF NOT EXISTS "ix_{self.edges_tbl.name}_graph_{self.edge_end_col}" '
+            f'ON {edges} ("{g}", "{self.edge_end_col}")',
+            f'CREATE INDEX IF NOT EXISTS "ix_{self.nodes_tbl.name}_graph" ON {nodes} ("{g}")',
             f'CREATE INDEX IF NOT EXISTS "ix_{self.nodes_tbl.name}_properties" '
             f'ON {nodes} USING GIN (properties)',
             f'CREATE INDEX IF NOT EXISTS "ix_{self.edges_tbl.name}_properties" '
@@ -304,9 +353,9 @@ class Graph:
         from .constraints import _Target
         pairs = []
         if nodes:
-            pairs.append((_Target(self.nodes_tbl, "nodes"), nodes))
+            pairs.append((_Target(self.nodes_tbl, "nodes", self.graph, self.graph_col), nodes))
         if edges:
-            pairs.append((_Target(self.edges_tbl, "edges"), edges))
+            pairs.append((_Target(self.edges_tbl, "edges", self.graph, self.graph_col), edges))
         return pairs
 
     def constraint_ddl(self, nodes: Optional[list] = None, edges: Optional[list] = None) -> list:
@@ -460,7 +509,7 @@ class Graph:
             nodes = []
             if node_ids:
                 q = select(cast(node_id_col, String).label("id"), nt.c.properties).where(
-                    cast(node_id_col, String).in_(node_ids)
+                    and_(self._scoped(nt), cast(node_id_col, String).in_(node_ids))
                 )
                 nodes = [{"id": r.id, "properties": r.properties} for r in session.execute(q).all()]
 
@@ -470,7 +519,7 @@ class Graph:
                     cast(getattr(et.c, self.edge_start_col), String).label("start_id"),
                     cast(getattr(et.c, self.edge_end_col), String).label("end_id"),
                     et.c.properties,
-                ).where(cast(edge_id_col, String).in_(edge_ids))
+                ).where(and_(self._scoped(et), cast(edge_id_col, String).in_(edge_ids)))
                 edges = [
                     {"start_id": r.start_id, "end_id": r.end_id, "properties": r.properties}
                     for r in session.execute(q).all()

@@ -1,0 +1,65 @@
+[
+  {
+    "query": "forward_1hop",
+    "cold_ms": 92.2,
+    "warm_ms": 13.9,
+    "nodes": 0,
+    "edges": 0
+  },
+  {
+    "query": "backward_1hop",
+    "cold_ms": 19.9,
+    "warm_ms": 16.9,
+    "nodes": 16,
+    "edges": 15
+  },
+  {
+    "query": "forward_bounded_4hop",
+    "cold_ms": 263.3,
+    "warm_ms": 269.0,
+    "nodes": 10350,
+    "edges": 10125
+  },
+  {
+    "query": "backward_bounded_3hop",
+    "cold_ms": 24.2,
+    "warm_ms": 23.7,
+    "nodes": 316,
+    "edges": 315
+  },
+  {
+    "query": "compound_2segment",
+    "cold_ms": 295.4,
+    "warm_ms": 283.4,
+    "nodes": 10441,
+    "edges": 10440
+  },
+  {
+    "query": "edge_or_tag",
+    "cold_ms": 276.0,
+    "warm_ms": 280.7,
+    "nodes": 10350,
+    "edges": 10125
+  },
+  {
+    "query": "not_filter",
+    "cold_ms": 26.1,
+    "warm_ms": 24.2,
+    "nodes": 316,
+    "edges": 315
+  },
+  {
+    "query": "range_gt",
+    "cold_ms": 62.6,
+    "warm_ms": 47.5,
+    "nodes": 3780,
+    "edges": 0
+  },
+  {
+    "query": "optional_last_hop",
+    "cold_ms": 26.4,
+    "warm_ms": 23.0,
+    "nodes": 16,
+    "edges": 15
+  }
+]
