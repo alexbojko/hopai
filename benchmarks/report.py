@@ -173,7 +173,7 @@ def overhead(row: dict) -> float | None:
 
 def _table(results: list) -> str:
     has_raw = any(r.get("raw_sql_ms") for r in results)
-    columns = ["Query", "Cold (ms)", "Warm (ms)"]
+    columns = ["Query", "Cold (ms)", "Warm (ms), median + range"]
     if has_raw:
         columns += ["Raw SQL (ms)", "Overhead"]
     columns += ["Nodes", "Edges"]
@@ -181,7 +181,10 @@ def _table(results: list) -> str:
               "| --- |" + " ---: |" * (len(columns) - 1))
     rows = []
     for r in results:
-        cells = [f"`{r['query']}`", f"{r.get('cold_ms', 0):,.1f}", f"{r.get('warm_ms', 0):,.1f}"]
+        warm = f"{r.get('warm_ms', 0):,.1f}"
+        if r.get("warm_min_ms") is not None and r.get("samples", 0) > 1:
+            warm += f" <sub>{r['warm_min_ms']:,.1f}-{r['warm_max_ms']:,.1f}</sub>"
+        cells = [f"`{r['query']}`", f"{r.get('cold_ms', 0):,.1f}", warm]
         if has_raw:
             ratio = overhead(r)
             cells += [f"{r.get('raw_sql_ms', 0):,.1f}",
@@ -263,8 +266,9 @@ def render(results: list, profile: dict, dataset: dict | None = None,
     parts += [
         "## Warm latency",
         "",
-        "Second run of each query, with the cache primed -- the number a live",
-        "system actually experiences.",
+        "Median of the warm runs, cache primed -- the number a live system",
+        "actually experiences. The spread is in the table; a single sample on a",
+        "shared machine moves further than most regressions worth catching.",
         "",
         "```",
         chart(results, "warm_ms"),

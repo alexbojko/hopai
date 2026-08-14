@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import time
 from pathlib import Path
 
@@ -25,12 +26,22 @@ def load_data(engine, data_dir: Path, schema: str):
     with engine.begin() as conn:
         conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
         conn.execute(text(f"CREATE SCHEMA {schema}"))
+        # Mirrors create_schema(), with one deliberate omission: the
+        # composite foreign keys that keep an edge inside its own graph.
+        # They cost a great deal on a COPY of millions of rows and
+        # nothing at all on a SELECT, so leaving them out speeds up
+        # loading without touching what is being measured.
         conn.execute(text(f"""
-            CREATE TABLE {schema}.nodes (id BIGINT PRIMARY KEY, properties JSONB NOT NULL DEFAULT '{{}}')
+            CREATE TABLE {schema}.nodes (
+                id BIGINT PRIMARY KEY,
+                graph_id TEXT NOT NULL DEFAULT 'default',
+                properties JSONB NOT NULL DEFAULT '{{}}'
+            )
         """))
         conn.execute(text(f"""
             CREATE TABLE {schema}.edges (
                 id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                graph_id TEXT NOT NULL DEFAULT 'default',
                 start_id BIGINT NOT NULL, end_id BIGINT NOT NULL,
                 properties JSONB NOT NULL DEFAULT '{{}}'
             )
@@ -54,8 +65,12 @@ def load_data(engine, data_dir: Path, schema: str):
         raw.close()
 
     with engine.begin() as conn:
-        conn.execute(text(f"CREATE INDEX ON {schema}.edges (start_id)"))
-        conn.execute(text(f"CREATE INDEX ON {schema}.edges (end_id)"))
+        # graph_id LEADS, exactly as create_schema() builds them -- a
+        # benchmark against differently-indexed tables measures the
+        # indexes, not the library.
+        conn.execute(text(f"CREATE INDEX ON {schema}.edges (graph_id, start_id)"))
+        conn.execute(text(f"CREATE INDEX ON {schema}.edges (graph_id, end_id)"))
+        conn.execute(text(f"CREATE INDEX ON {schema}.nodes (graph_id)"))
         conn.execute(text(f"CREATE INDEX ON {schema}.nodes USING GIN (properties)"))
         conn.execute(text(f"CREATE INDEX ON {schema}.edges USING GIN (properties)"))
         conn.execute(text(f"ANALYZE {schema}.nodes"))
@@ -118,30 +133,45 @@ def time_raw_sql(graph, start_hop, rest) -> float:
     return elapsed
 
 
-def run_suite(graph, hub_id: int, baseline: bool = True):
+def run_suite(graph, hub_id: int, baseline: bool = True, repeat: int = 5):
     suite = build_suite()
     results = []
     for name, hops in suite:
         start_hop, *rest = hops
-        times = []
-        r = None
-        for _ in range(2):  # first pass cold, second warm
+        # First call is cold. Everything after is warm, and the MEDIAN of
+        # those is what gets reported: a single warm sample on a shared
+        # machine moves 10-20% between runs, which is wider than most
+        # regressions worth catching -- so a one-shot number cannot tell
+        # a real change from the laptop breathing.
+        t0 = time.perf_counter()
+        r = graph.traverse(start_hop, *rest)
+        cold = (time.perf_counter() - t0) * 1000
+
+        warm_samples = []
+        for _ in range(repeat):
             t0 = time.perf_counter()
             r = graph.traverse(start_hop, *rest)
-            times.append((time.perf_counter() - t0) * 1000)
+            warm_samples.append((time.perf_counter() - t0) * 1000)
+
         row = {
             "query": name,
-            "cold_ms": round(times[0], 1),
-            "warm_ms": round(times[1], 1),
+            "cold_ms": round(cold, 1),
+            "warm_ms": round(statistics.median(warm_samples), 1),
+            "warm_min_ms": round(min(warm_samples), 1),
+            "warm_max_ms": round(max(warm_samples), 1),
+            "samples": repeat,
             "nodes": len(r.nodes),
             "edges": len(r.edges),
         }
         if baseline:
-            time_raw_sql(graph, start_hop, rest)          # warm the same way
-            row["raw_sql_ms"] = round(time_raw_sql(graph, start_hop, rest), 1)
+            time_raw_sql(graph, start_hop, rest)          # warm it the same way
+            row["raw_sql_ms"] = round(
+                statistics.median(time_raw_sql(graph, start_hop, rest)
+                                  for _ in range(repeat)), 1)
         results.append(row)
         extra = f" raw={row['raw_sql_ms']:9.1f}ms" if baseline else ""
-        print(f"{name:28s} cold={times[0]:9.1f}ms warm={times[1]:9.1f}ms{extra} "
+        print(f"{name:28s} cold={cold:9.1f}ms warm={row['warm_ms']:9.1f}ms"
+              f" [{row['warm_min_ms']:.1f}-{row['warm_max_ms']:.1f}]{extra} "
               f"nodes={len(r.nodes):8d} edges={len(r.edges):8d}")
 
     return results
@@ -160,6 +190,8 @@ if __name__ == "__main__":
     ap.add_argument("--hub-id", type=int, default=None,
                      help="defaults to nodes/2, matching generate_graph.py's default")
     ap.add_argument("--skip-load", action="store_true", help="reuse already-loaded data")
+    ap.add_argument("--repeat", type=int, default=5,
+                    help="warm runs per query; the median is reported (default 5)")
     ap.add_argument("--no-baseline", action="store_true",
                     help="skip the raw-SQL floor (hopai's own SQL run through the driver)")
     args = ap.parse_args()
@@ -174,7 +206,7 @@ if __name__ == "__main__":
 
     print(f"\n{'Query':28s} {'Cold':>13s} {'Warm':>13s} {'Nodes':>10s} {'Edges':>10s}")
     print("-" * 90)
-    results = run_suite(graph, args.hub_id or 0, baseline=not args.no_baseline)
+    results = run_suite(graph, args.hub_id or 0, baseline=not args.no_baseline, repeat=args.repeat)
 
     from report import machine_profile, render
 

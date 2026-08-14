@@ -17,7 +17,14 @@ convergent fan-in that real dependency graphs do.
 
 `bench_hopai.py` loads it and times nine queries covering direction,
 multi-hop bounds, compound chains, `OR`, `NOT`, range comparisons, and
-`OPTIONAL` — cold and warm.
+`OPTIONAL`.
+
+Each query runs once cold, then `--repeat` times warm (default 5), and
+the **median** is reported with its range. A single warm sample on a
+shared machine moves further than most regressions worth catching, so a
+one-shot number cannot tell a real change from the machine breathing —
+if you are comparing two commits, compare medians and look at whether the
+ranges overlap.
 
 Each run writes two files, **both overwritten every time**:
 

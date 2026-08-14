@@ -1,65 +1,101 @@
 [
   {
     "query": "forward_1hop",
-    "cold_ms": 92.2,
-    "warm_ms": 13.9,
+    "cold_ms": 107.0,
+    "warm_ms": 15.5,
+    "warm_min_ms": 15.2,
+    "warm_max_ms": 15.8,
+    "samples": 5,
     "nodes": 0,
-    "edges": 0
+    "edges": 0,
+    "raw_sql_ms": 13.7
   },
   {
     "query": "backward_1hop",
-    "cold_ms": 19.9,
-    "warm_ms": 16.9,
+    "cold_ms": 29.9,
+    "warm_ms": 22.9,
+    "warm_min_ms": 21.7,
+    "warm_max_ms": 24.2,
+    "samples": 5,
     "nodes": 16,
-    "edges": 15
+    "edges": 15,
+    "raw_sql_ms": 1.4
   },
   {
     "query": "forward_bounded_4hop",
-    "cold_ms": 263.3,
-    "warm_ms": 269.0,
+    "cold_ms": 296.0,
+    "warm_ms": 279.0,
+    "warm_min_ms": 275.2,
+    "warm_max_ms": 298.5,
+    "samples": 5,
     "nodes": 10350,
-    "edges": 10125
+    "edges": 10125,
+    "raw_sql_ms": 79.6
   },
   {
     "query": "backward_bounded_3hop",
-    "cold_ms": 24.2,
-    "warm_ms": 23.7,
+    "cold_ms": 37.5,
+    "warm_ms": 30.0,
+    "warm_min_ms": 29.2,
+    "warm_max_ms": 30.8,
+    "samples": 5,
     "nodes": 316,
-    "edges": 315
+    "edges": 315,
+    "raw_sql_ms": 3.2
   },
   {
     "query": "compound_2segment",
-    "cold_ms": 295.4,
-    "warm_ms": 283.4,
+    "cold_ms": 313.5,
+    "warm_ms": 300.9,
+    "warm_min_ms": 295.9,
+    "warm_max_ms": 324.2,
+    "samples": 5,
     "nodes": 10441,
-    "edges": 10440
+    "edges": 10440,
+    "raw_sql_ms": 88.6
   },
   {
     "query": "edge_or_tag",
-    "cold_ms": 276.0,
-    "warm_ms": 280.7,
+    "cold_ms": 312.4,
+    "warm_ms": 300.4,
+    "warm_min_ms": 295.8,
+    "warm_max_ms": 322.9,
+    "samples": 5,
     "nodes": 10350,
-    "edges": 10125
+    "edges": 10125,
+    "raw_sql_ms": 86.1
   },
   {
     "query": "not_filter",
-    "cold_ms": 26.1,
-    "warm_ms": 24.2,
+    "cold_ms": 62.0,
+    "warm_ms": 30.0,
+    "warm_min_ms": 28.8,
+    "warm_max_ms": 31.0,
+    "samples": 5,
     "nodes": 316,
-    "edges": 315
+    "edges": 315,
+    "raw_sql_ms": 3.5
   },
   {
     "query": "range_gt",
-    "cold_ms": 62.6,
-    "warm_ms": 47.5,
+    "cold_ms": 56.0,
+    "warm_ms": 52.5,
+    "warm_min_ms": 51.0,
+    "warm_max_ms": 67.4,
+    "samples": 5,
     "nodes": 3780,
-    "edges": 0
+    "edges": 0,
+    "raw_sql_ms": 11.4
   },
   {
     "query": "optional_last_hop",
-    "cold_ms": 26.4,
-    "warm_ms": 23.0,
+    "cold_ms": 34.3,
+    "warm_ms": 30.5,
+    "warm_min_ms": 30.0,
+    "warm_max_ms": 31.9,
+    "samples": 5,
     "nodes": 16,
-    "edges": 15
+    "edges": 15,
+    "raw_sql_ms": 8.4
   }
 ]
