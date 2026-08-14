@@ -66,7 +66,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
 from sqlalchemy import column as sa_column
-from sqlalchemy import func, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -190,7 +190,7 @@ CONSTRAINT_TYPES = (Unique, Index, Required, PropertyType, Check)
 
 @dataclass
 class _Target:
-    """The table a set of constraints applies to.
+    """The table a set of constraints applies to, and the graph within it.
 
     `properties_col` is deliberately an UNBOUND column rather than
     table.c.properties: an unbound one renders as `properties`, a bound
@@ -201,10 +201,38 @@ class _Target:
     Unique() in step."""
     table: Any
     label: str
+    graph: Optional[str] = None
+    graph_col: str = "graph_id"
     properties_col: Any = field(init=False)
 
     def __post_init__(self):
         self.properties_col = sa_column("properties", JSONB)
+
+    def scope_index(self, keys: tuple) -> tuple:
+        """Put graph_id in front of an index's columns.
+
+        One index serves every graph and uniqueness becomes per-graph for
+        free: two graphs may each have their own node with the same
+        email, which is the only sane reading of "these are separate
+        graphs"."""
+        if self.graph is None:
+            return keys
+        return (Col(self.graph_col), *keys)
+
+    def scope_check(self, expression):
+        """A CHECK applies to the whole table, so an unscoped one would
+        make this graph's rules bind every other graph's rows too. The
+        guard makes it vacuously true elsewhere."""
+        if self.graph is None:
+            return expression
+        return or_(sa_column(self.graph_col) != self.graph, expression)
+
+    def scope_name(self, name: str) -> str:
+        """Two graphs declaring the same check need two constraints, so
+        the generated name carries the graph."""
+        if self.graph is None or self.graph == "default":
+            return name
+        return f"{name}_{_slug(self.graph)}"[:63]
 
     @property
     def qualified(self) -> str:
@@ -268,8 +296,9 @@ def compile_constraint(constraint: Any, target: _Target) -> tuple:
     caller exactly what will run before it runs."""
     if isinstance(constraint, (Unique, Index)):
         unique = isinstance(constraint, Unique)
+        keys = target.scope_index(constraint.keys)
         name = constraint.name or _auto_name("uq" if unique else "ix", target, constraint.keys)
-        columns = ", ".join(key_sql(target, k) for k in constraint.keys)
+        columns = ", ".join(key_sql(target, k) for k in keys)
         ddl = (f'CREATE {"UNIQUE " if unique else ""}INDEX IF NOT EXISTS "{name}" '
                f'ON {target.qualified} ({columns})')
         if constraint.where is not None:
@@ -277,14 +306,17 @@ def compile_constraint(constraint: Any, target: _Target) -> tuple:
         return "index", name, ddl
 
     if isinstance(constraint, Required):
-        name = constraint.name or _auto_name("ck_required", target, constraint.keys)
-        body = _literal(target.properties_col.has_all(postgresql.array(constraint.keys)))
+        name = constraint.name or target.scope_name(
+            _auto_name("ck_required", target, constraint.keys))
+        body = _literal(target.scope_check(
+            target.properties_col.has_all(postgresql.array(constraint.keys))))
         return "check", name, _add_check(target, name, body)
 
     if isinstance(constraint, PropertyType):
-        name = constraint.name or _auto_name(f"ck_{constraint.json_type}", target, [constraint.key])
+        name = constraint.name or target.scope_name(
+            _auto_name(f"ck_{constraint.json_type}", target, [constraint.key]))
         expression = func.jsonb_typeof(target.properties_col[constraint.key]) == constraint.json_type
-        return "check", name, _add_check(target, name, _literal(expression))
+        return "check", name, _add_check(target, name, _literal(target.scope_check(expression)))
 
     if isinstance(constraint, Check):
         if constraint.name is None:
@@ -293,8 +325,9 @@ def compile_constraint(constraint: Any, target: _Target) -> tuple:
                 "spelling to derive one from, and an unnamed constraint cannot be "
                 "dropped or made idempotent"
             )
-        body = _literal(resolve(target.properties_col, constraint.filter))
-        return "check", constraint.name, _add_check(target, constraint.name, body)
+        name = target.scope_name(constraint.name)
+        body = _literal(target.scope_check(resolve(target.properties_col, constraint.filter)))
+        return "check", name, _add_check(target, name, body)
 
     raise TypeError(
         f"expected one of {', '.join(t.__name__ for t in CONSTRAINT_TYPES)}, "

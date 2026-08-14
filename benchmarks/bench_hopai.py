@@ -25,12 +25,21 @@ def load_data(engine, data_dir: Path, schema: str):
     with engine.begin() as conn:
         conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
         conn.execute(text(f"CREATE SCHEMA {schema}"))
+        # graph_id mirrors the real schema (see models.py / conftest.py):
+        # Graph() builds queries against the default model tables, which
+        # carry the column, so the physical tables must too or every
+        # query fails at runtime. No FKs here on purpose -- load speed.
         conn.execute(text(f"""
-            CREATE TABLE {schema}.nodes (id BIGINT PRIMARY KEY, properties JSONB NOT NULL DEFAULT '{{}}')
+            CREATE TABLE {schema}.nodes (
+                id BIGINT PRIMARY KEY,
+                graph_id TEXT NOT NULL DEFAULT 'default',
+                properties JSONB NOT NULL DEFAULT '{{}}'
+            )
         """))
         conn.execute(text(f"""
             CREATE TABLE {schema}.edges (
                 id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                graph_id TEXT NOT NULL DEFAULT 'default',
                 start_id BIGINT NOT NULL, end_id BIGINT NOT NULL,
                 properties JSONB NOT NULL DEFAULT '{{}}'
             )
@@ -54,8 +63,11 @@ def load_data(engine, data_dir: Path, schema: str):
         raw.close()
 
     with engine.begin() as conn:
-        conn.execute(text(f"CREATE INDEX ON {schema}.edges (start_id)"))
-        conn.execute(text(f"CREATE INDEX ON {schema}.edges (end_id)"))
+        # graph_id LEADS, matching create_schema(): every hop filters on
+        # it, and a trailing position would stop paying for itself the
+        # moment a second graph exists.
+        conn.execute(text(f"CREATE INDEX ON {schema}.edges (graph_id, start_id)"))
+        conn.execute(text(f"CREATE INDEX ON {schema}.edges (graph_id, end_id)"))
         conn.execute(text(f"CREATE INDEX ON {schema}.nodes USING GIN (properties)"))
         conn.execute(text(f"CREATE INDEX ON {schema}.edges USING GIN (properties)"))
         conn.execute(text(f"ANALYZE {schema}.nodes"))

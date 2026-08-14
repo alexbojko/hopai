@@ -513,3 +513,64 @@ class TestSubgraphResult:
         )
         g = result.to_networkx(multigraph=True)
         assert isinstance(g, nx.MultiDiGraph)
+
+
+# ---------------------------------------------------------------------
+# Gaps found by mutation testing. Each of these mutants survived the
+# whole suite, meaning the behaviour was executed and never asserted on.
+# ---------------------------------------------------------------------
+
+class TestMinHopsEdgeCollection:
+    def test_edges_from_too_short_a_walk_are_not_reported(self, fresh_graph):
+        """A -> B directly, and A -> C -> B. With hops=2, B qualifies via
+        the two-edge path only -- but B is also reached at depth 1, and
+        that shorter walk carries a different edge. Dropping the
+        `depth >= min_hops` filter on the edge-collection CTE lets A -> B
+        leak into a result that asked for two-hop paths.
+
+        Mutant hopai.core.xǁGraphǁbuild_query__mutmut_221 removed exactly
+        that predicate and nothing failed."""
+        fresh_graph.ingest({
+            "nodes": [{"id": 1, "n": "a"}, {"id": 2, "n": "b"}, {"id": 3, "n": "c"}],
+            "edges": [{"start_id": 1, "end_id": 2}, {"start_id": 1, "end_id": 3},
+                      {"start_id": 3, "end_id": 2}],
+        })
+        result = fresh_graph.traverse(Start(where={"n": "a"}), Hop(hops=2))
+        pairs = {(e["start_id"], e["end_id"]) for e in result.edges}
+        assert pairs == {("1", "3"), ("3", "2")}
+        assert ("1", "2") not in pairs   # the one-hop shortcut is not a two-hop path
+
+
+class TestHopWhereActuallyFilters:
+    def test_a_hop_filter_excludes_a_reachable_node(self, fresh_graph):
+        """Every existing hop test uses a `where` that all reachable
+        nodes happen to satisfy, so dropping the filter entirely changed
+        nothing and mutant build_query__mutmut_206 survived. Here A
+        reaches both B and C, and only B passes -- so the filter has to
+        do work for the assertion to hold."""
+        fresh_graph.ingest({
+            "nodes": [{"id": 1, "n": "a"}, {"id": 2, "n": "b", "keep": True},
+                      {"id": 3, "n": "c"}],
+            "edges": [{"start_id": 1, "end_id": 2}, {"start_id": 1, "end_id": 3}],
+        })
+        result = fresh_graph.traverse(Start(where={"n": "a"}), Hop(where={"keep": True}))
+        assert {n["properties"]["n"] for n in result.nodes} == {"a", "b"}
+        assert {(e["start_id"], e["end_id"]) for e in result.edges} == {("1", "2")}
+
+
+class TestEmptyResults:
+    def test_a_traversal_with_no_edges_returns_an_empty_list(self, fresh_graph):
+        """Not None. `Subgraph.edges = None` would break len(), iteration
+        and to_networkx() for every caller that does not special-case it.
+        Mutant xǁGraphǁtraverse__mutmut_61 turned [] into None."""
+        fresh_graph.add_nodes([{"n": 1}])
+        result = fresh_graph.traverse(Start(where={"n": 1}))
+        assert result.edges == []
+        assert result.to_networkx().number_of_edges() == 0
+
+    def test_dropping_a_schema_twice_is_not_an_error(self, fresh_graph):
+        """checkfirst=True is what makes drop_schema idempotent, and
+        idempotence is the whole reason it is safe in a teardown path.
+        Mutant xǁGraphǁdrop_schema__mutmut_4 removed it."""
+        fresh_graph.drop_schema()
+        fresh_graph.drop_schema()

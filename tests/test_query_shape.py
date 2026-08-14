@@ -155,9 +155,10 @@ class TestCustomSchema:
                   Column("properties", JSONB))
         g = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/x",
                   node_table=v, edge_table=e, node_id_col="vid", edge_id_col="lid",
-                  edge_start_col="src", edge_end_col="dst")
+                  edge_start_col="src", edge_end_col="dst", graph_col=None)
 
         sql = norm(g.build_query(Start(where={"a": 1}), [Hop(hops=(1, 2))]))
+        assert "graph_id" not in sql   # graph_col=None means no discriminator at all
         for name in ("vertex", "link", "vid", "lid", "src", "dst"):
             assert name in sql
         for default in ("nodes.id", "edges.start_id", "edges.end_id"):
@@ -241,6 +242,15 @@ class TestAggregateQueryShape:
         sql = self.agg_sql(offline_graph, Start(), [], {"friends": Count(), "avg_age": Avg("age")})
         assert "AS friends" in sql and "AS avg_age" in sql
 
+    def test_aggregate_query_is_graph_scoped(self, offline_graph):
+        """'Every read and write goes through Graph._scoped()' -- the
+        aggregation path is a new query builder, so it needs its own
+        proof: the discriminator must appear at every table access
+        (seed, walk base, recursive term, match join, final properties
+        join), or an aggregate quietly counts other graphs' rows."""
+        sql = self.agg_sql(offline_graph, Start(), [Hop()], {"n": Count()}, literal_binds=True)
+        assert sql.count("graph_id = 'default'") == 5
+
     @pytest.mark.parametrize("bad", [{}, None, [Count()], "count"])
     def test_aggregates_must_be_a_non_empty_dict(self, offline_graph, bad):
         with pytest.raises(ValueError, match="non-empty dict"):
@@ -288,12 +298,13 @@ class TestAggregateQueryShape:
                   Column("properties", JSONB))
         g = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/x",
                   node_table=v, edge_table=e, node_id_col="vid", edge_id_col="lid",
-                  edge_start_col="src", edge_end_col="dst")
+                  edge_start_col="src", edge_end_col="dst", graph_col=None)
         sql = norm(g.build_aggregate_query(Start(where={"a": 1}), [Hop()], {"n": Count()}))
         for name in ("vertex", "link", "vid", "src", "dst"):
             assert name in sql
         for default in ("nodes.id", "edges.start_id", "edges.end_id"):
             assert default not in sql
+        assert "graph_id" not in sql   # graph_col=None means no discriminator at all
 
 
 # ---------------------------------------------------------------------

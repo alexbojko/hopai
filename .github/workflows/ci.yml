@@ -174,6 +174,10 @@ jobs:
         # in the general one.
         env:
           MUTATION_NOTE: ${{ steps.scope.outputs.note }}
+          # Set only when mutmut was actually invoked, so "no results"
+          # can be reported as a broken harness rather than as an empty
+          # scope. The two must never look alike.
+          MUTATION_ATTEMPTED: ${{ steps.scope.outputs.run == 'true' && '1' || '' }}
         run: |
           set -euo pipefail
           python scripts/pr_report.py \
@@ -182,6 +186,7 @@ jobs:
             --mutmut-stats mutants/mutmut-cicd-stats.json \
             --mutmut-results survivors.txt \
             --mutation-note "${MUTATION_NOTE}" \
+            ${MUTATION_ATTEMPTED:+--mutation-attempted} \
             --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
