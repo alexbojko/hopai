@@ -45,16 +45,28 @@ from hopai import Graph, Start, Hop, OR, AND, NOT, GT, BETWEEN
 
 graph = Graph(create_engine("postgresql+psycopg2://user:pass@host/db"))
 
+# "Which companies do Alice's friends work for — counting friends of
+#  friends, up to four hops out, and only people who are still active?"
 result = graph.traverse(
-    Start(where={"type": "person"}),
-    Hop(where={"active": True}, via={"kind": "friend"}, hops=(1, 4)),
-    Hop(where={"type": "company"}, hops=3),
+    Start(where={"name": "Alice"}),                        # begin at Alice
+    Hop(via={"kind": "friend"},                            # follow `friend` edges
+        hops=(1, 4),                                       #   between 1 and 4 of them
+        where={"active": True}),                           #   landing only on active people
+    Hop(via={"kind": "works_at"},                          # then one `works_at` edge
+        where={"type": "company"}),                        #   landing on a company
 )
 
-result.nodes            # [{"id": ..., "properties": {...}}, ...]
-result.edges            # [{"start_id": ..., "end_id": ..., "properties": {...}}, ...]
+result.nodes            # every node on a complete matching chain
+result.edges            # every edge those chains actually traversed
 result.to_networkx()    # in-memory graph, if you have networkx installed
 ```
+
+Read a traversal left to right as a sentence: **start here → follow these
+edges this many times → land on nodes like this → then again**. `via`
+filters the *edges* you walk, `where` filters the *node* you arrive at.
+
+You get back the whole matching subgraph — Alice, the friends in between,
+the companies, and the real edges connecting them — not just the endpoints.
 
 ## 💡 Why
 
@@ -100,9 +112,13 @@ Different table or column names? `Graph(engine, node_table=..., edge_table=..., 
 ## 🧬 Many graphs, one database
 
 ```python
+# Three completely separate graphs, one database, one connection pool.
 marketing = Graph(engine, graph="marketing")
 support   = Graph(engine, graph="support")
 tenant    = graph.in_graph(f"tenant-{id}")     # same engine and tables
+
+marketing.add_nodes([{"type": "person", "name": "Alice"}])
+support.traverse(Start(where={"name": "Alice"}))   # finds nothing — different graph
 ```
 
 Every read and every write carries `graph_id = ...`, so the graphs are
@@ -125,12 +141,16 @@ runs a single unscoped graph against them.
 ## 📥 Getting data in
 
 ```python
+# "Alice is a person, Acme is a company, and Alice has worked at Acme
+#  since 2019."
 graph.add_nodes([
-    {"id": 1, "type": "person", "name": "Alice"},
-    {"type": "company", "name": "Acme"},          # id generated
+    {"type": "person", "name": "Alice"},          # ids assigned by Postgres
+    {"type": "company", "name": "Acme"},
 ])
 graph.add_edges([
-    {"start_id": 1, "end": {"name": "Acme"}, "kind": "works_at", "since": 2019},
+    {"start": {"name": "Alice"},    # endpoints looked up by property, so you
+     "end": {"name": "Acme"},       # never have to juggle generated ids
+     "kind": "works_at", "since": 2019},
 ])
 ```
 
@@ -145,6 +165,11 @@ isn't an identity key is a property.**
 
 The nested form is exactly `result.nodes`, so a subgraph loads into
 another graph without reshaping.
+
+Supply `id` yourself when it means something to you, or leave it out and
+let Postgres assign one — but **not both in the same call**. A batch where
+some rows have an id and others don't is refused, because it would insert
+`NULL` for the rest instead of generating them; split it into two calls.
 
 Edges take endpoints as `start_id`/`end_id`, or as `start`/`end`
 property dicts matching one existing node each — because whatever just
@@ -228,16 +253,26 @@ Two SQL semantics to know, both of which are what you want once stated:
 
 ## 🔎 Filters
 
+Anywhere a `where=` or `via=` is accepted:
+
 ```python
-{"type": "person"}                          # equality
-{"type": "person", "active": True}          # AND of keys, same dict
-{"type": ["person", "company"]}             # OR of values, one key (IN-like)
-OR({"type": "person"}, {"type": "company"})
-AND(OR(...), {"active": True})
-NOT({"type": "person"})                     # includes rows missing the key entirely
-GT("age", 18) / GTE / LT / LTE
-BETWEEN("age", 18, 65)
-lambda col: col.op("~")("^A")               # escape hatch: any real SQLAlchemy expression
+{"type": "person"}                    # people
+{"type": "person", "active": True}    # people who are ALSO active      (AND of keys)
+{"type": ["person", "company"]}       # people OR companies             (IN-like)
+
+OR({"type": "person"}, {"type": "company"})            # the same, spelled out
+AND(OR({"type": "person"}, {"type": "company"}),
+    {"active": True})                                  # ...and active
+
+NOT({"type": "person"})               # everything that is not a person — INCLUDING
+                                      # rows with no `type` key at all
+
+GT("age", 18)                         # age > 18        (GTE, LT, LTE likewise)
+BETWEEN("age", 18, 65)                # 18 <= age <= 65
+
+lambda col: col.op("->>")("name").op("~")("^A")   # escape hatch: any SQLAlchemy
+                                                  # expression — here, names
+                                                  # starting with "A"
 ```
 
 A bare list at the top level (`[{"a": 1}, {"b": 2}]`) raises `TypeError`
@@ -254,18 +289,45 @@ see `tests/test_hopai.py::test_not_includes_missing_key`.
 ## 🧭 Direction and hop count
 
 ```python
-Hop(hops=3)                 # exactly 3 hops
-Hop(hops=(1, 6))            # 1 to 6 hops
-Hop(direction="backward")   # follow end_id -> start_id ("what points to this")
+Hop(hops=3)                 # exactly 3 edges away
+Hop(hops=(1, 6))            # anywhere from 1 to 6 edges away
+Hop(direction="backward")   # walk edges INTO the node instead of out of it
 ```
 
-Direction is per-hop — a chain can mix forward and backward steps (a
-"who else does X's dependents depend on" query, for instance).
+Forward follows `start_id → end_id`; backward follows `end_id → start_id`,
+which is how you ask "what points at this?":
+
+```python
+# "Who works at Acme?" — start at the company and walk the works_at
+#  edges backwards, to the people on the other end.
+graph.traverse(
+    Start(where={"name": "Acme"}),
+    Hop(via={"kind": "works_at"}, direction="backward", where={"type": "person"}),
+)
+```
+
+Direction is per hop, so one chain can mix both:
+
+```python
+# "Who are Alice's colleagues?" — out to her employer, then back down to
+#  everyone else who works there.
+graph.traverse(
+    Start(where={"name": "Alice"}),
+    Hop(via={"kind": "works_at"}),                            # up to the company
+    Hop(via={"kind": "works_at"}, direction="backward"),      # back down to its people
+)
+```
 
 ## 🧩 OPTIONAL
 
 ```python
-Hop(where=..., optional=True)
+# "List every active person, and the company they work for IF they have
+#  one." Without optional=True, the unemployed drop out of the answer
+#  entirely; with it, they come back with no company attached.
+graph.traverse(
+    Start(where={"type": "person", "active": True}),
+    Hop(via={"kind": "works_at"}, where={"type": "company"}, optional=True),
+)
 ```
 
 Cypher's `OPTIONAL MATCH`, equivalent: nodes that reach this point in the
@@ -282,14 +344,18 @@ HTTP handler, config-driven traversal:
 ```python
 from hopai import traverse_json
 
+# The same question as the Quick start, in JSON: "which companies do
+# Alice's friends — up to four hops out, active only — work for?"
 traverse_json(graph, {
-    "start": {"where": {"type": "person"}},
+    "start": {"where": {"name": "Alice"}},
     "hops": [
-        {"where": {"active": True}, "via": {"kind": "friend"}, "hops": [1, 4]},
-        {"where": {"type": "company"}, "hops": 3, "optional": True},
+        {"via": {"kind": "friend"}, "hops": [1, 4], "where": {"active": True}},
+        {"via": {"kind": "works_at"}, "where": {"type": "company"}},
     ],
 })
 ```
+
+Same keys, same meaning, same engine — JSON in, JSON out.
 
 Filters accept the same grammar, spelled as JSON operators:
 `{"and": [...]}`, `{"or": [...]}`, `{"not": ...}`, `{"gt": [key, value]}`,
@@ -303,18 +369,22 @@ this into an LLM function-calling definition directly.
 For callers who already think in Cypher — reading and writing:
 
 ```python
+# Create two people and the friendship between them.
 graph.cypher("""
-    CREATE (a:person {email: 'a@x.com'})-[:friend]->(b:person {email: 'b@x.com'})
+    CREATE (a:person {email: 'alice@x.com'})-[:friend]->(b:person {email: 'bob@x.com'})
 """)
 
+# "Make sure Alice exists." Creates her the first time, and on every run
+# after that just stamps when she was last seen.
 graph.cypher("""
-    MERGE (a:person {email: 'a@x.com'})
+    MERGE (a:person {email: 'alice@x.com'})
     ON CREATE SET a.name = 'Alice'
     ON MATCH SET  a.last_seen = 2026
 """)
 
+# "Which of Alice's friends, up to four hops out, are active adults?"
 graph.cypher("""
-    MATCH (a:person)-[:friend*1..4]->(b {active: true})
+    MATCH (a:person {email: 'alice@x.com'})-[:friend*1..4]->(b {active: true})
     WHERE b.age > 18
     RETURN b
 """)
