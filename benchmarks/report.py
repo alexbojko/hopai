@@ -22,6 +22,7 @@ than raising when a platform does not offer it.
 
 from __future__ import annotations
 
+import math
 import os
 import platform
 import subprocess
@@ -217,9 +218,6 @@ def _profile_table(profile: dict) -> str:
     return "\n".join(["| | |", "| --- | --- |", *rows])
 
 
-import math
-
-
 def log_bar(value: float, low: float, high: float, width: int = 34) -> str:
     """A bar on a LOG scale.
 
@@ -409,7 +407,8 @@ def render(results: list, profile: dict, dataset: dict | None = None,
         "the whole chart; the numbers beside them are exact.",
         "",
         "```",
-        grouped_chart(results, [(k, l) for k, l in series if k != "raw_sql_ms" or has_raw]),
+        grouped_chart(results, [(key, label) for key, label in series
+                        if key != "raw_sql_ms" or has_raw]),
         "```",
         "",
         "## 03 — Full results",
