@@ -92,6 +92,36 @@ The node discriminator is the `type` property and the edge discriminator
 is `kind` -- the convention the Cypher front end already uses for
 labels. Nothing requires a row to carry them until the schema is
 enforced.
+
+INFERENCE -- when the graph grew chaotically and nobody declared
+anything, the schema is sitting in the data and Postgres can compute it:
+
+    inferred, report = graph.infer_schema()   # connects, scans, observes
+    print(report)                             # untyped rows, conflicts, counts
+    graph.define_schema(schema=inferred)      # the deliberate adoption step
+    graph.enforce_schema()                    # now the server validates writes
+
+An INFERRED schema is an observation; a DEFINED one is a contract. That
+is why infer_schema() is a method that visibly connects and scans, never
+a silent fallback inside `.schema`: blurring the two would let a
+property that merely HAPPENS to be on all forty rows today get frozen
+into a required-forever constraint by an enforce_schema() nobody meant
+that way. Adoption is the caller's second, explicit step -- and the
+report (per-type row counts, untyped rows, type conflicts) is what to
+read before taking it.
+
+Inference stays honest about what chaos looks like: a key holding both
+42 and "42" infers the type SET, never a silent winner, and is listed in
+the report; one kind observed across several endpoint pairs becomes
+several EdgeTypes; rows carrying no discriminator (or an empty one)
+cannot be invented into a type -- they are counted in the report and
+pass every per-type CHECK by construction, consistent with enforcement.
+An edge whose endpoint nodes carry no type has no expressible triple and
+is counted as skipped.
+
+Cost: one sequential scan per query -- the GIN index cannot serve an
+all-keys aggregate. Meant for start-up, migration or exploration, not
+per-request.
 """
 
 from __future__ import annotations
@@ -607,3 +637,161 @@ def compile_node_constraints(schema: GraphSchema, target: _Target) -> list:
 def compile_edge_constraints(schema: GraphSchema, target: _Target) -> list:
     return [pair for kind, properties in _properties_per_kind(schema.edge_types).items()
             for pair in _type_constraints(target, "kind", kind, properties)]
+
+
+# ---------------------------------------------------------------------
+# Inference: existing rows -> GraphSchema
+# ---------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TypeConflict:
+    """One property observed with more than one non-null JSON type --
+    the 42-versus-"42" situation. The schema carries the honest type
+    set; this entry is the pointer to the data worth cleaning."""
+    table: str
+    type_name: str
+    key: str
+    json_types: tuple
+
+
+@dataclass
+class InferenceReport:
+    """What infer_schema() saw that the schema alone cannot say -- read
+    it before adopting: `required` on a three-row type means much less
+    than on a three-million-row one."""
+    node_counts: dict
+    edge_counts: dict
+    untyped_nodes: int
+    untyped_edges: int
+    skipped_endpoint_edges: int
+    conflicts: tuple
+
+    def __str__(self) -> str:
+        lines = [
+            f"nodes: {sum(self.node_counts.values())} typed across "
+            f"{len(self.node_counts)} type(s) {dict(sorted(self.node_counts.items()))}, "
+            f"{self.untyped_nodes} untyped (outside the schema)",
+            f"edges: {sum(self.edge_counts.values())} with a kind across "
+            f"{len(self.edge_counts)} kind(s) {dict(sorted(self.edge_counts.items()))}, "
+            f"{self.untyped_edges} kindless, "
+            f"{self.skipped_endpoint_edges} skipped (endpoint node carries no type)",
+        ]
+        for c in self.conflicts:
+            lines.append(f"conflict: {c.table}/{c.type_name}.{c.key} observed as "
+                         f"{list(c.json_types)}")
+        return "\n".join(lines)
+
+
+def _named(value: Optional[str]) -> bool:
+    """A usable type/kind name. NULL means the key is absent (or held a
+    JSON null); '' would be a NodeType the model rejects -- neither can
+    be invented into a type, so both count as untyped."""
+    return value is not None and value != ""
+
+
+def _observed_counts(connection, graph, table, discriminator: str) -> dict:
+    from sqlalchemy import func, select
+    name = table.c.properties[discriminator].astext
+    rows = connection.execute(
+        select(name.label("name"), func.count().label("rows"))
+        .where(graph._scoped(table)).group_by(name)
+    ).all()
+    return {r.name: r.rows for r in rows}
+
+
+def _observed_keys(connection, graph, table, discriminator: str) -> list:
+    """(type name, key, json type, row count) per distinct combination
+    -- one lateral jsonb_each scan, Postgres doing all the work."""
+    from sqlalchemy import func, select
+    kv = func.jsonb_each(table.c.properties).table_valued(
+        "key", "value", joins_implicitly=True)
+    name = table.c.properties[discriminator].astext
+    json_type = func.jsonb_typeof(kv.c.value)
+    return connection.execute(
+        select(name.label("name"), kv.c.key.label("key"),
+               json_type.label("json_type"), func.count().label("rows"))
+        .where(graph._scoped(table))
+        .group_by(name, kv.c.key, json_type)
+    ).all()
+
+
+def _derive_properties(counts: dict, key_rows: list, discriminator: str,
+                       table_label: str, conflicts: list) -> dict:
+    """type name -> [Property], with required-ness from presence counts:
+    a key on EVERY row of its type is required, anything else optional;
+    an observed JSON null makes it nullable. Mixed non-null types become
+    a type set and a report entry -- never a silent winner."""
+    per_type: dict = {}
+    for row in key_rows:
+        if not _named(row.name) or row.key == discriminator:
+            continue
+        per_type.setdefault(row.name, {}).setdefault(row.key, {})[row.json_type] = row.rows
+    properties: dict = {}
+    for type_name in sorted(k for k in counts if _named(k)):
+        props = []
+        for key, observed in sorted(per_type.get(type_name, {}).items()):
+            json_types = tuple(sorted(observed))
+            non_null = [t for t in json_types if t != "null"]
+            if len(non_null) > 1:
+                conflicts.append(TypeConflict(table_label, type_name, key, json_types))
+            props.append(Property(key, json_types,
+                                  required=sum(observed.values()) == counts[type_name]))
+        properties[type_name] = props
+    return properties
+
+
+def infer_schema(graph) -> tuple:
+    """Derive (GraphSchema, InferenceReport) from the rows this graph
+    already holds. Read-only, never registers itself as the handle's
+    schema -- see the module docstring for why observation and contract
+    stay separate. Every query is scoped to this graph."""
+    from sqlalchemy import and_, func, select
+
+    nt, et = graph.nodes_tbl, graph.edges_tbl
+    conflicts: list = []
+    with graph.engine.connect() as connection:
+        node_counts = _observed_counts(connection, graph, nt, "type")
+        edge_counts = _observed_counts(connection, graph, et, "kind")
+        node_props = _derive_properties(node_counts, _observed_keys(
+            connection, graph, nt, "type"), "type", "nodes", conflicts)
+        edge_props = _derive_properties(edge_counts, _observed_keys(
+            connection, graph, et, "kind"), "kind", "edges", conflicts)
+
+        source, target = nt.alias("src"), nt.alias("dst")
+        kind = et.c.properties["kind"].astext
+        node_id = graph.node_id_col
+        triples = connection.execute(
+            select(kind.label("kind"),
+                   source.c.properties["type"].astext.label("source"),
+                   target.c.properties["type"].astext.label("target"),
+                   func.count().label("rows"))
+            .select_from(
+                et.join(source, getattr(et.c, graph.edge_start_col) == getattr(source.c, node_id))
+                  .join(target, getattr(et.c, graph.edge_end_col) == getattr(target.c, node_id)))
+            .where(and_(graph._scoped(et), graph._scoped(source), graph._scoped(target)))
+            .group_by(kind, source.c.properties["type"].astext,
+                      target.c.properties["type"].astext)
+        ).all()
+
+    node_types = [NodeType(name, properties=props)
+                  for name, props in sorted(node_props.items())]
+    edge_types = []
+    skipped = 0
+    for row in sorted(triples, key=lambda r: (r.kind or "", r.source or "", r.target or "")):
+        if not _named(row.kind):
+            continue  # already counted as kindless below
+        if not (_named(row.source) and _named(row.target)):
+            skipped += row.rows
+            continue
+        edge_types.append(EdgeType(row.kind, source=row.source, target=row.target,
+                                   properties=edge_props.get(row.kind, ())))
+
+    report = InferenceReport(
+        node_counts={k: v for k, v in node_counts.items() if _named(k)},
+        edge_counts={k: v for k, v in edge_counts.items() if _named(k)},
+        untyped_nodes=sum(v for k, v in node_counts.items() if not _named(k)),
+        untyped_edges=sum(v for k, v in edge_counts.items() if not _named(k)),
+        skipped_endpoint_edges=skipped,
+        conflicts=tuple(conflicts),
+    )
+    return GraphSchema(node_types, edge_types), report
