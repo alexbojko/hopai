@@ -23,6 +23,56 @@ from hopai import (
 # ---------------------------------------------------------------------
 
 class TestCoreTraversal:
+    def test_shared_ids_across_graphs_stay_scoped(self, write_engine):
+        """Every read goes through _scoped() -- including the
+        hydrate-by-id lookups after the walk. With the DEFAULT tables
+        that guard is invisible to tests (nodes.id is the table-wide PK,
+        so an id list already identifies rows uniquely), which is
+        exactly how mutants xǁGraphǁtraverseǁ__mutmut_47 and
+        build_query__mutmut_87 dropped it unnoticed. Graph() explicitly
+        supports caller-supplied tables, where PRIMARY KEY (id, graph_id)
+        is legitimate -- and there, an unscoped hydration returns the
+        other graph's rows."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text, text as sa_text
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        from hopai import Graph
+
+        meta = MetaData(schema="hopai_shared_ids")
+        nodes = Table("nodes", meta,
+                      Column("id", BigInteger, primary_key=True),
+                      Column("graph_id", Text, primary_key=True),
+                      Column("properties", JSONB, nullable=False))
+        edges = Table("edges", meta,
+                      Column("id", BigInteger, primary_key=True),
+                      Column("graph_id", Text, primary_key=True),
+                      Column("start_id", BigInteger, nullable=False),
+                      Column("end_id", BigInteger, nullable=False),
+                      Column("properties", JSONB, nullable=False))
+        with write_engine.begin() as conn:
+            conn.execute(sa_text("DROP SCHEMA IF EXISTS hopai_shared_ids CASCADE"))
+            conn.execute(sa_text("CREATE SCHEMA hopai_shared_ids"))
+        meta.create_all(write_engine)
+        with write_engine.begin() as conn:
+            conn.execute(nodes.insert(), [
+                {"id": 1, "graph_id": "g1", "properties": {"t": 1, "m": "one"}},
+                {"id": 2, "graph_id": "g1", "properties": {"m": "one-end"}},
+                {"id": 1, "graph_id": "g2", "properties": {"t": 1, "m": "two"}},
+                {"id": 2, "graph_id": "g2", "properties": {"m": "two-end"}},
+            ])
+            conn.execute(edges.insert(), [
+                {"id": 1, "graph_id": "g1", "start_id": 1, "end_id": 2,
+                 "properties": {"kind": "k"}},
+                {"id": 1, "graph_id": "g2", "start_id": 1, "end_id": 2,
+                 "properties": {"kind": "k"}},
+            ])
+        g1 = Graph(write_engine, graph="g1", node_table=nodes, edge_table=edges)
+        seed_only = g1.traverse(Start(where={"t": 1}))
+        assert [n["properties"]["m"] for n in seed_only.nodes] == ["one"]
+        one_hop = g1.traverse(Start(where={"t": 1}), Hop())
+        assert {n["properties"]["m"] for n in one_hop.nodes} == {"one", "one-end"}
+        assert len(one_hop.edges) == 1
+
     def test_simple_forward_hop(self, graph):
         result = graph.traverse(
             Start(where={"type": "leaf"}),
@@ -233,6 +283,20 @@ class TestOptional:
                 Hop(hops=1),
             )
 
+    def test_optional_keeps_a_seed_whose_only_edges_never_match(self, graph):
+        """n4-deadend's single edge is the wrong kind, so with ONE
+        optional hop it is kept purely by the pre-optional arm of the
+        result union -- no edge row ever mentions it. The earlier
+        optional test could not catch a broken arm (mutant
+        xǁGraphǁbuild_queryǁ__mutmut_193 nulled its id column) because
+        its kept nodes also arrived via the previous hop's edges."""
+        result = graph.traverse(
+            Start(where={"name": "n4-deadend"}),
+            Hop(via={"kind": "knows"}, optional=True),
+        )
+        assert [n["properties"]["name"] for n in result.nodes] == ["n4-deadend"]
+        assert result.edges == []
+
 
 # ---------------------------------------------------------------------
 # Hop validation
@@ -315,6 +379,13 @@ class TestJsonApi:
 
     def test_parse_filter_passthrough_for_plain_dict(self):
         assert parse_filter({"type": "leaf"}) == {"type": "leaf"}
+
+    def test_parse_filter_names_the_offending_type(self):
+        """The refusal must say what it got -- 'got list' is what turns
+        a bare-list mistake into an immediate fix."""
+        with pytest.raises(TypeError) as exc:
+            parse_filter([{"type": "leaf"}])
+        assert "got list" in str(exc.value)
 
     def test_parse_filter_none(self):
         assert parse_filter(None) is None

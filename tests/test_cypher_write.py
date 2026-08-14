@@ -168,6 +168,79 @@ class TestWriteRefusals:
             with pytest.raises(CypherError, match="not supported"):
                 ops(query)
 
+    # Refusal texts pinned by their actionable phrase -- see the same
+    # note in test_cypher.py: mutation testing proved these messages
+    # could be rewritten freely, and the message is the behavior.
+
+    def test_alternation_in_a_created_relationship_names_the_pattern(self):
+        with pytest.raises(CypherError) as exc:
+            ops("CREATE (a {i: 1})-[:x|y]->(b {i: 2})")
+        assert str(exc.value).startswith("a relationship being written has one type")
+        assert "`[:x|y]` is a pattern to match, not to create" in str(exc.value)
+
+    def test_traversing_match_before_a_write_refused(self):
+        with pytest.raises(CypherError) as exc:
+            ops("MATCH (a {x: 1})-[:k]->(b) CREATE (b)-[:z]->(c {n: 1})")
+        assert str(exc.value).startswith(
+            "a MATCH that precedes CREATE or MERGE may only bind single nodes")
+
+    def test_where_before_a_write_refused(self):
+        with pytest.raises(CypherError) as exc:
+            ops("MATCH (a {x: 1}) WHERE a.y = 2 CREATE (a)-[:z]->(c {n: 1})")
+        assert str(exc.value).startswith("WHERE is not supported before a write")
+
+    def test_anonymous_edge_endpoints_refused(self):
+        with pytest.raises(CypherError) as exc:
+            ops("CREATE ({x: 1})-[:knows]->({y: 2})")
+        assert str(exc.value).startswith("a node an edge connects has to be named")
+
+    def test_on_match_set_refusal_names_the_clause(self):
+        """ON CREATE SET and ON MATCH SET share one loop distinguished
+        only by the interpolated label -- lowercase either label (mutants
+        _merge_node 12/14) and the error blames the wrong clause."""
+        with pytest.raises(CypherError) as exc:
+            ops("MERGE (a {n: 1}) ON MATCH SET b.x = 1")
+        assert "ON MATCH SET refers to ['b']" in str(exc.value)
+        with pytest.raises(CypherError) as exc:
+            ops("MERGE (a {n: 1}) ON CREATE SET b.x = 1")
+        assert "ON CREATE SET refers to ['b']" in str(exc.value)
+
+    def test_multi_assignment_set_keeps_every_assignment(self):
+        """`SET a.x = 1, a.y = 2` -- the comma loop in
+        _parse_set_assignments had no test, so breaking the separator
+        check (mutant _13) was free."""
+        plan = ops("MERGE (a {n: 1}) ON CREATE SET a.x = 1, a.y = 2")
+        assert plan[0]["on_create"] == {"x": 1, "y": 2}
+
+    def test_a_three_node_chain_wires_each_edge_to_its_own_ends(self):
+        """(a)-[:x]->(b)-[:y]->(c): edge i connects nodes i and i+1. The
+        off-by-one mutant (_create__mutmut_10) is invisible on two-node
+        chains, where nodes[index-1] happens to equal the other end."""
+        plan = ops("CREATE (a {i: 1})-[:x]->(b {i: 2})-[:y]->(c {i: 3})")
+        assert [(r["start_var"], r["end_var"]) for r in plan[1]["rows"]] == [
+            ("a", "b"), ("b", "c")]
+
+    def test_matching_label_and_type_property_agree(self):
+        """`(a:person {type: 'person'})` is redundant but consistent, so
+        it must pass -- the consistency check indexes labels[0], and the
+        off-by-one mutant (_node_properties__mutmut_9) crashed on any
+        single-label node that spelled its type out."""
+        plan = ops("CREATE (a:person {type: 'person', x: 1})")
+        assert plan[0]["rows"] == [{"type": "person", "x": 1}]
+
+    def test_typeless_arrow_creates_an_edge_with_no_kind(self):
+        """`(a)-->(b)` has empty rel props, and the write path must
+        treat that {} as {} -- the props-to-None mutant
+        (_parse_rel__mutmut_8) crashed exactly here."""
+        plan = ops("CREATE (a {x: 1})-->(b {y: 2})")
+        assert plan[0]["op"] == "create_nodes"
+        assert plan[1]["op"] == "create_edges"
+        assert plan[1]["rows"][0]["properties"] == {}
+
+    def test_null_property_values_are_literals(self):
+        plan = ops("CREATE (a {gone: NULL, missing: null})")
+        assert plan[0]["rows"] == [{"gone": None, "missing": None}]
+
 
 # ---------------------------------------------------------------------
 # Execution
