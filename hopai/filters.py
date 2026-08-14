@@ -222,7 +222,10 @@ def parse_filter(spec: Optional[dict]):
         # plain equality/AND-of-keys dict -- passed through unchanged
         return spec
 
-    if len(present) > 1 or len(spec) > 1:
+    # `present` is a subset of spec's keys, so "more than one operator"
+    # is already covered by "more than one key" -- one condition, not two
+    # half-redundant ones a mutation can silently weaken.
+    if len(spec) > 1:
         raise ValueError(
             f"an operator filter must have exactly one key from {sorted(operator_keys)} "
             f"and nothing else -- got {list(spec.keys())}"

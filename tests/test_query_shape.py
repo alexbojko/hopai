@@ -440,6 +440,22 @@ class TestAggregateToolSchema:
 # ---------------------------------------------------------------------
 
 class TestFilterCompilation:
+    def test_an_unsupported_filter_type_is_named(self):
+        """resolve()'s catch-all, asserted VERBATIM for the same reason
+        as the bare-list message: it enumerates the accepted forms and
+        names what it got, and any unpinned fragment is a surviving
+        mutant waiting to flap into a CI report (x_resolve__mutmut_81
+        printed NoneType for every wrong-type filter)."""
+        from sqlalchemy import column as sa_column
+
+        from hopai.filters import resolve
+        with pytest.raises(TypeError) as exc:
+            resolve(sa_column("properties"), 42)
+        assert str(exc.value) == (
+            "filter must be None, a dict, AND/OR/NOT/GT/GTE/LT/LTE/BETWEEN, or a callable "
+            "-- got int"
+        )
+
     def test_equality_uses_jsonb_containment(self):
         """Containment, not `->> = value`: it is indexable by the GIN
         index and it treats a missing key as false rather than null,
@@ -504,8 +520,18 @@ class TestFilterCompilation:
         [],
     ])
     def test_bare_list_is_rejected(self, bad):
-        with pytest.raises(TypeError, match="ambiguous"):
+        """Asserted VERBATIM, the same rule hop.py's messages earned:
+        this message is a paste-able rewrite, and successive CI runs
+        surfaced its string mutants one flap at a time (x_resolve 9, 10,
+        ...) as long as any fragment went unpinned. If you reword it,
+        update this test."""
+        with pytest.raises(TypeError) as exc:
             filter_sql(bad)
+        assert str(exc.value) == (
+            "a bare list is ambiguous -- use OR(...) to mean 'any of these filters', "
+            "e.g. OR({'type': 'person'}, {'type': 'company'}) instead of "
+            "[{'type': 'person'}, {'type': 'company'}]"
+        )
 
     @pytest.mark.parametrize("bad", ["a string", 42, object()])
     def test_unsupported_filter_types_are_rejected(self, bad):
@@ -669,6 +695,45 @@ class TestJsonSpecTranslation:
             "hops": [{"where": {"between": ["age", 18, 65]}}],
         })
         assert repr(hops[0].where) == repr(BETWEEN("age", 18, 65))
+
+    def test_an_empty_hop_object_gets_every_documented_default(self):
+        """{} is a legal hop, and each default is part of the JSON
+        contract the tool schema documents -- mutants replacing any of
+        them (hops=2, optional=None, direction mangled) survived because
+        no test spelled a hop with everything omitted."""
+        _, hops = spec_to_traversal({"start": {"where": {"a": 1}}, "hops": [{}]})
+        (hop,) = hops
+        assert (hop.min_hops, hop.max_hops) == (1, 1)
+        assert hop.direction == "forward"
+        assert hop.optional is False
+        assert hop.where is None and hop.via is None and hop.label is None
+
+    def test_hop_range_and_label_forwarding(self):
+        _, hops = spec_to_traversal({
+            "start": {"where": {"a": 1}},
+            "hops": [{"hops": [2, 3], "label": "L"}],
+        })
+        assert (hops[0].min_hops, hops[0].max_hops) == (2, 3)
+        assert hops[0].label == "L"
+
+    def test_spec_errors_lead_with_the_missing_key(self):
+        """XX-padding mutants kept the matched fragment mid-string, so
+        the pins must anchor at the start of the message."""
+        with pytest.raises(ValueError) as exc:
+            spec_to_traversal({"hops": []})
+        assert str(exc.value).startswith("spec must have a 'start' key")
+        with pytest.raises(ValueError) as exc:
+            spec_to_aggregation({"start": {"where": {"a": 1}}})
+        assert str(exc.value).startswith('spec must have a non-empty "aggregates"')
+
+    def test_aggregate_query_needs_a_non_empty_dict(self):
+        """The same start-anchored pin for build_aggregate_query's own
+        refusal (mutant xǁGraphǁbuild_aggregate_query__mutmut_5)."""
+        from hopai import Graph, Start
+        offline = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline")
+        with pytest.raises(ValueError) as exc:
+            offline.build_aggregate_query(Start(), [], {})
+        assert str(exc.value).startswith("aggregates must be a non-empty dict")
 
 
 class TestToolSchema:

@@ -214,10 +214,12 @@ class TestSchemaDefinition:
         built = GraphSchema(node_types=[NodeType("person")])
         assert offgraph.define_schema(schema=built) is built
         assert offgraph.schema is built
-        with pytest.raises(ValueError, match="either schema= or nodes=/edges="):
+        with pytest.raises(ValueError) as exc:
             offgraph.define_schema(nodes=[NodeType("robot")], schema=built)
-        with pytest.raises(TypeError, match="GraphSchema"):
+        assert str(exc.value).startswith("pass either schema= or nodes=/edges=")
+        with pytest.raises(TypeError, match="GraphSchema") as exc:
             offgraph.define_schema(schema={"nodes": []})
+        assert "got dict" in str(exc.value)   # the refusal names what it got
 
 
 # ---------------------------------------------------------------------
@@ -460,6 +462,10 @@ class TestSchemaRepresentations:
         assert any("IS DISTINCT FROM 'person'" in statement for statement in ddl)
         assert any("?& ARRAY['email']" in statement for statement in ddl)
         assert any("IN ('null', 'number')" in statement for statement in ddl)
+        # the pg dialect's subscript rendering: _literal() compiling with
+        # the DEFAULT dialect instead (mutant x__literal__mutmut_4) emits
+        # `properties -> 'age'` here and nothing else in the DDL differs
+        assert any("jsonb_typeof(properties['age'])" in statement for statement in ddl)
         assert any('ALTER TABLE "edges"' in statement
                    and "IS DISTINCT FROM 'works_at'" in statement for statement in ddl)
 
