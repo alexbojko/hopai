@@ -91,6 +91,12 @@ class Coupon:
 
 
 @dataclass
+class Basket:
+    tags: list[str]                          # parametrized generic
+    extra: Optional[dict[str, int]] = None   # parametrized generic inside Optional
+
+
+@dataclass
 class WideFlag:
     value: Union[int, str, None]   # None present, but not Optional-shaped
 
@@ -256,10 +262,16 @@ class TestClassNotation:
             offgraph.define_schema(nodes=[Event])
         assert "created_at" in str(exc.value)
         assert "Property('created_at'" in str(exc.value)
+        # ...and the CLASS: two classes can share a field name, and an
+        # error that only says the field leaves the caller grepping
+        assert "Event" in str(exc.value)
 
     def test_non_optional_union_refused(self, offgraph):
-        with pytest.raises(TypeError, match="union"):
+        with pytest.raises(TypeError, match="union") as exc:
             offgraph.define_schema(nodes=[Flag])
+        # the members must be named readably -- "int, str", not reprs or
+        # placeholders -- or the suggested type-set rewrite is a puzzle
+        assert "int, str" in str(exc.value)
 
     def test_pep604_optional_matches_typing_optional(self, offgraph):
         """`str | None` and Optional[str] are the same annotation spelled
@@ -269,6 +281,15 @@ class TestClassNotation:
         offgraph.define_schema(nodes=[Coupon])
         (coupon,) = offgraph.schema.node_types
         assert coupon.properties == (Property("code", ("string", "null"), required=False),)
+
+    def test_parametrized_generics_map_by_origin(self, offgraph):
+        """list[str] and dict[str, int] are not the classes list and dict
+        -- they map via get_origin(), bare and inside Optional alike.
+        Without the origin arm both would be refused as unmapped."""
+        offgraph.define_schema(nodes=[Basket])
+        (basket,) = offgraph.schema.node_types
+        assert basket.properties == (Property("tags", "array", required=True),
+                                     Property("extra", ("object", "null"), required=False))
 
     def test_union_with_null_but_several_types_is_still_refused(self, offgraph):
         """Union[int, str, None] is not Optional-shaped -- it has no
@@ -340,6 +361,8 @@ class TestSchemaRepresentations:
         person = models["person"](email="a@x.com")
         assert person.age is None
         assert models["person"](email="a@x.com", age=None).age is None
+        # ("number", "null") must admit the number too, not only the null
+        assert models["person"](email="a@x.com", age=31).age == 31
         with pytest.raises(pydantic.ValidationError):
             models["person"]()                    # missing required
         with pytest.raises(pydantic.ValidationError):
@@ -392,10 +415,10 @@ class TestSchemaRepresentations:
                                ("enforce_schema", offgraph.enforce_schema)):
             with pytest.raises(ValueError, match=r"define_schema") as exc:
                 accessor()
-            # the message must say WHICH accessor needed the schema --
-            # "something failed somewhere" is not an error that names
-            # the fix
-            assert name in str(exc.value)
+            # the message must LEAD with which accessor needed the
+            # schema -- "something failed somewhere" is not an error
+            # that names the fix
+            assert str(exc.value).startswith(name)
 
     def test_defining_and_reading_needs_no_database(self, offgraph):
         """offgraph's DSN has nothing listening: if any part of

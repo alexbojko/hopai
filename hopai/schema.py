@@ -344,7 +344,10 @@ def _map_annotation(owner: str, field: str, annotation) -> tuple:
     if origin is Union or origin is _pytypes.UnionType:
         args = typing.get_args(annotation)
         non_null = [a for a in args if a is not type(None)]
-        if len(non_null) == 1 and len(non_null) < len(args):
+        # ==1 alone decides: typing collapses single-member unions before
+        # get_origin ever fires, so a union here has >= 2 args, and one
+        # non-null member among them implies the other is None.
+        if len(non_null) == 1:
             optional = True
             annotation = non_null[0]
             origin = typing.get_origin(annotation)
