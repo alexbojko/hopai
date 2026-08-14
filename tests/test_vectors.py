@@ -978,3 +978,28 @@ class TestDropVectorsLive:
 
     def test_drop_of_a_never_migrated_field_is_ignored(self, fresh_graph):
         assert fresh_graph.drop_vectors(nodes=["ghost"]) == ["ghost"]
+
+
+# ---------------------------------------------------------------------
+# Live: the seam with schema inference
+# ---------------------------------------------------------------------
+
+class TestVectorsAreInvisibleToSchemaInference:
+    def test_inferred_schema_never_reports_a_vector_field(self, fresh_graph):
+        """`vec_*` are real columns, not properties -- so a schema
+        inferred from the same rows must describe the properties only.
+        The two features landed independently; this pins the seam, since
+        an inference that ever reached for columns instead of JSONB keys
+        would start emitting 1536-dimension noise into every schema an
+        agent is shown."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "type": "doc", "title": "a"}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]}])
+        schema, report = g.infer_schema()
+        # `type` names the inferred node type rather than repeating as
+        # one of its properties, so `title` is the whole property set --
+        # and no vec_* column joins it.
+        properties = {p.name for nt in schema.node_types for p in nt.properties}
+        assert properties == {"title"}
+        assert [nt.name for nt in schema.node_types] == ["doc"]
+        assert report.node_counts == {"doc": 1}

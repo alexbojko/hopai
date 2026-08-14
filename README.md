@@ -322,6 +322,27 @@ edge kind. It does **not** police endpoint types ("`works_at` connects
 only person → company") — that needs a trigger, not a CHECK, and hopai
 says so rather than half-enforcing it.
 
+**Grew the graph first, never declared anything?** The schema is
+sitting in the data, and Postgres can compute it:
+
+```python
+inferred, report = graph.infer_schema()   # a few GROUP BYs over JSONB
+print(report)      # per-type row counts, untyped rows, 42-vs-"42" conflicts
+
+graph.define_schema(schema=inferred)      # adopt it — your call, not automatic
+graph.enforce_schema()                    # chaotic graph, now server-validated
+```
+
+Inference stays honest: a property on *every* row of its type infers
+required, missing-on-some infers optional, an observed null infers
+nullable, and a key holding both `42` and `"42"` infers the type set
+`["number", "string"]` plus a report entry — never a silently picked
+winner. Rows with no `type`/`kind` can't be invented into a type; they
+are counted in the report and left alone. An inferred schema is an
+**observation** — nothing is registered or enforced until you adopt it,
+which is exactly why `infer_schema()` is a method and not a silent
+`.schema` fallback.
+
 ## 🔎 Filters
 
 Anywhere a `where=` or `via=` is accepted:

@@ -520,19 +520,51 @@ class Graph:
 
     # -- graph schema ---------------------------------------------------
 
-    def define_schema(self, nodes: Optional[list] = None, edges: Optional[list] = None):
+    def define_schema(self, nodes: Optional[list] = None, edges: Optional[list] = None,
+                      schema=None):
         """Declare the shape of this graph: node types, their
         properties, and which edge kinds connect which node types.
         Entries are NodeType/EdgeType primitives or plain
         dataclass/pydantic classes -- see hopai/schema.py for both
-        notations and the annotation mapping.
+        notations and the annotation mapping. `schema=` adopts an
+        already-built GraphSchema instead -- the second step of the
+        infer -> review -> define -> enforce loop.
 
         In memory only: nothing touches the database until
         enforce_schema(). Calling this again replaces the schema.
         Returns the normalized GraphSchema."""
-        from .schema import build_schema
+        from .schema import GraphSchema, build_schema
+        if schema is not None:
+            if nodes is not None or edges is not None:
+                raise ValueError(
+                    "pass either schema= or nodes=/edges= -- schema= adopts a finished "
+                    "GraphSchema as-is, so there is nothing for nodes/edges to add to it"
+                )
+            if not isinstance(schema, GraphSchema):
+                raise TypeError(
+                    f"schema= takes a GraphSchema (e.g. from infer_schema()), "
+                    f"got {type(schema).__name__}"
+                )
+            self._schema = schema
+            return schema
         self._schema = build_schema(nodes, edges)
         return self._schema
+
+    def infer_schema(self) -> tuple:
+        """Derive the schema from the rows this graph already holds:
+        node types from `properties->>'type'`, edge kinds from
+        `properties->>'kind'` plus observed endpoint pairs, required
+        and nullable from presence counts. Returns
+        (GraphSchema, InferenceReport) and registers NOTHING -- an
+        inferred schema is an observation; adopting it as the contract
+        is `define_schema(schema=inferred)`, deliberately separate.
+        Read the report first: untyped rows, 42-vs-"42" conflicts, and
+        per-type row counts live there, not in the schema.
+
+        Full sequential scans, meant for start-up or migration -- see
+        hopai/schema.py's INFERENCE section for semantics and cost."""
+        from .schema import infer_schema
+        return infer_schema(self)
 
     @property
     def schema(self):

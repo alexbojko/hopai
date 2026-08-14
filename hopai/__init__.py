@@ -121,11 +121,10 @@ from .hop import Hop, Start
 from .ingest import INGEST_TOOL_SCHEMA, IngestResult
 from .json_api import (
     AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, aggregate_json, spec_to_aggregation,
-    spec_to_traversal, traverse_json,
+    spec_to_traversal, traverse_json, vector_search_json,
 )
-from .json_api import vector_search_json
 from .models import Edge, Node
-from .schema import EdgeType, GraphSchema, NodeType, Property
+from .schema import EdgeType, GraphSchema, InferenceReport, NodeType, Property, TypeConflict
 from .vectors import Near, Vector, parse_near
 
 # The trailing annotation is load-bearing: release-please updates this
@@ -145,7 +144,7 @@ __all__ = [
     "traverse_cypher", "cypher_to_traversal", "cypher_to_operations", "CypherError",
     "aggregate_cypher", "cypher_to_aggregation",
     "Unique", "Required", "Check", "Index", "PropertyType", "Col", "ConstraintViolation",
-    "GraphSchema", "NodeType", "EdgeType", "Property",
+    "GraphSchema", "NodeType", "EdgeType", "Property", "InferenceReport", "TypeConflict",
     "Vector", "Near", "parse_near", "vector_search_json",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",

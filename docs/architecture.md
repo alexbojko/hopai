@@ -120,7 +120,7 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/ingest.py` | The two row spellings, edge-by-property references, merge semantics |
 | `hopai/constraints.py` | What each constraint compiles to, and the SQL semantics that surprise people |
 | `hopai/vectors.py` | Why no pgvector, the storage and cost model, cosine-only, multivector semantics, and why vectors never pass through a tool schema |
-| `hopai/schema.py` | The graph-schema notations, the annotation mapping, what enforcement compiles to and the endpoint-type limit |
+| `hopai/schema.py` | The graph-schema notations, the annotation mapping, what enforcement compiles to and the endpoint-type limit, and why inference is an observation rather than a `.schema` fallback |
 | `hopai/cypher.py` | The translatable subset — read, write and aggregate — and why each refusal is a refusal |
 | `tests/conftest.py` | The fixture graph's shape |
 | `benchmarks/README.md` | Measured numbers, including where raw CTEs beat this library 2-5x |
