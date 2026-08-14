@@ -245,7 +245,10 @@ class TestAggregateQueryShape:
             offline_graph.build_aggregate_query(Start(), [], bad)
 
     def test_non_aggregate_values_are_rejected(self, offline_graph):
-        with pytest.raises(TypeError, match="must be Count, Sum, Avg, Min or Max"):
+        """`-- got str` included: the message names the offending type,
+        and a mutant that hardcoded a different type there survived a
+        match on the first half alone."""
+        with pytest.raises(TypeError, match="must be Count, Sum, Avg, Min or Max -- got str"):
             offline_graph.build_aggregate_query(Start(), [], {"n": "count"})
 
     @pytest.mark.parametrize("hops", [
@@ -295,25 +298,54 @@ class TestAggregateJsonPythonEquivalence:
         ({"fn": "sum", "property": "age"}, Sum("age")),
         ({"fn": "sum", "property": "age", "distinct": True}, Sum("age", distinct=True)),
         ({"fn": "avg", "property": "age"}, Avg("age")),
+        # avg WITH distinct is the one input that can tell "avg is in the
+        # sum/avg branch" from "avg fell through to min/max" -- there it
+        # raises "does not apply" instead of returning Avg(distinct=True).
+        # A mutant that broke exactly that survived without this case.
+        ({"fn": "avg", "property": "age", "distinct": True}, Avg("age", distinct=True)),
         ({"fn": "min", "property": "age"}, Min("age")),
         ({"fn": "max", "property": "age"}, Max("age")),
     ])
     def test_same_aggregate(self, json_form, python_form):
         assert repr(parse_aggregate(json_form)) == repr(python_form)
 
+    @pytest.mark.parametrize("agg,expected", [
+        (Count(), "Count()"),
+        (Count("age"), "Count('age')"),
+        (Count("age", distinct=True), "Count('age', distinct=True)"),
+        (Sum("age"), "Sum('age')"),
+        (Sum("age", distinct=True), "Sum('age', distinct=True)"),
+        (Avg("age"), "Avg('age')"),
+        (Avg("age", distinct=True), "Avg('age', distinct=True)"),
+        (Min("age"), "Min('age')"),
+        (Max("age"), "Max('age')"),
+    ])
+    def test_reprs_are_exact(self, agg, expected):
+        """The equivalence tests above (and the Cypher suite) compare
+        aggregates BY repr, so a drifted repr matches its own garbage on
+        both sides and hides real translation bugs -- a mutant that
+        mangled Count.__repr__ survived the whole suite to prove it.
+        One literal assertion per form pins them."""
+        assert repr(agg) == expected
+
     @pytest.mark.parametrize("bad,message", [
         ({"fn": "median", "property": "age"}, "must be one of"),
         ({}, "must be one of"),
         ({"fn": "sum"}, "aggregates a property"),
         ({"fn": "min", "property": "age", "distinct": True}, "does not apply"),
-        ({"fn": "count", "distinct": True}, "redundant"),
+        ({"fn": "count", "distinct": True}, "matched nodes are already distinct"),
         ({"fn": "count", "distinct": "yes", "property": "age"}, "true or false"),
         ({"fn": "count", "prop": "age"}, "unknown aggregate keys"),
-        ("count", "must be an object"),
+        # "got str", not just "must be an object": the message names the
+        # actual offending type, and a mutant that hardcoded NoneType
+        # there survived a looser match.
+        ("count", "must be an object -- got str"),
     ])
     def test_malformed_aggregates_are_rejected(self, bad, message):
-        """Errors name the fix -- the same standard the filter grammar
-        is held to."""
+        """Errors name the fix -- the same standard the filter grammar is
+        held to. Several matches are deliberately long phrases: mutation
+        testing showed the short ones still matched after the message was
+        mangled."""
         with pytest.raises((ValueError, TypeError), match=message):
             parse_aggregate(bad)
 
@@ -326,7 +358,7 @@ class TestAggregateJsonPythonEquivalence:
             cls(42)
 
     def test_count_distinct_without_property_rejected(self):
-        with pytest.raises(ValueError, match="redundant"):
+        with pytest.raises(ValueError, match="matched nodes are already distinct"):
             Count(distinct=True)
 
     def test_spec_to_aggregation_returns_the_full_triple(self):
