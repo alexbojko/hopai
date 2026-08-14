@@ -1,9 +1,39 @@
-# hopai
+<div align="center">
 
-A knowledge graph in the Postgres you already run. Multi-hop traversal,
-ingestion, and real constraints — with a Python API, a JSON one, and
-Cypher, so an agent and a developer can both use it without being taught
-anything new. No graph database required.
+# 🐘 hopai
+
+**A knowledge graph in the Postgres you already run — no graph database required.**
+
+[![CI](https://github.com/alexbojko/hopai/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/alexbojko/hopai/actions/workflows/ci.yml)
+![coverage](https://img.shields.io/badge/coverage-%E2%89%A585%25-brightgreen)
+![python](https://img.shields.io/badge/python-3.10%2B-blue)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+</div>
+
+Multi-hop traversal, ingestion, and real constraints — with a Python API,
+a JSON one, and Cypher, so an agent and a developer can both use it
+without being taught anything new.
+
+## ✨ Highlights
+
+- 🐘 **Plain PostgreSQL** — two ordinary tables and a recursive CTE. No
+  extension, no sidecar service, no new operational dependency.
+- 🧭 **Real multi-hop traversal** — bounded and unbounded hops, per-hop
+  direction, `OPTIONAL`, rich JSONB filtering, one round trip.
+- 🤖 **Three front ends, one engine** — Python, JSON (with a ready-made
+  LLM tool schema), and a Cypher subset all compile through the same
+  query builder.
+- 🔐 **Constraints Neo4j puts behind an enterprise licence** — unique,
+  composite, partial, existence, type and CHECK constraints on JSONB
+  properties.
+- 🧪 **Tested like it matters** — SQL-level assertions, a live-Postgres
+  suite, an 85% coverage gate and mutation testing in CI.
+- 📊 **Measured, not claimed** — real benchmark numbers in `benchmarks/`,
+  including where raw SQL still wins.
+
+## ⚡ Quick start
 
 ```bash
 pip install hopai
@@ -26,7 +56,7 @@ result.edges            # [{"start_id": ..., "end_id": ..., "properties": {...}}
 result.to_networkx()    # in-memory graph, if you have networkx installed
 ```
 
-## Why
+## 💡 Why
 
 Most "I need graph queries" projects reach for a dedicated graph
 database before checking whether they need to. This library is the
@@ -37,7 +67,7 @@ graph extension, and competitively with a real graph database, without
 adding an operational dependency. See `benchmarks/` for real, measured
 numbers, not a claim.
 
-## Schema
+## 🗄️ Schema
 
 ```python
 graph.create_schema()   # idempotent; safe to call on every start-up
@@ -67,7 +97,7 @@ CREATE INDEX ON edges USING GIN (properties);
 
 Different table or column names? `Graph(engine, node_table=..., edge_table=..., node_id_col=..., ...)`.
 
-## Many graphs, one database
+## 🧬 Many graphs, one database
 
 ```python
 marketing = Graph(engine, graph="marketing")
@@ -92,7 +122,7 @@ connection pool serves all of them.
 Bringing your own tables with no discriminator? `Graph(engine, graph_col=None)`
 runs a single unscoped graph against them.
 
-## Getting data in
+## 📥 Getting data in
 
 ```python
 graph.add_nodes([
@@ -147,7 +177,7 @@ Nodes are written before edges, so a single document can create a node
 and an edge that references it. `graph.add_networkx(g)` loads a networkx
 graph — the inverse of `result.to_networkx()`.
 
-## Constraints
+## 🔐 Constraints
 
 Neo4j puts uniqueness, composite and existence constraints behind an
 enterprise licence. Postgres has always had them, and a JSONB property
@@ -196,7 +226,7 @@ Two SQL semantics to know, both of which are what you want once stated:
   merge row must satisfy every check on its own even when it is destined
   to update a row that already does.
 
-## Filters
+## 🔎 Filters
 
 ```python
 {"type": "person"}                          # equality
@@ -221,7 +251,7 @@ missing property as SQL `NULL` and silently drops it under `NOT` too.
 Verified during development to be a real trap, not a hypothetical one —
 see `tests/test_hopai.py::test_not_includes_missing_key`.
 
-## Direction and hop count
+## 🧭 Direction and hop count
 
 ```python
 Hop(hops=3)                 # exactly 3 hops
@@ -232,7 +262,7 @@ Hop(direction="backward")   # follow end_id -> start_id ("what points to this")
 Direction is per-hop — a chain can mix forward and backward steps (a
 "who else does X's dependents depend on" query, for instance).
 
-## OPTIONAL
+## 🧩 OPTIONAL
 
 ```python
 Hop(where=..., optional=True)
@@ -244,7 +274,7 @@ the last hop** — supporting it mid-chain would mean every downstream hop
 tolerating a missing anchor, a materially larger feature this library
 hasn't built.
 
-## The JSON interface
+## 🤖 The JSON interface
 
 For callers that shouldn't or can't write Python — an LLM tool call, an
 HTTP handler, config-driven traversal:
@@ -268,7 +298,7 @@ Filters accept the same grammar, spelled as JSON operators:
 `hopai.TRAVERSE_TOOL_SCHEMA` is a ready-to-use JSON Schema for wiring
 this into an LLM function-calling definition directly.
 
-## Cypher as input syntax
+## 🗣️ Cypher as input syntax
 
 For callers who already think in Cypher — reading and writing:
 
@@ -342,7 +372,7 @@ translating into something that answers a different question:
   comma-separated patterns, `WITH` / `ORDER BY` / `LIMIT`, and
   `OPTIONAL MATCH` anywhere but last.
 
-## What this doesn't do (yet)
+## 🚧 What this doesn't do (yet)
 
 - No disjoint multi-pattern matching (`MATCH (a)-[]->(b), (c)-[]->(d)`
   joined on shared variables) — one linear chain of hops only.
@@ -353,7 +383,7 @@ translating into something that answers a different question:
   past roughly 10 hops — see `benchmarks/` for the actual numbers rather
   than a guess.
 
-## Development
+## 🛠️ Development
 
 ```bash
 pip install -e ".[dev]"
@@ -368,10 +398,15 @@ SQL. Those that do need one skip cleanly when it isn't there; set
 `HOPAI_REQUIRE_DB=1` (as CI does) to make a missing database an error
 instead.
 
-## Benchmarking
+CI enforces a **line coverage floor of 85%** and runs **mutation
+testing** (`mutmut`) on every PR — a surviving mutant is triaged, not
+ignored, because a line a mutation can change in silence is a line no
+test is really asserting on.
+
+## 📊 Benchmarking
 
 See `benchmarks/README.md`.
 
-## License
+## 📄 License
 
-MIT
+MIT — see [LICENSE](LICENSE).

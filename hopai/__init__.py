@@ -75,7 +75,7 @@ from .models import Edge, Node
 # hopai.__version__ silently drifts from the released version. There is
 # no "python" extra-file type -- the python strategy only auto-updates a
 # file literally named version.py.
-__version__ = "0.0.0"  # x-release-please-version
+__version__ = "0.0.1"  # x-release-please-version
 
 __all__ = [
     "Graph", "Subgraph", "Start", "Hop",
