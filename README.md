@@ -109,6 +109,44 @@ CREATE INDEX ON edges USING GIN (properties);
 
 Different table or column names? `Graph(engine, node_table=..., edge_table=..., node_id_col=..., ...)`.
 
+<details>
+<summary><b>Upgrading a database created by 0.0.1</b> — the <code>graph_id</code> column is new</summary>
+
+0.0.1 shipped before multi-graph support, so its tables have no `graph_id`.
+Nothing migrates automatically yet (built-in migrations are the next piece of
+work). If you have a 0.0.1 database, run this once — it puts every existing row
+into the `default` graph, which is where an unscoped `Graph(engine)` reads:
+
+```sql
+ALTER TABLE nodes ADD COLUMN graph_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE edges ADD COLUMN graph_id TEXT NOT NULL DEFAULT 'default';
+
+-- the composite FK is what makes a cross-graph edge impossible
+ALTER TABLE nodes ADD CONSTRAINT uq_nodes_id_graph UNIQUE (id, graph_id);
+ALTER TABLE edges DROP CONSTRAINT edges_start_id_fkey, DROP CONSTRAINT edges_end_id_fkey;
+ALTER TABLE edges ADD CONSTRAINT fk_edges_start_same_graph
+  FOREIGN KEY (start_id, graph_id) REFERENCES nodes (id, graph_id);
+ALTER TABLE edges ADD CONSTRAINT fk_edges_end_same_graph
+  FOREIGN KEY (end_id, graph_id) REFERENCES nodes (id, graph_id);
+
+-- graph_id has to LEAD, or the index stops helping once a second graph exists
+CREATE INDEX IF NOT EXISTS ix_edges_graph_start_id ON edges (graph_id, start_id);
+CREATE INDEX IF NOT EXISTS ix_edges_graph_end_id   ON edges (graph_id, end_id);
+CREATE INDEX IF NOT EXISTS ix_nodes_graph          ON nodes (graph_id);
+DROP INDEX IF EXISTS ix_edges_start_id, ix_edges_end_id;
+
+-- only if you ever inserted explicit ids with raw SQL: the identity sequence
+-- is still behind them, and the next generated id would collide
+SELECT setval(pg_get_serial_sequence('nodes','id'), GREATEST((SELECT COALESCE(MAX(id),0) FROM nodes), 1));
+SELECT setval(pg_get_serial_sequence('edges','id'), GREATEST((SELECT COALESCE(MAX(id),0) FROM edges), 1));
+```
+
+Your old FK names may differ if you created the tables by hand — check with
+`\d edges`. Verified against a real 0.0.1 database: existing data stays
+traversable, new writes work, and a second graph is isolated from it.
+
+</details>
+
 ## 🧬 Many graphs, one database
 
 ```python
