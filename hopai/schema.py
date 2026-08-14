@@ -326,8 +326,10 @@ def _class_fields(cls: type) -> list:
         return [(name, field.annotation, not field.is_required())
                 for name, field in cls.model_fields.items()]
     hints = typing.get_type_hints(cls)
+    # hints[f.name] cannot miss: dataclass fields exist BECAUSE of an
+    # entry in __annotations__, and get_type_hints returns every one.
     return [
-        (f.name, hints.get(f.name, f.type),
+        (f.name, hints[f.name],
          f.default is not dataclasses.MISSING or f.default_factory is not dataclasses.MISSING)
         for f in dataclasses.fields(cls)
     ]

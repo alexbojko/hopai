@@ -85,6 +85,16 @@ class Flag:
     value: Union[int, str]   # a union that is not Optional
 
 
+@dataclass
+class Coupon:
+    code: str | None = None  # PEP 604 spelling of Optional
+
+
+@dataclass
+class WideFlag:
+    value: Union[int, str, None]   # None present, but not Optional-shaped
+
+
 PydanticPerson = pydantic.create_model(
     "Person", email=(str, ...), nickname=(str, ""), age=(Optional[int], None))
 PydanticCompany = pydantic.create_model("Company", name=(str, ...))
@@ -180,6 +190,8 @@ class TestSchemaDefinition:
     def test_non_property_entries_are_named(self):
         with pytest.raises(TypeError, match="each property must be a Property"):
             NodeType("person", properties=["email"])
+        with pytest.raises(TypeError, match="list of Property"):
+            NodeType("person", properties="email")   # a str IS iterable -- of characters
         with pytest.raises(TypeError, match="NodeType|dataclass"):
             Graph(OFFLINE_DSN).define_schema(nodes=[42])
 
@@ -248,6 +260,22 @@ class TestClassNotation:
     def test_non_optional_union_refused(self, offgraph):
         with pytest.raises(TypeError, match="union"):
             offgraph.define_schema(nodes=[Flag])
+
+    def test_pep604_optional_matches_typing_optional(self, offgraph):
+        """`str | None` and Optional[str] are the same annotation spelled
+        two ways; get_origin() returns a DIFFERENT sentinel for each, so
+        without the types.UnionType arm the modern spelling would be
+        refused as an unmapped annotation."""
+        offgraph.define_schema(nodes=[Coupon])
+        (coupon,) = offgraph.schema.node_types
+        assert coupon.properties == (Property("code", ("string", "null"), required=False),)
+
+    def test_union_with_null_but_several_types_is_still_refused(self, offgraph):
+        """Union[int, str, None] is not Optional-shaped -- it has no
+        single JSON type to attach 'null' to. Accepting it would mean
+        guessing; the refusal must hold even though None is present."""
+        with pytest.raises(TypeError, match="union"):
+            offgraph.define_schema(nodes=[WideFlag])
 
     def test_class_as_property_bag_in_the_primitive_notation(self, offgraph):
         """NodeType(name, properties=SomeClass) must produce the same
@@ -324,19 +352,50 @@ class TestSchemaRepresentations:
         with pytest.raises(ImportError, match=r"pip install hopai\[pydantic\]"):
             _ = offgraph.schema_pydantic
 
+    def test_pydantic_model_names_are_camel_case(self, offgraph):
+        """The generated class is what shows up in ValidationError text
+        and reprs; 'works_at' must come back as WorksAt, not worksat or
+        the raw kind."""
+        primitive_schema(offgraph)
+        models = offgraph.schema_pydantic
+        assert models["person"].__name__ == "Person"
+        assert models["works_at"].__name__ == "WorksAt"
+
+    def test_pydantic_type_sets_and_null_only_properties(self, offgraph):
+        """A type-set property must validate as the UNION of its types
+        and a "null"-only property as exactly None -- collapsing either
+        to a single arbitrary member would accept what the schema
+        refuses, or refuse what it accepts."""
+        offgraph.define_schema(nodes=[NodeType("reading", properties=[
+            Property("val", ("number", "string"), required=True),
+            Property("gone", "null"),
+        ])])
+        model = offgraph.schema_pydantic["reading"]
+        assert model(val=3).val == 3
+        assert model(val="high").val == "high"
+        with pytest.raises(pydantic.ValidationError):
+            model(val=[1])
+        assert model(val=1, gone=None).gone is None
+        with pytest.raises(pydantic.ValidationError):
+            model(val=1, gone="not-null")
+
     def test_everything_before_define_schema_names_the_fix(self, offgraph):
         """None for .schema is the existence check; every derived
         representation must instead say HOW to get one -- a bare
         AttributeError or None propagating into json.dumps helps
         nobody."""
         assert offgraph.schema is None
-        for accessor in (lambda: offgraph.schema_json,
-                         lambda: offgraph.schema_networkx,
-                         lambda: offgraph.schema_pydantic,
-                         offgraph.schema_ddl,
-                         offgraph.enforce_schema):
-            with pytest.raises(ValueError, match=r"define_schema"):
+        for name, accessor in (("schema_json", lambda: offgraph.schema_json),
+                               ("schema_networkx", lambda: offgraph.schema_networkx),
+                               ("schema_pydantic", lambda: offgraph.schema_pydantic),
+                               ("schema_ddl", offgraph.schema_ddl),
+                               ("enforce_schema", offgraph.enforce_schema)):
+            with pytest.raises(ValueError, match=r"define_schema") as exc:
                 accessor()
+            # the message must say WHICH accessor needed the schema --
+            # "something failed somewhere" is not an error that names
+            # the fix
+            assert name in str(exc.value)
 
     def test_defining_and_reading_needs_no_database(self, offgraph):
         """offgraph's DSN has nothing listening: if any part of
@@ -356,12 +415,17 @@ class TestSchemaRepresentations:
         assert offgraph.in_graph("other").schema is None
 
     def test_schema_ddl_shows_the_checks_without_running_them(self, offgraph):
+        """Node AND edge constraints must both be in the preview -- a
+        schema_ddl() that silently forgot the edges table would review
+        clean and then enforce something else."""
         primitive_schema(offgraph)
         ddl = offgraph.schema_ddl()
         assert all(statement.startswith("ALTER TABLE") for statement in ddl)
         assert any("IS DISTINCT FROM 'person'" in statement for statement in ddl)
         assert any("?& ARRAY['email']" in statement for statement in ddl)
         assert any("IN ('null', 'number')" in statement for statement in ddl)
+        assert any('ALTER TABLE "edges"' in statement
+                   and "IS DISTINCT FROM 'works_at'" in statement for statement in ddl)
 
     def test_conflicting_property_schemas_for_one_kind_refused(self, offgraph):
         """Enforcement and models key on the kind alone (endpoints are
