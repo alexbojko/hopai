@@ -213,7 +213,11 @@ class TestLifecycle:
     def test_drop_constraints_is_the_inverse(self, fresh_graph):
         declarations = {"nodes": [Unique("email"), Required("type")]}
         fresh_graph.define_constraints(**declarations)
-        fresh_graph.drop_constraints(**declarations)
+        dropped = fresh_graph.drop_constraints(**declarations)
+        # the return value names what was dropped, same contract as
+        # define_constraints -- a list of Nones would satisfy any test
+        # that only counts it
+        assert dropped == ["uq_nodes_email", "ck_required_nodes_type"]
         assert "uq_nodes_email" not in indexes(fresh_graph)
         assert fresh_graph.add_nodes([{"email": "a@x.com"}, {"email": "a@x.com"}]) == 2
 

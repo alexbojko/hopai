@@ -206,6 +206,21 @@ class TestSchemaDefinition:
         offgraph.define_schema(nodes=[NodeType("robot")])
         assert [nt.name for nt in offgraph.schema.node_types] == ["robot"]
 
+    def test_schema_kwarg_adopts_a_finished_graph_schema(self, offgraph):
+        """define_schema(schema=...) is the adoption step of the
+        infer -> review -> define -> enforce loop; it must register the
+        object as-is, refuse to mix with nodes=/edges=, and name what it
+        takes when handed something else."""
+        built = GraphSchema(node_types=[NodeType("person")])
+        assert offgraph.define_schema(schema=built) is built
+        assert offgraph.schema is built
+        with pytest.raises(ValueError) as exc:
+            offgraph.define_schema(nodes=[NodeType("robot")], schema=built)
+        assert str(exc.value).startswith("pass either schema= or nodes=/edges=")
+        with pytest.raises(TypeError, match="GraphSchema") as exc:
+            offgraph.define_schema(schema={"nodes": []})
+        assert "got dict" in str(exc.value)   # the refusal names what it got
+
 
 # ---------------------------------------------------------------------
 # Definition: the class notation
@@ -447,6 +462,10 @@ class TestSchemaRepresentations:
         assert any("IS DISTINCT FROM 'person'" in statement for statement in ddl)
         assert any("?& ARRAY['email']" in statement for statement in ddl)
         assert any("IN ('null', 'number')" in statement for statement in ddl)
+        # the pg dialect's subscript rendering: _literal() compiling with
+        # the DEFAULT dialect instead (mutant x__literal__mutmut_4) emits
+        # `properties -> 'age'` here and nothing else in the DDL differs
+        assert any("jsonb_typeof(properties['age'])" in statement for statement in ddl)
         assert any('ALTER TABLE "edges"' in statement
                    and "IS DISTINCT FROM 'works_at'" in statement for statement in ddl)
 
@@ -570,3 +589,167 @@ class TestSchemaEnforcement:
         fresh_graph.enforce_schema()
         other = fresh_graph.in_graph("elsewhere")
         assert other.add_nodes([{"type": "person", "nickname": "lawless"}]) == 1
+
+
+# ---------------------------------------------------------------------
+# Inference -- against real PostgreSQL
+# ---------------------------------------------------------------------
+
+def as_shape(schema) -> tuple:
+    """A schema as order-insensitive dicts. Declaration preserves the
+    author's ordering while inference sorts, so round-trip equality is
+    about CONTENT: types, properties, required flags, endpoint triples."""
+    return (
+        {nt.name: {p.name: (p.json_type, p.required) for p in nt.properties}
+         for nt in schema.node_types},
+        {(et.kind, et.source, et.target): {p.name: (p.json_type, p.required)
+                                           for p in et.properties}
+         for et in schema.edge_types},
+    )
+
+
+def seed_chaotic(graph) -> None:
+    """A graph grown with no declared schema: consistent people, a
+    mixed-type key, untyped rows, one kind spanning two endpoint pairs,
+    and an edge into an untyped node."""
+    graph.add_nodes([
+        {"id": 1, "type": "person", "email": "a@x.com", "age": 42},
+        {"id": 2, "type": "person", "email": "b@x.com", "age": None, "nickname": "b"},
+        {"id": 3, "type": "person", "email": "c@x.com"},
+        {"id": 4, "type": "company", "name": "acme", "mixed": 1},
+        {"id": 5, "type": "company", "name": "globex", "mixed": "one"},
+        {"id": 6, "name": "untyped"},
+    ])
+    graph.add_edges([
+        {"start_id": 1, "end_id": 4, "kind": "works_at", "since": 2019},
+        {"start_id": 2, "end_id": 5, "kind": "works_at", "since": 2020},
+        {"start_id": 1, "end_id": 2, "kind": "likes"},
+        {"start_id": 1, "end_id": 4, "kind": "likes"},
+        {"start_id": 1, "end_id": 6, "kind": "dangles"},
+        {"start_id": 6, "end_id": 1},
+    ])
+
+
+class TestSchemaInference:
+    def test_required_optional_nullable_inferred_from_presence(self, fresh_graph):
+        """The declaration-side semantics, read backwards: on every row
+        -> required; missing on some -> optional; an observed JSON null
+        -> nullable. Getting any of these wrong freezes the wrong CHECK
+        the moment the inferred schema is adopted and enforced."""
+        seed_chaotic(fresh_graph)
+        inferred, _ = fresh_graph.infer_schema()
+        person = {p.name: p for nt in inferred.node_types if nt.name == "person"
+                  for p in nt.properties}
+        assert person["email"] == Property("email", "string", required=True)
+        assert person["age"] == Property("age", ("number", "null"), required=False)
+        assert person["nickname"] == Property("nickname", "string", required=False)
+
+    def test_mixed_types_infer_a_set_and_are_reported(self, fresh_graph):
+        """42 next to "one" must surface BOTH as the honest type set and
+        as a report entry -- a silent winner is the approximation this
+        library refuses, and an unreported set hides the data worth
+        cleaning."""
+        seed_chaotic(fresh_graph)
+        inferred, report = fresh_graph.infer_schema()
+        company = {p.name: p for nt in inferred.node_types if nt.name == "company"
+                   for p in nt.properties}
+        assert company["mixed"].json_type == ("number", "string")
+        (conflict,) = report.conflicts
+        assert (conflict.table, conflict.type_name, conflict.key) == ("nodes", "company", "mixed")
+        assert conflict.json_types == ("number", "string")
+
+    def test_one_kind_several_endpoint_pairs_becomes_several_edge_types(self, fresh_graph):
+        """likes person->person and likes person->company are two
+        observations; collapsing them to one triple would invent an
+        endpoint pair nobody wrote."""
+        seed_chaotic(fresh_graph)
+        inferred, _ = fresh_graph.infer_schema()
+        likes = {(et.source, et.target) for et in inferred.edge_types if et.kind == "likes"}
+        assert likes == {("person", "person"), ("person", "company")}
+
+    def test_untyped_rows_are_counted_not_invented(self, fresh_graph):
+        """A row with no discriminator belongs to no type: it must stay
+        OUT of the schema (there is nothing true to say about it) and IN
+        the report (silence would read as 'covered everything')."""
+        seed_chaotic(fresh_graph)
+        inferred, report = fresh_graph.infer_schema()
+        assert {nt.name for nt in inferred.node_types} == {"company", "person"}
+        assert report.untyped_nodes == 1
+        assert report.untyped_edges == 1        # the kindless edge
+        assert report.skipped_endpoint_edges == 1   # 'dangles' into the untyped node
+        assert "dangles" not in {et.kind for et in inferred.edge_types}
+        assert report.edge_counts["dangles"] == 1   # ...but the report still shows it
+
+    def test_report_carries_per_type_row_counts(self, fresh_graph):
+        """required=True on a 3-row type means almost nothing; the counts
+        are what let a human judge that before adopting."""
+        seed_chaotic(fresh_graph)
+        _, report = fresh_graph.infer_schema()
+        assert report.node_counts == {"person": 3, "company": 2}
+        assert report.edge_counts == {"works_at": 2, "likes": 2, "dangles": 1}
+
+    def test_infer_define_enforce_locks_the_graph_down(self, fresh_graph):
+        """The loop the feature exists for: a chaotically-grown graph
+        becomes a server-validated one in three calls, and the next
+        violating write is refused by Postgres itself."""
+        seed_chaotic(fresh_graph)
+        inferred, _ = fresh_graph.infer_schema()
+        fresh_graph.define_schema(schema=inferred)
+        fresh_graph.enforce_schema()
+        from hopai import ConstraintViolation
+        with pytest.raises(ConstraintViolation):
+            fresh_graph.add_nodes([{"type": "person", "nickname": "no-email"}])
+        with pytest.raises(ConstraintViolation):
+            fresh_graph.add_edges([{"start_id": 1, "end_id": 4, "kind": "works_at"}])
+
+    def test_round_trip_declared_written_inferred(self, fresh_graph):
+        """Rows written in conformance with a declared schema must infer
+        back the same shape -- if declaration and inference disagree
+        about the same data, one of them is lying. Every declared
+        property is exercised at least once, nulls included, since
+        inference can only see what the data shows."""
+        declared = primitive_schema(fresh_graph)
+        fresh_graph.add_nodes([
+            {"id": 1, "type": "person", "email": "a@x.com", "age": 42, "nickname": "a"},
+            {"id": 2, "type": "person", "email": "b@x.com", "age": None},
+            # no age at all -- present-on-every-row would otherwise
+            # (correctly!) infer required=True where optional was declared
+            {"id": 3, "type": "person", "email": "c@x.com"},
+            {"id": 4, "type": "company", "name": "acme"},
+        ])
+        fresh_graph.add_edges([
+            {"start_id": 1, "end_id": 4, "kind": "works_at", "since": 2019},
+        ])
+        inferred, report = fresh_graph.infer_schema()
+        assert as_shape(inferred) == as_shape(declared)
+        assert not report.conflicts
+        json.dumps(inferred.to_json())
+
+    def test_two_graphs_infer_independently(self, fresh_graph):
+        """The _scoped() invariant applied to inference: graph A's scan
+        must never see graph B's rows, or one tenant's chaos becomes
+        another tenant's schema."""
+        seed_chaotic(fresh_graph)
+        other = fresh_graph.in_graph("elsewhere")
+        other.add_nodes([{"id": 100, "type": "robot", "serial": "r2"}])
+        inferred_other, report_other = other.infer_schema()
+        assert {nt.name for nt in inferred_other.node_types} == {"robot"}
+        assert report_other.node_counts == {"robot": 1}
+        inferred_default, _ = fresh_graph.infer_schema()
+        assert "robot" not in {nt.name for nt in inferred_default.node_types}
+
+    def test_inference_registers_nothing(self, fresh_graph):
+        """Observation is not contract: after infer_schema() the handle
+        must still have NO schema -- adoption is define_schema(schema=),
+        deliberately a second call."""
+        seed_chaotic(fresh_graph)
+        fresh_graph.infer_schema()
+        assert fresh_graph.schema is None
+
+    def test_unreachable_database_fails_loudly(self, offgraph):
+        """Unlike definition, inference NEEDS the database: on a dead
+        DSN it must raise the driver's connection error -- not hang, and
+        never return a silent empty schema that reads as 'no types'."""
+        from sqlalchemy.exc import OperationalError
+        with pytest.raises(OperationalError):
+            offgraph.infer_schema()
