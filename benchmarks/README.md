@@ -15,15 +15,30 @@ the default settings). That structure, not a purely random graph, is
 what actually stresses a graph engine — random graphs rarely have the
 convergent fan-in that real dependency graphs do.
 
-`bench_hopai.py` loads it and times **17 queries** — 14 traversals covering
-forward, backward and mixed direction, bounded and deep multi-hop, compound
-chains, `OR` on nodes and on edges, `NOT`, range comparisons, composition and
-`OPTIONAL`, plus three aggregations (`Count`/`Sum`/`Avg`/`Min`/`Max`).
+`bench_hopai.py` loads it and times **29 queries**:
 
-`Q15` deliberately runs the same chain as `Q3`: the pair shows what
-`graph.aggregate()` saves by skipping edge reconstruction and node hydration on
-identical traversal work — the aggregate answers from the database and never
-materialises the subgraph.
+- **Q1–Q14, traversals** — forward, backward and mixed direction, bounded and
+  deep 12-hop, compound chains, `OR` on nodes and on edges, `NOT`, range
+  comparisons, composition and `OPTIONAL`.
+- **Q15–Q29, aggregations** — graded, because aggregation is not one operation
+  whose cost you can quote once. What it costs depends on how much the walk
+  underneath had to match, how many aggregates run over it, and whether
+  `DISTINCT` forces a sort:
+  - *simple* — no traversal at all; the aggregate is the whole query
+    (`Count`, `Avg` over a range, `Min`/`Max`).
+  - *complex* — a real walk underneath (`Count` after one hop, over a bounded
+    chain, over a `NOT` filter, `Count(property)` counting nodes that *have* it,
+    five statistics at once).
+  - *very complex* — deep and compound walks, `DISTINCT` over large match sets,
+    edge-filtered chains, and seven aggregates in a single query.
+
+Four aggregates deliberately reuse a traversal's exact chain — `Q19`/`Q3`,
+`Q25`/`Q5`, `Q26`/`Q7`, `Q27`/`Q14`. Each pair is the only honest way to quote
+what `graph.aggregate()` saves: same walk, same match set, one materialising a
+subgraph and one returning a number. The report computes the ratio for you.
+
+The report also groups every query by tier, so "how fast are aggregations" is a
+question with an answer instead of a single misleading number.
 
 Each query runs once cold, then `--repeat` times warm (default 5), and the
 **median** is reported with its range. A single warm sample on a shared machine

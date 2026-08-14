@@ -22,20 +22,21 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
 
 from report import (  # noqa: E402
-    UNKNOWN, bar, chart, empty_queries, findings, grouped_chart, headline,
-    log_bar, machine_profile, overhead, render,
+    UNKNOWN, bar, by_tier, chart, empty_queries, findings, grouped_chart,
+    headline, log_bar, machine_profile, overhead, render, twin_savings,
 )
 
 RESULTS = [
     {"id": "Q1", "query": "Forward 1-hop", "feature": "direction",
      "cold_ms": 100.0, "warm_ms": 50.0, "warm_min_ms": 48.0, "warm_max_ms": 52.0,
-     "samples": 5, "raw_sql_ms": 10.0, "nodes": 10, "edges": 9},
+     "samples": 5, "raw_sql_ms": 10.0, "nodes": 10, "edges": 9, "tier": "simple"},
     {"id": "Q2", "query": "Backward bounded", "feature": "multi-hop",
      "cold_ms": 400.0, "warm_ms": 200.0, "warm_min_ms": 195.0, "warm_max_ms": 205.0,
-     "samples": 5, "raw_sql_ms": 25.0, "nodes": 2000, "edges": 1999},
+     "samples": 5, "raw_sql_ms": 25.0, "nodes": 2000, "edges": 1999,
+     "tier": "complex"},
     {"id": "Q3", "query": "GT range", "feature": "range",
      "cold_ms": 20.0, "warm_ms": 10.0, "warm_min_ms": 9.0, "warm_max_ms": 11.0,
-     "samples": 5, "raw_sql_ms": 5.0, "nodes": 5, "edges": 0},
+     "samples": 5, "raw_sql_ms": 5.0, "nodes": 5, "edges": 0, "tier": "simple"},
 ]
 DNF = {"id": "Q4", "query": "Deep backward", "feature": "deep multi-hop",
        "dnf": True, "budget_s": 150.0, "cold_ms": 150000.0, "warm_ms": 150000.0,
@@ -124,9 +125,17 @@ class TestFindings:
         assert "next to the row count" in body
 
     def test_calls_out_queries_that_returned_nothing(self):
-        empty = [{**RESULTS[0], "id": "Q9", "query": "dud", "nodes": 0}]
+        empty = [{**RESULTS[0], "id": "Q9", "query": "dud", "nodes": 0, "empty": True}]
         body = "\n".join(findings(empty))
-        assert "measured nothing" in body.lower() and "`dud`" in body
+        assert "measured nothing" in body.lower() and "`Q9`" in body
+
+    def test_an_aggregate_with_no_row_count_is_not_called_empty(self):
+        """`avg` returns a mean and no count. Reading the missing count
+        as zero reported queries that computed a real value as having
+        measured nothing."""
+        avg_only = [{**RESULTS[0], "id": "Q16", "nodes": None, "empty": False}]
+        assert empty_queries(avg_only) == []
+        assert "measured nothing" not in "\n".join(findings(avg_only)).lower()
 
     def test_calls_out_non_completion_separately(self):
         body = "\n".join(findings([*RESULTS, DNF]))
@@ -140,6 +149,63 @@ class TestFindings:
     def test_says_nothing_notable_rather_than_inventing_a_finding(self):
         body = "\n".join(findings(RESULTS))
         assert "Noisy" not in body and "Did not finish" not in body
+
+
+class TestTiers:
+    """Aggregation cost is not one number -- it depends on how much the
+    walk underneath matched, how many aggregates run, and whether
+    DISTINCT sorts. Grouping is what makes the question answerable."""
+
+    def test_groups_and_orders_by_difficulty(self):
+        rows = by_tier(RESULTS)
+        body = "\n".join(rows)
+        assert body.index("simple") < body.index("complex")
+        assert "| simple | 2 |" in body       # Q1 and Q3
+
+    def test_names_the_slowest_in_each_tier(self):
+        assert "`Q2`" in "\n".join(by_tier(RESULTS))
+
+    def test_a_tier_with_no_queries_is_omitted(self):
+        assert "very complex" not in "\n".join(by_tier(RESULTS))
+
+    def test_untiered_results_produce_no_section(self):
+        assert by_tier([{"id": "Q1", "warm_ms": 1.0}]) == []
+
+
+class TestTwinSavings:
+    """An aggregate row is only quotable against the traversal it
+    mirrors -- same chain, same match set, one materialising a subgraph
+    and one not."""
+
+    TWIN = {"id": "Q19", "query": "count over Q2's chain", "feature": "agg: count",
+            "tier": "complex", "twin_of": "Q2", "warm_ms": 25.0, "nodes": 2000}
+
+    def test_pairs_an_aggregate_with_its_traversal(self):
+        pairs = twin_savings([*RESULTS, self.TWIN])
+        assert len(pairs) == 1
+        agg, traversal, ratio = pairs[0]
+        assert agg["id"] == "Q19" and traversal["id"] == "Q2"
+        assert ratio == pytest.approx(8.0)      # 200 / 25
+
+    def test_ignores_a_twin_that_did_not_run(self):
+        assert twin_savings([{**self.TWIN, "twin_of": "Q99"}]) == []
+
+    def test_the_finding_quotes_the_pair(self):
+        body = "\n".join(findings([*RESULTS, self.TWIN]))
+        assert "aggregating instead of traversing" in body
+        assert "8.0x" in body and "Same walk, same match set" in body
+
+
+class TestRowsColumn:
+    def test_a_missing_row_count_is_a_dash_not_zero(self):
+        """`avg` has no count. Printing 0 would read as 'matched
+        nothing', which is the opposite of what happened."""
+        body = render([{**RESULTS[0], "nodes": None}], PROFILE, generated_at="f")
+        assert "| - |" in body
+
+    def test_a_real_zero_is_still_shown(self):
+        body = render([{**RESULTS[0], "nodes": 0}], PROFILE, generated_at="f")
+        assert "| 0 |" in body
 
 
 class TestOverhead:
@@ -160,7 +226,8 @@ class TestRender:
 
     def test_has_every_section_in_order(self, body):
         order = ["# hopai benchmark", "## 01 — Headline", "## 02 — Every query",
-                 "## 03 — Full results", "## 04 — Findings", "## 05 — Environment"]
+                 "## 03 — Cost by difficulty", "## 04 — Full results",
+                 "## 05 — Findings", "## 06 — Environment"]
         positions = [body.index(section) for section in order]
         assert positions == sorted(positions)
 
@@ -216,4 +283,4 @@ class TestLegacyHelpers:
         assert chart(RESULTS, "warm_ms").splitlines()[0].startswith("Backward")
 
     def test_empty_queries_finds_zero_row_results(self):
-        assert empty_queries([{**RESULTS[0], "query": "dud", "nodes": 0}]) == ["dud"]
+        assert empty_queries([{**RESULTS[0], "id": "Q9", "empty": True}]) == ["Q9"]

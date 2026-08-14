@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 import os
+import statistics
 import platform
 import subprocess
 from datetime import datetime, timezone
@@ -153,10 +154,16 @@ def chart(results: list, key: str, width: int = 40) -> str:
 def empty_queries(results: list) -> list:
     """Queries that matched nothing.
 
-    Their timing is real and meaningless: a traversal that returns no
-    rows did no work, so it will always look fast and will always be the
-    wrong thing to quote. Called out rather than quietly listed."""
-    return [r["query"] for r in results if not r.get("nodes")]
+    Their timing is real and meaningless: a query that matched nothing
+    did no work, so it will always look fast and will always be the wrong
+    thing to quote.
+
+    Emptiness comes from the runner, not from a row count -- an
+    aggregate without a Count() has no row count, and treating that
+    absence as zero reported queries that computed real values as having
+    measured nothing."""
+    return [r.get("id") or r["query"] for r in results
+            if r.get("empty") if not r.get("dnf")]
 
 
 def overhead(row: dict) -> float | None:
@@ -180,16 +187,17 @@ def _table(results: list) -> str:
     budget in the timing column would let non-completion read as a
     latency."""
     has_raw = any(r.get("raw_sql_ms") for r in results)
-    columns = ["ID", "Query", "Feature", "Cold (ms)", "Warm (ms), median + range"]
+    columns = ["ID", "Query", "Feature", "Tier", "Cold (ms)", "Warm (ms), median + range"]
     if has_raw:
         columns += ["Raw SQL (ms)", "Overhead"]
     columns += ["Rows"]
     header = ("| " + " | ".join(columns) + " |\n"
-              "| --- | --- | --- |" + " ---: |" * (len(columns) - 3))
+              "| --- | --- | --- | --- |" + " ---: |" * (len(columns) - 4))
 
     rows = []
     for r in results:
-        cells = [r.get("id", ""), r.get("query", ""), f"`{r.get('feature', '')}`"]
+        cells = [r.get("id", ""), r.get("query", ""), f"`{r.get('feature', '')}`",
+                 r.get("tier", "")]
         if r.get("dnf"):
             outcome = f"**DNF** (>{r.get('budget_s', 0):.0f}s)"
             cells += [outcome, outcome] + (["-", "-"] if has_raw else []) + ["-"]
@@ -203,7 +211,10 @@ def _table(results: list) -> str:
         if has_raw:
             ratio = overhead(r)
             cells += [f"{r.get('raw_sql_ms', 0):,.1f}", f"{ratio:.1f}x" if ratio else "-"]
-        cells += [f"{r.get('nodes') or 0:,}"]
+        # "-" not "0": an aggregate without a Count() has no row count,
+        # and printing zero would read as "matched nothing".
+        rows_cell = "-" if r.get("nodes") is None else f"{r['nodes']:,}"
+        cells += [rows_cell]
         rows.append("| " + " | ".join(cells) + " |")
     return "\n".join([header, *rows]) if rows else "(no measurements)"
 
@@ -293,6 +304,45 @@ def headline(results: list) -> list:
     return ["| | |", "| ---: | --- |", *stats]
 
 
+def by_tier(results: list) -> list:
+    """Median warm time per difficulty tier.
+
+    Aggregation cost is not one number: it depends on how much the walk
+    underneath had to match, how many aggregates run, and whether
+    DISTINCT forces a sort. Grouping by tier is what makes "how fast are
+    aggregations" a question with an answer."""
+    tiers = ("simple", "complex", "very complex")
+    rows = ["| Tier | Queries | Median warm | Slowest |", "| --- | ---: | ---: | --- |"]
+    seen = False
+    for tier in tiers:
+        group = [r for r in results if r.get("tier") == tier and not r.get("dnf")
+                 and r.get("warm_ms")]
+        if not group:
+            continue
+        seen = True
+        slowest = max(group, key=lambda r: r["warm_ms"])
+        rows.append(
+            f"| {tier} | {len(group)} | "
+            f"{statistics.median(r['warm_ms'] for r in group):,.1f} ms | "
+            f"`{slowest['id']}` {slowest['warm_ms']:,.1f} ms |")
+    return rows if seen else []
+
+
+def twin_savings(results: list) -> list:
+    """Aggregate rows measured against the traversal they mirror.
+
+    The pair is the only honest way to quote what aggregation saves: the
+    same chain, the same match set, one materialising a subgraph and one
+    not."""
+    index = {r.get("id"): r for r in results}
+    pairs = []
+    for row in results:
+        twin = index.get(row.get("twin_of"))
+        if twin and row.get("warm_ms") and twin.get("warm_ms"):
+            pairs.append((row, twin, twin["warm_ms"] / row["warm_ms"]))
+    return pairs
+
+
 def findings(results: list) -> list:
     """Observations the data supports, stated only when it does.
 
@@ -312,6 +362,20 @@ def findings(results: list) -> list:
             f"hydration, and it is roughly fixed per call -- so it dominates a small "
             f"answer and shrinks against a large one. Read it next to the row count, "
             f"never alone.",
+            "",
+        ]
+
+    pairs = twin_savings(results)
+    if pairs:
+        best = max(pairs, key=lambda p: p[2])
+        out += [
+            f"**What aggregating instead of traversing saves.** `{best[0]['id']}` runs "
+            f"`{best[1]['id']}`'s chain and returns a number instead of a subgraph: "
+            f"{best[0]['warm_ms']:,.1f} ms against {best[1]['warm_ms']:,.1f} ms, "
+            f"**{best[2]:.1f}x**. Same walk, same match set -- the difference is the "
+            f"edge-reconstruction CTEs and the property hydration that a count does not "
+            f"need. Pairs measured: "
+            + ", ".join(f"`{a['id']}`/`{b['id']}` {r:.1f}x" for a, b, r in pairs) + ".",
             "",
         ]
 
@@ -411,7 +475,11 @@ def render(results: list, profile: dict, dataset: dict | None = None,
                         if key != "raw_sql_ms" or has_raw]),
         "```",
         "",
-        "## 03 — Full results",
+        "## 03 — Cost by difficulty",
+        "",
+        *by_tier(results),
+        "",
+        "## 04 — Full results",
         "",
         _table(results),
         "",
@@ -425,10 +493,10 @@ def render(results: list, profile: dict, dataset: dict | None = None,
             "",
         ]
     parts += [
-        "## 04 — Findings",
+        "## 05 — Findings",
         "",
         *findings(results),
-        "## 05 — Environment",
+        "## 06 — Environment",
         "",
         _profile_table(profile),
         "",
