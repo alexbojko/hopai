@@ -139,7 +139,12 @@ jobs:
             # tree (without it every test dies on an import error).
             python - "$CHANGED" <<'PY'
           import re, sys
-          paths = " ".join(sys.argv[1].split())
+          # NEWLINE-separated, indented: setup.cfg list options are one
+          # value per line. Space-separating them made mutmut read the
+          # whole string as a single path, match nothing, and stop with
+          # "could not find any test case for any mutant" -- which the
+          # report then showed as no mutation data at all.
+          paths = "\n    ".join(sys.argv[1].split())
           config = open("setup.cfg").read()
           open("setup.cfg", "w").write(
               re.sub(r"^source_paths = .*$", f"source_paths = {paths}", config, count=1, flags=re.M))
@@ -168,6 +173,10 @@ jobs:
         # in the general one.
         env:
           MUTATION_NOTE: ${{ steps.scope.outputs.note }}
+          # Set only when mutmut was actually invoked, so "no results"
+          # can be reported as a broken harness rather than as an empty
+          # scope. The two must never look alike.
+          MUTATION_ATTEMPTED: ${{ steps.scope.outputs.run == 'true' && '1' || '' }}
         run: |
           set -euo pipefail
           python scripts/pr_report.py \
@@ -176,6 +185,7 @@ jobs:
             --mutmut-stats mutants/mutmut-cicd-stats.json \
             --mutmut-results survivors.txt \
             --mutation-note "${MUTATION_NOTE}" \
+            ${MUTATION_ATTEMPTED:+--mutation-attempted} \
             --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"

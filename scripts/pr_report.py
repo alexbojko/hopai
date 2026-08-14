@@ -102,10 +102,25 @@ def render_coverage(percent: float, threshold: float, by_file: list) -> str:
     return "\n".join(lines)
 
 
-def render_mutation(stats: dict, found: list, note: str) -> str:
+def render_mutation(stats: dict, found: list, note: str, attempted: bool = False) -> str:
     """Mutation half of the comment. `note` explains the scope, or why
-    there was nothing to run."""
+    there was nothing to run.
+
+    `attempted` separates the two ways there can be no numbers, which
+    must never read alike: nothing to mutate (fine) versus mutmut ran and
+    produced nothing (a broken harness). The second is the case the
+    triage rule calls out -- it looks like a clean sweep and is the
+    opposite."""
     if stats is None:
+        if attempted:
+            return "\n".join([
+                "### ⚠️ Mutation testing — HARNESS FAILED", "",
+                f"{note}  mutmut ran but produced no results, so **nothing was "
+                f"checked**. This is not a clean sweep: the usual cause is a file "
+                f"the suite reads that `also_copy` does not put in the mutants "
+                f"tree, which fails the baseline run before any mutant is tried. "
+                f"See the job log.",
+            ])
         return "\n".join(["### 🧬 Mutation testing — not run", "", note])
 
     total, killed = stats.get("total", 0), stats.get("killed", 0)
@@ -138,10 +153,11 @@ def render_mutation(stats: dict, found: list, note: str) -> str:
     return "\n".join(lines)
 
 
-def render(percent, threshold, by_file, stats, found, note, run_url) -> str:
+def render(percent, threshold, by_file, stats, found, note, run_url,
+           attempted: bool = False) -> str:
     parts = [MARKER, "## Test quality report", "",
              render_coverage(percent, threshold, by_file), "",
-             render_mutation(stats, found, note)]
+             render_mutation(stats, found, note, attempted)]
     if run_url:
         parts += ["", f"<sub>[CI run]({run_url})</sub>"]
     return "\n".join(parts) + "\n"
@@ -154,6 +170,9 @@ def main() -> None:
     parser.add_argument("--mutmut-stats", type=Path)
     parser.add_argument("--mutmut-results", type=Path)
     parser.add_argument("--mutation-note", default="")
+    parser.add_argument("--mutation-attempted", action="store_true",
+                        help="mutmut was run; missing results therefore mean a broken "
+                             "harness rather than an empty scope")
     parser.add_argument("--run-url", default="")
     args = parser.parse_args()
 
@@ -164,7 +183,7 @@ def main() -> None:
 
     print(render(coverage_percent(args.coverage_xml), args.threshold,
                  coverage_by_file(args.coverage_xml), stats, found,
-                 args.mutation_note, args.run_url), end="")
+                 args.mutation_note, args.run_url, args.mutation_attempted), end="")
 
 
 if __name__ == "__main__":

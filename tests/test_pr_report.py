@@ -123,6 +123,20 @@ class TestMutationSection:
         body = render_mutation(None, [], "no hopai/ files changed")
         assert "not run" in body and "no hopai/ files changed" in body
 
+    def test_a_broken_harness_does_not_read_like_a_clean_sweep(self):
+        """The two ways to have no numbers must not look alike. mutmut
+        aborting before it checks anything once rendered as a mild
+        'not run', which is the single most misleading thing this comment
+        could say."""
+        body = render_mutation(None, [], "4 changed files", attempted=True)
+        assert "HARNESS FAILED" in body
+        assert "nothing was checked" in body
+        assert "not a clean sweep" in body
+
+    def test_an_empty_scope_is_not_reported_as_a_failure(self):
+        body = render_mutation(None, [], "nothing changed", attempted=False)
+        assert "HARNESS FAILED" not in body
+
     def test_zero_mutants_does_not_divide_by_zero(self):
         assert "0%" in render_mutation({"total": 0, "killed": 0}, [], "scope")
 

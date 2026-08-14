@@ -173,6 +173,13 @@ class Ingestor:
             with self.g.engine.begin() as opened:
                 yield opened
 
+    def _graph_stamp(self) -> dict:
+        """The graph column for an inserted row, or nothing when the
+        caller's tables have no such column."""
+        if self.g.graph_col is None:
+            return {}
+        return {self.g.graph_col: self.g.graph}
+
     def _node_id_col(self):
         return getattr(self.g.nodes_tbl.c, self.g.node_id_col)
 
@@ -202,7 +209,7 @@ class Ingestor:
         payload, explicit_ids = [], False
         for row in rows:
             identity, properties = split_row(row, _NODE_KEYS, "node")
-            record = {"properties": properties}
+            record = {"properties": properties, **self._graph_stamp()}
             if "id" in identity:
                 record[id_column.name] = identity["id"]
                 explicit_ids = True
@@ -308,7 +315,7 @@ class Ingestor:
 
         payload = []
         for row, identity, properties in split:
-            record = {"properties": properties}
+            record = {"properties": properties, **self._graph_stamp()}
             for side, column in (("start", start_col), ("end", end_col)):
                 if side in row and isinstance(row[side], dict):
                     record[column] = resolved[_reference_key(row[side])]
@@ -340,8 +347,12 @@ class Ingestor:
         table = self.g.nodes_tbl
         id_column = self._node_id_col()
         query = select(id_column, table.c.properties).where(
+            # Scoped: without this an edge could resolve its endpoint to a
+            # node in another graph, and the composite foreign key would
+            # then reject the write with a message about nothing obvious.
+            self.g._scoped(table),
             or_(*(table.c.properties.op("@>")(
-                bindparam(None, reference, type_=JSONB)) for reference in distinct.values()))
+                bindparam(None, reference, type_=JSONB)) for reference in distinct.values())),
         )
         matches = connection.execute(query).all()
 
@@ -381,8 +392,14 @@ class Ingestor:
         # match the index expression exactly for Postgres to infer it, and
         # a bound parameter in that position is neither matchable nor
         # accepted. key_sql() is the same function CREATE INDEX uses.
-        target = _Target(table, what)
-        index_elements = [text(key_sql(target, key)) for key in on]
+        target = _Target(table, what, self.g.graph, self.g.graph_col or "graph_id")
+        if self.g.graph_col is None:
+            target.graph = None
+        # scope_index() is what Unique() used to build the index, so the
+        # conflict target is spelled identically -- including the leading
+        # graph column. Without it Postgres cannot infer the index and
+        # every merge fails.
+        index_elements = [text(key_sql(target, key)) for key in target.scope_index(tuple(on))]
 
         ids: list = []
         for chunk in _chunks(payload):
