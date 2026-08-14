@@ -494,6 +494,21 @@ class TestTraversalNearShape:
                                   [Hop()]), literal_binds=True)
         assert sql.count("graph_id = 'default'") == 5
 
+    @pytest.mark.parametrize("start,hops", [
+        (Start(near=Near("summary", [1.0, 0.0, 0.0]), k=3), [Hop()]),
+        (Start(), [Hop(near=Near("summary", [1.0, 0.0, 0.0]), k=3)]),
+    ])
+    def test_ranked_ctes_break_ties_on_the_id(self, vg, start, hops):
+        """When more nodes tie on similarity than k keeps, WHICH ones
+        survive must not be arbitrary -- two runs of the same traversal
+        would otherwise return different subgraphs. The search side has
+        the same tiebreak; a mutant dropping it here survived, because
+        every behavioral test used distinct similarities."""
+        import re
+
+        sql = norm(vg.build_query(start, hops))
+        assert re.search(r"ORDER BY [^ ]+ DESC, \w+\.node_id", sql), sql
+
     def test_hop_near_ranks_after_deduplication(self, vg):
         """Many walks can reach one node; its similarity is one number.
         The reached_i subquery dedupes BEFORE the per-row subquery runs,
@@ -1018,6 +1033,18 @@ class TestVectorSearchLive:
         })
         assert json.loads(json.dumps(result)) == result
         assert [h["id"] for h in result["results"]] == ["1", "3"]
+
+    def test_vector_search_json_k_actually_truncates(self, fresh_graph):
+        """`k` in the spec has to REACH the search. Pairing it with a
+        min_similarity that already limits the result hides a misread
+        key behind the threshold's answer -- a mutant that looked up
+        "K" survived exactly that way."""
+        g = _corpus(fresh_graph)
+        spec = {"near": {"field": "docvec", "vector": QUERY}, "where": {"type": "doc"}}
+        assert len(vector_search_json(g, {**spec, "k": 1})["results"]) == 1
+        assert len(vector_search_json(g, {**spec, "k": 3})["results"]) == 3
+        # ...and the documented default when the key is absent.
+        assert len(vector_search_json(g, spec)["results"]) == 5
 
 
 # ---------------------------------------------------------------------
