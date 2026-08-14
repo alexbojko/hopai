@@ -307,8 +307,24 @@ def headline(results: list) -> list:
             f"| **{under_1s} / {len(results)}** | queries answering in under a second |",
         ]
     stats.append(
-        f"| **{len(dnf)}** | queries that did not finish"
+        f"| **{len(dnf)}** | queries hopai did not finish"
         + (": " + ", ".join(f"`{r['id']}`" for r in dnf) if dnf else "") + " |")
+
+    # Another system failing to answer is the headline number in any
+    # comparison, and counting only our own DNFs reported "0 did not
+    # finish" on a run where AGE never answered at all.
+    for key, label in (("neo4j_ms", "Neo4j"), ("age_ms", "AGE")):
+        failed = [r for r in results if key in r and r.get(key) is None]
+        if failed:
+            stats.append(
+                f"| **{len(failed)}** | {label} did not finish: "
+                + ", ".join(f"`{r['id']}`" for r in failed) + " |")
+        worst = [r for r in results if r.get(key) and r.get("warm_ms")]
+        if worst:
+            top = max(worst, key=lambda r: r[key] / r["warm_ms"])
+            stats.append(
+                f"| **{top[key] / top['warm_ms']:,.0f}x** | widest gap to {label}: "
+                f"`{top['id']}` ({top[key]:,.0f} ms vs {top['warm_ms']:,.1f} ms) |")
     return ["| | |", "| ---: | --- |", *stats]
 
 
