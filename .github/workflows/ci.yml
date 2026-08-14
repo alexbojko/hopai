@@ -139,7 +139,12 @@ jobs:
             # tree (without it every test dies on an import error).
             python - "$CHANGED" <<'PY'
           import re, sys
-          paths = " ".join(sys.argv[1].split())
+          # NEWLINE-separated, indented: setup.cfg list options are one
+          # value per line. Space-separating them made mutmut read the
+          # whole string as a single path, match nothing, and stop with
+          # "could not find any test case for any mutant" -- which the
+          # report then showed as no mutation data at all.
+          paths = "\n    ".join(sys.argv[1].split())
           config = open("setup.cfg").read()
           open("setup.cfg", "w").write(
               re.sub(r"^source_paths = .*$", f"source_paths = {paths}", config, count=1, flags=re.M))
