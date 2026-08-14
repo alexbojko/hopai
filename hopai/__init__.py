@@ -69,7 +69,13 @@ from .ingest import INGEST_TOOL_SCHEMA, IngestResult
 from .json_api import TRAVERSE_TOOL_SCHEMA, spec_to_traversal, traverse_json
 from .models import Edge, Node
 
-__version__ = "0.0.0"
+# The trailing annotation is load-bearing: release-please updates this
+# file with its GENERIC updater, which rewrites the version only on lines
+# carrying this marker. Without it the file is left untouched and
+# hopai.__version__ silently drifts from the released version. There is
+# no "python" extra-file type -- the python strategy only auto-updates a
+# file literally named version.py.
+__version__ = "0.0.0"  # x-release-please-version
 
 __all__ = [
     "Graph", "Subgraph", "Start", "Hop",
