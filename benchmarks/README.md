@@ -15,9 +15,19 @@ the default settings). That structure, not a purely random graph, is
 what actually stresses a graph engine — random graphs rarely have the
 convergent fan-in that real dependency graphs do.
 
-`bench_hopai.py` loads it and times nine queries covering direction,
-multi-hop bounds, compound chains, `OR`, `NOT`, range comparisons, and
-`OPTIONAL` — cold and warm, writing results to `bench_results.json`.
+`bench_hopai.py` loads it and times twelve queries — nine traversals
+covering direction, multi-hop bounds, compound chains, `OR`, `NOT`,
+range comparisons, and `OPTIONAL`, plus three aggregations
+(`Count`/`Sum`/`Avg`/`Min`/`Max`) — cold and warm, writing results to
+`bench_results.json`.
+
+`agg_count_4hop` deliberately runs the same chain as
+`forward_bounded_4hop`: the pair shows what `graph.aggregate()` saves by
+skipping edge reconstruction and node hydration on identical traversal
+work. In the run recorded during development (default 1M-node graph,
+local Postgres 16) the aggregate answered in 75ms warm against the
+traversal's 653ms — the difference is the `hop_edges`/`edge_rows` CTEs
+and the hydration of ~10k nodes and edges that a count does not need.
 
 ## Comparing against Neo4j and Apache AGE
 
@@ -64,6 +74,15 @@ WHERE a.type IS NULL OR a.type <> 'leaf'
 OPTIONAL MATCH (a)-[:EDGE*1..1]->(dep:Node {type:'leaf'})
 RETURN count(DISTINCT a), count(DISTINCT dep)
 ```
+
+A note on those `RETURN count(DISTINCT a)` tails now that hopai
+translates aggregation: they aggregate the *start* variable, which hopai
+still refuses (only the last node of a chain can be aggregated — see
+`hopai/cypher.py`). They are written that way because Neo4j and AGE
+count them fine, and on those systems the tail is just "how many rows".
+The three `agg_*` queries in `bench_hopai.py` are the shapes hopai's own
+Cypher front end runs directly, e.g.
+`MATCH (a {type: 'leaf'})-[*1..4]->(m {flag: 1}) RETURN count(DISTINCT m)`.
 
 **A finding worth knowing before you run these on AGE:** in the full
 investigation this library came out of, two of these nine query shapes

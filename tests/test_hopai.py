@@ -13,7 +13,8 @@ import pytest
 
 from hopai import (
     AND, BETWEEN, GT, GTE, LT, LTE, NOT, OR,
-    Hop, Start, parse_filter, traverse_json,
+    Avg, Count, Hop, Max, Min, Start, Sum,
+    aggregate_json, parse_filter, traverse_json,
 )
 
 
@@ -317,6 +318,141 @@ class TestJsonApi:
 
     def test_parse_filter_none(self):
         assert parse_filter(None) is None
+
+
+# ---------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------
+
+class TestAggregations:
+    def test_zero_hop_aggregates_over_the_seed_set(self, graph):
+        """The fixture's four leaves, three of which carry a priority
+        (3, 7, 15) -- every function checked against numbers small enough
+        to verify by hand."""
+        result = graph.aggregate(
+            Start(where={"type": "leaf"}),
+            aggregates={"n": Count(), "with_priority": Count("priority"),
+                        "total": Sum("priority"), "mean": Avg("priority"),
+                        "lo": Min("priority"), "hi": Max("priority")},
+        )
+        assert result == {"n": 4, "with_priority": 3, "total": 25,
+                          "mean": 25 / 3, "lo": 3, "hi": 15}
+
+    def test_fan_in_counts_each_node_once(self, graph):
+        """n1 and n2 both feed m1. A per-path count would report 3
+        reached nodes where the answer is 2 (m1, m2) -- the same fan-in
+        bug the traversal's local-path design exists to prevent, showing
+        up as a wrong number instead of a wrong subgraph."""
+        result = graph.aggregate(
+            Start(where={"type": "leaf"}),
+            Hop(via={"kind": "knows"}),
+            aggregates={"reached": Count()},
+        )
+        assert result == {"reached": 2}
+
+    def test_aggregates_the_last_hop_not_the_seed(self, graph):
+        """Two hops end on the hub; a count of 1 proves the aggregate ran
+        over the final match and not an earlier position."""
+        result = graph.aggregate(
+            Start(where={"type": "leaf"}),
+            Hop(via={"kind": "knows"}),
+            Hop(where={"type": "hub"}, via={"kind": "refers"}),
+            aggregates={"hubs": Count()},
+        )
+        assert result == {"hubs": 1}
+
+    def test_empty_match_set(self, graph):
+        """count and sum answer 0; avg/min/max answer None. A sum of NULL
+        (PG's default) would make every caller null-check a total."""
+        result = graph.aggregate(
+            Start(where={"type": "no_such_type"}),
+            aggregates={"n": Count(), "s": Sum("priority"),
+                        "a": Avg("priority"), "lo": Min("priority")},
+        )
+        assert result == {"n": 0, "s": 0, "a": None, "lo": None}
+
+    def test_results_are_json_serializable(self, graph):
+        """The driver hands NUMERIC back as Decimal, which json.dumps
+        refuses -- and an aggregation result is exactly what gets
+        serialized into a tool response."""
+        import json
+        result = graph.aggregate(Start(where={"type": "leaf"}),
+                                 aggregates={"total": Sum("priority"), "mean": Avg("priority")})
+        assert json.loads(json.dumps(result)) == result
+        assert isinstance(result["total"], int)      # a whole number, not 25.0
+
+    def test_distinct_collapses_equal_values(self, fresh_graph):
+        """Two nodes share priority 5; distinct=True must fold them to
+        one value while the plain form counts both nodes."""
+        fresh_graph.add_nodes([
+            {"id": 1, "type": "t", "priority": 5},
+            {"id": 2, "type": "t", "priority": 5},
+            {"id": 3, "type": "t", "priority": 10},
+        ])
+        result = fresh_graph.aggregate(
+            Start(where={"type": "t"}),
+            aggregates={"total": Sum("priority"), "distinct_total": Sum("priority", distinct=True),
+                        "values": Count("priority", distinct=True),
+                        "mean": Avg("priority"), "distinct_mean": Avg("priority", distinct=True)},
+        )
+        assert result == {"total": 20, "distinct_total": 15, "values": 2,
+                          "mean": 20 / 3, "distinct_mean": 7.5}
+
+    def test_non_numeric_value_is_ignored_not_an_error(self, fresh_graph):
+        """One node carrying "high" where a number was expected must not
+        abort the query -- a bare ::numeric cast would. It still counts
+        as present for Count, which asks a different question."""
+        fresh_graph.add_nodes([
+            {"id": 1, "type": "t", "priority": 5},
+            {"id": 2, "type": "t", "priority": "high"},
+        ])
+        result = fresh_graph.aggregate(
+            Start(where={"type": "t"}),
+            aggregates={"total": Sum("priority"), "present": Count("priority")},
+        )
+        assert result == {"total": 5, "present": 2}
+
+    def test_json_null_property_is_absent(self, fresh_graph):
+        """{"priority": null} counts as 'no priority', matching Cypher's
+        judgement that a null property does not exist -- `->` instead of
+        `->>` in the Count compilation would count it."""
+        fresh_graph.add_nodes([
+            {"id": 1, "type": "t", "priority": 5},
+            {"id": 2, "type": "t", "priority": None},
+        ])
+        result = fresh_graph.aggregate(Start(where={"type": "t"}),
+                                       aggregates={"present": Count("priority")})
+        assert result == {"present": 1}
+
+    def test_aggregate_json_matches_python_api(self, graph):
+        """The JSON front end must not drift from the Python one -- same
+        spec, same numbers."""
+        json_result = aggregate_json(graph, {
+            "start": {"where": {"type": "leaf"}},
+            "hops": [{"via": {"kind": "knows"}}],
+            "aggregates": {"n": {"fn": "count"},
+                           "hi": {"fn": "max", "property": "priority"}},
+        })
+        python_result = graph.aggregate(
+            Start(where={"type": "leaf"}), Hop(via={"kind": "knows"}),
+            aggregates={"n": Count(), "hi": Max("priority")},
+        )
+        assert json_result == python_result
+
+    def test_backward_direction(self, graph):
+        """Aggregation goes through the same hop machinery as traversal,
+        direction included: two leaves point at m1."""
+        result = graph.aggregate(
+            Start(where={"name": "m1"}),
+            Hop(direction="backward", via={"kind": "knows"}),
+            aggregates={"parents": Count(), "min_priority": Min("priority")},
+        )
+        assert result == {"parents": 2, "min_priority": 3}
+
+    def test_optional_hop_is_refused(self, graph):
+        with pytest.raises(ValueError, match="no effect on an aggregation"):
+            graph.aggregate(Start(where={"type": "leaf"}), Hop(optional=True),
+                            aggregates={"n": Count()})
 
 
 # ---------------------------------------------------------------------

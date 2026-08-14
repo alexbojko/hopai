@@ -3,8 +3,8 @@ benchmarks/bench_hopai.py
 
 Loads a generated graph (see generate_graph.py) into PostgreSQL and runs
 a suite of queries through hopai, covering direction, multi-hop
-bounds, compound chains, AND/OR/NOT, range comparisons, and OPTIONAL --
-timing each one cold and warm.
+bounds, compound chains, AND/OR/NOT, range comparisons, OPTIONAL, and
+aggregation -- timing each one cold and warm.
 
 Usage:
     python generate_graph.py --nodes 1000000 --out-dir ./data
@@ -108,6 +108,50 @@ def run_suite(graph, hub_id: int):
             "edges": len(r.edges),
         })
         print(f"{name:28s} cold={times[0]:9.1f}ms warm={times[1]:9.1f}ms nodes={len(r.nodes):8d} edges={len(r.edges):8d}")
+
+    results.extend(run_aggregate_suite(graph))
+    return results
+
+
+def run_aggregate_suite(graph):
+    """Aggregations over the same chains the traversal suite walks --
+    agg_count_4hop deliberately reuses forward_bounded_4hop's chain, so
+    the two rows show what skipping edge reconstruction and hydration
+    is worth on identical work."""
+    from hopai import AND, GT, Avg, Count, Hop, Max, Min, Start, Sum
+
+    suite = [
+        ("agg_count_4hop",
+         [Start(where={"type": "leaf"}), Hop(where={"flag": 1}, hops=(1, 4))],
+         {"n": Count()}),
+        # backward from the flag layer (depth 3) far enough to reach the
+        # depth-7 leaves -- the only nodes carrying the numeric
+        # `priority` the stats need
+        ("agg_stats_backward_4hop",
+         [Start(where={"flag": 1}), Hop(hops=(1, 4), direction="backward")],
+         {"n": Count(), "total": Sum("priority"), "mean": Avg("priority"),
+          "lo": Min("priority"), "hi": Max("priority")}),
+        ("agg_range_count",
+         [Start(where=AND({"type": "leaf"}, GT("priority", 5)))],
+         {"n": Count(), "mean": Avg("priority")}),
+    ]
+
+    results = []
+    for name, hops, aggregates in suite:
+        start_hop, *rest = hops
+        times = []
+        r = None
+        for _ in range(2):  # first pass cold, second warm
+            t0 = time.perf_counter()
+            r = graph.aggregate(start_hop, *rest, aggregates=aggregates)
+            times.append((time.perf_counter() - t0) * 1000)
+        results.append({
+            "query": name,
+            "cold_ms": round(times[0], 1),
+            "warm_ms": round(times[1], 1),
+            "values": r,
+        })
+        print(f"{name:28s} cold={times[0]:9.1f}ms warm={times[1]:9.1f}ms {r}")
 
     return results
 

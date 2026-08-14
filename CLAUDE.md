@@ -216,6 +216,13 @@ The pipeline spans three modules and is easier to follow as one flow than file b
    `(kind, id)` rows — `"node"` / `"edge"` — in one round trip.
 4. **`core.py:traverse`** — splits those rows by `kind` and issues two follow-up `SELECT`s to
    hydrate properties. `elapsed_ms` on the returned `Subgraph` times all three queries.
+5. **`aggregates.py` + `core.py:build_aggregate_query`** — the aggregation path.
+   `Count`/`Sum`/`Avg`/`Min`/`Max` mirror the filter DSL, `parse_aggregate()` reads the JSON
+   form, and `cypher.py`'s `RETURN` translation emits the same objects, so all three front ends
+   compile through the one `resolve_aggregate()` — the same single-path rule as filters.
+   `build_aggregate_query` reuses the seed/walk/match chain via `_walk_matches` (shared with
+   `build_query`, so the two can never disagree about what a traversal matches) and aggregates
+   over the **final** match CTE, emitting none of the edge CTEs and doing no hydration.
 
 Writes are a separate path: `Graph` exposes them, `ingest.py` and `constraints.py` implement
 them, and `core.py` stays the traversal engine. The one place they meet is
@@ -241,6 +248,12 @@ inference only works when the two are spelled identically, so they must come fro
   `test_not_includes_missing_key`.
 - **A bare top-level list raises `TypeError`.** It reads as "AND these" but would mean OR; callers
   must write `OR(...)`.
+- **Aggregates run over the LAST step's matched nodes only.** A mid-chain match CTE includes nodes
+  with no continuation to the end of the chain, so aggregating one would silently count nodes
+  Cypher would not — `cypher.py` refuses non-last targets, and bare `count(b)`/`sum(b.x)`/`avg(b.x)`
+  with hops involved (Cypher counts per *path* there; hopai deliberately does not track path
+  multiplicity across hops). The acceptance matrix lives in `cypher.py`'s AGGREGATION docstring
+  section; loosening a refusal into a near-enough mapping is the bug, not the fix.
 
 ### Two gotchas that surprise readers of the result
 
@@ -262,9 +275,10 @@ actually hit during development. Read the relevant one before changing behavior:
 | --- | --- |
 | `hopai/core.py` header | Why local paths, split queries, edge-derived nodes, last-hop-only `optional` |
 | `hopai/filters.py` header | The full DSL in both forms, and why `OR`/`AND`/`NOT` are explicit classes |
+| `hopai/aggregates.py` header | The aggregation DSL in both forms, the three aggregation semantics, and the numeric edge cases |
 | `hopai/hop.py` header | Why `Start` and `Hop` are separate types rather than one |
 | `hopai/models.py` header | The expected DDL, and the typed-columns / JSONB-bag split |
-| `hopai/cypher.py` header | The translatable Cypher subset (read and write), and why each refusal is a refusal |
+| `hopai/cypher.py` header | The translatable Cypher subset (read, write and aggregate), and why each refusal is a refusal |
 | `hopai/ingest.py` header | The two row spellings, edge-by-property references, and merge semantics |
 | `hopai/constraints.py` header | What each constraint compiles to, and the two SQL semantics that surprise people |
 | `tests/conftest.py` | The 7-node fixture graph — it deliberately contains a dead end, a fan-in, and a cycle |
@@ -277,8 +291,9 @@ actually hit during development. Read the relevant one before changing behavior:
   touching non-obvious code; skip it for mechanical changes.
 - New tests belong to an existing `TestX` class in `tests/test_hopai.py` and get a docstring saying
   what would break without the fix.
-- `json_api.py` is a translation layer only. Anything it needs to *decide* belongs in `filters.py`
-  or `core.py`, and `TRAVERSE_TOOL_SCHEMA` must stay in step with what `spec_to_traversal` accepts.
+- `json_api.py` is a translation layer only. Anything it needs to *decide* belongs in `filters.py`,
+  `aggregates.py` or `core.py`, and `TRAVERSE_TOOL_SCHEMA` / `AGGREGATE_TOOL_SCHEMA` must stay in
+  step with what `spec_to_traversal` / `spec_to_aggregation` accept.
 - `cypher.py` is the same: a front end that emits `(Start, [Hop])` for reads and a list of
   ingestion operations for writes, holding no query logic of its own. Its rule is **refuse, don't
   approximate** — a Cypher construct with no hopai equivalent, or with a *different meaning* here

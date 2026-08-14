@@ -22,6 +22,9 @@ without being taught anything new.
   extension, no sidecar service, no new operational dependency.
 - 🧭 **Real multi-hop traversal** — bounded and unbounded hops, per-hop
   direction, `OPTIONAL`, rich JSONB filtering, one round trip.
+- 🧮 **In-database aggregation** — `count` / `sum` / `avg` / `min` /
+  `max` over what a traversal matches, computed where the data lives
+  instead of hydrating a subgraph to count it.
 - 🤖 **Three front ends, one engine** — Python, JSON (with a ready-made
   LLM tool schema), and a Cypher subset all compile through the same
   query builder.
@@ -249,6 +252,59 @@ the last hop** — supporting it mid-chain would mean every downstream hop
 tolerating a missing anchor, a materially larger feature this library
 hasn't built.
 
+## 🧮 Aggregation
+
+A number instead of a subgraph — computed in the database, in one round
+trip, with none of the edge-reconstruction or hydration work a traversal
+pays for:
+
+```python
+from hopai import Count, Sum, Avg, Min, Max
+
+graph.aggregate(
+    Start(where={"type": "person"}),
+    Hop(via={"kind": "friend"}, hops=(1, 4)),
+    aggregates={"friends": Count(), "avg_age": Avg("age"), "oldest": Max("age")},
+)
+# {"friends": 42, "avg_age": 31.5, "oldest": 87}
+```
+
+The aggregates run over the **distinct nodes the last hop matched** (the
+seed set when there are no hops), each node counted once however many
+paths reach it. `distinct=True` on `Count`/`Sum`/`Avg` collapses equal
+property values first — `Sum("age", distinct=True)` adds each age once.
+`Count("age")` counts nodes carrying the property; bare `Count()` counts
+the nodes themselves.
+
+The values come back as plain `int`/`float`, JSON-ready. Over an empty
+match: `count` → `0`, `sum` → `0`, `avg`/`min`/`max` → `None`. A missing,
+`null` or non-numeric property value is ignored, the way both SQL and
+Cypher aggregates skip `NULL` — one node carrying `"high"` where you
+expected a number doesn't error the query (`PropertyType("age", "number")`
+is the constraint that keeps such rows out entirely).
+
+The same call in JSON (`AGGREGATE_TOOL_SCHEMA` is the ready-made LLM tool
+definition):
+
+```python
+from hopai import aggregate_json
+
+aggregate_json(graph, {
+    "start": {"where": {"type": "person"}},
+    "hops": [{"via": {"kind": "friend"}, "hops": [1, 4]}],
+    "aggregates": {"friends": {"fn": "count"},
+                   "avg_age": {"fn": "avg", "property": "age"}},
+})
+```
+
+…and in Cypher, where it earns its own subtlety — see the Cypher section
+below:
+
+```python
+graph.cypher("MATCH (a:person)-[:friend*1..4]->(b) RETURN count(DISTINCT b)")
+# {"count": 42}
+```
+
 ## 🤖 The JSON interface
 
 For callers that shouldn't or can't write Python — an LLM tool call, an
@@ -328,15 +384,35 @@ Change the keys with `node_label_key=` / `edge_type_key=`, or pass
 Translates: linear `MATCH` chains (including several `MATCH` clauses
 joined end to end), `*min..max`, `->` / `<-` per hop, `[:A|B]`, inline
 property maps, `WHERE` with `AND`/`OR`/comparisons/`IN`/`IS NULL`,
-`all(r IN relationships(p) WHERE ...)` → `via`, and `OPTIONAL MATCH` as
-the last clause.
+`all(r IN relationships(p) WHERE ...)` → `via`, `OPTIONAL MATCH` as
+the last clause, and aggregating `RETURN` — with rules worth reading:
+
+**Aggregation translates only when it means the same thing.** Cypher
+aggregates over result *rows* — one per path — while hopai aggregates
+over the distinct nodes the last step matched. So:
+
+- `count(DISTINCT b)`, `sum(DISTINCT b.age)`, `avg(DISTINCT b.age)`,
+  `count(DISTINCT b.age)` translate exactly (distinct values are
+  distinct values, however many paths there are), as do bare
+  `min(b.age)` / `max(b.age)` (an extremum is immune to multiplicity)
+  and any bare aggregate on a hopless single-node pattern
+  (`MATCH (a:person) RETURN count(a)` — one node, one row).
+- `WITH DISTINCT b RETURN avg(b.age)` — Cypher's spelling of hopai's
+  native per-matched-node aggregation — is recognized as a unit.
+- Bare `count(b)` / `sum(b.age)` / `avg(b.age)` / `count(*)` with hops
+  involved count **per path** — a node reachable two ways counts twice —
+  which hopai deliberately cannot express. They raise, naming both exact
+  rewrites, instead of quietly answering the per-node question.
+- Only the *last* node of the chain can be aggregated; grouping
+  (`RETURN b.city, count(b)`), relationship-variable aggregates and
+  `collect()`/`stdev()`/percentiles raise for now.
 
 Everything else raises `CypherError` naming the rewrite, rather than
 translating into something that answers a different question:
 
-- **`RETURN` has no target.** A traversal returns the whole matching
-  subgraph, so projections are parsed and ignored — and aggregations
-  (`RETURN count(a)`) raise, since the caller clearly wanted a number.
+- **A plain `RETURN` has no target.** A traversal returns the whole
+  matching subgraph, so non-aggregating projections are parsed and
+  ignored.
 - **`x.k <> v` and `NOT x.k = v` raise.** Cypher evaluates these to
   `NULL` when `k` is missing and drops the row; hopai's containment-based
   `NOT` keeps it. Same spelling, different result set. Write the
@@ -344,14 +420,19 @@ translating into something that answers a different question:
   `NOT({"k": v})`.
 - Also refused: cross-variable `OR` (`a.x = 1 OR b.y = 2`), unbounded
   `*` (pass `max_var_length=N` to cap it), undirected `-[]-`,
-  comma-separated patterns, `WITH` / `ORDER BY` / `LIMIT`, and
-  `OPTIONAL MATCH` anywhere but last.
+  comma-separated patterns, `WITH` (except the `WITH DISTINCT` unit
+  above) / `ORDER BY` / `LIMIT`, and `OPTIONAL MATCH` anywhere but last.
 
 ## 🚧 What this doesn't do (yet)
 
 - No disjoint multi-pattern matching (`MATCH (a)-[]->(b), (c)-[]->(d)`
   joined on shared variables) — one linear chain of hops only.
 - `OPTIONAL` only on the last hop, not mid-chain.
+- Aggregation covers `count`/`sum`/`avg`/`min`/`max` over the last
+  step's matched nodes, numeric properties only. No grouping
+  (`RETURN b.city, count(b)`), no edge-property aggregates, no
+  `stddev`/percentiles, no lexicographic `min`/`max` on strings — each
+  refuses with a message rather than approximating.
 - Synchronous only — every call blocks; no `AsyncSession` support yet.
 - A cycle-protection path array is carried on every recursive row. Cheap
   at moderate depth, measurably not-cheap on single-segment traversals

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 from typing import Optional
 
@@ -51,6 +52,16 @@ def _qualify(table) -> str:
     if table.schema:
         return f'"{table.schema}"."{table.name}"'
     return f'"{table.name}"'
+
+
+def _plain(value):
+    """Aggregate results as plain Python. The driver returns NUMERIC as
+    Decimal, which json.dumps refuses -- and an aggregation result is
+    exactly the kind of thing that gets serialized straight into a tool
+    response. Integral values come back as int (a count of 3, not 3.0)."""
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    return value
 
 
 @dataclass
@@ -122,13 +133,17 @@ class Graph:
 
     # -- query building -----------------------------------------------
 
-    # NOTE: the walk-building logic lives directly in build_query below,
-    # not split into a helper -- SQLAlchemy's CTE self-reference (the
-    # recursive term referring back to the CTE it's part of) reads more
-    # clearly kept in one place than split across methods that each need
-    # the same alias objects passed around.
+    # NOTE: the whole walk -- SQLAlchemy's CTE self-reference included --
+    # lives in the single _walk_matches loop below rather than being
+    # split across methods that would each need the same alias objects
+    # passed around. It became a (private) helper only because
+    # build_aggregate_query needs the exact same seed/walk/match chain;
+    # there is still exactly one place the walk is built.
 
-    def build_query(self, start: Start, hops: list):
+    def _walk_matches(self, start: Start, hops: list):
+        """The seed CTE plus, per hop, its (full recursive walk, match)
+        CTE pair. Shared by build_query and build_aggregate_query, so
+        the two can never disagree about what a traversal matches."""
         from sqlalchemy.dialects.postgresql import array
         from sqlalchemy.sql.expression import any_ as sa_any_
         from sqlalchemy import not_ as sa_not_
@@ -139,28 +154,15 @@ class Graph:
         edge_id_col = getattr(et.c, self.edge_id_col)
         node_id_col = getattr(nt.c, self.node_id_col)
 
-        n = len(hops)
-        for i, hop in enumerate(hops):
-            if hop.optional and i != n - 1:
-                raise ValueError(
-                    f"hop {i} ({hop.label or 'unlabeled'}): optional=True is only supported on "
-                    f"the LAST hop in a chain. If you need multiple optional extensions, run "
-                    f"separate queries."
-                )
-
         seed = (
             select(node_id_col.label("node_id"))
             .where(resolve(nt.c.properties, start.where))
             .cte("seed")
         )
         prev_match = seed
-        hop_edge_ctes = []
-        pre_optional_match = None
+        pairs = []
 
         for i, hop in enumerate(hops):
-            if hop.optional:
-                pre_optional_match = prev_match
-
             if hop.direction == "forward":
                 join_col, move_col = edge_start_col, edge_end_col
             else:
@@ -214,6 +216,36 @@ class Graph:
                 .where(full_walk.c.depth >= hop.min_hops)
                 .cte(f"match_{i}")
             )
+            pairs.append((full_walk, match_i))
+            prev_match = match_i
+
+        return seed, pairs
+
+    def build_query(self, start: Start, hops: list):
+        nt, et = self.nodes_tbl, self.edges_tbl
+        edge_start_col = getattr(et.c, self.edge_start_col)
+        edge_end_col = getattr(et.c, self.edge_end_col)
+        edge_id_col = getattr(et.c, self.edge_id_col)
+        node_id_col = getattr(nt.c, self.node_id_col)
+
+        n = len(hops)
+        for i, hop in enumerate(hops):
+            if hop.optional and i != n - 1:
+                raise ValueError(
+                    f"hop {i} ({hop.label or 'unlabeled'}): optional=True is only supported on "
+                    f"the LAST hop in a chain. If you need multiple optional extensions, run "
+                    f"separate queries."
+                )
+
+        seed, pairs = self._walk_matches(start, hops)
+        prev_match = seed
+        hop_edge_ctes = []
+        pre_optional_match = None
+
+        for i, (full_walk, match_i) in enumerate(pairs):
+            hop = hops[i]
+            if hop.optional:
+                pre_optional_match = prev_match
 
             hop_edges_i = (
                 select(distinct(func.unnest(full_walk.c.local_edges)).label("edge_id"))
@@ -261,6 +293,45 @@ class Graph:
             )
 
         return node_selects[0].union(*node_selects[1:], *edge_selects)
+
+    def build_aggregate_query(self, start: Start, hops: list, aggregates: dict):
+        """The single statement Graph.aggregate() runs: the same
+        seed/walk/match chain as build_query, with the aggregates
+        computed over the final match instead of the subgraph being
+        reported. None of the edge-reconstruction CTEs (`hop_edges_*`,
+        `all_edges`, `edge_rows`) are emitted -- an aggregation needs no
+        edges, so it is strictly less work than the traversal it
+        summarizes."""
+        from .aggregates import resolve_aggregate
+
+        if not isinstance(aggregates, dict) or not aggregates:
+            raise ValueError(
+                "aggregates must be a non-empty dict naming each result, e.g. "
+                "{'friends': Count(), 'avg_age': Avg('age')}"
+            )
+        for i, hop in enumerate(hops):
+            if hop.optional:
+                raise ValueError(
+                    f"hop {i} ({hop.label or 'unlabeled'}): optional=True has no effect on "
+                    f"an aggregation -- aggregates run over the nodes the last hop matched, "
+                    f"and a chain the hop did not extend contributes nothing either way. "
+                    f"Drop the flag, so nobody reads it as changing the number."
+                )
+
+        nt = self.nodes_tbl
+        node_id_col = getattr(nt.c, self.node_id_col)
+        seed, pairs = self._walk_matches(start, hops)
+        # The final match: what the last hop reached, or the seed set when
+        # there are no hops. Aggregating any OTHER position would count
+        # nodes with no continuation to the end of the chain -- the
+        # question Cypher's mid-chain aggregates do NOT answer, which is
+        # why cypher.py refuses them rather than landing here.
+        final = pairs[-1][1] if pairs else seed
+        columns = [
+            resolve_aggregate(nt.c.properties, agg).label(name)
+            for name, agg in aggregates.items()
+        ]
+        return select(*columns).select_from(final.join(nt, node_id_col == final.c.node_id))
 
     # -- schema ---------------------------------------------------------
 
@@ -419,17 +490,24 @@ class Graph:
         return cypher_to_operations(query, **options)
 
     def cypher(self, query: str, **options):
-        """Run any supported Cypher, reading or writing.
+        """Run any supported Cypher: reading, writing, or aggregating.
 
         Returns a Subgraph for a query that matches, an IngestResult for
-        one that creates or merges. Which one it is is visible in the
+        one that creates or merges, and a plain dict of numbers for one
+        whose RETURN aggregates. Which one it is is visible in the
         query, and this is the entry point anyone arriving from a Neo4j
-        driver reaches for first; traverse_cypher() and write_cypher()
-        are the same thing when you would rather be explicit."""
-        from .cypher import _Parser, _tokenize, _WriteClause, traverse_cypher
+        driver reaches for first; traverse_cypher(), write_cypher() and
+        aggregate_cypher() are the same thing when you would rather be
+        explicit."""
+        from .cypher import (
+            _Parser, _ReturnClause, _tokenize, _WriteClause, aggregate_cypher,
+            traverse_cypher,
+        )
         clauses = _Parser(_tokenize(query)).parse()
         if any(isinstance(c, _WriteClause) for c in clauses):
             return self.write_cypher(query, **options)
+        if any(isinstance(c, _ReturnClause) for c in clauses):
+            return aggregate_cypher(self, query, **options)
         return traverse_cypher(self, query, **options)
 
     def add_networkx(self, nx_graph):
@@ -439,6 +517,28 @@ class Graph:
         return self._ingestor.add_networkx(nx_graph)
 
     # -- execution ------------------------------------------------------
+
+    def aggregate(self, start: Start, *hops: Hop, aggregates: dict) -> dict:
+        """Aggregate over the nodes a traversal matches, without
+        hydrating them. `start` and the hops mean exactly what they mean
+        in traverse(); the aggregates run over the distinct nodes the
+        LAST hop matched (the seed set when there are no hops), each one
+        counted once however many paths reach it.
+
+            graph.aggregate(
+                Start(where={"type": "person"}),
+                Hop(via={"kind": "friend"}, hops=(1, 4)),
+                aggregates={"friends": Count(), "avg_age": Avg("age")},
+            )
+            # -> {"friends": 42, "avg_age": 31.5}
+
+        Returns plain JSON-serializable values: count -> int, sum -> a
+        number (0 when nothing matched), avg/min/max -> a number or None
+        when nothing matched. One statement, one round trip."""
+        query = self.build_aggregate_query(start, list(hops), aggregates)
+        with Session(self.engine) as session:
+            row = session.execute(query).one()
+        return {name: _plain(value) for name, value in zip(aggregates, row, strict=True)}
 
     def traverse(self, start: Start, *hops: Hop) -> Subgraph:
         """Run one traversal. `start` picks the seed set; each `Hop`
