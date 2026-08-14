@@ -3,9 +3,16 @@
 ## hopai vs. raw Postgres, on the same data
 
 ```bash
-python generate_graph.py --nodes 1000000 --seed 42 --out-dir ./data
+python generate_graph.py --nodes 1000000 --edges-per-node 3 --seed 42 --out-dir ./data
 python bench_hopai.py --data-dir ./data --dsn "postgresql+psycopg2://user:pass@host/db"
 ```
+
+`--edges-per-node` is the knob that decides whether this is a graph worth
+benchmarking. The old fixed 0.8 gave a million nodes only 810k edges — fewer
+edges than nodes, which is a forest of short chains. Traversal cost is driven by
+fan-out, so the default is now **3.0**: a million nodes, three million edges.
+Edges stream to disk as they are generated, so density is bounded by patience
+rather than memory.
 
 `generate_graph.py` produces a graph with a known, verifiable shape: a
 sparse random background DAG plus a deliberately structured "hub"

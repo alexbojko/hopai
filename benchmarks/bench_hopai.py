@@ -229,7 +229,8 @@ def run_suite(graph, hub_id: int, baseline: bool = True, repeat: int = 5,
         print(f"{qid:4s} {label:30s} cold={cold:9.1f}ms warm={row['warm_ms']:9.1f}ms"
               f"{extra}{others_txt} answer={row['answer']}")
 
-    results.extend(run_aggregate_suite(graph, repeat=repeat, baseline=baseline))
+    results.extend(run_aggregate_suite(graph, repeat=repeat, baseline=baseline,
+                                       others=others, budget_s=budget_s))
     return results
 
 
@@ -331,7 +332,8 @@ def time_raw_aggregate_sql(graph, start_hop, rest, aggregates) -> float:
         raw.close()
 
 
-def run_aggregate_suite(graph, repeat: int = 5, baseline: bool = True):
+def run_aggregate_suite(graph, repeat: int = 5, baseline: bool = True,
+                        others=(), budget_s: float = 150.0):
     results = []
     for entry, label, feature, tier, hops, aggregates in build_aggregate_suite():
         qid, _, twin = entry.partition("#")
@@ -373,10 +375,22 @@ def run_aggregate_suite(graph, repeat: int = 5, baseline: bool = True):
             row["raw_sql_ms"] = round(
                 statistics.median(time_raw_aggregate_sql(graph, start_hop, rest, aggregates)
                                   for _ in range(repeat)), 1)
+        # the other engines run the aggregate too -- an empty cell in a
+        # comparison table reads as "it cannot do this", which is a claim
+        for other in others:
+            ms, answer = other.run(qid, budget_s)
+            key = other.name.split()[-1].lower()
+            row[f"{key}_ms"] = None if ms is None else round(ms, 1)
+            row[f"{key}_answer"] = answer
+
         results.append(row)
         extra = f" raw={row['raw_sql_ms']:8.1f}ms" if baseline else ""
+        others_txt = "".join(
+            f" {o.name.split()[-1].lower()}="
+            f"{'DNF' if row.get(o.name.split()[-1].lower() + '_ms') is None else str(row[o.name.split()[-1].lower() + '_ms']) + 'ms'}"
+            for o in others)
         print(f"{qid:4s} {label:34s} cold={cold:9.1f}ms warm={row['warm_ms']:9.1f}ms"
-              f"{extra}  {values}")
+              f"{extra}{others_txt}  {values}")
     return results
 
 

@@ -85,15 +85,83 @@ CYPHER = {
     "Q14": "MATCH (h:Node {type:'hub'})<-[:EDGE*1..12]-(a:Node) RETURN count(DISTINCT a) AS n",
 }
 
+
+# Aggregations, Q15-Q29. Every query in the suite has a Cypher
+# equivalent so no cell in the comparison table is empty -- a blank cell
+# reads as "the other system could not do this", which is a claim, and
+# usually a false one.
+#
+# `WITH DISTINCT a` before the aggregate is load-bearing: hopai
+# aggregates over the DISTINCT nodes the last hop matched, while a bare
+# Cypher aggregate counts once per PATH. Without it a node reachable
+# three ways is summed three times and the two systems answer different
+# questions.
+CYPHER.update({
+    "Q15": "MATCH (a:Node {type:'leaf'}) RETURN count(a) AS n",
+    "Q16": "MATCH (a:Node {type:'leaf'}) WHERE a.priority > 5 RETURN avg(a.priority) AS n",
+    "Q17": "MATCH (a:Node {type:'leaf'}) "
+           "RETURN min(a.priority) AS lo, max(a.priority) AS hi",
+    "Q18": "MATCH (a:Node {type:'leaf'})-[:EDGE]->(m:Node {flag:1}) "
+           "RETURN count(DISTINCT m) AS n",
+    "Q19": "MATCH (a:Node {type:'leaf'})-[:EDGE*1..4]->(m:Node {flag:1}) "
+           "RETURN count(DISTINCT m) AS n",
+    "Q20": "MATCH (h:Node {type:'hub'})<-[:EDGE*1..3]-(a:Node) "
+           "WHERE a.priority IS NOT NULL RETURN count(DISTINCT a) AS n",
+    "Q21": "MATCH (f:Node {flag:1})<-[:EDGE*1..4]-(a:Node) WITH DISTINCT a "
+           "RETURN count(a) AS n, sum(a.priority) AS total, avg(a.priority) AS mean, "
+           "min(a.priority) AS lo, max(a.priority) AS hi",
+    "Q22": "MATCH (h:Node {type:'hub'})<-[:EDGE*1..3]-(a:Node) "
+           "WHERE a.type IS NULL OR a.type <> 'leaf' RETURN count(DISTINCT a) AS n",
+    "Q23": "MATCH (h:Node {type:'hub'})<-[:EDGE*1..4]-(a:Node) "
+           "RETURN count(DISTINCT a.priority) AS n",
+    "Q24": "MATCH (h:Node {type:'hub'})<-[:EDGE*1..4]-(a:Node) "
+           "WITH DISTINCT a.priority AS p RETURN sum(p) AS total, avg(p) AS mean",
+    "Q25": "MATCH (a:Node {type:'leaf'})-[:EDGE*1..4]->(m:Node {flag:1}) "
+           "MATCH (m)-[:EDGE*1..3]->(h:Node {type:'hub'}) RETURN count(DISTINCT h) AS n",
+    "Q26": "MATCH p=(a:Node {type:'leaf'})-[:EDGE*1..4]->(m:Node {flag:1}) "
+           "WHERE all(r IN relationships(p) WHERE r.tag IN ['p1','p2']) "
+           "RETURN count(DISTINCT m) AS n",
+    "Q27": "MATCH (h:Node {type:'hub'})<-[:EDGE*1..12]-(a:Node) "
+           "RETURN count(DISTINCT a) AS n",
+    "Q28": "MATCH (h:Node {type:'hub'})<-[:EDGE*1..12]-(a:Node) WITH DISTINCT a "
+           "RETURN count(a) AS n, count(a.priority) AS have, "
+           "count(DISTINCT a.priority) AS distinct_p, sum(a.priority) AS total, "
+           "avg(a.priority) AS mean, min(a.priority) AS lo, max(a.priority) AS hi",
+    "Q29": "MATCH (a:Node)-[:EDGE*1..2]->(b:Node) "
+           "WHERE (a.type IN ['leaf','hub']) AND a.type = 'leaf' "
+           "RETURN count(DISTINCT b) AS n",
+})
+
+
 #: AGE 1.5/1.7 has no `all()` over relationships(p), so Q7 needs the
 #: UNWIND+CASE rewrite. Documented in benchmarks/README.md because it is
 #: also the query where AGE's answer historically disagreed.
 AGE_OVERRIDES = {
+    # AGE has no all() over relationships(p) -- same rewrite as Q7
+    "Q26": "MATCH p=(a:Node {type:'leaf'})-[:EDGE*1..4]->(m:Node {flag:1}) "
+           "UNWIND relationships(p) AS r "
+           "WITH m, collect(CASE WHEN r.tag IN ['p1','p2'] THEN 1 ELSE 0 END) AS ok "
+           "WHERE NOT 0 IN ok RETURN count(DISTINCT m) AS n",
     "Q7": "MATCH p=(a:Node {type:'leaf'})-[:EDGE*1..4]->(m:Node {flag:1}) "
           "UNWIND relationships(p) AS r "
           "WITH m, collect(CASE WHEN r.tag IN ['p1','p2'] THEN 1 ELSE 0 END) AS ok "
           "WHERE NOT 0 IN ok RETURN count(DISTINCT m) AS n",
 }
+
+
+def _as_number(value):
+    """agtype comes back as text. An aggregate may be a count or a mean,
+    so parse int first and fall back to float -- `int("12.49")` raises,
+    which sank a whole run on the one query that returns an average."""
+    if value is None:
+        return None
+    text = str(value).strip('"')
+    for cast in (int, float):
+        try:
+            return cast(text)
+        except ValueError:
+            continue
+    return text
 
 
 class Neo4jRunner:
@@ -119,7 +187,11 @@ class Neo4jRunner:
     def load(self, node_count: int = 0, edge_count: int = 0) -> None:
         """Load the same CSVs, then index the properties queries filter
         on -- an unindexed comparison would measure the missing index."""
-        self._post("MATCH (n) DETACH DELETE n", timeout=1800)
+        # Batched: a single DETACH DELETE over a million-node graph
+        # builds one transaction bigger than the heap and dies with a
+        # bare "Failed to commit transaction".
+        self._post("MATCH (n) CALL { WITH n DETACH DELETE n } "
+                   "IN TRANSACTIONS OF 10000 ROWS", timeout=3600)
         self._post("CREATE INDEX node_id IF NOT EXISTS FOR (n:Node) ON (n.id)", timeout=300)
         self._post("LOAD CSV FROM 'file:///nodes.csv' AS row "
                    "CALL { WITH row CREATE (n:Node {id: toInteger(row[0]), props: row[1]}) } "
@@ -263,7 +335,6 @@ class AgeRunner:
                 except psycopg2.Error:
                     return None, "ERROR"
                 elapsed = (time.perf_counter() - t0) * 1000
-            answer = int(str(rows[0][0])) if rows and rows[0][0] is not None else None
-            return elapsed, answer
+            return elapsed, _as_number(rows[0][0] if rows else None)
         finally:
             conn.close()

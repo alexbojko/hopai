@@ -190,9 +190,10 @@ def _table(results: list) -> str:
     systems = [(f"{k}_ms", label) for k, label in (("neo4j", "Neo4j"), ("age", "AGE"))
                if any(k + "_ms" in r for r in results)]
     columns = ["ID", "Query", "Feature", "Tier", "Cold (ms)", "hopai warm (ms)"]
-    if has_raw:
-        columns += ["Raw SQL (ms)", "Overhead"]
     columns += [f"{label} (ms)" for _, label in systems]
+    columns += [f"{label} / hopai" for _, label in systems]
+    if has_raw:
+        columns += ["Raw SQL (ms)"]
     columns += ["Answer"]
     header = ("| " + " | ".join(columns) + " |\n"
               "| --- | --- | --- | --- |" + " ---: |" * (len(columns) - 4))
@@ -203,8 +204,8 @@ def _table(results: list) -> str:
                  r.get("tier", "")]
         if r.get("dnf"):
             outcome = f"**DNF** (>{r.get('budget_s', 0):.0f}s)"
-            cells += [outcome, outcome] + (["-", "-"] if has_raw else [])
-            cells += ["-"] * len(systems) + ["-"]
+            cells += [outcome, outcome]
+            cells += ["-"] * (2 * len(systems)) + (["-"] if has_raw else []) + ["-"]
             rows.append("| " + " | ".join(cells) + " |")
             continue
 
@@ -212,13 +213,24 @@ def _table(results: list) -> str:
         if r.get("warm_min_ms") is not None and r.get("samples", 0) > 1:
             warm += f" <sub>{r['warm_min_ms']:,.1f}-{r['warm_max_ms']:,.1f}</sub>"
         cells += [f"{r.get('cold_ms', 0):,.1f}", warm]
-        if has_raw:
-            ratio = overhead(r)
-            cells += [f"{r.get('raw_sql_ms', 0):,.1f}", f"{ratio:.1f}x" if ratio else "-"]
         for key, _ in systems:
             value = r.get(key)
             cells.append("**DNF**" if key in r and value is None
                          else ("-" if value is None else f"{value:,.1f}"))
+        # how many times slower the other engine was; "DNF" beats any number
+        for key, _ in systems:
+            value, ours = r.get(key), r.get("warm_ms")
+            if key in r and value is None:
+                cells.append("**DNF**")
+            elif value and ours:
+                ratio = value / ours
+                # below 1 the other engine won; two decimals so it does
+                # not round to "0.0x" and read as no measurement
+                cells.append(f"{ratio:,.1f}x" if ratio >= 1 else f"{ratio:.2f}x")
+            else:
+                cells.append("-")
+        if has_raw:
+            cells += [f"{r.get('raw_sql_ms', 0):,.1f}"]
         # the comparable answer, or the row count where there is no
         # cross-system number to agree on
         answer = r.get("answer", r.get("nodes"))
@@ -408,7 +420,12 @@ def findings(results: list) -> list:
         ours = r.get("answer")
         for key, label in (("neo4j_answer", "Neo4j"), ("age_answer", "AGE")):
             theirs = r.get(key)
-            if ours is not None and isinstance(theirs, int) and theirs != ours:
+            if ours is None or not isinstance(theirs, (int, float)):
+                continue
+            # floats only need to agree to a sensible tolerance; an
+            # average differing in the twelfth decimal is not a
+            # disagreement between engines
+            if abs(theirs - ours) > max(1e-6, abs(ours) * 1e-9):
                 disagreements.append(f"`{r['id']}` hopai {ours:,} vs {label} {theirs:,}")
     if disagreements:
         out += [
@@ -497,8 +514,15 @@ def render(results: list, profile: dict, dataset: dict | None = None,
     stamp = generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     dataset = dataset or {}
     ran = [r for r in results if not r.get("dnf")]
-    series = [("warm_ms", "hopai"), ("raw_sql_ms", "raw SQL")]
+    # Neo4j and AGE are the comparison; raw SQL is a floor, not a rival,
+    # so it sits last in the chart and last in the table.
     has_raw = any(r.get("raw_sql_ms") for r in results)
+    series = [("warm_ms", "hopai")]
+    for key, label in (("neo4j_ms", "Neo4j"), ("age_ms", "AGE")):
+        if any(key in r for r in results):
+            series.append((key, label))
+    if has_raw:
+        series.append(("raw_sql_ms", "raw SQL"))
 
     parts = [
         "# hopai benchmark",
@@ -524,8 +548,7 @@ def render(results: list, profile: dict, dataset: dict | None = None,
         "the whole chart; the numbers beside them are exact.",
         "",
         "```",
-        grouped_chart(results, [(key, label) for key, label in series
-                        if key != "raw_sql_ms" or has_raw]),
+        grouped_chart(results, series),
         "```",
         "",
         "## 03 — Cost by difficulty",
@@ -535,6 +558,10 @@ def render(results: list, profile: dict, dataset: dict | None = None,
         "## 04 — Full results",
         "",
         _table(results),
+        "",
+        "`Neo4j / hopai` and `AGE / hopai` are ratios: **above 1 the other engine was",
+        "slower, below 1 it was faster.** `Raw SQL` is hopai's own statement through the",
+        "driver -- a floor, not a rival.",
         "",
     ]
     if has_raw:
