@@ -152,6 +152,15 @@ def resolve(column, filt: Any):
     if filt is None:
         return literal(True)
 
+    # Checked by marker, not isinstance: importing hopai.vectors here
+    # would be a cycle, and the mistake deserves a better answer than
+    # the generic rejection below.
+    if getattr(filt, "_is_near", False):
+        raise TypeError(
+            "Near(...) ranks rows by similarity; it is not a boolean filter. Pass it as "
+            "near= on Start/Hop or to vector_search(), not inside where=/via="
+        )
+
     if callable(filt) and not isinstance(filt, (OR, AND, NOT)):
         return filt(column)
 

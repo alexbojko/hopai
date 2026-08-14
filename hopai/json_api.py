@@ -26,6 +26,15 @@ hopai.filters.parse_filter(): plain objects for equality/AND, plus
 `hops` accepts either an integer (exact hop count) or a two-element
 array [min, max].
 
+`start` and each hop also accept `near` (a {"field", "vector", ...}
+similarity spec or a list of them -- hopai.vectors.parse_near) and `k`,
+mirroring Start/Hop's near=/k=. DELIBERATELY absent from the tool
+schemas below: a tool-calling model asked to fill in "vector" will
+invent plausible floats, and an invented embedding finds confidently
+wrong neighbors. These keys exist for HTTP/config callers that hold
+real vectors; hopai/vectors.py has the full reasoning, and a test pins
+the omission.
+
 An aggregation spec is the same thing plus an `aggregates` object (see
 hopai.aggregates for what the forms mean), run with aggregate_json():
 
@@ -44,6 +53,11 @@ from .aggregates import parse_aggregate
 from .core import Graph, Subgraph
 from .filters import parse_filter
 from .hop import Hop, Start
+from .vectors import parse_near
+
+
+def _near_of(spec: dict):
+    return parse_near(spec["near"]) if "near" in spec else None
 
 
 def spec_to_traversal(spec: dict) -> tuple:
@@ -57,6 +71,8 @@ def spec_to_traversal(spec: dict) -> tuple:
     start = Start(
         where=parse_filter(start_spec.get("where")),
         label=start_spec.get("label"),
+        near=_near_of(start_spec),
+        k=start_spec.get("k"),
     )
 
     hops = []
@@ -69,6 +85,8 @@ def spec_to_traversal(spec: dict) -> tuple:
                 direction=h.get("direction", "forward"),
                 optional=h.get("optional", False),
                 label=h.get("label"),
+                near=_near_of(h),
+                k=h.get("k"),
             )
         )
     return start, hops
@@ -122,10 +140,47 @@ def aggregate_json(graph: Graph, spec: dict) -> dict:
     return graph.aggregate(start, *hops, aggregates=aggregates)
 
 
+def vector_search_json(graph: Graph, spec: dict) -> dict:
+    """Run a vector search described entirely in JSON -- the
+    vector_search() counterpart of traverse_json(), for HTTP/config
+    callers that hold real embeddings. There is deliberately NO tool
+    schema for this (see the module docstring): a model cannot supply
+    the "vector" values truthfully.
+
+        vector_search_json(graph, {
+            "near": {"field": "summary", "vector": [...]},
+            "k": 10,
+            "target": "nodes",
+            "where": {"type": "person"},
+        })
+        # -> {"results": [{"id": "1", "similarity": 0.93, ...}, ...]}
+    """
+    if "near" not in spec:
+        raise ValueError('spec must have a "near" key, e.g. '
+                         '{"near": {"field": "summary", "vector": [...]}}')
+    results = graph.vector_search(
+        *_as_list(parse_near(spec["near"])),
+        target=spec.get("target", "nodes"),
+        k=spec.get("k", 10),
+        where=parse_filter(spec.get("where")),
+    )
+    return {"results": results}
+
+
+def _as_list(near) -> list:
+    return near if isinstance(near, list) else [near]
+
+
 # A JSON Schema description of the spec format above, ready to hand
 # directly to an LLM function-calling / tool definition. Kept here
 # rather than hand-duplicated wherever hopai gets wired into an
 # agent framework or MCP server later.
+#
+# NO "near"/"k" here, and no vector-search schema, ON PURPOSE: an LLM
+# filling a "vector" parameter invents floats, and invented embeddings
+# find confidently wrong neighbors. Vector search reaches an agent as
+# results (via application code that embeds real text), never as a
+# tool the model fills in. tests/test_vectors.py pins this omission.
 TRAVERSE_TOOL_SCHEMA: dict = {
     "name": "traverse_graph",
     "description": (

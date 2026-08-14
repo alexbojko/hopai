@@ -31,6 +31,9 @@ without being taught anything new.
 - 🔐 **Constraints Neo4j puts behind an enterprise licence** — unique,
   composite, partial, existence, type and CHECK constraints on JSONB
   properties.
+- 🧲 **Vector search without pgvector** — exact cosine similarity on
+  plain `real[]` columns, many named fields per node/edge, weighted
+  multivector queries, and similarity-seeded traversals.
 - 🧪 **Tested like it matters** — SQL-level assertions, a live-Postgres
   suite, an 85% coverage gate and mutation testing in CI.
 - 📊 **Measured, not claimed** — real benchmark numbers in `benchmarks/`,
@@ -457,6 +460,66 @@ graph.cypher("MATCH (a:person)-[:friend*1..4]->(b) RETURN count(DISTINCT b)")
 # {"count": 42}
 ```
 
+## 🧲 Vector search
+
+Exact cosine similarity over nodes and edges — computed by Postgres
+itself, on plain `real[]` columns. No pgvector, no extension, no
+approximate index, and (because it is exact) metadata filtering costs
+nothing extra:
+
+```python
+from hopai import Vector, Near
+
+graph.define_vectors(nodes=[Vector("summary", 1536), Vector("title", 384)])
+graph.migrate_vectors()      # ALTER TABLE, idempotent; vector_ddl() previews it
+
+graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
+
+graph.vector_search(Near("summary", query_embedding), k=10,
+                    where={"type": "person"})
+# [{"id": "1", "similarity": 0.93, "properties": {...}}, ...]
+```
+
+Declare as many fields as you need — each is one migration-managed
+column, dimension-checked by the server **per graph**, so two graphs
+sharing the tables can give the same field different dimensionality.
+
+Several fields can rank one query together (multivector search), each
+with a weight, an optional per-field floor, and a say over rows missing
+its vector:
+
+```python
+graph.vector_search(
+    Near("summary", q_summary, weight=0.7),
+    Near("title",   q_title,   weight=0.3, missing="zero"),  # title optional
+    k=10,
+)
+```
+
+And similarity composes with traversal — seed a walk with the most
+similar nodes, or keep only the most similar of what a hop reaches:
+
+```python
+graph.traverse(
+    Start(near=Near("summary", query_embedding), k=25),   # 25 nearest seeds
+    Hop(via={"kind": "cites"}, hops=(1, 3)),
+)
+graph.aggregate(Start(near=Near("summary", q), k=100),
+                aggregates={"avg_score": Avg("score")})
+```
+
+Two honest limits, both documented in depth in `hopai/vectors.py`: the
+search is an exact scan, so its cost is linear in the candidates left
+after filtering — measured at roughly dimensions × 0.25 µs per
+candidate row (≈0.4 ms per 1536-dim vector; an unfiltered 20k × 384-dim
+scan lands around two seconds — `benchmarks/bench_vectors.py` has the
+numbers), which makes a few thousand filtered candidates interactive
+and unfiltered hundreds of thousands the wrong tool. And there is
+deliberately **no LLM tool schema** for it, because a model asked to
+fill in a `"vector"` parameter will invent one, and an invented
+embedding finds confidently wrong neighbors. Embed real text in your
+application, then hand the model the results.
+
 ## 🤖 The JSON interface
 
 For callers that shouldn't or can't write Python — an LLM tool call, an
@@ -593,6 +656,11 @@ translating into something that answers a different question:
   (`RETURN b.city, count(b)`), no edge-property aggregates, no
   `stddev`/percentiles, no lexicographic `min`/`max` on strings — each
   refuses with a message rather than approximating.
+- Vector search is exact and unindexed by design — no ANN (HNSW/IVF)
+  and no late-interaction/ColBERT multivectors; `hopai/vectors.py`
+  spells out the cost model and why each refusal is a refusal. Cosine
+  is the only metric — on the unit-normalized vectors every current
+  embedding API ships, dot and euclidean rank identically anyway.
 - Synchronous only — every call blocks; no `AsyncSession` support yet.
 - A cycle-protection path array is carried on every recursive row. Cheap
   at moderate depth, measurably not-cheap on single-segment traversals

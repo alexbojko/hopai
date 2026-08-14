@@ -44,11 +44,41 @@ def _normalize_hops(hops: HopCount) -> tuple:
     raise TypeError(f"hops must be an int or a (min, max) tuple -- got {hops!r}")
 
 
+def _validate_near_k(owner: str, near, k) -> None:
+    # Structural checks only: whether each Near names a real field of
+    # the right dimensionality needs the Graph's registry, so that
+    # validation lives in core/vectors at build time -- the same split
+    # as optional=, which build_query validates.
+    if k is not None:
+        if near is None:
+            raise ValueError(
+                f"{owner}: k={k!r} without near= orders nothing -- k is how many of the "
+                f"most similar to keep, so it needs a Near to rank by. Note k is not the "
+                f"hop count; that is hops="
+            )
+        if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+            raise ValueError(f"{owner}: k must be a positive integer, got {k!r}")
+    if isinstance(near, (list, tuple)) and not near:
+        raise ValueError(f"{owner}: near=[] is empty -- pass a Near(...) or a list of them, "
+                         f"or drop the argument")
+
+
 @dataclass
 class Start:
-    """The seed set a traversal begins from."""
+    """The seed set a traversal begins from.
+
+    near/k: seed from vector similarity instead of (or as well as) a
+    property filter -- Near(field, vector) specs to rank by, and k for
+    how many of the most similar nodes to keep. `where` still applies;
+    similarity ranks what survives it. See hopai/vectors.py.
+    """
     where: Optional[Any] = None
     label: Optional[str] = None
+    near: Optional[Any] = None
+    k: Optional[int] = None
+
+    def __post_init__(self):
+        _validate_near_k("Start", self.near, self.k)
 
 
 @dataclass
@@ -67,6 +97,13 @@ class Hop:
                 OPTIONAL MATCH). Only valid on the LAST hop in a chain --
                 see Graph.traverse() for why.
     label:      a name for your own reference; not used to build SQL.
+    near:       rank the nodes this hop reaches by vector similarity --
+                Near(field, vector) specs against NODE vector fields
+                (edges walk by `via`, they are not ranked). With k, only
+                the k most similar reached nodes continue the chain and
+                are reported: a semantic beam. See hopai/vectors.py.
+    k:          how many of the most similar reached nodes to keep.
+                NOT the hop count -- that is `hops`.
     """
     where: Optional[Any] = None
     via: Optional[Any] = None
@@ -74,8 +111,11 @@ class Hop:
     direction: str = "forward"
     optional: bool = False
     label: Optional[str] = None
+    near: Optional[Any] = None
+    k: Optional[int] = None
 
     def __post_init__(self):
         self.min_hops, self.max_hops = _normalize_hops(self.hops)
         if self.direction not in ("forward", "backward"):
             raise ValueError(f"direction must be 'forward' or 'backward', got {self.direction!r}")
+        _validate_near_k("Hop", self.near, self.k)

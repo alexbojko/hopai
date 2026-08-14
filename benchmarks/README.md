@@ -29,6 +29,25 @@ local Postgres 16) the aggregate answered in 75ms warm against the
 traversal's 653ms — the difference is the `hop_edges`/`edge_rows` CTEs
 and the hydration of ~10k nodes and edges that a count does not need.
 
+## Vector search
+
+```bash
+python bench_vectors.py --dsn "postgresql+psycopg2://user:pass@host/db" --rows 20000 --dims 384
+```
+
+Self-contained (generates its own vectors), and exists so the cost
+model in `hopai/vectors.py` stays a measurement. The transferable
+number is `us_per_element`: the exact-cosine scan pays a fixed
+executor cost per vector element, so a candidate row costs about
+`dimensions x that`. Recorded during development (Postgres 16, one
+core): **0.28 µs/element** — an unfiltered 20k × 384-dim search in
+~2.1 s, the same search `where=`-filtered to 25 % of rows in ~0.6 s,
+a similarity-seeded traversal within a few ms of its seed search.
+Per-element casting variants (array-level float8 cast, float4
+accumulation) were measured within ±15 % of this — the cost is the
+executor's per-tuple work, not the arithmetic — which is why the SQL
+keeps the formulation whose float8 accumulation is correct.
+
 ## Comparing against Neo4j and Apache AGE
 
 These require separate running instances this repo doesn't set up for

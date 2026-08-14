@@ -51,6 +51,13 @@ read.** When a design question comes up, these decide it, in order:
   matrix; loosening a refusal into a near-enough mapping is the bug, not the fix.
 - **Every read and write goes through `Graph._scoped()`.** Forgetting the graph
   discriminator does not error; it silently touches another graph's rows.
+- **Vectors live in `vec_*` real columns, never in `properties`, and never pass
+  through an LLM tool schema.** JSONB storage would bloat the GIN index and every
+  result; a tool-schema `"vector"` parameter invites a model to invent an embedding,
+  and an invented embedding finds confidently wrong neighbors. Similarity is exact
+  (unnest+sum cosine, float8 accumulation); a traversal without `near=` must emit
+  byte-identical SQL to the pre-vector engine. (`test_defining_vectors_changes_no_near_less_query`,
+  `TestToolSchemasStayVectorFree`)
 - **Writes are one transaction**, batching included. A half-committed write makes a
   retry collide with rows that landed.
 
@@ -70,7 +77,9 @@ read.** When a design question comes up, these decide it, in order:
   aggregation triple, or ingestion operations, and hold no query logic. Widening a
   subset means adding a translation, never loosening a refusal into a near-enough
   mapping. The tool schemas (`TRAVERSE_TOOL_SCHEMA` / `AGGREGATE_TOOL_SCHEMA` /
-  `INGEST_TOOL_SCHEMA`) must stay in step with what the parsers accept.
+  `INGEST_TOOL_SCHEMA`) must stay in step with what the parsers accept — with one
+  pinned exception: the vector keys (`near`/`k`) are parsed but deliberately never
+  advertised to a model (see `vectors.py`).
 - Comments explain *why*, citing the bug or trade-off. Match that for non-obvious code;
   skip it for mechanical changes.
 - New tests join an existing `TestX` class and say what would break without the fix.

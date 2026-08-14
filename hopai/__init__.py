@@ -70,9 +70,29 @@ over the distinct nodes the last step matched; the same three notations:
         MATCH (a:person)-[:friend*1..4]->(b) RETURN count(DISTINCT b)
     ''')
 
+VECTOR SEARCH -- exact cosine similarity on plain real[] columns, no
+pgvector, no extension; declare named fields, migrate, store, search,
+or seed a traversal from similarity:
+
+    from hopai import Vector, Near
+
+    graph.define_vectors(nodes=[Vector("summary", 1536)])
+    graph.migrate_vectors()                       # ALTER TABLE, idempotent
+    graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
+    graph.vector_search(Near("summary", query_embedding), k=10,
+                        where={"type": "person"})
+    graph.traverse(Start(near=Near("summary", query_embedding), k=25),
+                   Hop(via={"kind": "cites"}))
+
+Several Near specs combine into one weighted score (multivector
+search). See hopai/vectors.py for the storage model, the cost model,
+and every deliberate refusal.
+
 FOR TOOL-CALLING MODELS: TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA and
 INGEST_TOOL_SCHEMA are JSON Schemas ready to hand to a function-calling
 definition, covering reading, aggregating and writing respectively.
+(Vector search has no tool schema on purpose -- a model asked for an
+embedding invents one; vectors.py explains.)
 
 SCHEMA -- declare the shape of the graph (node types, edge kinds, typed
 properties) as plain dataclasses or NodeType/EdgeType primitives, read
@@ -103,8 +123,10 @@ from .json_api import (
     AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, aggregate_json, spec_to_aggregation,
     spec_to_traversal, traverse_json,
 )
+from .json_api import vector_search_json
 from .models import Edge, Node
 from .schema import EdgeType, GraphSchema, NodeType, Property
+from .vectors import Near, Vector, parse_near
 
 # The trailing annotation is load-bearing: release-please updates this
 # file with its GENERIC updater, which rewrites the version only on lines
@@ -124,6 +146,7 @@ __all__ = [
     "aggregate_cypher", "cypher_to_aggregation",
     "Unique", "Required", "Check", "Index", "PropertyType", "Col", "ConstraintViolation",
     "GraphSchema", "NodeType", "EdgeType", "Property",
+    "Vector", "Near", "parse_near", "vector_search_json",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",
 ]

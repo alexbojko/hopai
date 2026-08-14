@@ -38,6 +38,32 @@ PG both do) instead of aborting the whole statement.
 Why only the final match may be aggregated — and which Cypher spellings translate
 exactly versus refuse — is the AGGREGATION section of `hopai/cypher.py`'s docstring.
 
+## The vector path
+
+`vectors.py` owns everything similarity-shaped; `core.py` only decides *where* a ranked
+set plugs into the walk.
+
+- A vector field is a `vec_<name> real[]` column **beside** `properties`, never inside
+  it — JSONB storage would bloat the GIN index and every result. Dimensions are a
+  per-graph scoped CHECK (`scope_check`), which is what lets two graphs give one shared
+  column different dimensionality — the reason the column is `real[]` and not a typed
+  `vector(d)`.
+- Similarity is exact cosine as a correlated `unnest`+`sum` scalar subquery. The query
+  vector's norm is precomputed in Python (one `sqrt` in the SQL, not two), and the
+  products are cast to float8 **before** summing — `sum(real)` accumulates in float4
+  and drifts over embedding-length arrays. Both facts are pinned by shape tests.
+- `ranked_ids()` is the one shape behind `Start(near=)` and `Hop(near=)`: an inner
+  select computing labeled per-field similarities over deduplicated candidates, an
+  outer select filtering/ordering/limiting. In `_walk_matches` it simply **becomes**
+  the `seed` / `match_i` CTE, so everything downstream (edge reconstruction, dead-end
+  pruning, aggregation) is unchanged — and a traversal without `near` emits
+  byte-identical SQL to the pre-vector code, which a test asserts.
+- Writes go through `set_vectors()` only (UPDATE … FROM VALUES … RETURNING, one
+  transaction, missing ids fail the call); ingestion rows never carry vectors.
+- The JSON forms exist (`"near"`/`"k"` in specs, `vector_search_json`) but the LLM tool
+  schemas deliberately omit them — a model fills a `"vector"` parameter by inventing
+  floats. `tests/test_vectors.py::TestToolSchemasStayVectorFree` pins the omission.
+
 ## The write path
 
 `Graph` exposes the writes; `ingest.py` and `constraints.py` implement them; `core.py`
@@ -93,6 +119,7 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/models.py` | The DDL, the typed-columns / JSONB split, the composite FK |
 | `hopai/ingest.py` | The two row spellings, edge-by-property references, merge semantics |
 | `hopai/constraints.py` | What each constraint compiles to, and the SQL semantics that surprise people |
+| `hopai/vectors.py` | Why no pgvector, the storage and cost model, cosine-only, multivector semantics, and why vectors never pass through a tool schema |
 | `hopai/schema.py` | The graph-schema notations, the annotation mapping, what enforcement compiles to and the endpoint-type limit |
 | `hopai/cypher.py` | The translatable subset — read, write and aggregate — and why each refusal is a refusal |
 | `tests/conftest.py` | The fixture graph's shape |
