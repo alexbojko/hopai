@@ -48,10 +48,22 @@ set plugs into the walk.
   per-graph scoped CHECK (`scope_check`), which is what lets two graphs give one shared
   column different dimensionality — the reason the column is `real[]` and not a typed
   `vector(d)`.
-- Similarity is exact cosine as a correlated `unnest`+`sum` scalar subquery. The query
-  vector's norm is precomputed in Python (one `sqrt` in the SQL, not two), and the
-  products are cast to float8 **before** summing — `sum(real)` accumulates in float4
-  and drifts over embedding-length arrays. Both facts are pinned by shape tests.
+- Similarity is exact cosine as an `unnest`+`sum` **LATERAL**, one per field. LATERAL
+  rather than a correlated scalar subquery is a measurement: a scalar subquery gets
+  pulled up and re-evaluated at every site the outer query names it (filter, score,
+  `ORDER BY`), which cost 2× for identical results. It also makes the value readable as
+  a column, which is what the missing/wrong-length guards need. The query vector's norm
+  is precomputed in Python (one `sqrt` in the SQL, not two), and the products are cast
+  to float8 **before** summing — `sum(real)` accumulates in float4 and drifts over
+  embedding-length arrays. All pinned by shape tests.
+- A similarity is NULL — read everywhere as "missing" — when the stored vector is NULL,
+  all zeros, or **not the declared length**. That last one is not defensive noise:
+  `unnest(a, b)` pads the shorter array with NULLs, so a mis-sized vector would
+  otherwise score a confident cosine over the shared prefix.
+- The dimension CHECK's name carries a `_graph_token` (schema.py's, reused) rather than
+  a slugged graph suffix. Independent truncation of base and suffix let two graphs share
+  one constraint — silently disabling one graph's enforcement and letting its
+  `drop_vectors()` remove the other's.
 - `ranked_ids()` is the one shape behind `Start(near=)` and `Hop(near=)`: an inner
   select computing labeled per-field similarities over deduplicated candidates, an
   outer select filtering/ordering/limiting. In `_walk_matches` it simply **becomes**

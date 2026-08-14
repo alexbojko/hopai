@@ -23,28 +23,30 @@ run -- no pgvector, no extension, no approximate index.
 WHY NOT PGVECTOR: this library's first rule is that Postgres and
 SQLAlchemy are the whole stack -- a feature needing an extension is the
 wrong feature, however popular the extension. So a vector field is an
-ordinary `real[]` column and similarity is computed by Postgres itself:
+ordinary `real[]` column and similarity is computed by Postgres itself,
+once per candidate row, as a LATERAL:
 
-    (SELECT sum(x*y) / nullif(sqrt(sum(x*x)) * <query norm>, 0)
-     FROM unnest(vec_summary, :query) AS t(x, y))
+    FROM nodes JOIN LATERAL (
+        SELECT sum(x*y) / nullif(sqrt(sum(x*x)) * <query norm>, 0) AS s
+        FROM unnest(vec_summary, :query) AS t(x, y)) AS near_0 ON true
 
 That is EXACT cosine similarity over every candidate row -- no index
 can serve an exact ORDER BY similarity, so none is created and none is
 pretended. The cost model, measured rather than hoped
 (benchmarks/bench_vectors.py; Postgres 16, one core): the executor
-pays roughly a quarter of a microsecond per vector element, so one
-candidate costs about dimensions x 0.25us -- ~0.1ms per 384-dim row,
-~0.4ms per 1536-dim row, and an unfiltered scan of 20,000 384-dim
-vectors lands around two seconds. "Candidates" is what is left AFTER
-the `where=` filter and the graph discriminator, both served by the
-existing indexes -- and because the search is exact, filtering costs
-nothing extra: the filtered-vector-search that approximate indexes
-struggle with (filter first, rank the survivors) is simply how every
-search here runs. A few thousand filtered candidates answer
-interactively; tens of thousands per query is the practical ceiling.
-Past it, this feature is the wrong tool: the columns are ordinary
-Postgres columns, and a manual `ALTER TABLE ... USING vec_x::vector(d)`
-moves them to pgvector without this library's involvement.
+pays roughly 0.13 microseconds per vector element, so one candidate
+costs about dimensions x 0.13us -- ~0.05ms per 384-dim row, ~0.2ms per
+1536-dim row, and an unfiltered scan of 20,000 384-dim vectors lands
+near one second. "Candidates" is what is left AFTER the `where=`
+filter and the graph discriminator, both served by the existing
+indexes -- and because the search is exact, filtering costs nothing
+extra: the filtered-vector-search that approximate indexes struggle
+with (filter first, rank the survivors) is simply how every search
+here runs. A few thousand filtered candidates answer interactively;
+tens of thousands per query is the practical ceiling. Past it, this
+feature is the wrong tool: the columns are ordinary Postgres columns,
+and a manual `ALTER TABLE ... USING vec_x::vector(d)` moves them to
+pgvector without this library's involvement.
 
 WHY THESE STORAGE CHOICES, each visible in the DDL:
 
@@ -108,20 +110,21 @@ row whose id does not exist fails the whole call by name.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from sqlalchemy import (
-    Column, and_, cast, column as sa_column, func, literal, or_, select, text,
+    Column, and_, case, cast, column as sa_column, func, literal, or_, select, text,
     update, values,
 )
 from sqlalchemy import String as SAString
 from sqlalchemy.dialects.postgresql import ARRAY, DOUBLE_PRECISION, REAL
 from sqlalchemy.exc import IntegrityError
 
-from .constraints import ConstraintViolation, _auto_name, _literal, _Target
+from .constraints import ConstraintViolation, _literal, _slug, _Target
 from .filters import resolve
 
 #: Every vector field lives in a real column named after itself with
@@ -313,6 +316,22 @@ def build_registry(nodes, edges) -> dict:
     return registry
 
 
+def _attach(table, column_name: str):
+    """The vec_* column as SQLAlchemy metadata, adding it if this
+    handle never declared it.
+
+    drop_vectors() accepts bare field names and probes the catalog
+    rather than the registry -- deliberately, since a fresh handle
+    (in_graph(), or a teardown script that never declares anything)
+    legitimately has no declaration for a column that exists in the
+    database. Without this the UPDATE fails to compile with
+    "Unconsumed column names", which names nothing the caller can act
+    on."""
+    if column_name not in table.c:
+        table.append_column(Column(column_name, ARRAY(REAL), nullable=True))
+    return table.c[column_name]
+
+
 def attach_columns(graph) -> None:
     """Make the declared columns visible to SQLAlchemy so queries can
     reference them. Table metadata is shared between Graph handles on
@@ -320,8 +339,7 @@ def attach_columns(graph) -> None:
     behavior on its own -- every use is gated on this handle's registry."""
     for target, table in (("nodes", graph.nodes_tbl), ("edges", graph.edges_tbl)):
         for field in graph._vectors[target].values():
-            if field.column_name not in table.c:
-                table.append_column(Column(field.column_name, ARRAY(REAL), nullable=True))
+            _attach(table, field.column_name)
 
 
 def _defined(graph, target: str, caller: str) -> dict:
@@ -386,17 +404,34 @@ def validate_nears(graph, target: str, near, k, caller: str) -> list:
 # Similarity as SQL
 # ---------------------------------------------------------------------
 
-def _similarity(table, near: Near):
+def _similarity(table, near: Near, index: int):
     """Exact cosine similarity of one row's stored vector against the
-    query, as a correlated scalar subquery.
+    query, as a LATERAL join yielding one column.
+
+    LATERAL, not a correlated scalar subquery, and that is a
+    measurement rather than a preference: a scalar subquery sitting in
+    a plain sub-SELECT gets pulled up by the planner and re-evaluated
+    at EVERY place the outer query names it -- the filter, the score,
+    the ORDER BY -- so the expensive unnest ran twice per candidate
+    (three times with min_similarity), for identical results. A LATERAL
+    is computed once per row and referenced as an ordinary column;
+    measured at 1.9-2.2x faster on 4k x 384-dim, and it is what lets
+    the guards below read the value at all.
 
     The query vector's own norm is a Python constant, so only the dot
-    product and the STORED vector's norm are computed per row -- one
-    unnest pass instead of paying a third of the work to recompute a
-    number that never changes. The float8 casts are load-bearing:
-    sum(real) accumulates in float4 and drifts over long vectors.
-    NULL when the stored vector is NULL or all zeros (no direction),
-    which downstream treats as "missing"."""
+    product and the STORED vector's norm are computed per row. The
+    float8 casts are load-bearing: sum(real) accumulates in float4 and
+    drifts over long vectors.
+
+    NULL -- which every caller reads as "missing" -- when the stored
+    vector is NULL, all zeros (no direction), or NOT THE DECLARED
+    LENGTH. That last guard is not paranoia: unnest(a, b) pads the
+    shorter array with NULLs and sum() skips them, so a stored vector
+    of the wrong size would otherwise score a confident cosine over
+    whatever prefix the two share -- a silently wrong answer, which is
+    the worst thing this library can produce. It is reachable whenever
+    a field's declared dimensions and its stored rows disagree (a
+    redefinition not yet re-migrated, say)."""
     column = table.c[VECTOR_COLUMN_PREFIX + near.field]
     zipped = func.unnest(
         column, literal(list(near.vector), type_=ARRAY(REAL))
@@ -404,39 +439,72 @@ def _similarity(table, near: Near):
     x = cast(zipped.c.x, DOUBLE_PRECISION)
     y = cast(zipped.c.y, DOUBLE_PRECISION)
     stored_norm = func.sqrt(func.sum(x * x))
-    denominator = func.nullif(stored_norm * literal(_norm(near.vector)), 0.0,
-                              type_=DOUBLE_PRECISION)
-    return (
-        select(func.sum(x * y) / denominator)
-        .select_from(zipped)
-        .correlate(table)
-        .scalar_subquery()
+    # type_ is not decoration: without it SQLAlchemy types nullif() as
+    # NUMERIC, and a float8 numerator over a numeric denominator is
+    # numeric division -- slower, and a different arithmetic than the
+    # float8 the rest of this expression is careful to stay in.
+    denominator = func.nullif(
+        stored_norm * literal(_norm(near.vector), type_=DOUBLE_PRECISION),
+        literal(0.0, type_=DOUBLE_PRECISION),
+        type_=DOUBLE_PRECISION,
     )
+    comparable = func.array_length(column, 1) == len(near.vector)
+    # No else_: a CASE with no ELSE is NULL, which is the "missing"
+    # every caller already reads. Spelling it literal(None) makes
+    # SQLAlchemy warn about rendering NULL as a bound parameter.
+    body = select(
+        case((comparable, func.sum(x * y) / denominator)).label("s")
+    ).select_from(zipped)
+    return body.lateral(f"near_{index}")
 
 
-def _sim_columns(table, nears: list) -> list:
-    """One labeled per-field similarity column each -- coalesced to 0
-    for missing="zero", so a threshold and the combined score read the
-    same number for the same row."""
-    columns = []
+def _with_laterals(from_obj, laterals: list):
+    """Attach the per-field LATERALs to a FROM clause.
+
+    An explicit `JOIN LATERAL (...) ON true` rather than the comma
+    form: they mean the same thing to Postgres, but SQLAlchemy reads a
+    comma with no ON clause as an accidental cartesian product and
+    warns on every single search -- a warning that is wrong here (a
+    LATERAL is correlated by construction) and would teach readers to
+    ignore the ones that are right."""
+    for lateral in laterals:
+        from_obj = from_obj.join(lateral, literal(True))
+    return from_obj
+
+
+def _similarity_terms(table, nears: list) -> tuple:
+    """(laterals, labeled columns, candidate guards) for one query.
+
+    Each field is computed once, in a LATERAL; `sim_i` is that value,
+    coalesced to 0 for missing="zero" so a threshold and the combined
+    score read the same number for the same row."""
+    laterals, columns, guards, has_direction = [], [], [], []
     for i, near in enumerate(nears):
-        sim = _similarity(table, near)
-        if near.missing == "zero":
-            sim = func.coalesce(sim, 0.0)
-        columns.append(sim.label(f"sim_{i}"))
-    return columns
+        lateral = _similarity(table, near, i)
+        laterals.append(lateral)
+        has_direction.append(lateral.c.s.isnot(None))
+        value = func.coalesce(lateral.c.s, 0.0) if near.missing == "zero" else lateral.c.s
+        columns.append(value.label(f"sim_{i}"))
 
-
-def _presence_guards(table, nears: list) -> list:
-    """Which rows are candidates at all. A missing="exclude" field's
-    rows are dropped before any similarity is computed; when EVERY
-    field says "zero", a row with no vectors at all would score a
-    meaningless 0, so at least one vector must be present."""
-    guards = [table.c[VECTOR_COLUMN_PREFIX + one.field].isnot(None)
-              for one in nears if one.missing == "exclude"]
-    if not guards:
-        guards = [or_(*(table.c[VECTOR_COLUMN_PREFIX + one.field].isnot(None) for one in nears))]
-    return guards
+    # A cheap prefilter, so rows carrying no vector at all never reach
+    # the arithmetic. It is an optimization, NOT the correctness
+    # boundary -- a present-but-directionless vector passes it, and is
+    # caught by the NULL similarity downstream.
+    present = [table.c[VECTOR_COLUMN_PREFIX + one.field].isnot(None)
+               for one in nears if one.missing == "exclude"]
+    if present:
+        guards.extend(present)
+    else:
+        # Every field says "zero", so nothing NULLs the combined score
+        # and the row must be shown to have at least one usable vector
+        # here. `IS NOT NULL` on the columns is not enough: an all-zero
+        # or wrong-length vector is present and still means "missing",
+        # and such a row would otherwise rank at a meaningless 0 --
+        # above a row whose real vector points the other way.
+        guards.append(or_(*(table.c[VECTOR_COLUMN_PREFIX + one.field].isnot(None)
+                            for one in nears)))
+        guards.append(or_(*has_direction))
+    return laterals, columns, guards
 
 
 def _combined(inner, nears: list):
@@ -459,20 +527,23 @@ def ranked_ids(graph, table, id_expr, from_obj, condition, nears: list, k: Optio
     already lives in from_obj's join) -- this function only adds the
     similarity layer."""
     conditions = [] if condition is None else [condition]
+    laterals, columns, guards = _similarity_terms(table, nears)
     inner = (
-        select(id_expr.label("node_id"), *_sim_columns(table, nears))
-        .select_from(from_obj)
-        .where(*conditions, *_presence_guards(table, nears))
+        select(id_expr.label("node_id"), *columns)
+        .select_from(_with_laterals(from_obj, laterals))
+        .where(*conditions, *guards)
         .subquery()
     )
-    query = select(inner.c.node_id).where(*_thresholds(inner, nears))
+    combined = _combined(inner, nears)
+    # `combined IS NOT NULL` belongs to BOTH shapes, not just the
+    # ranked one: it is what drops a row whose exclude-mode vector has
+    # no direction. Inside `if k is not None` it meant one set of Near
+    # specs matched different rows depending on whether k was passed --
+    # a threshold-only query kept rows that the same query with k
+    # correctly rejected.
+    query = select(inner.c.node_id).where(combined.isnot(None), *_thresholds(inner, nears))
     if k is not None:
-        combined = _combined(inner, nears)
-        query = (
-            query.where(combined.isnot(None))
-            .order_by(combined.desc(), inner.c.node_id)
-            .limit(k)
-        )
+        query = query.order_by(combined.desc(), inner.c.node_id).limit(k)
     return query
 
 
@@ -490,11 +561,11 @@ def build_search_query(graph, near, target: str = "nodes", k: int = 10, where: A
         identity.append(getattr(table.c, graph.edge_start_col).label("_start"))
         identity.append(getattr(table.c, graph.edge_end_col).label("_end"))
 
+    laterals, sim_columns, guards = _similarity_terms(table, nears)
     inner = (
-        select(*identity, table.c.properties.label("properties"), *_sim_columns(table, nears))
-        .select_from(table)
-        .where(and_(graph._scoped(table), resolve(table.c.properties, where),
-                    *_presence_guards(table, nears)))
+        select(*identity, table.c.properties.label("properties"), *sim_columns)
+        .select_from(_with_laterals(table, laterals))
+        .where(and_(graph._scoped(table), resolve(table.c.properties, where), *guards))
         .subquery()
     )
     combined = _combined(inner, nears)
@@ -542,7 +613,41 @@ def _target_for(graph, target_name: str) -> _Target:
 
 
 def _constraint_name(target: _Target, field: Vector) -> str:
-    return target.scope_name(_auto_name("ck_vec_dims", target, [field.name]))
+    """The dimension CHECK's name: unique per (graph, table, field),
+    deterministic, and within Postgres's 63-character limit.
+
+    NOT _auto_name() + scope_name(), which is what this used to be and
+    which collides two different ways -- both silent, both producing
+    wrong answers rather than errors:
+
+      - Each truncates to 63 INDEPENDENTLY, so once the base name fills
+        the budget the graph suffix is cut off entirely and every graph
+        shares one constraint. The second graph's migrate_vectors()
+        then finds the first graph's constraint, matches the dimension
+        regex, and reports success having added nothing -- so that
+        graph accepts any dimensionality, and unnest() pads the short
+        side with NULLs into a confident wrong score. Worse,
+        drop_vectors() in one graph drops the other graph's constraint.
+        Vector() cannot catch this itself: it validates the 59-char
+        COLUMN budget, while the constraint budget depends on the table
+        name and the graph, neither of which it knows.
+      - _slug'd names contain '_', so field 'v_b' in graph 'a' and
+        field 'v' in graph 'b_a' produce one name with no truncation at
+        all. schema.py hit this exact ambiguity and answered it with
+        _graph_token, a fixed-charset token carrying no '_'; reusing it
+        keeps one answer in the codebase instead of two.
+    """
+    from .schema import _graph_token
+
+    token = _graph_token(target.graph)
+    name = f"ck_vec_dims_{token}_{target.table.name}_{_slug(field.name)}"
+    if len(name) <= 63:
+        return name
+    # Too long to stay readable: the tail becomes a digest of exactly
+    # the parts that would otherwise be cut, so distinctness survives.
+    digest = hashlib.sha256(
+        f"{target.graph}\0{target.table.name}\0{field.name}".encode()).hexdigest()[:12]
+    return f"{name[:50]}_{digest}"
 
 
 def _dims_check_body(target: _Target, field: Vector) -> str:
@@ -676,7 +781,7 @@ def drop_vectors(graph, nodes=None, edges=None) -> list:
                     "table": table.name, "column": field.column_name, "schema": table.schema,
                 }).scalar()
                 if exists is not None:
-                    column = sa_column(field.column_name)
+                    column = _attach(table, field.column_name)
                     connection.execute(
                         update(table)
                         .where(graph._scoped(table), column.isnot(None))

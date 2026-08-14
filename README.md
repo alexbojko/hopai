@@ -531,9 +531,9 @@ graph.aggregate(Start(near=Near("summary", q), k=100),
 
 Two honest limits, both documented in depth in `hopai/vectors.py`: the
 search is an exact scan, so its cost is linear in the candidates left
-after filtering — measured at roughly dimensions × 0.25 µs per
-candidate row (≈0.4 ms per 1536-dim vector; an unfiltered 20k × 384-dim
-scan lands around two seconds — `benchmarks/bench_vectors.py` has the
+after filtering — measured at roughly dimensions × 0.13 µs per
+candidate row (≈0.2 ms per 1536-dim vector; an unfiltered 20k × 384-dim
+scan lands near one second — `benchmarks/bench_vectors.py` has the
 numbers), which makes a few thousand filtered candidates interactive
 and unfiltered hundreds of thousands the wrong tool. And there is
 deliberately **no LLM tool schema** for it, because a model asked to

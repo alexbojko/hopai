@@ -116,7 +116,7 @@ class TestVectorDDL:
         # EXTERNAL skips TOAST compression: float noise does not
         # compress, and decompressing every row would tax every scan.
         assert 'ALTER TABLE "nodes" ALTER COLUMN "vec_summary" SET STORAGE EXTERNAL' in ddl
-        checks = [s for s in ddl if "ck_vec_dims_nodes_summary" in s]
+        checks = [s for s in ddl if "ck_vec_dims_default_nodes_summary" in s]
         assert len(checks) == 1
         assert "array_ndims(vec_summary) = 1" in checks[0]
         assert "array_length(vec_summary, 1) = 3" in checks[0]
@@ -130,13 +130,47 @@ class TestVectorDDL:
 
     def test_non_default_graph_gets_its_own_constraint_name(self, vg):
         """Two graphs declaring the same field need two constraints --
-        same rule as scope_name() everywhere else."""
+        same rule as scope_name() everywhere else. The graph token sits
+        right after the prefix, mirroring schema.py's ck_schema_*."""
         other = vg.in_graph("team_a")
         other.define_vectors(nodes=[Vector("summary", 5)])
         checks = [s for s in other.vector_ddl() if "ADD CONSTRAINT" in s]
-        assert "ck_vec_dims_nodes_summary_team_a" in checks[0]
+        default = [s for s in vg.vector_ddl() if "ADD CONSTRAINT" in s][0]
+        assert "ck_vec_dims_default_nodes_summary" in default
+        assert "ck_vec_dims_default_nodes_summary" not in checks[0]
         assert "graph_id != 'team_a'" in checks[0]
         assert "array_length(vec_summary, 1) = 5" in checks[0]
+
+    @pytest.mark.parametrize("graph_a,field_a,graph_b,field_b", [
+        # Long enough that the old name filled the 63-char budget and
+        # the graph suffix was truncated away entirely -- so BOTH graphs
+        # got one constraint. The second migrate_vectors() then found
+        # the first graph's constraint, matched the dimension regex, and
+        # reported success having added nothing: that graph accepted any
+        # dimensionality, and drop_vectors() in one graph removed the
+        # other's check. Vector() cannot catch this -- it validates the
+        # column budget, which knows nothing of the table or graph name.
+        ("tenant_one", "s" * 46, "tenant_two", "s" * 46),
+        # No truncation needed: _slug'd names carry '_', so 'v_b' in
+        # graph 'a' and 'v' in graph 'b_a' used to produce one string.
+        ("a", "v_b", "b_a", "v"),
+    ])
+    def test_field_and_graph_can_never_share_a_constraint_name(
+            self, vg, graph_a, field_a, graph_b, field_b):
+        import re
+
+        def name_for(graph, field):
+            handle = vg.in_graph(graph)
+            handle.define_vectors(nodes=[Vector(field, 3)])
+            ddl = [s for s in handle.vector_ddl() if "ADD CONSTRAINT" in s][0]
+            return re.search(r'ADD CONSTRAINT "([^"]+)"', ddl).group(1)
+
+        first, second = name_for(graph_a, field_a), name_for(graph_b, field_b)
+        assert first != second
+        assert len(first) <= 63 and len(second) <= 63
+        # Deterministic, or a re-run of migrate_vectors() would add a
+        # second constraint instead of being a no-op.
+        assert name_for(graph_a, field_a) == first
 
     def test_custom_tables_without_discriminator_have_no_guard(self):
         from sqlalchemy import BigInteger, Column, MetaData, Table
@@ -606,7 +640,7 @@ class TestVectorMigrationLive:
                 "SELECT conname FROM pg_constraint "
                 "WHERE conrelid = CAST('nodes' AS regclass) AND contype = 'c'"
             ))}
-        assert "ck_vec_dims_nodes_docvec" in names
+        assert "ck_vec_dims_default_nodes_docvec" in names
 
     def test_wrong_dimensions_are_rejected_by_the_server_too(self, fresh_graph):
         """The CHECK is what protects writes that bypass this library
@@ -614,7 +648,7 @@ class TestVectorMigrationLive:
         constraints instead of Python validation."""
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": 1, "type": "doc"}])
-        with pytest.raises(Exception, match="ck_vec_dims_nodes_docvec"), \
+        with pytest.raises(Exception, match="ck_vec_dims_default_nodes_docvec"), \
                 g.engine.begin() as conn:
             conn.execute(text(
                 "UPDATE nodes SET vec_docvec = '{1,2}' WHERE id = 1"))
@@ -657,7 +691,7 @@ class TestVectorMigrationLive:
         g.add_nodes([{"id": 1, "type": "doc"}])
         with g.engine.begin() as conn:
             conn.execute(text(
-                'ALTER TABLE nodes DROP CONSTRAINT "ck_vec_dims_nodes_docvec"'))
+                'ALTER TABLE nodes DROP CONSTRAINT "ck_vec_dims_default_nodes_docvec"'))
             conn.execute(text("UPDATE nodes SET vec_docvec = '{1,2}' WHERE id = 1"))
         with pytest.raises(ConstraintViolation, match="drop_vectors"):
             g.migrate_vectors()
@@ -665,7 +699,10 @@ class TestVectorMigrationLive:
     def test_two_graphs_may_give_one_field_different_dimensions(self, fresh_graph):
         """The reason vectors are real[] plus a scoped CHECK instead of
         a typed vector(d) column: per-graph dimensionality on shared
-        tables. Each graph's rule binds only its own rows."""
+        tables. Each graph's rule binds only its own rows -- so BOTH
+        constraints must exist under distinct names, and each must
+        reject the other's size. Asserting only that 'some constraint
+        fired' would pass while the two graphs shared one check."""
         a = _migrated(fresh_graph)
         b = fresh_graph.in_graph("other")
         b.define_vectors(nodes=[Vector("docvec", 2)])
@@ -674,10 +711,20 @@ class TestVectorMigrationLive:
         b.add_nodes([{"id": 2, "t": "b"}])
         assert a.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 2.0, 3.0]}]) == 1
         assert b.set_vectors(nodes=[{"id": 2, "docvec": [1.0, 2.0]}]) == 1
-        with pytest.raises(Exception, match="ck_vec_dims_nodes_docvec_other"), \
-                fresh_graph.engine.begin() as conn:
-            conn.execute(text(
-                "UPDATE nodes SET vec_docvec = '{1,2,3}' WHERE id = 2"))
+
+        with fresh_graph.engine.connect() as conn:
+            names = sorted(row[0] for row in conn.execute(text(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid = CAST('nodes' AS regclass) AND contype = 'c' "
+                "AND conname LIKE 'ck\\_vec\\_dims\\_%docvec' ESCAPE '\\'")))
+        assert len(names) == 2, f"one constraint is serving both graphs: {names}"
+
+        # Each graph rejects the OTHER graph's dimensionality.
+        for row_id, bad in ((2, "{1,2,3}"), (1, "{1,2}")):
+            with pytest.raises(Exception, match="ck_vec_dims_"), \
+                    fresh_graph.engine.begin() as conn:
+                conn.execute(text(
+                    f"UPDATE nodes SET vec_docvec = '{bad}' WHERE id = {row_id}"))
 
 
 # ---------------------------------------------------------------------
@@ -846,6 +893,60 @@ class TestVectorSearchLive:
         hits = g.vector_search(Near("docvec", QUERY, min_similarity=0.99), k=10)
         assert [h["id"] for h in hits] == ["1", "7"]
 
+    def test_wrong_length_stored_vector_never_scores_a_prefix_cosine(self, fresh_graph):
+        """unnest(a, b) pads the shorter array with NULLs and sum()
+        skips them, so a stored vector of the wrong size would score a
+        confident cosine over the prefix the two happen to share --
+        1.0 for a 4-of-8 match. Reachable whenever declared dimensions
+        and stored rows disagree, which redefining a field without
+        re-migrating does. It must read as missing, not as similar."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "n": "short"}, {"id": 2, "n": "right"}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 2, "docvec": [0.6, 0.8, 0.0]}])
+        # Redefine to 6 dims WITHOUT re-migrating: node 1's stored 3-dim
+        # vector is now a perfect match on the shared prefix.
+        g.define_vectors(nodes=[Vector("docvec", 6)])
+        hits = g.vector_search(Near("docvec", [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]), k=10)
+        assert hits == []
+
+    def test_zero_mode_excludes_a_row_whose_only_vector_has_no_direction(self, fresh_graph):
+        """With every field in missing="zero" nothing NULLs the combined
+        score, so an all-zero vector -- which the module defines as
+        missing -- would rank at 0, ABOVE a row whose real vector points
+        the other way. Presence of a column is not presence of a
+        direction."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "n": "directionless"}, {"id": 2, "n": "opposite"},
+                     {"id": 3, "n": "aligned"}])
+        g.set_vectors(nodes=[
+            {"id": 1, "docvec": [0.0, 0.0, 0.0]},
+            {"id": 2, "titlevec": [-1.0, 0.0, 0.0]},
+            {"id": 3, "docvec": [1.0, 0.0, 0.0], "titlevec": [1.0, 0.0, 0.0]},
+        ])
+        hits = g.vector_search(Near("docvec", QUERY, missing="zero"),
+                               Near("titlevec", QUERY, missing="zero"), k=10)
+        assert [h["id"] for h in hits] == ["3", "2"]
+
+    def test_threshold_only_and_k_agree_on_membership(self, fresh_graph):
+        """The same Near specs must match the same rows whether or not
+        k is set. `combined IS NOT NULL` used to live inside the k
+        branch, so a threshold-only traversal kept a row whose
+        exclude-mode vector had no direction -- one the identical search
+        with k correctly rejected."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "n": "directionless-doc"}, {"id": 2, "n": "good"}])
+        g.set_vectors(nodes=[
+            {"id": 1, "docvec": [0.0, 0.0, 0.0], "titlevec": [1.0, 0.0, 0.0]},
+            {"id": 2, "docvec": [1.0, 0.0, 0.0], "titlevec": [1.0, 0.0, 0.0]},
+        ])
+        nears = [Near("docvec", QUERY), Near("titlevec", QUERY, min_similarity=0.5)]
+        with_k = {h["id"] for h in g.vector_search(*nears, k=10)}
+        result = g.traverse(Start(near=nears), Hop(optional=True))
+        threshold_only = {n["id"] for n in result.nodes}
+        assert with_k == {"2"}
+        assert threshold_only == with_k
+
     def test_stored_zero_vector_ranks_as_missing(self, fresh_graph):
         """A zero vector has no direction; NULL-ing its similarity and
         excluding it beats a division error mid-statement."""
@@ -986,7 +1087,7 @@ class TestDropVectorsLive:
                 "SELECT conname FROM pg_constraint "
                 "WHERE conrelid = CAST('nodes' AS regclass) AND contype = 'c'"))}
         assert remaining == 0
-        assert "ck_vec_dims_nodes_docvec" not in names
+        assert "ck_vec_dims_default_nodes_docvec" not in names
         assert "docvec" not in g.vectors["nodes"]
 
     def test_drop_leaves_other_graphs_vectors_alone(self, fresh_graph):
@@ -1005,6 +1106,35 @@ class TestDropVectorsLive:
 
     def test_drop_of_a_never_migrated_field_is_ignored(self, fresh_graph):
         assert fresh_graph.drop_vectors(nodes=["ghost"]) == ["ghost"]
+
+    def test_drop_works_on_a_handle_that_never_declared_the_field(self, fresh_graph):
+        """drop_vectors() takes bare names and probes the catalog, not
+        the registry -- so a teardown script, or any fresh in_graph()
+        handle, is a supported caller. It used to fail to compile
+        ("Unconsumed column names") whenever define_vectors() had not
+        attached the column to the table metadata in this process."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "t": "doc"}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]}])
+
+        # Its own Table objects, so the vec_* column is genuinely absent
+        # from the metadata -- the state a fresh process starts in,
+        # which the shared module-level tables would otherwise hide.
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        md = MetaData()
+        n = Table("nodes", md, Column("id", BigInteger, primary_key=True),
+                  Column("graph_id", Text), Column("properties", JSONB))
+        e = Table("edges", md, Column("id", BigInteger, primary_key=True),
+                  Column("graph_id", Text), Column("start_id", BigInteger),
+                  Column("end_id", BigInteger), Column("properties", JSONB))
+        undeclared = Graph(fresh_graph.engine, node_table=n, edge_table=e)
+        assert "vec_docvec" not in undeclared.nodes_tbl.c
+        assert undeclared.drop_vectors(nodes=["docvec"]) == ["docvec"]
+        with fresh_graph.engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT count(*) FROM nodes WHERE vec_docvec IS NOT NULL")).scalar() == 0
 
 
 # ---------------------------------------------------------------------
