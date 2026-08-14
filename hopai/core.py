@@ -133,6 +133,7 @@ class Graph:
         self.edge_start_col = edge_start_col
         self.edge_end_col = edge_end_col
         self.graph_col = graph_col
+        self._schema = None
         if graph_col is not None:
             for table in (self.nodes_tbl, self.edges_tbl):
                 if graph_col not in table.c:
@@ -151,7 +152,11 @@ class Graph:
         """The same tables and engine, scoped to a different graph.
 
         `Graph` is a cheap handle, so this is how you move between graphs
-        rather than building a second engine and pool for each."""
+        rather than building a second engine and pool for each.
+
+        The new handle starts with NO schema -- a different graph is
+        allowed a different shape, so a schema never travels implicitly;
+        call define_schema() on the new handle if it has one."""
         return Graph(self.engine, graph=graph, node_table=self.nodes_tbl,
                      edge_table=self.edges_tbl, node_id_col=self.node_id_col,
                      edge_id_col=self.edge_id_col, edge_start_col=self.edge_start_col,
@@ -478,6 +483,112 @@ class Graph:
                             f'ALTER TABLE {target.qualified} DROP CONSTRAINT IF EXISTS "{name}"'))
                     dropped.append(name)
         return dropped
+
+    # -- graph schema ---------------------------------------------------
+
+    def define_schema(self, nodes: Optional[list] = None, edges: Optional[list] = None):
+        """Declare the shape of this graph: node types, their
+        properties, and which edge kinds connect which node types.
+        Entries are NodeType/EdgeType primitives or plain
+        dataclass/pydantic classes -- see hopai/schema.py for both
+        notations and the annotation mapping.
+
+        In memory only: nothing touches the database until
+        enforce_schema(). Calling this again replaces the schema.
+        Returns the normalized GraphSchema."""
+        from .schema import build_schema
+        self._schema = build_schema(nodes, edges)
+        return self._schema
+
+    @property
+    def schema(self):
+        """The declared schema as canonical dataclasses, or None when
+        define_schema() has not been called on this handle -- that is
+        the existence check."""
+        return self._schema
+
+    @property
+    def schema_json(self) -> dict:
+        """The schema in JSON Schema vocabulary, json.dumps-clean --
+        made to be pasted into a system prompt or a tool result."""
+        return self._defined_schema("schema_json").to_json()
+
+    @property
+    def schema_networkx(self):
+        """The schema as an nx.MultiDiGraph meta-graph: node types as
+        nodes, edge kinds as edges. Needs the networkx extra."""
+        return self._defined_schema("schema_networkx").to_networkx()
+
+    @property
+    def schema_pydantic(self) -> dict:
+        """Generated pydantic models, one per node type and edge kind.
+        Needs pydantic v2 -- pip install hopai[pydantic]."""
+        return self._defined_schema("schema_pydantic").to_pydantic()
+
+    def _defined_schema(self, wanted: str):
+        if self._schema is None:
+            raise ValueError(
+                f"{wanted} needs a schema and none is defined for this Graph -- "
+                f"call define_schema(...) first"
+            )
+        return self._schema
+
+    def _schema_targets(self) -> tuple:
+        from .constraints import _Target
+        return (_Target(self.nodes_tbl, "nodes", self.graph, self.graph_col),
+                _Target(self.edges_tbl, "edges", self.graph, self.graph_col))
+
+    def schema_ddl(self) -> list:
+        """The exact SQL enforce_schema() would run, without running it.
+        For review, for a migration file, or for showing an agent what
+        it is about to change -- the same contract as constraint_ddl()."""
+        from .schema import compile_edge_constraints, compile_node_constraints
+        schema = self._defined_schema("schema_ddl()")
+        node_target, edge_target = self._schema_targets()
+        return [ddl for _, ddl in (compile_node_constraints(schema, node_target)
+                                   + compile_edge_constraints(schema, edge_target))]
+
+    def enforce_schema(self) -> list:
+        """Compile the declared schema to Postgres CHECK constraints, so
+        EVERY write path is validated by the server -- add_nodes, merge,
+        Cypher CREATE/MERGE, even SQL from another service -- and a
+        violation surfaces as ConstraintViolation.
+
+        A separate, explicit step rather than a side effect of
+        define_schema(), because ADD CONSTRAINT validates every existing
+        row -- on pre-schema data that can fail, and it should fail in a
+        call whose name says it enforces.
+
+        Idempotent, and it reconciles: a schema-derived constraint that
+        the current schema no longer produces is dropped, so re-running
+        after a schema change converges instead of accreting. Only
+        constraints this mechanism named (ck_schema_*) are ever touched
+        -- define_constraints() declarations are not its to drop.
+        Returns the constraint names now in force, in order."""
+        from .schema import (
+            SCHEMA_CHECKS, compile_edge_constraints, compile_node_constraints,
+            schema_constraint_prefixes,
+        )
+        schema = self._defined_schema("enforce_schema()")
+        node_target, edge_target = self._schema_targets()
+        groups = [(node_target, compile_node_constraints(schema, node_target)),
+                  (edge_target, compile_edge_constraints(schema, edge_target))]
+        applied = []
+        with self.engine.begin() as connection:
+            for target, pairs in groups:
+                existing = {row[0] for row in connection.execute(
+                    SCHEMA_CHECKS, {"table": target.qualified}).all()}
+                current = {name for name, _ in pairs}
+                prefixes = schema_constraint_prefixes(target)
+                for stale in sorted(n for n in existing
+                                    if n.startswith(prefixes) and n not in current):
+                    connection.execute(text(
+                        f'ALTER TABLE {target.qualified} DROP CONSTRAINT "{stale}"'))
+                for name, ddl in pairs:
+                    if name not in existing:
+                        connection.execute(text(ddl))
+                    applied.append(name)
+        return applied
 
     # -- writing --------------------------------------------------------
 

@@ -73,6 +73,18 @@ over the distinct nodes the last step matched; the same three notations:
 FOR TOOL-CALLING MODELS: TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA and
 INGEST_TOOL_SCHEMA are JSON Schemas ready to hand to a function-calling
 definition, covering reading, aggregating and writing respectively.
+
+SCHEMA -- declare the shape of the graph (node types, edge kinds, typed
+properties) as plain dataclasses or NodeType/EdgeType primitives, read
+it back as dataclasses, JSON Schema, networkx or pydantic models, and
+optionally have Postgres enforce it on every write path:
+
+    graph.define_schema(nodes=[Person, Company], edges=[WorksAt])
+    graph.schema_json        # for a system prompt or tool result
+    graph.enforce_schema()   # CHECK constraints; violations raise
+                             # ConstraintViolation
+
+See hopai/schema.py for both notations and the annotation mapping.
 """
 
 from .aggregates import Avg, Count, Max, Min, Sum, parse_aggregate
@@ -92,6 +104,7 @@ from .json_api import (
     spec_to_traversal, traverse_json,
 )
 from .models import Edge, Node
+from .schema import EdgeType, GraphSchema, NodeType, Property
 
 # The trailing annotation is load-bearing: release-please updates this
 # file with its GENERIC updater, which rewrites the version only on lines
@@ -110,6 +123,7 @@ __all__ = [
     "traverse_cypher", "cypher_to_traversal", "cypher_to_operations", "CypherError",
     "aggregate_cypher", "cypher_to_aggregation",
     "Unique", "Required", "Check", "Index", "PropertyType", "Col", "ConstraintViolation",
+    "GraphSchema", "NodeType", "EdgeType", "Property",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",
 ]
