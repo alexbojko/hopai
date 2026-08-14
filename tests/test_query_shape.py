@@ -440,6 +440,18 @@ class TestAggregateToolSchema:
 # ---------------------------------------------------------------------
 
 class TestFilterCompilation:
+    def test_an_unsupported_filter_type_is_named(self):
+        """resolve()'s catch-all must say what it got -- 'got int' is
+        what turns a wrong-type filter into an immediate fix (mutant
+        x_resolve__mutmut_81 printed NoneType instead and nothing
+        objected)."""
+        from sqlalchemy import column as sa_column
+
+        from hopai.filters import resolve
+        with pytest.raises(TypeError) as exc:
+            resolve(sa_column("properties"), 42)
+        assert "got int" in str(exc.value)
+
     def test_equality_uses_jsonb_containment(self):
         """Containment, not `->> = value`: it is indexable by the GIN
         index and it treats a missing key as false rather than null,
