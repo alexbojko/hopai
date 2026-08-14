@@ -66,10 +66,17 @@ pytest tests/ --cov=hopai --cov-report=term-missing    # coverage; CI requires >
 
 pip install -e ".[dev,mutation]"
 pytest tests/ --cov=hopai --cov-report=          # mutmut needs a .coverage file first
-mutmut run hopai/hop.py                          # one module — the usual local loop
+mutmut run "hopai.hop.*"                         # one module — the usual local loop
 mutmut results                                   # survivors
 mutmut show <mutant-id>                          # the diff of one survivor
 ```
+
+The filter is an `fnmatch` glob over dotted MUTANT names (`hopai.hop.x_foo__mutmut_1`),
+so it is spelled `"hopai.hop.*"` and never `hopai/hop.py` — a path silently matches
+nothing and mutmut aborts with "Filtered for specific mutants, but nothing matches".
+Same trap one level up: `source_paths` (and CI's narrowed rewrite of it) is a
+NEWLINE-separated ini list; a space-separated line is read as one nonexistent path and
+mutmut "succeeds" having mutated zero files.
 
 Config is `setup.cfg` (mutmut's only config surface). Two settings there exist
 because of bugs, not taste: `hopai` is in `also_copy` as well as `source_paths`
