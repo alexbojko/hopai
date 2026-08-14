@@ -378,6 +378,23 @@ class TestMinHopsEdgeCollection:
         assert ("1", "2") not in pairs   # the one-hop shortcut is not a two-hop path
 
 
+class TestHopWhereActuallyFilters:
+    def test_a_hop_filter_excludes_a_reachable_node(self, fresh_graph):
+        """Every existing hop test uses a `where` that all reachable
+        nodes happen to satisfy, so dropping the filter entirely changed
+        nothing and mutant build_query__mutmut_206 survived. Here A
+        reaches both B and C, and only B passes -- so the filter has to
+        do work for the assertion to hold."""
+        fresh_graph.ingest({
+            "nodes": [{"id": 1, "n": "a"}, {"id": 2, "n": "b", "keep": True},
+                      {"id": 3, "n": "c"}],
+            "edges": [{"start_id": 1, "end_id": 2}, {"start_id": 1, "end_id": 3}],
+        })
+        result = fresh_graph.traverse(Start(where={"n": "a"}), Hop(where={"keep": True}))
+        assert {n["properties"]["n"] for n in result.nodes} == {"a", "b"}
+        assert {(e["start_id"], e["end_id"]) for e in result.edges} == {("1", "2")}
+
+
 class TestEmptyResults:
     def test_a_traversal_with_no_edges_returns_an_empty_list(self, fresh_graph):
         """Not None. `Subgraph.edges = None` would break len(), iteration
