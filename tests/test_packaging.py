@@ -80,28 +80,25 @@ class TestReleaseConfig:
             assert isinstance(entry, str) or entry.get("type") in {
                 "json", "yaml", "toml", "xml", "generic"}, entry
 
-    def test_release_as_is_removed_once_it_has_done_its_job(self, config):
+    def test_release_as_is_gone_once_anything_has_been_released(self, config):
         """`release-as` pins EVERY release to that version until deleted.
 
-        It is here because nothing else produced 0.0.1: from a 0.0.0
-        baseline release-please proposes 0.1.0 for a feature, and neither
-        `initial-version` nor the pre-1.0 bump flags changed that (checked
-        against `release-please manifest-pr --dry-run`, which is the mode
-        the action runs).
+        It existed only to force the first release to 0.0.1, because from
+        a 0.0.0 baseline release-please proposes 0.1.0 and neither
+        `initial-version` nor the pre-1.0 bump flags changed that.
 
-        So it is allowed only while it still matches where the project
-        is: before the first release (manifest 0.0.0), and on the release
-        PR itself (manifest == release-as). The moment anything is
-        released past it, this fails -- which is the first PR where
-        leaving it in would silently re-release the same version."""
+        The rule is: the moment the manifest leaves 0.0.0, it must be
+        gone. An earlier version of this test also allowed
+        `released == pinned`, which is the exact state right after the
+        first release -- so it passed while the pipeline was pinned to
+        re-release 0.0.1 forever, which PyPI would reject."""
         pinned = config.get("release-as")
         if pinned is None:
             return
-        released = manifest_version()
-        assert released in ("0.0.0", pinned), (
-            f"release-as is pinned to {pinned} but {released} is already released; "
-            f"remove `release-as` from release-please-config.json or every future "
-            f"release will claim {pinned} again"
+        assert manifest_version() == "0.0.0", (
+            f"release-as is still pinned to {pinned} but {manifest_version()} is "
+            f"released; remove `release-as` from release-please-config.json or every "
+            f"future release will claim {pinned} again and PyPI will reject it"
         )
 
     def test_the_module_carries_the_generic_updater_annotation(self):
