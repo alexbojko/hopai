@@ -51,22 +51,46 @@ A result carries every node and edge on a matching chain:
     result.edges           # list[{"start_id": ..., "end_id": ..., "properties": {...}}]
     result.to_networkx()   # in-memory graph, if you have networkx installed
 
-FOR TOOL-CALLING MODELS: TRAVERSE_TOOL_SCHEMA and INGEST_TOOL_SCHEMA are
-JSON Schemas ready to hand to a function-calling definition, covering
-reading and writing respectively.
+AGGREGATE -- a number instead of a subgraph, computed in the database,
+over the distinct nodes the last step matched; the same three notations:
+
+    from hopai import Count, Sum, Avg, Min, Max, aggregate_json
+
+    graph.aggregate(                                    # Python
+        Start(where={"type": "person"}),
+        Hop(via={"kind": "friend"}, hops=(1, 4)),
+        aggregates={"friends": Count(), "avg_age": Avg("age")},
+    )                                                   # {"friends": 42, "avg_age": 31.5}
+    aggregate_json(graph, {                             # JSON in, JSON out
+        "start": {"where": {"type": "person"}},
+        "hops": [{"via": {"kind": "friend"}, "hops": [1, 4]}],
+        "aggregates": {"friends": {"fn": "count"}},
+    })
+    graph.cypher('''                                    # Cypher
+        MATCH (a:person)-[:friend*1..4]->(b) RETURN count(DISTINCT b)
+    ''')
+
+FOR TOOL-CALLING MODELS: TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA and
+INGEST_TOOL_SCHEMA are JSON Schemas ready to hand to a function-calling
+definition, covering reading, aggregating and writing respectively.
 """
 
+from .aggregates import Avg, Count, Max, Min, Sum, parse_aggregate
 from .constraints import (
     Check, Col, ConstraintViolation, Index, PropertyType, Required, Unique,
 )
 from .core import Graph, Subgraph
 from .cypher import (
-    CypherError, cypher_to_operations, cypher_to_traversal, traverse_cypher,
+    CypherError, aggregate_cypher, cypher_to_aggregation, cypher_to_operations,
+    cypher_to_traversal, traverse_cypher,
 )
 from .filters import AND, BETWEEN, GT, GTE, LT, LTE, NOT, OR, parse_filter
 from .hop import Hop, Start
 from .ingest import INGEST_TOOL_SCHEMA, IngestResult
-from .json_api import TRAVERSE_TOOL_SCHEMA, spec_to_traversal, traverse_json
+from .json_api import (
+    AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, aggregate_json, spec_to_aggregation,
+    spec_to_traversal, traverse_json,
+)
 from .models import Edge, Node
 
 # The trailing annotation is load-bearing: release-please updates this
@@ -80,8 +104,11 @@ __version__ = "0.0.1"  # x-release-please-version
 __all__ = [
     "Graph", "Subgraph", "Start", "Hop",
     "OR", "AND", "NOT", "GT", "GTE", "LT", "LTE", "BETWEEN", "parse_filter",
+    "Count", "Sum", "Avg", "Min", "Max", "parse_aggregate",
     "traverse_json", "spec_to_traversal", "TRAVERSE_TOOL_SCHEMA",
+    "aggregate_json", "spec_to_aggregation", "AGGREGATE_TOOL_SCHEMA",
     "traverse_cypher", "cypher_to_traversal", "cypher_to_operations", "CypherError",
+    "aggregate_cypher", "cypher_to_aggregation",
     "Unique", "Required", "Check", "Index", "PropertyType", "Col", "ConstraintViolation",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",

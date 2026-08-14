@@ -44,6 +44,11 @@ read.** When a design question comes up, these decide it, in order:
 - **`NOT` negates a containment test on purpose**, so rows *missing* the key are
   included. Naive `<> value` drops them. (`test_not_includes_missing_key`)
 - **A bare top-level list raises `TypeError`** — it reads as AND but would mean OR.
+- **Aggregates run over the LAST step's matched nodes only.** A mid-chain match includes
+  nodes with no continuation to the chain's end, so aggregating one would count nodes
+  Cypher would not — and bare `count(b)`/`sum(b.x)` with hops mean per-*path* in Cypher,
+  which hopai cannot express. `cypher.py`'s AGGREGATION docstring holds the acceptance
+  matrix; loosening a refusal into a near-enough mapping is the bug, not the fix.
 - **Every read and write goes through `Graph._scoped()`.** Forgetting the graph
   discriminator does not error; it silently touches another graph's rows.
 - **Writes are one transaction**, batching included. A half-committed write makes a
@@ -61,9 +66,11 @@ read.** When a design question comes up, these decide it, in order:
   **equivalent** (record the one-line proof; "probably fine" is not a proof), or
   **out of scope** (say so explicitly). A run reporting `0 checked`, or all `segfault`,
   is a broken harness, not a clean sweep.
-- `json_api.py` and `cypher.py` are front ends that emit `(Start, [Hop])` or ingestion
-  operations and hold no query logic. Widening a subset means adding a translation,
-  never loosening a refusal into a near-enough mapping.
+- `json_api.py` and `cypher.py` are front ends that emit `(Start, [Hop])`, an
+  aggregation triple, or ingestion operations, and hold no query logic. Widening a
+  subset means adding a translation, never loosening a refusal into a near-enough
+  mapping. The tool schemas (`TRAVERSE_TOOL_SCHEMA` / `AGGREGATE_TOOL_SCHEMA` /
+  `INGEST_TOOL_SCHEMA`) must stay in step with what the parsers accept.
 - Comments explain *why*, citing the bug or trade-off. Match that for non-obvious code;
   skip it for mechanical changes.
 - New tests join an existing `TestX` class and say what would break without the fix.

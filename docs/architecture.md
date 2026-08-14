@@ -19,6 +19,25 @@ Spanning three modules, easier as one flow than file by file:
 4. **`core.py:traverse`** — splits by `kind`, then two follow-up `SELECT`s hydrate
    properties. `elapsed_ms` times all three queries.
 
+## The aggregation path
+
+`Count`/`Sum`/`Avg`/`Min`/`Max` in `aggregates.py` mirror the filter DSL:
+`parse_aggregate()` reads the JSON form, `cypher.py`'s `RETURN` translation emits the
+same objects, and **all three front ends compile through one `resolve_aggregate()`** —
+the same single-path rule as filters.
+
+`core.py:build_aggregate_query` reuses the seed/walk/match chain via `_walk_matches`
+(shared with `build_query`, so the two can never disagree about what a traversal
+matches) and aggregates over the **final** match CTE — the last hop's distinct nodes,
+or the seed set when there are no hops. It emits none of the edge CTEs and
+`Graph.aggregate()` does no hydration, which is why an aggregate answers in a fraction
+of its traversal twin's time (see `benchmarks/`). Numeric extraction is guarded with
+`jsonb_typeof`, so a stray non-numeric value reads as NULL (ignored, like Cypher and
+PG both do) instead of aborting the whole statement.
+
+Why only the final match may be aggregated — and which Cypher spellings translate
+exactly versus refuse — is the AGGREGATION section of `hopai/cypher.py`'s docstring.
+
 ## The write path
 
 `Graph` exposes the writes; `ingest.py` and `constraints.py` implement them; `core.py`
@@ -67,10 +86,11 @@ bugs actually hit. Read the relevant one before changing behavior.
 | --- | --- |
 | `hopai/core.py` | Local paths, split queries, edge-derived nodes, last-hop-only `optional` |
 | `hopai/filters.py` | The DSL in both forms, and why `OR`/`AND`/`NOT` are explicit classes |
+| `hopai/aggregates.py` | The aggregation DSL in both forms, the three aggregation semantics, numeric edge cases |
 | `hopai/hop.py` | Why `Start` and `Hop` are separate types |
 | `hopai/models.py` | The DDL, the typed-columns / JSONB split, the composite FK |
 | `hopai/ingest.py` | The two row spellings, edge-by-property references, merge semantics |
 | `hopai/constraints.py` | What each constraint compiles to, and the SQL semantics that surprise people |
-| `hopai/cypher.py` | The translatable subset, read and write, and why each refusal is a refusal |
+| `hopai/cypher.py` | The translatable subset — read, write and aggregate — and why each refusal is a refusal |
 | `tests/conftest.py` | The fixture graph's shape |
 | `benchmarks/README.md` | Measured numbers, including where raw CTEs beat this library 2-5x |

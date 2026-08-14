@@ -53,13 +53,14 @@ quietly answers a different question. That is the same choice
 
 WHAT DOES NOT TRANSLATE, and why:
 
-  RETURN has no target.       hopai returns a subgraph -- every node and
-                              edge on a matching chain. There is no
-                              projection, aggregation, ORDER BY or LIMIT
-                              to map onto, so RETURN is parsed and
-                              ignored. Aggregates (`RETURN count(a)`)
-                              raise rather than being silently dropped,
-                              since the caller clearly wanted a number.
+  RETURN projects nothing.    hopai returns a subgraph -- every node and
+                              edge on a matching chain -- so a plain
+                              RETURN is parsed and ignored, and ORDER BY
+                              / LIMIT still refuse. The exception is an
+                              aggregating RETURN, which becomes a
+                              Graph.aggregate() call -- see AGGREGATION
+                              below for exactly which spellings, and why
+                              the rest refuse.
   Cross-variable OR.          `WHERE a.x = 1 OR b.y = 2` spans two hops'
                               filters; a Hop filter binds one node.
   Unbounded `*`.              `max_hops` drives the recursion guard, so
@@ -76,6 +77,37 @@ WHAT DOES NOT TRANSLATE, and why:
                               (recognized as a single unit, not by any
                               compositional rule) is what maps exactly
                               onto NOT({"type": "leaf"}).
+
+AGGREGATION: `RETURN count(DISTINCT b)` and friends translate to
+Graph.aggregate(), which aggregates over the distinct nodes the LAST
+step of the chain matched. Cypher, however, aggregates over result ROWS
+-- one per path -- and that difference decides everything here. Three
+semantics exist:
+
+  per matched node    each distinct node once. hopai's native result;
+                      Cypher spells it `WITH DISTINCT b RETURN avg(b.age)`,
+                      and that exact WITH form is accepted as a unit
+                      (like the null-safe negation idiom).
+  per distinct value  equal values collapse first. Cypher's
+                      `avg(DISTINCT b.age)` -- accepted, exact.
+  per path            a node reachable two ways counts twice. Cypher's
+                      bare `avg(b.age)` when hops are involved. hopai
+                      does not track path multiplicity across hops, so
+                      these REFUSE rather than quietly answering the
+                      per-node question.
+
+Consequences, each a one-line rule:
+  - `count(DISTINCT b)` is exact (the distinct nodes ARE the count).
+  - `min`/`max` are exact bare or DISTINCT -- multiplicity cannot
+    change an extremum.
+  - With no hops there are no paths to multiply, so bare `count(a)` /
+    `avg(a.age)` on a single-node pattern are exact too.
+  - Only the LAST node of the chain can be aggregated: a mid-chain
+    match may include nodes with no continuation to the chain's end,
+    which Cypher would not count. Reverse the pattern instead.
+  - Mixing aggregates with plain return items is grouping (GROUP BY),
+    which hopai does not have yet; relationship-variable aggregates and
+    collect()/stdev()/percentiles are not supported yet either.
 
 LABELS: hopai has no label concept -- a node is its JSONB properties. So
 `(a:person)` compiles to a property test, `{node_label_key: "person"}`,
@@ -265,8 +297,31 @@ class _AllRels:
     expr: Any
 
 
-_AGGREGATES = {"count", "sum", "avg", "min", "max", "collect", "stdev", "percentiledisc",
-               "percentilecont"}
+@dataclass
+class _AggItem:
+    """One aggregate in a RETURN: `avg(DISTINCT b.age) AS mean`."""
+    fn: str                  # 'count' | 'sum' | 'avg' | 'min' | 'max'
+    var: Optional[str]       # None only for count(*)
+    key: Optional[str]       # None for count(b) / count(*)
+    distinct: bool
+    alias: Optional[str]
+
+
+@dataclass
+class _ReturnClause:
+    """An aggregating RETURN, possibly prefixed by `WITH DISTINCT var`.
+    A RETURN with no aggregates never becomes a clause -- it is parsed
+    and ignored, since the subgraph is the result either way."""
+    items: list              # [_AggItem, ...], never empty
+    distinct_var: Optional[str]
+
+
+#: The aggregate functions Graph.aggregate() computes.
+_TRANSLATED_AGGREGATES = {"count", "sum", "avg", "min", "max"}
+#: Recognized as aggregation so they refuse helpfully instead of being
+#: mistaken for a projection and ignored.
+_AGGREGATES = _TRANSLATED_AGGREGATES | {"collect", "stdev", "percentiledisc",
+                                        "percentilecont"}
 _SUBGRAPH = ("hopai returns the whole subgraph of every node and edge on a matching "
              "chain, so there is nothing for this clause to act on")
 _NO_DELETE = ("hopai has no delete API yet, in Cypher or in Python -- remove rows with SQL "
@@ -275,7 +330,9 @@ _NO_DELETE = ("hopai has no delete API yet, in Cypher or in Python -- remove row
 #: Complete sentences: each is raised as-is, because "X is not supported"
 #: with a generic suffix reads wrong once the reasons differ this much.
 _UNSUPPORTED_CLAUSES = {
-    "WITH": f"WITH is not supported: {_SUBGRAPH}, and no intermediate projection to carry",
+    "WITH": f"WITH is not supported: {_SUBGRAPH}, and no intermediate projection to "
+            f"carry. The one exception is `WITH DISTINCT <var> RETURN <aggregates>`, "
+            f"the spelling of aggregation per matched node",
     "UNWIND": f"UNWIND is not supported: {_SUBGRAPH}",
     "SET": "a bare SET (updating rows a MATCH found) is not supported. Only "
            "`MERGE ... ON CREATE SET` and `ON MATCH SET` are",
@@ -365,7 +422,11 @@ class _Parser:
                 clauses.append(self._parse_write("merge"))
             elif self._at_kw("RETURN"):
                 self._next()
-                self._parse_return()
+                ret = self._parse_return(distinct_var=None)
+                if ret is not None:
+                    clauses.append(ret)
+            elif self._at_kw("WITH"):
+                clauses.append(self._parse_with_distinct_return())
             elif self._at_name():
                 word = self._peek().value.upper()
                 if word in _UNSUPPORTED_CLAUSES:
@@ -374,28 +435,101 @@ class _Parser:
             else:
                 t = self._peek()
                 raise CypherError(f"unexpected {self._describe(t)} at position {t.pos}")
-        if not clauses:
+        if not any(isinstance(c, (_MatchClause, _WriteClause)) for c in clauses):
             raise CypherError("query has no MATCH clause")
         return clauses
 
-    def _parse_return(self) -> None:
-        """RETURN is parsed only to reject what it would silently lose.
-        The result of a traversal is always the full matching subgraph,
-        so a projection has nothing to project."""
-        while self._peek().kind != "eof":
-            t = self._peek()
-            if t.kind == "name":
-                word = t.value.upper()
-                if word in _UNSUPPORTED_CLAUSES:
-                    raise CypherError(_UNSUPPORTED_CLAUSES[word])
-                if t.value.lower() in _AGGREGATES and self._peek(1).kind == "punct" \
-                        and self._peek(1).value == "(":
-                    raise CypherError(
-                        f"aggregation ({t.value}(...)) is not supported: a traversal returns "
-                        f"the matching subgraph, not a scalar. Run the traversal and count "
-                        f"the result -- len(result.nodes), or count the ids you care about"
-                    )
+    def _parse_with_distinct_return(self) -> _ReturnClause:
+        """`WITH DISTINCT <var> RETURN <aggregates>` -- Cypher's spelling
+        of aggregation per matched node, recognized as one unit (the same
+        move as the null-safe negation idiom: neither half translates
+        alone). Any other WITH raises the general refusal."""
+        self._expect_kw("WITH")
+        if not (self._at_kw("DISTINCT") and self._peek(1).kind == "name"
+                and self._peek(2).kind == "name" and self._peek(2).value.upper() == "RETURN"):
+            raise CypherError(_UNSUPPORTED_CLAUSES["WITH"])
+        self._next()                       # DISTINCT
+        var = self._expect_name()
+        self._expect_kw("RETURN")
+        ret = self._parse_return(distinct_var=var)
+        if ret is None:
+            raise CypherError(
+                f"WITH DISTINCT {var} is only supported before an aggregating RETURN -- "
+                f"without an aggregate the result is the subgraph, already deduplicated, "
+                f"so drop the WITH"
+            )
+        return ret
+
+    def _parse_return(self, distinct_var: Optional[str]) -> Optional[_ReturnClause]:
+        """A RETURN with aggregates parses into a _ReturnClause; one
+        without is consumed and ignored (the result of a traversal is the
+        full matching subgraph, so a plain projection has nothing to
+        project) -- while still rejecting what following it would
+        silently lose (ORDER BY, LIMIT, ...)."""
+        if not self._sees_aggregate():
+            if distinct_var is not None:
+                return None   # _parse_with_distinct_return raises with the better message
+            while self._peek().kind != "eof":
+                t = self._peek()
+                if t.kind == "name" and t.value.upper() in _UNSUPPORTED_CLAUSES:
+                    raise CypherError(_UNSUPPORTED_CLAUSES[t.value.upper()])
+                self._next()
+            return None
+
+        items = [self._parse_return_item()]
+        while self._at_punct(","):
             self._next()
+            items.append(self._parse_return_item())
+        t = self._peek()
+        if t.kind == "name" and t.value.upper() in _UNSUPPORTED_CLAUSES:
+            raise CypherError(_UNSUPPORTED_CLAUSES[t.value.upper()])
+        if t.kind != "eof":
+            raise CypherError(f"unexpected {self._describe(t)} at position {t.pos}")
+        return _ReturnClause(items=items, distinct_var=distinct_var)
+
+    def _sees_aggregate(self) -> bool:
+        """Whether the rest of the query contains an aggregate call --
+        decides between strict item parsing and scan-and-ignore."""
+        for j in range(self.i, len(self.toks) - 1):
+            if (self.toks[j].kind == "name" and self.toks[j].value.lower() in _AGGREGATES
+                    and self.toks[j + 1].kind == "punct" and self.toks[j + 1].value == "("):
+                return True
+        return False
+
+    def _parse_return_item(self) -> _AggItem:
+        t = self._peek()
+        if t.kind != "name" or not (self._peek(1).kind == "punct" and self._peek(1).value == "("):
+            raise CypherError(
+                f"RETURN mixes an aggregate with a plain item at position {t.pos} -- that "
+                f"is grouped aggregation (GROUP BY), which hopai does not support yet. "
+                f"Either aggregate every item, or drop the aggregates and take the subgraph"
+            )
+        fn = self._next().value.lower()
+        if fn not in _TRANSLATED_AGGREGATES:
+            raise CypherError(
+                f"{fn}(...) is not supported -- the aggregates hopai computes are "
+                f"{', '.join(sorted(_TRANSLATED_AGGREGATES))}"
+            )
+        self._expect_punct("(")
+        distinct = False
+        if self._at_kw("DISTINCT"):
+            self._next()
+            distinct = True
+        if self._at_punct("*"):
+            self._next()
+            var, key = None, None
+        else:
+            var = self._expect_name()
+            key = None
+            if self._at_punct("."):
+                self._next()
+                key = self._expect_name()
+        self._expect_punct(")")
+        alias = None
+        if self._at_kw("AS"):
+            self._next()
+            alias = self._expect_name()
+        return _AggItem(fn=fn, var=var, key=key, distinct=distinct, alias=alias)
 
     # -- MATCH ----------------------------------------------------------
 
@@ -1065,6 +1199,111 @@ class _Translator:
             )
         return start, hops
 
+    # -- aggregating RETURN ----------------------------------------------
+
+    def emit_aggregates(self, ret: _ReturnClause) -> dict:
+        """The {name: aggregate} dict a _ReturnClause means, or a
+        CypherError naming the rewrite when its Cypher meaning is not
+        exactly what Graph.aggregate() computes -- see AGGREGATION in
+        the module docstring for the rules being enforced here."""
+        last_var = self.nodes[-1].var
+        if self.optional_hop is not None:
+            raise CypherError(
+                "an OPTIONAL MATCH cannot feed an aggregation: the aggregate runs over "
+                "the nodes the hop matched, and a chain the hop did not extend "
+                "contributes nothing either way -- the number is identical without "
+                "OPTIONAL, so drop it"
+            )
+        if ret.distinct_var is not None and ret.distinct_var != last_var:
+            raise CypherError(
+                f"WITH DISTINCT {ret.distinct_var} must name the last node of the chain "
+                f"({last_var or 'which is anonymous -- give it a variable'}) -- that is "
+                f"the only set hopai can aggregate"
+            )
+        # With no hops every node is its own (only) result row, and with
+        # WITH DISTINCT the rows have been deduplicated to exactly the
+        # matched nodes -- either way bare aggregates lose their per-path
+        # multiplicity and become exact.
+        per_node = ret.distinct_var is not None or not self.rels
+        aggregates: dict = {}
+        for item in ret.items:
+            name = item.alias or (item.fn if item.key is None else f"{item.fn}_{item.key}")
+            if name in aggregates:
+                raise CypherError(
+                    f"two aggregates both land on the result key {name!r} -- give one an "
+                    f"alias: `{item.fn}(...) AS other_name`"
+                )
+            aggregates[name] = self._translate_aggregate(item, last_var, per_node)
+        return aggregates
+
+    def _translate_aggregate(self, item: _AggItem, last_var: Optional[str], per_node: bool):
+        from .aggregates import Avg, Count, Max, Min, Sum
+
+        def refuse_bare() -> CypherError:
+            target = f"{item.var}.{item.key}" if item.key else (item.var or "*")
+            return CypherError(
+                f"bare {item.fn}({target}) aggregates one row per PATH -- a node two "
+                f"paths reach counts twice -- and hopai does not track path multiplicity "
+                f"across hops. Write {item.fn}(DISTINCT ...) to aggregate distinct "
+                f"values, or `WITH DISTINCT {last_var or '<var>'} RETURN "
+                f"{item.fn}(...)` to aggregate each matched node once"
+            )
+
+        if item.var is None:                    # count(*) et al.
+            if item.fn != "count":
+                raise CypherError(
+                    f"{item.fn}(*) aggregates nothing in particular -- write "
+                    f"{item.fn}(<var>.<property>)"
+                )
+            if not per_node:
+                raise refuse_bare()
+            return Count()
+
+        if item.var in self.rel_index or item.var in self.path_vars:
+            raise CypherError(
+                f"aggregation over relationships ({item.fn}({item.var}...)) is not "
+                f"supported yet -- aggregate the node at the end of the hop instead"
+            )
+        if item.var not in self.node_index:
+            raise CypherError(f"unknown variable {item.var!r} in RETURN")
+        if self.node_index[item.var] != len(self.nodes) - 1:
+            raise CypherError(
+                f"only the LAST node of the chain can be aggregated, and {item.var!r} is "
+                f"not it: hopai does not track which mid-chain nodes lie on a complete "
+                f"path, so {item.fn}({item.var}...) here would count nodes Cypher would "
+                f"not. Reverse the pattern so {item.var} comes last, or run a separate "
+                f"traversal"
+            )
+
+        if item.fn == "count":
+            if item.key is None:
+                # count(DISTINCT b) IS the distinct-node count -- exact
+                # even with paths involved, unlike every other bare form.
+                if item.distinct or per_node:
+                    return Count()
+                raise refuse_bare()
+            if item.distinct:
+                return Count(item.key, distinct=True)
+            if per_node:
+                return Count(item.key)
+            raise refuse_bare()
+
+        if item.key is None:
+            raise CypherError(
+                f"{item.fn}({item.var}) aggregates a whole node -- write "
+                f"{item.fn}({item.var}.<property>)"
+            )
+        if item.fn in ("sum", "avg"):
+            cls = Sum if item.fn == "sum" else Avg
+            if item.distinct:
+                return cls(item.key, distinct=True)
+            if per_node:
+                return cls(item.key)
+            raise refuse_bare()
+        # min/max: an extremum is immune to both duplication and
+        # deduplication, so bare and DISTINCT spellings are both exact.
+        return (Min if item.fn == "min" else Max)(item.key)
+
 
 # ---------------------------------------------------------------------
 # Writes: CREATE and MERGE
@@ -1307,6 +1546,12 @@ def cypher_to_operations(
             "this query only reads -- run it with graph.traverse_cypher() (or "
             "graph.cypher(), which picks for you)"
         )
+    if any(isinstance(c, _ReturnClause) for c in clauses):
+        raise CypherError(
+            "RETURN with an aggregate after a write is not supported -- a write "
+            "produces an IngestResult, not a number. Run the aggregation as its own "
+            "MATCH query afterwards"
+        )
     return _WriteTranslator(opts).translate(clauses)
 
 
@@ -1344,16 +1589,60 @@ def cypher_to_traversal(
     """
     opts = _Options(node_label_key=node_label_key, edge_type_key=edge_type_key,
                     max_var_length=max_var_length)
+    translator, ret = _translate_read(query, opts)
+    if ret is not None:
+        raise CypherError(
+            "this query aggregates -- run it with graph.aggregate_cypher() (or "
+            "graph.cypher(), which picks for you)"
+        )
+    return translator.emit()
+
+
+def _translate_read(query: str, opts: _Options) -> tuple:
+    """Parse and translate a read query's MATCH chain, returning the
+    loaded translator and the aggregating _ReturnClause if there is one
+    -- the shared front half of cypher_to_traversal and
+    cypher_to_aggregation."""
     clauses = _Parser(_tokenize(query)).parse()
     if any(isinstance(c, _WriteClause) for c in clauses):
         raise CypherError(
             "this query writes -- run it with graph.write_cypher() (or graph.cypher(), "
             "which picks for you)"
         )
+    matches = [c for c in clauses if isinstance(c, _MatchClause)]
     translator = _Translator(opts)
-    translator._build_chain(clauses)
-    translator._attach_where(clauses)
-    return translator.emit()
+    translator._build_chain(matches)
+    translator._attach_where(matches)
+    return translator, next((c for c in clauses if isinstance(c, _ReturnClause)), None)
+
+
+def cypher_to_aggregation(
+    query: str,
+    *,
+    node_label_key: Optional[str] = "type",
+    edge_type_key: Optional[str] = "kind",
+    max_var_length: Optional[int] = None,
+) -> tuple:
+    """Translate an aggregating Cypher MATCH into
+    `(Start, [Hop, ...], {name: aggregate})` -- the exact arguments of
+    `Graph.aggregate()`. Exposed separately from aggregate_cypher() so
+    you can inspect or adjust the translation before running it.
+
+    Takes the same keyword options as cypher_to_traversal(), refuses the
+    same things, and additionally refuses aggregation spellings whose
+    Cypher meaning differs from what hopai computes -- see AGGREGATION
+    in the module docstring for the rules and each rewrite."""
+    opts = _Options(node_label_key=node_label_key, edge_type_key=edge_type_key,
+                    max_var_length=max_var_length)
+    translator, ret = _translate_read(query, opts)
+    if ret is None:
+        raise CypherError(
+            "this query has no aggregating RETURN -- run it with "
+            "graph.traverse_cypher() (or graph.cypher(), which picks for you)"
+        )
+    aggregates = translator.emit_aggregates(ret)
+    start, hops = translator.emit()
+    return start, hops, aggregates
 
 
 def traverse_cypher(graph: Graph, query: str, **options) -> Subgraph:
@@ -1368,3 +1657,20 @@ def traverse_cypher(graph: Graph, query: str, **options) -> Subgraph:
     """
     start, hops = cypher_to_traversal(query, **options)
     return graph.traverse(start, *hops)
+
+
+def aggregate_cypher(graph: Graph, query: str, **options) -> dict:
+    """Run an aggregation written in Cypher.
+
+        aggregate_cypher(graph, '''
+            MATCH (a:person)-[:friend*1..4]->(b)
+            RETURN count(DISTINCT b), avg(DISTINCT b.age) AS mean_age
+        ''')
+        # -> {"count": 42, "mean_age": 31.5}
+
+    Result keys are the `AS` aliases where given, else `fn` or
+    `fn_property` (`count`, `avg_age`). Accepts the same keyword options
+    as cypher_to_traversal().
+    """
+    start, hops, aggregates = cypher_to_aggregation(query, **options)
+    return graph.aggregate(start, *hops, aggregates=aggregates)

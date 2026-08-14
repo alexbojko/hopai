@@ -137,13 +137,14 @@ jobs:
             # value covers the whole package for local runs; `hopai` stays
             # in also_copy, so the package is still whole in the mutants
             # tree (without it every test dies on an import error).
+            #
+            # The paths MUST be newline-separated (the ini continuation
+            # format also_copy uses): mutmut reads a space-separated line
+            # as ONE path that does not exist, mutates 0 files, and still
+            # exits 0 -- so every multi-file PR silently reported
+            # "not run" instead of any verdict.
             python - "$CHANGED" <<'PY'
           import re, sys
-          # NEWLINE-separated, indented: setup.cfg list options are one
-          # value per line. Space-separating them made mutmut read the
-          # whole string as a single path, match nothing, and stop with
-          # "could not find any test case for any mutant" -- which the
-          # report then showed as no mutation data at all.
           paths = "\n    ".join(sys.argv[1].split())
           config = open("setup.cfg").read()
           open("setup.cfg", "w").write(

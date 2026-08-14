@@ -41,10 +41,18 @@ still pass on the strength of everything else.
 ```bash
 pip install -e ".[dev,mutation]"
 pytest tests/ --cov=hopai --cov-report=    # mutmut needs a .coverage file first
-mutmut run hopai/hop.py                    # one module — the usual local loop
+mutmut run "hopai.hop.*"                   # one module — the usual local loop
 mutmut results
 mutmut show <mutant-id>
 ```
+
+The run filter is an `fnmatch` glob over dotted MUTANT names
+(`hopai.hop.x_foo__mutmut_1`), so it is spelled `"hopai.hop.*"` and never
+`hopai/hop.py` — a path silently matches nothing and mutmut aborts with "Filtered for
+specific mutants, but nothing matches". The same trap one level up: `source_paths` in
+`setup.cfg` (and CI's narrowed rewrite of it) is a NEWLINE-separated ini list; a
+space-separated line is read as one nonexistent path and mutmut "succeeds" having
+mutated zero files.
 
 Config is `setup.cfg`, mutmut's only config surface. Three settings there exist
 because of bugs, not taste:
