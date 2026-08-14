@@ -208,6 +208,53 @@ class TestRowsColumn:
         assert "| 0 |" in body
 
 
+class TestSystemComparison:
+    """Neo4j and AGE columns, and the checks that keep the comparison
+    honest: a speed comparison between systems returning different
+    answers is not a comparison."""
+
+    ROWS = [
+        {**RESULTS[0], "answer": 321, "neo4j_ms": 12.6, "neo4j_answer": 321,
+         "age_ms": 1654.7, "age_answer": 321},
+        {**RESULTS[1], "id": "Q6", "answer": 1, "neo4j_ms": 14.8, "neo4j_answer": 0,
+         "age_ms": 11.8, "age_answer": 0},
+    ]
+
+    def test_columns_appear_only_when_a_system_ran(self):
+        with_systems = render(self.ROWS, PROFILE, generated_at="f")
+        assert "Neo4j (ms)" in with_systems and "AGE (ms)" in with_systems
+        assert "Neo4j (ms)" not in render(RESULTS, PROFILE, generated_at="f")
+
+    def test_a_dnf_from_another_system_is_labelled(self):
+        """`None` means it never answered. Printing a blank would read as
+        'not measured' and a number would be a lie."""
+        dnf = [{**self.ROWS[0], "age_ms": None}]
+        assert "**DNF**" in render(dnf, PROFILE, generated_at="f")
+
+    def test_disagreeing_answers_are_flagged(self):
+        body = "\n".join(findings(self.ROWS))
+        assert "Answers that disagree" in body
+        assert "`Q6` hopai 1 vs Neo4j 0" in body
+        assert "not a comparison" in body
+
+    def test_matching_answers_are_not_flagged(self):
+        assert "disagree" not in "\n".join(findings([self.ROWS[0]]))
+
+    def test_a_large_gap_against_another_system_is_called_out(self):
+        body = "\n".join(findings(self.ROWS))
+        assert "Where the alternatives fall over" in body and "33x" in body
+
+    def test_the_answer_column_is_the_comparable_number(self):
+        """Not the node count -- traverse() returns every node on a
+        matching chain, which is a different question from the
+        `count(DISTINCT endpoint)` the other systems are asked."""
+        body = render([{**RESULTS[0], "nodes": 9999, "answer": 321}], PROFILE,
+                      generated_at="f")
+        row = next(line for line in body.splitlines() if line.startswith("| Q1 |"))
+        assert row.endswith("| 321 |")
+        assert "9,999" not in row
+
+
 class TestOverhead:
     def test_is_warm_over_raw(self):
         assert overhead(RESULTS[1]) == pytest.approx(8.0)

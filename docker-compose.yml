@@ -38,3 +38,54 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  # ---------------------------------------------------------------
+  # Comparison systems for benchmarks/bench_hopai.py. Opt in with
+  #   docker compose --profile compare up -d
+  # They are NOT part of the test stack: nothing in tests/ touches
+  # them, and starting them costs a couple of GB of RAM.
+  # ---------------------------------------------------------------
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: hopai-bench-neo4j
+    profiles: ["compare"]
+    environment:
+      NEO4J_AUTH: neo4j/benchpassword
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_server_memory_pagecache_size: 1G
+      # the loader uses LOAD CSV from the import directory
+      NEO4J_apoc_import_file_enabled: "true"
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      # NOT :ro -- neo4j chowns this directory on startup and refuses
+      # to boot if it cannot
+      - ./benchmarks/data:/var/lib/neo4j/import
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  age:
+    # Apache AGE ships as a PostgreSQL extension, so this is a second
+    # Postgres -- not the one the tests use. Same data, same machine,
+    # different engine, which is the only way the comparison is fair.
+    image: apache/age:latest
+    container_name: hopai-bench-age
+    profiles: ["compare"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: agebench
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./benchmarks/data:/data:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agebench"]
+      interval: 3s
+      timeout: 3s
+      retries: 30

@@ -68,6 +68,38 @@ let it read as the winner.
 
 ## Comparing against Neo4j and Apache AGE
 
+```bash
+docker compose --profile compare up -d          # neo4j + apache/age
+python bench_hopai.py --data-dir ./data --dsn "postgresql+psycopg2://..." \
+    --neo4j-url http://localhost:7474 \
+    --age-dsn "postgresql://postgres:testpass@localhost:5433/agebench"
+```
+
+Both load the **same CSVs** and answer the **same question**, and the report
+verifies the answers agree before putting the timings side by side — a speed
+comparison between systems returning different results is not a comparison.
+Timings, answers and any disagreement all land in `RESULTS.md`.
+
+**The comparable metric is `count(DISTINCT endpoint)`, not hopai's node count.**
+`traverse()` returns every node on a matching chain — seeds and intermediates
+included — which is a different question from what Cypher is asked. The runner
+uses `graph.aggregate(..., Count())`, which counts exactly what the last hop
+matched.
+
+**One real disagreement, recorded rather than smoothed over.** On `Q6`
+(`(h)<-[]-(m)-[]->(x)`) hopai answers 1 and both Neo4j and AGE answer 0. Cypher
+enforces *relationship uniqueness* within a MATCH — the same edge may not be
+walked twice in one pattern — so `x = h` is excluded. hopai's hops are
+independent steps and have no such rule. Neither is wrong; they are different
+questions. It also means `traverse_cypher()` of that pattern does not answer
+what Neo4j would, which is worth knowing before treating the Cypher front end
+as a drop-in.
+
+No new dependencies: Neo4j is driven through its HTTP query API with `urllib`,
+and AGE is a PostgreSQL extension that `psycopg2` already reaches.
+
+### The Cypher run by each system
+
 These require separate running instances this repo doesn't set up for
 you. The Cypher equivalents for the same nine queries (substitute your
 own label/property names):

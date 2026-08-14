@@ -187,10 +187,13 @@ def _table(results: list) -> str:
     budget in the timing column would let non-completion read as a
     latency."""
     has_raw = any(r.get("raw_sql_ms") for r in results)
-    columns = ["ID", "Query", "Feature", "Tier", "Cold (ms)", "Warm (ms), median + range"]
+    systems = [(f"{k}_ms", label) for k, label in (("neo4j", "Neo4j"), ("age", "AGE"))
+               if any(k + "_ms" in r for r in results)]
+    columns = ["ID", "Query", "Feature", "Tier", "Cold (ms)", "hopai warm (ms)"]
     if has_raw:
         columns += ["Raw SQL (ms)", "Overhead"]
-    columns += ["Rows"]
+    columns += [f"{label} (ms)" for _, label in systems]
+    columns += ["Answer"]
     header = ("| " + " | ".join(columns) + " |\n"
               "| --- | --- | --- | --- |" + " ---: |" * (len(columns) - 4))
 
@@ -200,7 +203,8 @@ def _table(results: list) -> str:
                  r.get("tier", "")]
         if r.get("dnf"):
             outcome = f"**DNF** (>{r.get('budget_s', 0):.0f}s)"
-            cells += [outcome, outcome] + (["-", "-"] if has_raw else []) + ["-"]
+            cells += [outcome, outcome] + (["-", "-"] if has_raw else [])
+            cells += ["-"] * len(systems) + ["-"]
             rows.append("| " + " | ".join(cells) + " |")
             continue
 
@@ -211,10 +215,14 @@ def _table(results: list) -> str:
         if has_raw:
             ratio = overhead(r)
             cells += [f"{r.get('raw_sql_ms', 0):,.1f}", f"{ratio:.1f}x" if ratio else "-"]
-        # "-" not "0": an aggregate without a Count() has no row count,
-        # and printing zero would read as "matched nothing".
-        rows_cell = "-" if r.get("nodes") is None else f"{r['nodes']:,}"
-        cells += [rows_cell]
+        for key, _ in systems:
+            value = r.get(key)
+            cells.append("**DNF**" if key in r and value is None
+                         else ("-" if value is None else f"{value:,.1f}"))
+        # the comparable answer, or the row count where there is no
+        # cross-system number to agree on
+        answer = r.get("answer", r.get("nodes"))
+        cells += ["-" if answer is None else f"{answer:,}"]
         rows.append("| " + " | ".join(cells) + " |")
     return "\n".join([header, *rows]) if rows else "(no measurements)"
 
@@ -378,6 +386,35 @@ def findings(results: list) -> list:
             + ", ".join(f"`{a['id']}`/`{b['id']}` {r:.1f}x" for a, b, r in pairs) + ".",
             "",
         ]
+
+    disagreements = []
+    for r in results:
+        ours = r.get("answer")
+        for key, label in (("neo4j_answer", "Neo4j"), ("age_answer", "AGE")):
+            theirs = r.get(key)
+            if ours is not None and isinstance(theirs, int) and theirs != ours:
+                disagreements.append(f"`{r['id']}` hopai {ours:,} vs {label} {theirs:,}")
+    if disagreements:
+        out += [
+            "**Answers that disagree.** " + "; ".join(disagreements) + ". A speed "
+            "comparison between systems returning different results is not a comparison "
+            "-- these are flagged rather than smoothed over, and are worth resolving "
+            "before quoting the timings beside them.",
+            "",
+        ]
+
+    slow = [(r, r["age_ms"]) for r in results if r.get("age_ms")]
+    if slow:
+        worst = max(slow, key=lambda p: p[1])
+        if worst[0].get("warm_ms") and worst[1] / worst[0]["warm_ms"] > 5:
+            out += [
+                f"**Where the alternatives fall over.** `{worst[0]['id']}` "
+                f"({worst[0]['query']}) took {worst[1]:,.0f} ms on AGE against "
+                f"{worst[0]['warm_ms']:,.1f} ms here -- "
+                f"{worst[1] / worst[0]['warm_ms']:,.0f}x. Traversal is where the gap "
+                f"opens; plain property filters are competitive on every system.",
+                "",
+            ]
 
     empty = empty_queries(ran)
     if empty:

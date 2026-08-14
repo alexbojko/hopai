@@ -158,7 +158,7 @@ def time_raw_sql(graph, start_hop, rest) -> float:
 
 
 def run_suite(graph, hub_id: int, baseline: bool = True, repeat: int = 5,
-              budget_s: float = 150.0):
+              budget_s: float = 150.0, others=()):
     """Time every query, marking any that blow the time budget as DNF.
 
     A query that never returns is not a slow query, it is a different
@@ -207,11 +207,27 @@ def run_suite(graph, hub_id: int, baseline: bool = True, repeat: int = 5,
             row["raw_sql_ms"] = round(
                 statistics.median(time_raw_sql(graph, start_hop, rest)
                                   for _ in range(repeat)), 1)
+        # The comparable answer: Cypher's `count(DISTINCT endpoint)` and
+        # hopai's traverse() are different questions -- traverse returns
+        # every node on a matching chain, seeds and intermediates
+        # included. aggregate() counts exactly what the last hop matched,
+        # which is what the other systems are asked for.
+        row["answer"] = _comparable_answer(graph, start_hop, rest)
+
+        for other in others:
+            ms, answer = other.run(qid, budget_s)
+            key = other.name.split()[-1].lower()
+            row[f"{key}_ms"] = None if ms is None else round(ms, 1)
+            row[f"{key}_answer"] = answer
+
         results.append(row)
         extra = f" raw={row['raw_sql_ms']:8.1f}ms" if baseline else ""
+        others_txt = "".join(
+            f" {o.name.split()[-1].lower()}="
+            f"{'DNF' if row.get(o.name.split()[-1].lower() + '_ms') is None else format(row[o.name.split()[-1].lower() + '_ms'], '.0f') + 'ms'}"
+            for o in others)
         print(f"{qid:4s} {label:30s} cold={cold:9.1f}ms warm={row['warm_ms']:9.1f}ms"
-              f" [{row['warm_min_ms']:.1f}-{row['warm_max_ms']:.1f}]{extra}"
-              f" rows={len(r.nodes):8d}")
+              f"{extra}{others_txt} answer={row['answer']}")
 
     results.extend(run_aggregate_suite(graph, repeat=repeat, baseline=baseline))
     return results
@@ -364,6 +380,19 @@ def run_aggregate_suite(graph, repeat: int = 5, baseline: bool = True):
     return results
 
 
+def _comparable_answer(graph, start_hop, rest):
+    """`count(DISTINCT last-hop node)` -- the number every system is
+    asked for. Returns None where hopai cannot express it (an OPTIONAL
+    hop has no aggregate meaning, and aggregate() says so rather than
+    inventing one)."""
+    from hopai import Count
+
+    try:
+        return graph.aggregate(start_hop, *rest, aggregates={"n": Count()})["n"]
+    except ValueError:
+        return None
+
+
 def _with_timeout(graph, budget_s: float, start_hop, rest):
     """Run one traversal, letting the SERVER cancel it if it overruns.
 
@@ -398,6 +427,14 @@ if __name__ == "__main__":
     ap.add_argument("--hub-id", type=int, default=None,
                      help="defaults to nodes/2, matching generate_graph.py's default")
     ap.add_argument("--skip-load", action="store_true", help="reuse already-loaded data")
+    ap.add_argument("--neo4j-url", type=str, default="",
+                    help="compare against Neo4j, e.g. http://localhost:7474 "
+                         "(docker compose --profile compare up -d)")
+    ap.add_argument("--age-dsn", type=str, default="",
+                    help="compare against Apache AGE, e.g. "
+                         "postgresql://postgres:testpass@localhost:5433/agebench")
+    ap.add_argument("--skip-load-comparisons", action="store_true",
+                    help="reuse data already loaded into Neo4j / AGE")
     ap.add_argument("--budget", type=float, default=150.0,
                     help="per-query time budget in seconds; overruns are reported DNF")
     ap.add_argument("--repeat", type=int, default=5,
@@ -419,9 +456,24 @@ if __name__ == "__main__":
                    f"-c statement_timeout={int(args.budget * 1000)}"})
     graph = Graph(engine_scoped)
 
+    others = []
+    if args.neo4j_url or args.age_dsn:
+        from comparison import AgeRunner, Neo4jRunner
+        if args.neo4j_url:
+            others.append(Neo4jRunner(args.neo4j_url))
+        if args.age_dsn:
+            others.append(AgeRunner(args.age_dsn))
+        if not args.skip_load_comparisons:
+            for other in others:
+                print(f"Loading {other.name}...")
+                t0 = time.perf_counter()
+                other.load()
+                print(f"  {other.name} loaded in {time.perf_counter() - t0:.1f}s")
+
     print(f"\n{'ID':4s} {'Query':30s} {'Cold':>14s} {'Warm':>14s}")
     print("-" * 110)
-    results = run_suite(graph, args.hub_id or 0, baseline=not args.no_baseline, repeat=args.repeat, budget_s=args.budget)
+    results = run_suite(graph, args.hub_id or 0, baseline=not args.no_baseline, repeat=args.repeat, budget_s=args.budget,
+                         others=others)
 
     from report import machine_profile, render
 
