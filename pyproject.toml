@@ -43,7 +43,11 @@ Changelog = "https://github.com/alexbojko/hopai/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 networkx = ["networkx>=3.0"]
-dev = ["pytest>=8.0", "pytest-cov>=5.0", "networkx>=3.0", "ruff>=0.6"]
+# sqlmodel already drags pydantic in transitively, so this extra exists
+# to pin the MAJOR version: schema_pydantic generates v2 models, and
+# sqlmodel's own floor still tolerates v1 in some resolutions.
+pydantic = ["pydantic>=2.0"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "networkx>=3.0", "pydantic>=2.0", "ruff>=0.6"]
 # Pinned <4 deliberately: the config surface this project relies on
 # (`source_paths`, `also_copy`, `mutate_only_covered_lines`, and the
 # `export-cicd-stats` JSON the PR comment parses) is the documented 3.x

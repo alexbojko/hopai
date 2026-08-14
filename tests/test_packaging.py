@@ -136,6 +136,15 @@ class TestDistributionMetadata:
         required = pyproject.split("[project.optional-dependencies]")[0]
         assert "networkx" not in required
 
+    def test_pydantic_stays_optional(self, pyproject):
+        """schema_pydantic imports it lazily and the hopai[pydantic]
+        extra pins v2. pydantic must never become a DIRECT required
+        dependency: sqlmodel already brings it transitively at ITS
+        chosen floor, and a direct pin here would silently take over
+        every install's resolution."""
+        required = pyproject.split("[project.optional-dependencies]")[0]
+        assert "pydantic" not in required
+
     def test_requires_python_matches_the_tested_versions(self, pyproject):
         assert 'requires-python = ">=3.10"' in pyproject
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
