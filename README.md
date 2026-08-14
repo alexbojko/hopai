@@ -258,6 +258,67 @@ Two SQL semantics to know, both of which are what you want once stated:
   merge row must satisfy every check on its own even when it is destined
   to update a row that already does.
 
+## 📐 Graph schema
+
+Declare the *shape* of the graph — which node types exist, which
+properties each carries, and which edge kinds connect which node types —
+as plain dataclasses. An edge class names its endpoints as fields
+annotated with node classes:
+
+```python
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class Person:
+    email: str                  # no default -> required
+    age: Optional[int] = None   # optional, may be null
+
+@dataclass
+class Company:
+    name: str
+
+@dataclass
+class WorksAt:
+    source: Person              # endpoint, not a property
+    target: Company             # endpoint, not a property
+    since: int                  # property
+
+graph.define_schema(nodes=[Person, Company], edges=[WorksAt])
+```
+
+Pydantic v2 models work anywhere a dataclass does, and the same schema
+can be spelled with explicit primitives instead — `NodeType`,
+`EdgeType`, `Property` — when there is no class to hand over. All three
+inputs normalize to the identical canonical form.
+
+Read it back in whichever representation the consumer speaks:
+
+```python
+graph.schema           # canonical dataclasses; None until defined
+graph.schema_json      # JSON Schema vocabulary — paste it into a system prompt
+graph.schema_networkx  # nx.MultiDiGraph meta-graph (pip install hopai[networkx])
+graph.schema_pydantic  # generated pydantic models  (pip install hopai[pydantic])
+```
+
+Declaring is in-memory and instant. **Enforcing** is a separate,
+explicit step that compiles the schema to CHECK constraints, so the
+database itself rejects a person without an email or an `age` of
+`"42"` — whichever door the write came through, Cypher and raw SQL
+included:
+
+```python
+graph.schema_ddl()      # the exact SQL, without running it
+graph.enforce_schema()  # idempotent; re-running after a schema change
+                        # drops the rules the schema no longer has
+graph.add_nodes([{"type": "person"}])   # ConstraintViolation: email required
+```
+
+Enforcement covers property presence and JSON type per node type and
+edge kind. It does **not** police endpoint types ("`works_at` connects
+only person → company") — that needs a trigger, not a CHECK, and hopai
+says so rather than half-enforcing it.
+
 ## 🔎 Filters
 
 Anywhere a `where=` or `via=` is accepted:

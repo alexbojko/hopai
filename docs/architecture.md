@@ -64,7 +64,9 @@ One pair of tables holds every graph, discriminated by `graph_id`.
 - `Unique`/`Index` prepend `graph_id` (`_Target.scope_index`), so one index serves every
   graph with per-graph semantics. `Required`/`Check`/`PropertyType` compile to
   `graph_id <> '<g>' OR <predicate>` (`_Target.scope_check`) — an unguarded CHECK covers
-  the whole table and would make one graph's rules law everywhere.
+  the whole table and would make one graph's rules law everywhere. Schema enforcement
+  (`enforce_schema()`) rides the same `scope_check`, and its reconcile-on-re-enforce
+  only ever touches constraints carrying its own graph's `ck_schema_*` name prefix.
 - `merge_*` conflict targets go through the same `scope_index()`.
 - `graph_col=None` disables all of it for callers bringing their own tables.
 
@@ -95,6 +97,7 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/models.py` | The DDL, the typed-columns / JSONB split, the composite FK |
 | `hopai/ingest.py` | The two row spellings, edge-by-property references, merge semantics |
 | `hopai/constraints.py` | What each constraint compiles to, and the SQL semantics that surprise people |
+| `hopai/schema.py` | The graph-schema notations, the annotation mapping, what enforcement compiles to and the endpoint-type limit |
 | `hopai/cypher.py` | The translatable subset — read, write and aggregate — and why each refusal is a refusal |
 | `tests/conftest.py` | The fixture graph's shape |
 | `benchmarks/README.md` | Measured numbers, including where raw CTEs beat this library 2-5x |
