@@ -441,16 +441,20 @@ class TestAggregateToolSchema:
 
 class TestFilterCompilation:
     def test_an_unsupported_filter_type_is_named(self):
-        """resolve()'s catch-all must say what it got -- 'got int' is
-        what turns a wrong-type filter into an immediate fix (mutant
-        x_resolve__mutmut_81 printed NoneType instead and nothing
-        objected)."""
+        """resolve()'s catch-all, asserted VERBATIM for the same reason
+        as the bare-list message: it enumerates the accepted forms and
+        names what it got, and any unpinned fragment is a surviving
+        mutant waiting to flap into a CI report (x_resolve__mutmut_81
+        printed NoneType for every wrong-type filter)."""
         from sqlalchemy import column as sa_column
 
         from hopai.filters import resolve
         with pytest.raises(TypeError) as exc:
             resolve(sa_column("properties"), 42)
-        assert "got int" in str(exc.value)
+        assert str(exc.value) == (
+            "filter must be None, a dict, AND/OR/NOT/GT/GTE/LT/LTE/BETWEEN, or a callable "
+            "-- got int"
+        )
 
     def test_equality_uses_jsonb_containment(self):
         """Containment, not `->> = value`: it is indexable by the GIN
@@ -516,13 +520,18 @@ class TestFilterCompilation:
         [],
     ])
     def test_bare_list_is_rejected(self, bad):
-        """The message's rewrite is `OR(...)`, spelled the way it must be
-        typed -- lowercase `or(...)` (mutant x_resolve__mutmut_10) would
-        send the caller to a Python keyword that cannot be called."""
+        """Asserted VERBATIM, the same rule hop.py's messages earned:
+        this message is a paste-able rewrite, and successive CI runs
+        surfaced its string mutants one flap at a time (x_resolve 9, 10,
+        ...) as long as any fragment went unpinned. If you reword it,
+        update this test."""
         with pytest.raises(TypeError) as exc:
             filter_sql(bad)
-        assert "ambiguous" in str(exc.value)
-        assert "use OR(...)" in str(exc.value)
+        assert str(exc.value) == (
+            "a bare list is ambiguous -- use OR(...) to mean 'any of these filters', "
+            "e.g. OR({'type': 'person'}, {'type': 'company'}) instead of "
+            "[{'type': 'person'}, {'type': 'company'}]"
+        )
 
     @pytest.mark.parametrize("bad", ["a string", 42, object()])
     def test_unsupported_filter_types_are_rejected(self, bad):
