@@ -1134,6 +1134,17 @@ class TestDropVectorsLive:
     def test_drop_of_a_never_migrated_field_is_ignored(self, fresh_graph):
         assert fresh_graph.drop_vectors(nodes=["ghost"]) == ["ghost"]
 
+    def test_drop_of_an_undeclared_field_alongside_declared_ones(self, fresh_graph):
+        """Dropping a name this handle never declared is a no-op, and
+        that includes the case where the handle DOES declare others --
+        the registry cleanup must not assume the field is in it. The
+        no-registry test above cannot catch this: it never reaches the
+        cleanup at all."""
+        g = _migrated(fresh_graph)
+        assert set(g.vectors["nodes"]) == {"docvec", "titlevec"}
+        assert g.drop_vectors(nodes=["ghost"]) == ["ghost"]
+        assert set(g.vectors["nodes"]) == {"docvec", "titlevec"}
+
     def test_drop_works_on_a_handle_that_never_declared_the_field(self, fresh_graph):
         """drop_vectors() takes bare names and probes the catalog, not
         the registry -- so a teardown script, or any fresh in_graph()

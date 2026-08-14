@@ -109,6 +109,19 @@ class TestUnique:
         with pytest.raises(ValueError, match="no column 'nope'"):
             fresh_graph.constraint_ddl(edges=[Unique(Col("nope"))])
 
+    @pytest.mark.parametrize("target,other", [("nodes", "edges"), ("edges", "nodes")])
+    def test_unknown_column_says_which_table(self, fresh_graph, target, other):
+        """`Col('nope')` on the wrong table is a typo the caller fixes
+        by looking at ONE table, so the message has to name which --
+        the columns it goes on to list differ between the two. Nothing
+        pinned that name, and a mutant relabelling the edges target
+        survived the suite."""
+        with pytest.raises(ValueError) as raised:
+            fresh_graph.constraint_ddl(**{target: [Unique(Col("nope"))]})
+        message = str(raised.value)
+        assert message.startswith(f"{target} has no column 'nope'")
+        assert other not in message
+
 
 # ---------------------------------------------------------------------
 # Presence and type
