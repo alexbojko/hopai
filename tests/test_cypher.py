@@ -462,6 +462,21 @@ class TestAggregationRefusals:
         with pytest.raises(CypherError, match="path"):
             agg(f"MATCH (a)-[]->(b) RETURN {item}")
 
+    def test_bare_count_star_refusal_names_itself(self):
+        """The refusal quotes the spelling it refuses -- `count(*)`,
+        star included. A mutant that broke the `*` fallback printed
+        `count(None)` and the loose "path" match above let it through."""
+        with pytest.raises(CypherError, match=r"bare count\(\*\) aggregates one row per PATH"):
+            agg("MATCH (a)-[]->(b) RETURN count(*)")
+
+    def test_bare_aggregate_on_anonymous_last_node_names_the_rewrite(self):
+        """With an anonymous last node there is no variable to suggest,
+        so the rewrite hint falls back to the literal `<var>`
+        placeholder -- pinned here because mutants that mangled it
+        survived every named-variable test."""
+        with pytest.raises(CypherError, match=r"WITH DISTINCT <var> RETURN"):
+            agg("MATCH (a)-[]->() RETURN count(*)")
+
     def test_non_last_variable_refused(self):
         """The start-side count every benchmarks/README.md example uses:
         mid-chain match sets include nodes with no continuation to the
@@ -509,8 +524,19 @@ class TestAggregationRefusals:
             agg("MATCH (a)-[]->(b) OPTIONAL MATCH (b)-[]->(c) RETURN count(DISTINCT c)")
 
     def test_with_distinct_must_name_the_last_node(self):
-        with pytest.raises(CypherError, match="last node"):
+        """The error names the node that WOULD be right -- `(b)` --
+        which is the actionable half; a mutant that replaced it with the
+        anonymous-node hint survived a match on the first half alone."""
+        with pytest.raises(CypherError,
+                           match=r"WITH DISTINCT a must name the last node of the chain \(b\)"):
             agg("MATCH (a)-[]->(b) WITH DISTINCT a RETURN count(a)")
+
+    def test_with_distinct_wrong_var_and_anonymous_last_node(self):
+        """When the last node has no variable the error cannot name it,
+        so it says to add one -- the one WITH DISTINCT path no other
+        test walks."""
+        with pytest.raises(CypherError, match="give it a variable"):
+            agg("MATCH (a)-[]->() WITH DISTINCT a RETURN count(a)")
 
     def test_general_with_still_refused(self):
         """Only the `WITH DISTINCT <var> RETURN <aggregates>` unit is
@@ -695,3 +721,49 @@ class TestAgainstFixtureGraph:
         -- a plain dict of numbers, decided by what the query says."""
         result = graph.cypher("MATCH (a:leaf) RETURN count(a)")
         assert result == {"count": 4}
+
+
+class TestOptionForwarding:
+    """Every dispatching entry point takes the same keyword options as
+    cypher_to_traversal(), and each must actually pass them through --
+    mutation testing caught graph.cypher() variants that dropped
+    **options in one branch and nothing failed, because no test passed
+    an option whose loss changes the answer. node_label_key=None makes
+    `(a:leaf)` match all 7 fixture nodes instead of the 4 leaves, which
+    is exactly such an option."""
+
+    def test_graph_cypher_forwards_options_to_a_traversal(self, graph):
+        assert len(graph.cypher("MATCH (a:leaf) RETURN a").nodes) == 4
+        assert len(graph.cypher("MATCH (a:leaf) RETURN a", node_label_key=None).nodes) == 7
+
+    def test_graph_cypher_forwards_options_to_an_aggregation(self, graph):
+        assert graph.cypher("MATCH (a:leaf) RETURN count(a)") == {"count": 4}
+        assert graph.cypher("MATCH (a:leaf) RETURN count(a)",
+                            node_label_key=None) == {"count": 7}
+
+    def test_graph_cypher_forwards_options_to_a_write(self, fresh_graph):
+        fresh_graph.cypher("CREATE (a:person {x: 1})", node_label_key=None)
+        result = fresh_graph.traverse(Start(where={"x": 1}))
+        assert result.nodes[0]["properties"] == {"x": 1}   # label ignored, no "type"
+
+    def test_traverse_cypher_forwards_options(self, graph):
+        result = traverse_cypher(graph, "MATCH (a:leaf) RETURN a", node_label_key=None)
+        assert len(result.nodes) == 7
+
+    def test_aggregate_cypher_forwards_options(self, graph):
+        assert aggregate_cypher(graph, "MATCH (a:leaf) RETURN count(a)",
+                                node_label_key=None) == {"count": 7}
+
+    def test_cypher_to_aggregation_forwards_every_option(self):
+        """One query whose translation visibly consumes all three
+        options: without node_label_key=None the label filters, without
+        edge_type_key=None the type filters, and without max_var_length
+        the unbounded `*` raises."""
+        start, hops, aggregates = cypher_to_aggregation(
+            "MATCH (a:leaf)-[r:knows*]->(b) RETURN count(DISTINCT b)",
+            node_label_key=None, edge_type_key=None, max_var_length=3,
+        )
+        assert start.where is None
+        assert hops[0].via is None
+        assert (hops[0].min_hops, hops[0].max_hops) == (1, 3)
+        assert list(aggregates) == ["count"]

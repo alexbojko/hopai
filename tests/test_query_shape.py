@@ -69,7 +69,9 @@ class TestQueryStructure:
             assert f"match_{i}" in sql
             assert f"hop_edges_{i}" in sql
         assert f"walk_{n}" not in sql
-        assert "all_edges" in sql and "edge_rows" in sql
+        # "all_edges AS", not just "all_edges": a mutant renamed the CTE
+        # to XXall_edgesXX and the bare substring check still matched.
+        assert "all_edges AS" in sql and "edge_rows AS" in sql
         assert sql.count("UNION ALL") == n           # one recursive term per hop
         # (n-1) to fold the per-hop edge CTEs together, then 2 to union
         # the node and edge result rows
@@ -263,6 +265,17 @@ class TestAggregateQueryShape:
         with pytest.raises(ValueError, match="no effect on an aggregation"):
             offline_graph.build_aggregate_query(Start(), hops, {"n": Count()})
 
+    def test_optional_rejection_names_the_offending_hop(self, offline_graph):
+        """Same standard as the traverse-side optional error: the
+        message says which hop, by index and label (or 'unlabeled'), so
+        the caller of a long chain is not left counting Hops by hand."""
+        with pytest.raises(ValueError, match=r"hop 1 \(unlabeled\): optional=True"):
+            offline_graph.build_aggregate_query(
+                Start(), [Hop(), Hop(optional=True)], {"n": Count()})
+        with pytest.raises(ValueError, match=r"hop 0 \(fanout\): optional=True"):
+            offline_graph.build_aggregate_query(
+                Start(), [Hop(optional=True, label="fanout")], {"n": Count()})
+
     def test_custom_table_and_column_names_are_used(self):
         from sqlalchemy import BigInteger, Column, MetaData, Table
         from sqlalchemy.dialects.postgresql import JSONB
@@ -376,7 +389,7 @@ class TestAggregateJsonPythonEquivalence:
         {"start": {"where": {"a": 1}}, "aggregates": {}},
     ])
     def test_missing_or_empty_aggregates_rejected(self, spec):
-        with pytest.raises(ValueError, match='"aggregates"'):
+        with pytest.raises(ValueError, match='non-empty "aggregates" object'):
             spec_to_aggregation(spec)
 
 

@@ -325,6 +325,14 @@ class TestJsonApi:
 # ---------------------------------------------------------------------
 
 class TestAggregations:
+    def test_seed_only_traversal_returns_empty_edges_list(self, graph):
+        """Not an aggregation, but caught by its mutation run: on the
+        seed-only path `edges` must be an empty LIST, not None --
+        to_dict()/to_networkx() iterate it, and a None would crash both.
+        Nothing previously asserted edges on a hopless traversal."""
+        result = graph.traverse(Start(where={"type": "leaf"}))
+        assert result.edges == [] and len(result.nodes) == 4
+
     def test_zero_hop_aggregates_over_the_seed_set(self, graph):
         """The fixture's four leaves, three of which carry a priority
         (3, 7, 15) -- every function checked against numbers small enough
