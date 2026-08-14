@@ -333,6 +333,25 @@ class TestAggregations:
         result = graph.traverse(Start(where={"type": "leaf"}))
         assert result.edges == [] and len(result.nodes) == 4
 
+    def test_min_hops_excludes_edges_of_too_short_walks(self, fresh_graph):
+        """A shortcut edge straight to a node that also lies at the
+        required depth must NOT be reported: hop_edges filters walks by
+        depth >= min_hops separately from the match filter, and losing
+        that predicate leaks the depth-1 edge whenever its endpoint is
+        legitimately matched deeper. A surviving mutant proved the
+        7-node fixture cannot catch this -- it has no shortcut edge --
+        so this graph exists to have one."""
+        fresh_graph.add_nodes([{"id": 1, "name": "a"}, {"id": 2, "name": "b"},
+                               {"id": 3, "name": "hub"}])
+        fresh_graph.add_edges([
+            {"start_id": 1, "end_id": 3},   # the shortcut: 1 hop straight to the hub
+            {"start_id": 1, "end_id": 2},
+            {"start_id": 2, "end_id": 3},
+        ])
+        result = fresh_graph.traverse(Start(where={"name": "a"}), Hop(hops=(2, 2)))
+        pairs = {(e["start_id"], e["end_id"]) for e in result.edges}
+        assert pairs == {("1", "2"), ("2", "3")}   # 1->3 is not on any 2-hop walk
+
     def test_zero_hop_aggregates_over_the_seed_set(self, graph):
         """The fixture's four leaves, three of which carry a priority
         (3, 7, 15) -- every function checked against numbers small enough

@@ -442,6 +442,9 @@ class TestAggregationTranslation:
         assert start.where == {"type": "person"}
         assert (hops[0].min_hops, hops[0].max_hops) == (1, 4)
         assert repr(hops[0].where) == repr({"active": True})
+        # via included: a mutant that quietly defaulted edge_type_key
+        # survived while only the option-override direction was tested
+        assert repr(hops[0].via) == repr({"kind": "friend"})
         assert list(aggregates) == ["count"]
 
 
@@ -519,8 +522,11 @@ class TestAggregationRefusals:
     def test_optional_match_cannot_feed_an_aggregation(self):
         """count(DISTINCT c) over an OPTIONAL MATCH equals the count over
         the required MATCH -- accepting the flag would let callers
-        believe it changed the number."""
-        with pytest.raises(CypherError, match="OPTIONAL"):
+        believe it changed the number. The full head phrase is pinned:
+        a bare match on "OPTIONAL" also matched the word's second
+        occurrence at the message's tail, so case-mangling mutants of
+        the head survived."""
+        with pytest.raises(CypherError, match="an OPTIONAL MATCH cannot feed an aggregation"):
             agg("MATCH (a)-[]->(b) OPTIONAL MATCH (b)-[]->(c) RETURN count(DISTINCT c)")
 
     def test_with_distinct_must_name_the_last_node(self):
@@ -544,6 +550,30 @@ class TestAggregationRefusals:
         naming that one exception."""
         with pytest.raises(CypherError, match="WITH is not supported"):
             agg("MATCH (a)-[]->(b) WITH b RETURN count(b)")
+
+    @pytest.mark.parametrize("query", [
+        "MATCH (a)-[]->(b) WITH DISTINCT RETURN count(b)",                       # no variable
+        "MATCH (a)-[]->(b) WITH DISTINCT b MATCH (b)-[]->(c) RETURN count(c)",   # no RETURN next
+        "MATCH (a)-[]->(b) WITH b b RETURN count(b)",                            # no DISTINCT
+        "MATCH (a)-[]->(b) WITH DISTINCT 5 RETURN count(b)",                     # not a name
+    ])
+    def test_near_miss_with_forms_get_the_canonical_refusal(self, query):
+        """Each of these is one boolean-operator slip away from the gate
+        accepting garbage -- consuming RETURN as the variable, or
+        silently reading `WITH b b` as WITH DISTINCT b. Mutation testing
+        produced exactly those slips and every one survived, because no
+        test fed the gate a near-miss. All must fall through to the one
+        honest WITH refusal."""
+        with pytest.raises(CypherError, match="WITH is not supported"):
+            agg(query)
+
+    def test_with_distinct_before_a_non_aggregating_return_expression(self):
+        """`RETURN 5` after the unit prefix: the gate accepts (a RETURN
+        does follow), and the missing aggregate is what refuses -- a
+        mutant that peeked one token past the gate re-routed this to the
+        generic WITH error instead."""
+        with pytest.raises(CypherError, match="aggregating RETURN"):
+            agg("MATCH (a)-[]->(b) WITH DISTINCT b RETURN 5")
 
     def test_with_distinct_without_aggregates_refused(self):
         with pytest.raises(CypherError, match="aggregating RETURN"):
