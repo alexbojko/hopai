@@ -90,15 +90,23 @@ same data that answered in under a second on Neo4j and raw Postgres. Set
 a `statement_timeout` before running these against AGE, or a single
 query can tie up your session indefinitely.
 
-## bench_postgres_cte -- the honest floor
+## The honest floor
 
-`bench_hopai.py`'s numbers include hopai's own overhead (SQLAlchemy
-query construction, cycle-protection path tracking). If you want the
-absolute floor -- hand-written recursive CTEs against the same data with
-none of that -- the query shapes hopai generates are visible by
-calling `graph.build_query(...)` and inspecting the compiled statement.
-In the original investigation, raw CTEs were faster than hopai on
-most queries by a factor of 2-5x, and hopai was faster than raw CTEs
-on none -- that gap is the honest price of the API's convenience and
-correctness guarantees (path tracking, dead-end pruning, automatic
-node/edge derivation), not a hidden cost.
+`bench_hopai.py` measures it on every run (`--no-baseline` to skip). For each
+query it takes the statement hopai just built, executes it **straight through
+the driver** — no SQLAlchemy result mapping, no property hydration, no
+`Subgraph` — and reports both numbers with the ratio between them.
+
+That is the floor for the same query. It is deliberately not two hand-written
+queries: one statement, measured twice, cannot drift out of step with the
+library the way a parallel hand-maintained SQL file always does.
+
+On a 50k-node graph the gap ran 1.3x-10.8x, clustering around 3.5-4.8x on the
+queries that return real volume. Read the small-result rows carefully: hopai's
+per-call cost is roughly fixed (two extra round trips to hydrate properties),
+so it dominates a query returning 16 nodes and nearly disappears on one
+returning 10,000. Quote the ratio next to the row size, never on its own.
+
+The gap is what the API buys — result mapping, dead-end pruning, automatic
+node/edge derivation, cycle protection. It is a price, stated, not a hidden
+cost.

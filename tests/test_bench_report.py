@@ -19,7 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
 
 from report import (  # noqa: E402
-    UNKNOWN, bar, chart, empty_queries, machine_profile, render,
+    UNKNOWN, bar, chart, empty_queries, machine_profile, overhead, render,
 )
 
 RESULTS = [
@@ -102,6 +102,31 @@ class TestEmptyQueries:
         body = render(results, PROFILE, generated_at="fixed")
         assert "Measured nothing" in body and "`dud`" in body
         assert "not how fast the query is" in body
+
+
+class TestRawSqlFloor:
+    """The raw-SQL column answers "what does the library layer cost?".
+    It is only honest if the ratio is computed, not eyeballed."""
+
+    WITH_RAW = [{"query": "q1", "cold_ms": 200.0, "warm_ms": 100.0,
+                 "raw_sql_ms": 25.0, "nodes": 5, "edges": 4}]
+
+    def test_overhead_is_warm_over_raw(self):
+        assert overhead(self.WITH_RAW[0]) == pytest.approx(4.0)
+
+    def test_overhead_is_none_when_the_floor_was_not_measured(self):
+        assert overhead({"warm_ms": 10.0}) is None
+        assert overhead({"raw_sql_ms": 10.0}) is None
+
+    def test_the_table_grows_the_columns_only_when_measured(self):
+        with_raw = render(self.WITH_RAW, PROFILE, generated_at="fixed")
+        assert "Raw SQL (ms)" in with_raw and "4.0x" in with_raw
+        without = render(RESULTS, PROFILE, generated_at="fixed")
+        assert "Raw SQL (ms)" not in without
+
+    def test_the_floor_gets_its_own_chart_when_measured(self):
+        assert "The floor" in render(self.WITH_RAW, PROFILE, generated_at="fixed")
+        assert "The floor" not in render(RESULTS, PROFILE, generated_at="fixed")
 
 
 class TestRender:

@@ -158,14 +158,36 @@ def empty_queries(results: list) -> list:
     return [r["query"] for r in results if not r.get("nodes")]
 
 
+def overhead(row: dict) -> float | None:
+    """How many times slower traverse() is than the same SQL run raw.
+
+    Not a criticism of the library -- the gap buys result mapping,
+    property hydration and a Subgraph. It is the number to quote when
+    somebody asks what the convenience costs, and quoting it honestly
+    means measuring it rather than estimating it."""
+    raw, warm = row.get("raw_sql_ms"), row.get("warm_ms")
+    if not raw or not warm:
+        return None
+    return warm / raw
+
+
 def _table(results: list) -> str:
-    header = ("| Query | Cold (ms) | Warm (ms) | Nodes | Edges |\n"
-              "| --- | ---: | ---: | ---: | ---: |")
-    rows = [
-        f"| `{r['query']}` | {r.get('cold_ms', 0):,.1f} | {r.get('warm_ms', 0):,.1f} "
-        f"| {r.get('nodes', 0):,} | {r.get('edges', 0):,} |"
-        for r in results
-    ]
+    has_raw = any(r.get("raw_sql_ms") for r in results)
+    columns = ["Query", "Cold (ms)", "Warm (ms)"]
+    if has_raw:
+        columns += ["Raw SQL (ms)", "Overhead"]
+    columns += ["Nodes", "Edges"]
+    header = ("| " + " | ".join(columns) + " |\n"
+              "| --- |" + " ---: |" * (len(columns) - 1))
+    rows = []
+    for r in results:
+        cells = [f"`{r['query']}`", f"{r.get('cold_ms', 0):,.1f}", f"{r.get('warm_ms', 0):,.1f}"]
+        if has_raw:
+            ratio = overhead(r)
+            cells += [f"{r.get('raw_sql_ms', 0):,.1f}",
+                      f"{ratio:.1f}x" if ratio else "-"]
+        cells += [f"{r.get('nodes', 0):,}", f"{r.get('edges', 0):,}"]
+        rows.append("| " + " | ".join(cells) + " |")
     return "\n".join([header, *rows]) if rows else "(no measurements)"
 
 
@@ -177,6 +199,29 @@ def _profile_table(profile: dict) -> str:
     rows = [f"| {labels.get(k, f'`{k}`')} | {v} |"
             for k, v in profile.items() if v not in (None, "")]
     return "\n".join(["| | |", "| --- | --- |", *rows])
+
+
+def _floor_section(results: list) -> list:
+    """hopai's own statement, executed straight through the driver.
+
+    Only rendered when it was measured. The gap between this and warm
+    latency is what the library layer costs -- result mapping, property
+    hydration, building a Subgraph -- measured rather than estimated,
+    and from ONE statement rather than from two hand-written queries
+    somebody has to keep in step."""
+    if not any(r.get("raw_sql_ms") for r in results):
+        return []
+    return [
+        "## The floor: the same SQL, run raw",
+        "",
+        "No result mapping, no property hydration, no `Subgraph`. The ratio in the",
+        "table below is what the convenience costs.",
+        "",
+        "```",
+        chart(results, "raw_sql_ms"),
+        "```",
+        "",
+    ]
 
 
 def render(results: list, profile: dict, dataset: dict | None = None,
@@ -233,6 +278,7 @@ def render(results: list, profile: dict, dataset: dict | None = None,
         chart(results, "cold_ms"),
         "```",
         "",
+        *_floor_section(results),
         "## All measurements",
         "",
         _table(results),

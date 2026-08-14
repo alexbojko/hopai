@@ -62,10 +62,10 @@ def load_data(engine, data_dir: Path, schema: str):
         conn.execute(text(f"ANALYZE {schema}.edges"))
 
 
-def run_suite(graph, hub_id: int):
+def build_suite():
     from hopai import AND, GT, NOT, Hop, Start
 
-    suite = [
+    return [
         ("forward_1hop", [Start(where={"type": "leaf"}), Hop(where={"flag": 1}, hops=1)]),
         ("backward_1hop", [Start(where={"type": "hub"}), Hop(hops=1, direction="backward")]),
         ("forward_bounded_4hop", [Start(where={"type": "leaf"}), Hop(where={"flag": 1}, hops=(1, 4))]),
@@ -91,6 +91,35 @@ def run_suite(graph, hub_id: int):
         ]),
     ]
 
+
+def time_raw_sql(graph, start_hop, rest) -> float:
+    """Execute the SQL hopai just built, straight through the driver.
+
+    This is the floor the README has always talked about and never
+    measured: the SAME query, with none of hopai's Python around it --
+    no SQLAlchemy result mapping, no property hydration round trips, no
+    Subgraph. The gap between this and traverse() is what the library
+    layer costs, and it is the honest way to quote that, because both
+    numbers come from one statement rather than from two hand-written
+    queries somebody has to keep in step.
+    """
+    statement = graph.build_query(start_hop, list(rest))
+    compiled = statement.compile(dialect=graph.engine.dialect,
+                                 compile_kwargs={"literal_binds": True})
+    raw = graph.engine.raw_connection()
+    try:
+        cursor = raw.cursor()
+        t0 = time.perf_counter()
+        cursor.execute(str(compiled))
+        cursor.fetchall()
+        elapsed = (time.perf_counter() - t0) * 1000
+    finally:
+        raw.close()
+    return elapsed
+
+
+def run_suite(graph, hub_id: int, baseline: bool = True):
+    suite = build_suite()
     results = []
     for name, hops in suite:
         start_hop, *rest = hops
@@ -100,14 +129,20 @@ def run_suite(graph, hub_id: int):
             t0 = time.perf_counter()
             r = graph.traverse(start_hop, *rest)
             times.append((time.perf_counter() - t0) * 1000)
-        results.append({
+        row = {
             "query": name,
             "cold_ms": round(times[0], 1),
             "warm_ms": round(times[1], 1),
             "nodes": len(r.nodes),
             "edges": len(r.edges),
-        })
-        print(f"{name:28s} cold={times[0]:9.1f}ms warm={times[1]:9.1f}ms nodes={len(r.nodes):8d} edges={len(r.edges):8d}")
+        }
+        if baseline:
+            time_raw_sql(graph, start_hop, rest)          # warm the same way
+            row["raw_sql_ms"] = round(time_raw_sql(graph, start_hop, rest), 1)
+        results.append(row)
+        extra = f" raw={row['raw_sql_ms']:9.1f}ms" if baseline else ""
+        print(f"{name:28s} cold={times[0]:9.1f}ms warm={times[1]:9.1f}ms{extra} "
+              f"nodes={len(r.nodes):8d} edges={len(r.edges):8d}")
 
     return results
 
@@ -125,6 +160,8 @@ if __name__ == "__main__":
     ap.add_argument("--hub-id", type=int, default=None,
                      help="defaults to nodes/2, matching generate_graph.py's default")
     ap.add_argument("--skip-load", action="store_true", help="reuse already-loaded data")
+    ap.add_argument("--no-baseline", action="store_true",
+                    help="skip the raw-SQL floor (hopai's own SQL run through the driver)")
     args = ap.parse_args()
 
     engine = create_engine(args.dsn)
@@ -137,7 +174,7 @@ if __name__ == "__main__":
 
     print(f"\n{'Query':28s} {'Cold':>13s} {'Warm':>13s} {'Nodes':>10s} {'Edges':>10s}")
     print("-" * 90)
-    results = run_suite(graph, args.hub_id or 0)
+    results = run_suite(graph, args.hub_id or 0, baseline=not args.no_baseline)
 
     from report import machine_profile, render
 
