@@ -327,7 +327,7 @@ def attach_columns(graph) -> None:
 def _defined(graph, target: str, caller: str) -> dict:
     if target not in _TARGETS:
         raise ValueError(f"target must be one of {_TARGETS}, got {target!r}")
-    registry = getattr(graph, "_vectors", None)
+    registry = graph._vectors
     if registry is None or not registry.get(target):
         raise ValueError(
             f"{caller} needs vector fields and none are defined for {target} on this Graph -- "
@@ -570,7 +570,7 @@ def vector_ddl(graph) -> list:
     the same contract as constraint_ddl() and schema_ddl()."""
     statements = []
     for target_name in _TARGETS:
-        fields = getattr(graph, "_vectors", None) or {}
+        fields = graph._vectors or {}
         target = _target_for(graph, target_name)
         for field in (fields.get(target_name) or {}).values():
             statements.extend(_field_ddl(target, field))
@@ -597,7 +597,7 @@ def migrate_vectors(graph) -> list:
     names drop_vectors() (or the conflicting column) rather than
     quietly serving two incompatible definitions. Returns
     "table.column" for every field ensured, in order."""
-    if getattr(graph, "_vectors", None) is None:
+    if graph._vectors is None:
         raise ValueError("migrate_vectors() needs vector fields and none are defined -- "
                          "call define_vectors(...) first")
     ensured = []
@@ -679,9 +679,8 @@ def drop_vectors(graph, nodes=None, edges=None) -> list:
                         .where(graph._scoped(table), column.isnot(None))
                         .values({field.column_name: None})
                     )
-                registry = getattr(graph, "_vectors", None)
-                if registry:
-                    registry[target_name].pop(field.name, None)
+                if graph._vectors:
+                    graph._vectors[target_name].pop(field.name, None)
                 dropped.append(field.name)
     return dropped
 

@@ -74,6 +74,11 @@ class TestVectorDeclaration:
         fails at build with a KeyError instead of compiling."""
         assert "vec_summary" in vg.nodes_tbl.c
         assert "vec_rel" in vg.edges_tbl.c
+        # Nullable, load-bearingly: create_schema() emits this metadata,
+        # and a NOT NULL vector column would reject every node written
+        # before its embedding exists -- which is all of them. A mutant
+        # that flipped this survived the suite in silence.
+        assert vg.nodes_tbl.c.vec_summary.nullable is True
 
     @pytest.mark.parametrize("bad", ["Vec", "9x", "", "a-b", "a b", "vec.sum", None, 42])
     def test_field_names_are_held_to_identifier_rules(self, bad):
@@ -188,7 +193,9 @@ class TestNearValidation:
             Near(bad, [1.0])
 
     def test_search_with_no_near_at_all_is_rejected(self, vg):
-        with pytest.raises(ValueError, match="pass a Near"):
+        """The caller name leads the message so the reader knows which
+        call to fix -- matched exactly, or a mutant can mangle it."""
+        with pytest.raises(ValueError, match=r"vector_search\(\): near=\[\] is empty"):
             vg.build_vector_search_query()
 
     def test_numpy_style_arrays_are_accepted_via_tolist(self):
@@ -375,6 +382,34 @@ class TestSearchQueryShape:
                        literal_binds=True)
         assert ">= 0.5" in sql
 
+    def test_custom_table_and_column_names_are_used(self):
+        """Same contract as the traversal's custom-schema test. The
+        default tables name BOTH id columns `id`, so picking the edge
+        id column for a node search is invisible there -- only distinct
+        names can catch it, and a mutant doing exactly that survived."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        md = MetaData()
+        v = Table("vertex", md, Column("vid", BigInteger, primary_key=True),
+                  Column("properties", JSONB))
+        e = Table("link", md, Column("lid", BigInteger, primary_key=True),
+                  Column("src", BigInteger), Column("dst", BigInteger),
+                  Column("properties", JSONB))
+        g = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/x",
+                  node_table=v, edge_table=e, node_id_col="vid", edge_id_col="lid",
+                  edge_start_col="src", edge_end_col="dst", graph_col=None)
+        g.define_vectors(nodes=[Vector("summary", 3)], edges=[Vector("rel", 3)])
+
+        nodes_sql = norm(g.build_vector_search_query(Near("summary", [1.0, 0.0, 0.0])))
+        assert "vertex.vid" in nodes_sql and "lid" not in nodes_sql
+        assert "graph_id" not in nodes_sql
+        edges_sql = norm(g.build_vector_search_query(Near("rel", [1.0, 0.0, 0.0]),
+                                                     target="edges"))
+        for name in ("link.lid", "link.src", "link.dst"):
+            assert name in edges_sql
+        assert "vid" not in edges_sql
+
 
 # ---------------------------------------------------------------------
 # Traversal integration
@@ -442,6 +477,21 @@ class TestTraversalNearShape:
             vg.build_query(Start(), [Hop(), Hop(near=Near("summary", [1.0, 0.0, 0.0]),
                                                label="ranked")])
 
+    def test_traversal_near_keeps_the_presence_guards(self, vg):
+        """The guards are not just an optimization: in all-zero missing
+        mode a vectorless node's score coalesces to 0, which is NOT
+        NULL -- so without the presence guard it would quietly join the
+        ranked set. A mutant that dropped the guards survived every
+        behavioral test because exclude mode also filters via NULL
+        propagation; the guard has to be pinned in the SQL itself."""
+        exclude = norm(vg.build_query(
+            Start(near=Near("summary", [1.0, 0.0, 0.0]), k=3), [Hop()]))
+        assert "vec_summary IS NOT NULL" in exclude
+        zero = norm(vg.build_query(
+            Start(near=[Near("summary", [1.0, 0.0, 0.0], missing="zero"),
+                        Near("title", [0.0, 1.0, 0.0], missing="zero")], k=3), [Hop()]))
+        assert "vec_summary IS NOT NULL OR" in zero
+
 
 # ---------------------------------------------------------------------
 # The JSON front end
@@ -469,8 +519,13 @@ class TestNearJsonPythonEquivalence:
         ({"field": "s"}, r"needs \['vector'\]"),
         ({"vector": [1.0]}, r"needs \['field'\]"),
         ({"field": "s", "vector": [1.0], "top_k": 3}, "unknown"),
-        ([], "empty list"),
-        ("s", "must be an object"),
+        # Anchored: an unanchored "empty list" kept matching after a
+        # mutant mangled the message's edges.
+        ([], '^"near" is an empty list'),
+        # "got str", not just "must be an object": the message names the
+        # actual offending type -- same standard as parse_aggregate,
+        # where a mutant hardcoding NoneType survived a looser match.
+        ("s", "must be an object or a list of objects -- got str"),
     ])
     def test_malformed_near_specs_are_rejected(self, bad, message):
         with pytest.raises((ValueError, TypeError), match=message):
@@ -544,11 +599,29 @@ class TestVectorMigrationLive:
             g.migrate_vectors()
 
     def test_conflicting_column_type_is_refused(self, fresh_graph):
+        """On its own tables rather than the shared Node metadata: the
+        define_vectors() here would otherwise attach vec_clash to the
+        global Table, and the NEXT in-process run of this test would
+        then create `nodes` with the column and die on the raw ALTER.
+        mutmut's baseline runs the suite twice in one process, so that
+        leak read as `0/N mutants checked` on every vector PR."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        md = MetaData()
+        v = Table("clash_nodes", md, Column("id", BigInteger, primary_key=True),
+                  Column("properties", JSONB))
+        e = Table("clash_edges", md, Column("id", BigInteger, primary_key=True),
+                  Column("start_id", BigInteger), Column("end_id", BigInteger),
+                  Column("properties", JSONB))
         with fresh_graph.engine.begin() as conn:
-            conn.execute(text("ALTER TABLE nodes ADD COLUMN vec_clash text"))
-        fresh_graph.define_vectors(nodes=[Vector("clash", 3)])
+            conn.execute(text(
+                "CREATE TABLE clash_nodes (id bigint primary key, "
+                "properties jsonb, vec_clash text)"))
+        g = Graph(fresh_graph.engine, node_table=v, edge_table=e, graph_col=None)
+        g.define_vectors(nodes=[Vector("clash", 3)])
         with pytest.raises(ValueError, match="not a float array"):
-            fresh_graph.migrate_vectors()
+            g.migrate_vectors()
 
     def test_existing_violating_rows_fail_the_migration_by_name(self, fresh_graph):
         """ADD CONSTRAINT validates existing rows; pre-vector data of
