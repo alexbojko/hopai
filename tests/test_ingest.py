@@ -327,6 +327,13 @@ class TestNetworkxRoundTrip:
         assert set(reloaded.edges) == set(original.edges)
         for node in original.nodes:
             assert reloaded.nodes[node] == original.nodes[node]
+        # edge PROPERTIES too: add_networkx builds its edge rows under a
+        # literal "properties" key, and mutating that key silently
+        # re-nested every edge's attributes (xǁIngestorǁadd_networkxǁ_14)
+        for edge in original.edges:
+            assert reloaded.edges[edge] == original.edges[edge]
+        assert any(original.edges[e] for e in original.edges), \
+            "fixture must carry at least one edge with properties, or this asserts nothing"
 
 
 class TestToolSchema:

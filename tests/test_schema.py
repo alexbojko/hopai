@@ -214,8 +214,9 @@ class TestSchemaDefinition:
         built = GraphSchema(node_types=[NodeType("person")])
         assert offgraph.define_schema(schema=built) is built
         assert offgraph.schema is built
-        with pytest.raises(ValueError, match="either schema= or nodes=/edges="):
+        with pytest.raises(ValueError) as exc:
             offgraph.define_schema(nodes=[NodeType("robot")], schema=built)
+        assert str(exc.value).startswith("pass either schema= or nodes=/edges=")
         with pytest.raises(TypeError, match="GraphSchema") as exc:
             offgraph.define_schema(schema={"nodes": []})
         assert "got dict" in str(exc.value)   # the refusal names what it got

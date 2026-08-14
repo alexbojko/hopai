@@ -194,6 +194,19 @@ class TestPatternTranslation:
         start, _ = tr("MATCH (a {gone: NULL, missing: null})")
         assert start.where == {"gone": None, "missing": None}
 
+    def test_boolean_literals_in_a_property_map(self):
+        """true AND false: only true had coverage, so the FALSE keyword
+        comparison was freely mutable."""
+        start, _ = tr("MATCH (a {flag: false, ok: true})")
+        assert start.where == {"flag": False, "ok": True}
+
+    def test_a_comment_ending_directly_before_a_keyword(self):
+        """The comment skip must resume at exactly newline+1: the +2
+        mutant ate the next character, which every existing comment test
+        hid behind indentation whitespace."""
+        start, _ = tr("MATCH (a:person) // c\nRETURN a")
+        assert start.where == {"type": "person"}
+
 
 class TestLabelMapping:
     def test_custom_keys(self):
@@ -709,7 +722,7 @@ class TestAggregationRefusals:
     def test_exists_refused_with_the_is_not_null_rewrite(self):
         with pytest.raises(CypherError) as exc:
             tr("MATCH (a) WHERE exists(a.email) RETURN a")
-        assert "exists(...) is not supported" in str(exc.value)
+        assert str(exc.value).startswith("exists(...) is not supported")
         assert "IS NOT NULL" in str(exc.value)
 
     def test_comma_separated_patterns_refused(self):
@@ -736,6 +749,19 @@ class TestAggregationRefusals:
         with pytest.raises(CypherError) as exc:
             tr("MATCH (a)-[]-(b) RETURN b")
         assert "Hop.direction is 'forward' or 'backward'" in str(exc.value)
+        # the bare `--` spelling reaches the refusal through a different
+        # tokenizer arm than `-[]-`; only the second had coverage
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a)--(b) RETURN b")
+        assert "Hop.direction is 'forward' or 'backward'" in str(exc.value)
+
+    def test_conflicting_relationship_filters_name_the_hop(self):
+        """`[r:x {kind: 'y'}]` asks one edge property for two values; the
+        refusal's label ('relationship at hop 0') was interpolated by
+        code no test reached."""
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a)-[r:x {kind: 'y'}]->(b) RETURN b")
+        assert str(exc.value).startswith("relationship at hop 0 requires")
 
     def test_rel_variable_reusing_a_node_variable_refused(self):
         """The already-bound check is an OR of two indexes; mutant
@@ -750,7 +776,7 @@ class TestAggregationRefusals:
         or-to-and mutants printed None instead."""
         with pytest.raises(CypherError) as exc:
             tr("MATCH (:A:B)")
-        assert "node (anonymous) has multiple labels" in str(exc.value)
+        assert "node (anonymous) has multiple labels (A:B)" in str(exc.value)
         with pytest.raises(CypherError) as exc:
             tr("MATCH (:person {type: 'robot'})")
         assert "node (anonymous) requires" in str(exc.value)
@@ -775,7 +801,9 @@ class TestAggregationRefusals:
     def test_with_distinct_on_an_anonymous_last_node_says_to_name_it(self):
         with pytest.raises(CypherError) as exc:
             cypher_to_aggregation("MATCH (a)-[:x]->() WITH DISTINCT a RETURN count(a)")
-        assert "give it a variable" in str(exc.value)
+        # parenthesized exactly: the XX-padding mutant kept the phrase
+        # but broke the interpolation's delimiters
+        assert "(which is anonymous -- give it a variable)" in str(exc.value)
 
     def test_entry_point_refusals_lead_with_the_diagnosis(self):
         """Both wrong-entry-point messages must OPEN with what the query
@@ -833,6 +861,11 @@ class TestSyntaxErrors:
         with pytest.raises(CypherError) as exc:
             tr(query)
         assert phrase in str(exc.value)
+
+    def test_no_match_clause_message_is_the_whole_message(self):
+        with pytest.raises(CypherError) as exc:
+            tr("RETURN 1")
+        assert str(exc.value) == "query has no MATCH clause"
 
 
 # ---------------------------------------------------------------------
