@@ -25,9 +25,9 @@ from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 
 from hopai import (
-    AND, BETWEEN, GT, GTE, LT, LTE, NOT, OR,
-    Graph, Hop, Start, Subgraph, TRAVERSE_TOOL_SCHEMA,
-    parse_filter, spec_to_traversal,
+    AGGREGATE_TOOL_SCHEMA, AND, BETWEEN, GT, GTE, LT, LTE, NOT, OR,
+    Avg, Count, Graph, Hop, Max, Min, Start, Subgraph, Sum, TRAVERSE_TOOL_SCHEMA,
+    parse_aggregate, parse_filter, spec_to_aggregation, spec_to_traversal,
 )
 from hopai.filters import resolve
 from hopai.models import Node
@@ -70,7 +70,9 @@ class TestQueryStructure:
             assert f"match_{i}" in sql
             assert f"hop_edges_{i}" in sql
         assert f"walk_{n}" not in sql
-        assert "all_edges" in sql and "edge_rows" in sql
+        # "all_edges AS", not just "all_edges": a mutant renamed the CTE
+        # to XXall_edgesXX and the bare substring check still matched.
+        assert "all_edges AS" in sql and "edge_rows AS" in sql
         assert sql.count("UNION ALL") == n           # one recursive term per hop
         # (n-1) to fold the per-hop edge CTEs together, then 2 to union
         # the node and edge result rows
@@ -208,6 +210,268 @@ class TestCustomSchema:
         quietly undo that."""
         assert "***" in repr(offline_graph)
         assert "offline:offline" not in repr(offline_graph)
+
+
+# ---------------------------------------------------------------------
+# The aggregate query's shape
+# ---------------------------------------------------------------------
+
+class TestAggregateQueryShape:
+    @staticmethod
+    def agg_sql(graph, start, hops, aggregates, literal_binds=False) -> str:
+        return norm(graph.build_aggregate_query(start, hops, aggregates), literal_binds)
+
+    def test_no_edge_reconstruction_ctes(self, offline_graph):
+        """The whole point of aggregating in the database: no edges are
+        reported, so none of the edge CTEs may be emitted. If hop_edges
+        reappears here, the aggregation is paying for a subgraph it
+        throws away."""
+        sql = self.agg_sql(offline_graph, Start(), [Hop(hops=(1, 4)), Hop()], {"n": Count()})
+        for cte in ("hop_edges", "all_edges", "edge_rows"):
+            assert cte not in sql
+        for cte in ("walk_0", "match_0", "walk_1", "match_1"):
+            assert cte in sql
+
+    def test_single_statement_one_round_trip(self, offline_graph):
+        sql = self.agg_sql(offline_graph, Start(), [Hop()], {"n": Count(), "s": Sum("x")})
+        assert ";" not in sql
+        assert sql.count("WITH RECURSIVE") == 1
+
+    def test_zero_hops_aggregates_the_seed_without_recursion(self, offline_graph):
+        sql = self.agg_sql(offline_graph, Start(where={"type": "leaf"}), [], {"n": Count()})
+        assert "seed" in sql and "RECURSIVE" not in sql and "walk_0" not in sql
+
+    def test_aggregates_run_over_the_last_match(self, offline_graph):
+        """Aggregating match_0 in a two-hop chain would count nodes with
+        no continuation to the chain's end -- the semantic the whole
+        design refuses."""
+        sql = self.agg_sql(offline_graph, Start(), [Hop(), Hop()], {"n": Count()})
+        assert "JOIN match_1 ON" in sql or "FROM match_1" in sql
+        assert "FROM match_0 JOIN nodes" not in sql
+
+    def test_numeric_aggregates_guard_with_jsonb_typeof(self, offline_graph):
+        """A bare ::numeric cast would abort the whole query on one node
+        carrying a string; the CASE guard turns that row into an ignored
+        NULL instead, which is what both Cypher and PG do with nulls."""
+        sql = self.agg_sql(offline_graph, Start(), [], {"a": Avg("age")}, literal_binds=True)
+        assert "jsonb_typeof" in sql and "CASE WHEN" in sql
+        assert "AS NUMERIC" in sql
+
+    def test_sum_coalesces_the_empty_set_to_zero(self, offline_graph):
+        """PG says NULL, Cypher and Python's sum([]) say 0; 0 is the
+        answer nobody has to null-check."""
+        sql = self.agg_sql(offline_graph, Start(), [], {"s": Sum("x")})
+        assert "coalesce" in sql
+        assert "coalesce" not in self.agg_sql(offline_graph, Start(), [], {"a": Avg("x")})
+
+    def test_distinct_lands_inside_the_aggregate(self, offline_graph):
+        plain = self.agg_sql(offline_graph, Start(), [], {"s": Sum("x")})
+        distinct = self.agg_sql(offline_graph, Start(), [], {"s": Sum("x", distinct=True)})
+        assert "sum(DISTINCT" in distinct and "sum(DISTINCT" not in plain
+
+    def test_count_of_property_uses_astext(self, offline_graph):
+        """->> is SQL NULL for a missing key AND for an explicit JSON
+        null, so both read as 'property absent' -- the judgement Cypher
+        makes. `->` would count an explicit null."""
+        sql = self.agg_sql(offline_graph, Start(), [], {"n": Count("age")})
+        assert "->>" in sql
+        assert "->>" not in self.agg_sql(offline_graph, Start(), [], {"n": Count()})
+
+    def test_result_names_become_column_labels(self, offline_graph):
+        sql = self.agg_sql(offline_graph, Start(), [], {"friends": Count(), "avg_age": Avg("age")})
+        assert "AS friends" in sql and "AS avg_age" in sql
+
+    def test_aggregate_query_is_graph_scoped(self, offline_graph):
+        """'Every read and write goes through Graph._scoped()' -- the
+        aggregation path is a new query builder, so it needs its own
+        proof: the discriminator must appear at every table access
+        (seed, walk base, recursive term, match join, final properties
+        join), or an aggregate quietly counts other graphs' rows."""
+        sql = self.agg_sql(offline_graph, Start(), [Hop()], {"n": Count()}, literal_binds=True)
+        assert sql.count("graph_id = 'default'") == 5
+
+    @pytest.mark.parametrize("bad", [{}, None, [Count()], "count"])
+    def test_aggregates_must_be_a_non_empty_dict(self, offline_graph, bad):
+        with pytest.raises(ValueError, match="non-empty dict"):
+            offline_graph.build_aggregate_query(Start(), [], bad)
+
+    def test_non_aggregate_values_are_rejected(self, offline_graph):
+        """`-- got str` included: the message names the offending type,
+        and a mutant that hardcoded a different type there survived a
+        match on the first half alone."""
+        with pytest.raises(TypeError, match="must be Count, Sum, Avg, Min or Max -- got str"):
+            offline_graph.build_aggregate_query(Start(), [], {"n": "count"})
+
+    @pytest.mark.parametrize("hops", [
+        [Hop(optional=True)],
+        [Hop(), Hop(optional=True)],
+        [Hop(optional=True), Hop()],   # invalid for traverse too -- still the agg message
+    ])
+    def test_optional_hops_are_rejected(self, offline_graph, hops):
+        """optional cannot change an aggregate (the aggregate runs over
+        what the hop matched), so accepting it would let callers believe
+        it did."""
+        with pytest.raises(ValueError, match="no effect on an aggregation"):
+            offline_graph.build_aggregate_query(Start(), hops, {"n": Count()})
+
+    def test_optional_rejection_names_the_offending_hop(self, offline_graph):
+        """Same standard as the traverse-side optional error: the
+        message says which hop, by index and label (or 'unlabeled'), so
+        the caller of a long chain is not left counting Hops by hand."""
+        with pytest.raises(ValueError, match=r"hop 1 \(unlabeled\): optional=True"):
+            offline_graph.build_aggregate_query(
+                Start(), [Hop(), Hop(optional=True)], {"n": Count()})
+        with pytest.raises(ValueError, match=r"hop 0 \(fanout\): optional=True"):
+            offline_graph.build_aggregate_query(
+                Start(), [Hop(optional=True, label="fanout")], {"n": Count()})
+
+    def test_custom_table_and_column_names_are_used(self):
+        from sqlalchemy import BigInteger, Column, MetaData, Table
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        md = MetaData()
+        v = Table("vertex", md, Column("vid", BigInteger, primary_key=True),
+                  Column("properties", JSONB))
+        e = Table("link", md, Column("lid", BigInteger, primary_key=True),
+                  Column("src", BigInteger), Column("dst", BigInteger),
+                  Column("properties", JSONB))
+        g = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/x",
+                  node_table=v, edge_table=e, node_id_col="vid", edge_id_col="lid",
+                  edge_start_col="src", edge_end_col="dst", graph_col=None)
+        sql = norm(g.build_aggregate_query(Start(where={"a": 1}), [Hop()], {"n": Count()}))
+        for name in ("vertex", "link", "vid", "src", "dst"):
+            assert name in sql
+        for default in ("nodes.id", "edges.start_id", "edges.end_id"):
+            assert default not in sql
+        assert "graph_id" not in sql   # graph_col=None means no discriminator at all
+
+
+# ---------------------------------------------------------------------
+# The JSON aggregate grammar must mean what the Python grammar means
+# ---------------------------------------------------------------------
+
+class TestAggregateJsonPythonEquivalence:
+    """parse_aggregate() feeds the same resolve_aggregate() the Python
+    classes do; reprs are exact, so comparing them proves the mapping."""
+
+    @pytest.mark.parametrize("json_form,python_form", [
+        ({"fn": "count"}, Count()),
+        ({"fn": "count", "property": "age"}, Count("age")),
+        ({"fn": "count", "property": "age", "distinct": True}, Count("age", distinct=True)),
+        ({"fn": "sum", "property": "age"}, Sum("age")),
+        ({"fn": "sum", "property": "age", "distinct": True}, Sum("age", distinct=True)),
+        ({"fn": "avg", "property": "age"}, Avg("age")),
+        # avg WITH distinct is the one input that can tell "avg is in the
+        # sum/avg branch" from "avg fell through to min/max" -- there it
+        # raises "does not apply" instead of returning Avg(distinct=True).
+        # A mutant that broke exactly that survived without this case.
+        ({"fn": "avg", "property": "age", "distinct": True}, Avg("age", distinct=True)),
+        ({"fn": "min", "property": "age"}, Min("age")),
+        ({"fn": "max", "property": "age"}, Max("age")),
+    ])
+    def test_same_aggregate(self, json_form, python_form):
+        assert repr(parse_aggregate(json_form)) == repr(python_form)
+
+    @pytest.mark.parametrize("agg,expected", [
+        (Count(), "Count()"),
+        (Count("age"), "Count('age')"),
+        (Count("age", distinct=True), "Count('age', distinct=True)"),
+        (Sum("age"), "Sum('age')"),
+        (Sum("age", distinct=True), "Sum('age', distinct=True)"),
+        (Avg("age"), "Avg('age')"),
+        (Avg("age", distinct=True), "Avg('age', distinct=True)"),
+        (Min("age"), "Min('age')"),
+        (Max("age"), "Max('age')"),
+    ])
+    def test_reprs_are_exact(self, agg, expected):
+        """The equivalence tests above (and the Cypher suite) compare
+        aggregates BY repr, so a drifted repr matches its own garbage on
+        both sides and hides real translation bugs -- a mutant that
+        mangled Count.__repr__ survived the whole suite to prove it.
+        One literal assertion per form pins them."""
+        assert repr(agg) == expected
+
+    @pytest.mark.parametrize("bad,message", [
+        ({"fn": "median", "property": "age"}, "must be one of"),
+        ({}, "must be one of"),
+        ({"fn": "sum"}, "aggregates a property"),
+        ({"fn": "min", "property": "age", "distinct": True}, "does not apply"),
+        ({"fn": "count", "distinct": True}, "matched nodes are already distinct"),
+        ({"fn": "count", "distinct": "yes", "property": "age"}, "true or false"),
+        ({"fn": "count", "prop": "age"}, "unknown aggregate keys"),
+        # "got str", not just "must be an object": the message names the
+        # actual offending type, and a mutant that hardcoded NoneType
+        # there survived a looser match.
+        ("count", "must be an object -- got str"),
+    ])
+    def test_malformed_aggregates_are_rejected(self, bad, message):
+        """Errors name the fix -- the same standard the filter grammar is
+        held to. Several matches are deliberately long phrases: mutation
+        testing showed the short ones still matched after the message was
+        mangled."""
+        with pytest.raises((ValueError, TypeError), match=message):
+            parse_aggregate(bad)
+
+    @pytest.mark.parametrize("cls", [Count, Sum, Avg, Min, Max])
+    def test_non_string_property_rejected(self, cls):
+        """Passing a filter, a number, or a whole node where a key
+        belongs should fail at construction with the type named, not
+        surface later as a broken SQL expression."""
+        with pytest.raises(TypeError, match="string key"):
+            cls(42)
+
+    def test_count_distinct_without_property_rejected(self):
+        with pytest.raises(ValueError, match="matched nodes are already distinct"):
+            Count(distinct=True)
+
+    def test_spec_to_aggregation_returns_the_full_triple(self):
+        start, hops, aggregates = spec_to_aggregation({
+            "start": {"where": {"type": "person"}},
+            "hops": [{"via": {"kind": "friend"}, "hops": [1, 4]}],
+            "aggregates": {"n": {"fn": "count"}, "mean": {"fn": "avg", "property": "age"}},
+        })
+        assert start.where == {"type": "person"}
+        assert (hops[0].min_hops, hops[0].max_hops) == (1, 4)
+        assert repr(aggregates["n"]) == "Count()" and repr(aggregates["mean"]) == "Avg('age')"
+
+    @pytest.mark.parametrize("spec", [
+        {"start": {"where": {"a": 1}}},
+        {"start": {"where": {"a": 1}}, "aggregates": {}},
+    ])
+    def test_missing_or_empty_aggregates_rejected(self, spec):
+        with pytest.raises(ValueError, match='non-empty "aggregates" object'):
+            spec_to_aggregation(spec)
+
+
+class TestAggregateToolSchema:
+    """Same contract as TestToolSchema: the schema is what an agent reads
+    instead of documentation."""
+
+    def test_is_json_serializable(self):
+        assert json.loads(json.dumps(AGGREGATE_TOOL_SCHEMA)) == AGGREGATE_TOOL_SCHEMA
+
+    def test_traversal_half_matches_traverse_schema_minus_optional(self):
+        """The two schemas describe the same traversal spec, except that
+        aggregate() refuses `optional` -- so the hop schemas must agree
+        on everything else, or the specs drift apart key by key."""
+        t_hops = TRAVERSE_TOOL_SCHEMA["parameters"]["properties"]["hops"]["items"]["properties"]
+        a_hops = AGGREGATE_TOOL_SCHEMA["parameters"]["properties"]["hops"]["items"]["properties"]
+        assert set(t_hops) - set(a_hops) == {"optional"}
+        for key in a_hops:
+            assert a_hops[key] == t_hops[key]
+
+    def test_fn_enum_matches_what_parse_aggregate_accepts(self):
+        agg_schema = AGGREGATE_TOOL_SCHEMA["parameters"]["properties"]["aggregates"]
+        for fn in agg_schema["additionalProperties"]["properties"]["fn"]["enum"]:
+            parse_aggregate({"fn": fn, "property": "age"})  # must not raise
+
+    def test_an_example_from_the_schema_translates(self):
+        start, hops, aggregates = spec_to_aggregation({
+            "start": {"where": {"type": "person"}},
+            "hops": [{"via": {"kind": "friend"}, "hops": [1, 4], "direction": "forward"}],
+            "aggregates": {"friends": {"fn": "count"}},
+        })
+        assert start.where and len(hops) == 1 and list(aggregates) == ["friends"]
 
 
 # ---------------------------------------------------------------------

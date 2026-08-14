@@ -3,8 +3,8 @@ benchmarks/bench_hopai.py
 
 Loads a generated graph (see generate_graph.py) into PostgreSQL and runs
 a suite of queries through hopai, covering direction, multi-hop
-bounds, compound chains, AND/OR/NOT, range comparisons, and OPTIONAL --
-timing each one cold and warm.
+bounds, compound chains, AND/OR/NOT, range comparisons, OPTIONAL, and
+aggregation -- timing each one cold and warm.
 
 Usage:
     python generate_graph.py --nodes 1000000 --out-dir ./data
@@ -26,9 +26,11 @@ def load_data(engine, data_dir: Path, schema: str):
     with engine.begin() as conn:
         conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
         conn.execute(text(f"CREATE SCHEMA {schema}"))
-        # Mirrors create_schema(), with one deliberate omission: the
-        # composite foreign keys that keep an edge inside its own graph.
-        # They cost a great deal on a COPY of millions of rows and
+        # graph_id mirrors the real schema (see models.py): Graph()
+        # builds against the default model tables, which carry the
+        # column, so the physical tables must too or every query fails at
+        # runtime. The composite foreign keys are deliberately omitted --
+        # they cost a great deal on a COPY of millions of rows and
         # nothing at all on a SELECT, so leaving them out speeds up
         # loading without touching what is being measured.
         conn.execute(text(f"""
@@ -65,9 +67,10 @@ def load_data(engine, data_dir: Path, schema: str):
         raw.close()
 
     with engine.begin() as conn:
-        # graph_id LEADS, exactly as create_schema() builds them -- a
-        # benchmark against differently-indexed tables measures the
-        # indexes, not the library.
+        # graph_id LEADS, matching create_schema(): every hop filters on
+        # it, and a trailing position would stop paying for itself the
+        # moment a second graph exists. Benchmarking differently-indexed
+        # tables would measure the indexes, not the library.
         conn.execute(text(f"CREATE INDEX ON {schema}.edges (graph_id, start_id)"))
         conn.execute(text(f"CREATE INDEX ON {schema}.edges (graph_id, end_id)"))
         conn.execute(text(f"CREATE INDEX ON {schema}.nodes (graph_id)"))
@@ -207,6 +210,64 @@ def run_suite(graph, hub_id: int, baseline: bool = True, repeat: int = 5,
         print(f"{qid:4s} {label:30s} cold={cold:9.1f}ms warm={row['warm_ms']:9.1f}ms"
               f" [{row['warm_min_ms']:.1f}-{row['warm_max_ms']:.1f}]{extra}"
               f" rows={len(r.nodes):8d}")
+
+    results.extend(run_aggregate_suite(graph, repeat=repeat))
+    return results
+
+
+def run_aggregate_suite(graph, repeat: int = 5):
+    """Aggregations over the same chains the traversal suite walks.
+
+    Q15 deliberately reuses Q3's chain, so the two rows show what
+    skipping edge reconstruction and property hydration is worth on
+    identical work -- the aggregate answers from the database and never
+    materialises the subgraph."""
+    from hopai import AND, GT, Avg, Count, Hop, Max, Min, Start, Sum
+
+    suite = [
+        ("Q15", "Aggregate count over Q3's chain", "aggregation",
+         [Start(where={"type": "leaf"}), Hop(where={"flag": 1}, hops=(1, 4))],
+         {"n": Count()}),
+        # backward from the flag layer far enough to reach the depth-7
+        # leaves -- the only nodes carrying the numeric `priority` the
+        # statistics need
+        ("Q16", "Aggregate stats, backward <=4", "aggregation",
+         [Start(where={"flag": 1}), Hop(hops=(1, 4), direction="backward")],
+         {"n": Count(), "total": Sum("priority"), "mean": Avg("priority"),
+          "lo": Min("priority"), "hi": Max("priority")}),
+        ("Q17", "Aggregate over a range filter", "aggregation",
+         [Start(where=AND({"type": "leaf"}, GT("priority", 5)))],
+         {"n": Count(), "mean": Avg("priority")}),
+    ]
+
+    results = []
+    for qid, label, feature, hops, aggregates in suite:
+        start_hop, *rest = hops
+        t0 = time.perf_counter()
+        values = graph.aggregate(start_hop, *rest, aggregates=aggregates)
+        cold = (time.perf_counter() - t0) * 1000
+
+        warm = []
+        for _ in range(repeat):
+            t0 = time.perf_counter()
+            values = graph.aggregate(start_hop, *rest, aggregates=aggregates)
+            warm.append((time.perf_counter() - t0) * 1000)
+
+        results.append({
+            "id": qid, "query": label, "feature": feature,
+            "cold_ms": round(cold, 1),
+            "warm_ms": round(statistics.median(warm), 1),
+            "warm_min_ms": round(min(warm), 1),
+            "warm_max_ms": round(max(warm), 1),
+            "samples": repeat,
+            # an aggregate returns numbers, not a subgraph; `nodes` is the
+            # count it computed so the report's row column stays meaningful
+            "nodes": values.get("n"),
+            "edges": None,
+            "values": {k: (float(v) if v is not None else None) for k, v in values.items()},
+        })
+        print(f"{qid:4s} {label:30s} cold={cold:9.1f}ms "
+              f"warm={results[-1]['warm_ms']:9.1f}ms {values}")
     return results
 
 

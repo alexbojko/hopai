@@ -15,33 +15,41 @@ the default settings). That structure, not a purely random graph, is
 what actually stresses a graph engine — random graphs rarely have the
 convergent fan-in that real dependency graphs do.
 
-`bench_hopai.py` loads it and times nine queries covering direction,
-multi-hop bounds, compound chains, `OR`, `NOT`, range comparisons, and
-`OPTIONAL`.
+`bench_hopai.py` loads it and times **17 queries** — 14 traversals covering
+forward, backward and mixed direction, bounded and deep multi-hop, compound
+chains, `OR` on nodes and on edges, `NOT`, range comparisons, composition and
+`OPTIONAL`, plus three aggregations (`Count`/`Sum`/`Avg`/`Min`/`Max`).
 
-Each query runs once cold, then `--repeat` times warm (default 5), and
-the **median** is reported with its range. A single warm sample on a
-shared machine moves further than most regressions worth catching, so a
-one-shot number cannot tell a real change from the machine breathing —
-if you are comparing two commits, compare medians and look at whether the
-ranges overlap.
+`Q15` deliberately runs the same chain as `Q3`: the pair shows what
+`graph.aggregate()` saves by skipping edge reconstruction and node hydration on
+identical traversal work — the aggregate answers from the database and never
+materialises the subgraph.
+
+Each query runs once cold, then `--repeat` times warm (default 5), and the
+**median** is reported with its range. A single warm sample on a shared machine
+moves further than most regressions worth catching, so a one-shot number cannot
+tell a real change from the machine breathing — comparing two commits means
+comparing medians and checking whether the ranges overlap.
+
+A query that overruns `--budget` seconds (default 150) is cancelled by the
+server and reported as **DNF** — its own outcome, never a large number that
+would average in with real measurements.
 
 Each run writes two files, **both overwritten every time**:
 
-- `RESULTS.md` — the report: ASCII charts of cold and warm latency with
-  the numbers beside them, a table of every measurement, and the machine
-  it ran on (CPU, cores, RAM, OS, Python, PostgreSQL version, and the
-  server settings that actually move these numbers — `shared_buffers`,
-  `work_mem`, `effective_cache_size`, parallel workers, JIT).
+- `RESULTS.md` — the report: headline figures, a log-scale ASCII chart of every
+  query, the full results table, derived findings, and the machine it ran on
+  (CPU, cores, RAM, OS, Python, PostgreSQL version, and the server settings that
+  actually move these numbers — `shared_buffers`, `work_mem`,
+  `effective_cache_size`, parallel workers, JIT).
 - `bench_results.json` — the same measurements, raw.
 
-Both are git-ignored, because a benchmark number belongs to the machine
-that produced it. Commit one deliberately (`git add -f`) when you want to
-publish a specific run.
+Both are git-ignored, because a benchmark number belongs to the machine that
+produced it. Commit one deliberately (`git add -f`) to publish a specific run.
 
-**A query that returns zero rows is called out, in the chart and at the
-top of the report.** Its timing is real and meaningless — finding nothing
-is always fast — so the report refuses to let it read as the winner.
+**A query that returns zero rows is called out** in the findings. Its timing is
+real and meaningless — finding nothing is always fast — so the report refuses to
+let it read as the winner.
 
 ## Comparing against Neo4j and Apache AGE
 
@@ -88,6 +96,15 @@ WHERE a.type IS NULL OR a.type <> 'leaf'
 OPTIONAL MATCH (a)-[:EDGE*1..1]->(dep:Node {type:'leaf'})
 RETURN count(DISTINCT a), count(DISTINCT dep)
 ```
+
+A note on those `RETURN count(DISTINCT a)` tails now that hopai
+translates aggregation: they aggregate the *start* variable, which hopai
+still refuses (only the last node of a chain can be aggregated — see
+`hopai/cypher.py`). They are written that way because Neo4j and AGE
+count them fine, and on those systems the tail is just "how many rows".
+The three `agg_*` queries in `bench_hopai.py` are the shapes hopai's own
+Cypher front end runs directly, e.g.
+`MATCH (a {type: 'leaf'})-[*1..4]->(m {flag: 1}) RETURN count(DISTINCT m)`.
 
 **A finding worth knowing before you run these on AGE:** in the full
 investigation this library came out of, two of these nine query shapes

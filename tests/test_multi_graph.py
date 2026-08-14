@@ -70,6 +70,22 @@ class TestIsolation:
         marketing.add_nodes([{"type": "person", "name": "m3"}])
         assert "m3" not in names(support, Hop())
 
+    def test_aggregation_counts_only_its_own_graph(self, two):
+        """The aggregation path is a separate query builder, so it needs
+        its own proof that _scoped() reaches it -- a count that quietly
+        summed both graphs would be the silently-wrong answer this whole
+        design exists to prevent."""
+        from hopai import Count
+
+        marketing, support = two
+        support.add_nodes([{"type": "person", "name": "s3"}])
+        assert marketing.aggregate(Start(where={"type": "person"}),
+                                   aggregates={"n": Count()}) == {"n": 2}
+        assert support.aggregate(Start(where={"type": "person"}),
+                                 aggregates={"n": Count()}) == {"n": 3}
+        assert marketing.aggregate(Start(), Hop(via={"kind": "knows"}),
+                                   aggregates={"reached": Count()}) == {"reached": 1}
+
     def test_fifty_graphs_cost_fifty_rows(self, fresh_graph):
         """Graph names are strings, not schemas: a new graph is a row, not
         a CREATE SCHEMA, which is the whole reason for this design. Each

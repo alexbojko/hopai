@@ -23,12 +23,20 @@ from __future__ import annotations
 import pytest
 
 from hopai import (
-    NOT, Hop, Start, CypherError, cypher_to_traversal, traverse_cypher,
+    NOT, Hop, Start, CypherError, aggregate_cypher, cypher_to_aggregation,
+    cypher_to_traversal, traverse_cypher,
 )
 
 
 def tr(query: str, **options):
     return cypher_to_traversal(query, **options)
+
+
+def agg(query: str, **options) -> dict:
+    """The {name: aggregate-repr} dict a query translates to -- reprs for
+    the same reason filters are compared by repr()."""
+    _, _, aggregates = cypher_to_aggregation(query, **options)
+    return {name: repr(a) for name, a in aggregates.items()}
 
 
 def bounds(hop: Hop) -> tuple:
@@ -283,11 +291,12 @@ class TestSemanticRefusals:
         with pytest.raises(CypherError, match="[Uu]ndirected"):
             tr("MATCH (a)-[]-(b) RETURN b")
 
-    def test_aggregation_refused(self):
-        """Every Cypher example in benchmarks/README.md ends in count().
-        Ignoring it would answer a different question than was asked."""
-        with pytest.raises(CypherError, match="aggregation"):
-            tr("MATCH (a)-[]->(b) RETURN count(DISTINCT a)")
+    def test_an_aggregating_query_is_refused_by_the_traversal_translator(self):
+        """A subgraph and a number are different things, so the wrong
+        entry point says so rather than dropping the count on the floor
+        -- the mirror of the write-query refusal below."""
+        with pytest.raises(CypherError, match="this query aggregates"):
+            tr("MATCH (a)-[]->(b) RETURN count(DISTINCT b)")
 
     @pytest.mark.parametrize("query", [
         "MATCH (a)-[]->(b) RETURN b ORDER BY b.x",
@@ -355,6 +364,237 @@ class TestSemanticRefusals:
     def test_existential_relationship_predicates_refused(self):
         with pytest.raises(CypherError, match="not supported"):
             tr("MATCH p=(a)-[*1..2]->(b) WHERE any(r IN relationships(p) WHERE r.k = 1) RETURN b")
+
+
+# ---------------------------------------------------------------------
+# Aggregating RETURN -- accepted spellings
+# ---------------------------------------------------------------------
+
+class TestAggregationTranslation:
+    """Each accepted spelling is one whose Cypher meaning is EXACTLY what
+    Graph.aggregate() computes -- the acceptance matrix from cypher.py's
+    AGGREGATION docstring section, one test per rule."""
+
+    def test_count_distinct_node(self):
+        """count(DISTINCT b) is the distinct-node count, which is the one
+        bare-variable aggregate that stays exact with paths involved."""
+        assert agg("MATCH (a)-[]->(b) RETURN count(DISTINCT b)") == {"count": "Count()"}
+
+    def test_distinct_property_aggregates(self):
+        """DISTINCT collapses to distinct VALUES on both sides, so these
+        translate exactly however many paths reach each node."""
+        assert agg("MATCH (a)-[]->(b) RETURN sum(DISTINCT b.age), avg(DISTINCT b.age), "
+                   "count(DISTINCT b.age)") == {
+            "sum_age": "Sum('age', distinct=True)",
+            "avg_age": "Avg('age', distinct=True)",
+            "count_age": "Count('age', distinct=True)",
+        }
+
+    def test_min_max_are_exact_bare(self):
+        """An extremum is immune to path multiplicity, so min/max need no
+        DISTINCT -- refusing them would refuse a correct translation."""
+        assert agg("MATCH (a)-[:x*1..3]->(b) RETURN min(b.age), max(b.age)") == {
+            "min_age": "Min('age')", "max_age": "Max('age')",
+        }
+
+    def test_min_max_accept_redundant_distinct(self):
+        assert agg("MATCH (a)-[]->(b) RETURN min(DISTINCT b.age)") == {"min_age": "Min('age')"}
+
+    def test_zero_hops_allows_bare_aggregates(self):
+        """With no hops every node is its own only row -- no multiplicity
+        exists, so `RETURN count(a)` on a single-node pattern is exact.
+        This is the shape of benchmarks/README.md's range_gt query."""
+        assert agg("MATCH (a:leaf) WHERE a.priority > 5 RETURN count(a), avg(a.priority)") == {
+            "count": "Count()", "avg_priority": "Avg('priority')",
+        }
+
+    def test_with_distinct_prefix_means_per_node(self):
+        """`WITH DISTINCT b RETURN avg(b.age)` is Cypher's spelling of
+        hopai's native per-matched-node aggregation -- recognized as a
+        unit, like the null-safe negation idiom."""
+        assert agg("MATCH (a)-[]->(b) WITH DISTINCT b RETURN "
+                   "count(b), sum(b.age), avg(b.age)") == {
+            "count": "Count()", "sum_age": "Sum('age')", "avg_age": "Avg('age')",
+        }
+
+    def test_with_distinct_count_star(self):
+        assert agg("MATCH (a)-[]->(b) WITH DISTINCT b RETURN count(*)") == {"count": "Count()"}
+
+    def test_with_distinct_duplicate_default_keys_refused(self):
+        """count(b) and count(*) both land on the key 'count'; silently
+        overwriting one would return fewer numbers than were asked for."""
+        with pytest.raises(CypherError, match="alias"):
+            agg("MATCH (a)-[]->(b) WITH DISTINCT b RETURN count(b), count(*)")
+
+    def test_with_distinct_inner_distinct_still_means_values(self):
+        assert agg("MATCH (a)-[]->(b) WITH DISTINCT b RETURN sum(DISTINCT b.age)") == {
+            "sum_age": "Sum('age', distinct=True)",
+        }
+
+    def test_aliases_name_the_results(self):
+        assert agg("MATCH (a)-[]->(b) RETURN count(DISTINCT b) AS n, "
+                   "min(b.age) AS youngest") == {"n": "Count()", "youngest": "Min('age')"}
+
+    def test_translation_returns_the_traversal_too(self):
+        start, hops, aggregates = cypher_to_aggregation(
+            "MATCH (a:person)-[:friend*1..4]->(b {active: true}) RETURN count(DISTINCT b)"
+        )
+        assert start.where == {"type": "person"}
+        assert (hops[0].min_hops, hops[0].max_hops) == (1, 4)
+        assert repr(hops[0].where) == repr({"active": True})
+        # via included: a mutant that quietly defaulted edge_type_key
+        # survived while only the option-override direction was tested
+        assert repr(hops[0].via) == repr({"kind": "friend"})
+        assert list(aggregates) == ["count"]
+
+
+# ---------------------------------------------------------------------
+# Aggregating RETURN -- refusals, each naming its rewrite
+# ---------------------------------------------------------------------
+
+class TestAggregationRefusals:
+    def test_bare_count_with_hops_names_both_rewrites(self):
+        """Bare count(b) counts one row per PATH -- inexpressible here.
+        The error must hand back both exact spellings, or the caller is
+        left knowing only what they cannot do."""
+        with pytest.raises(CypherError, match=r"per PATH(.|\n)*DISTINCT(.|\n)*WITH DISTINCT b"):
+            agg("MATCH (a)-[]->(b) RETURN count(b)")
+
+    @pytest.mark.parametrize("item", ["count(*)", "sum(b.age)", "avg(b.age)", "count(b.age)"])
+    def test_per_path_spellings_refused(self, item):
+        with pytest.raises(CypherError, match="path"):
+            agg(f"MATCH (a)-[]->(b) RETURN {item}")
+
+    def test_bare_count_star_refusal_names_itself(self):
+        """The refusal quotes the spelling it refuses -- `count(*)`,
+        star included. A mutant that broke the `*` fallback printed
+        `count(None)` and the loose "path" match above let it through."""
+        with pytest.raises(CypherError, match=r"bare count\(\*\) aggregates one row per PATH"):
+            agg("MATCH (a)-[]->(b) RETURN count(*)")
+
+    def test_bare_aggregate_on_anonymous_last_node_names_the_rewrite(self):
+        """With an anonymous last node there is no variable to suggest,
+        so the rewrite hint falls back to the literal `<var>`
+        placeholder -- pinned here because mutants that mangled it
+        survived every named-variable test."""
+        with pytest.raises(CypherError, match=r"WITH DISTINCT <var> RETURN"):
+            agg("MATCH (a)-[]->() RETURN count(*)")
+
+    def test_non_last_variable_refused(self):
+        """The start-side count every benchmarks/README.md example uses:
+        mid-chain match sets include nodes with no continuation to the
+        chain's end, which Cypher would not count -- so this names the
+        reversal instead of silently counting them."""
+        with pytest.raises(CypherError, match="LAST node(.|\n)*[Rr]everse"):
+            agg("MATCH (a)-[]->(b) RETURN count(DISTINCT a)")
+
+    def test_relationship_variable_refused(self):
+        with pytest.raises(CypherError, match="relationships"):
+            agg("MATCH (a)-[r:knows]->(b) RETURN count(DISTINCT r)")
+
+    def test_path_variable_refused(self):
+        with pytest.raises(CypherError, match="relationships"):
+            agg("MATCH p=(a)-[*1..2]->(b) RETURN count(DISTINCT p)")
+
+    def test_unknown_variable_refused(self):
+        with pytest.raises(CypherError, match="unknown variable"):
+            agg("MATCH (a)-[]->(b) RETURN count(DISTINCT zz)")
+
+    def test_mixing_aggregates_with_projection_is_grouping(self):
+        """`RETURN b.city, count(DISTINCT b)` means GROUP BY, a feature
+        hopai does not have -- silently computing the global count would
+        answer a different question."""
+        with pytest.raises(CypherError, match="GROUP BY"):
+            agg("MATCH (a)-[]->(b) RETURN b, count(DISTINCT b)")
+
+    def test_unsupported_aggregate_functions_name_the_supported_ones(self):
+        with pytest.raises(CypherError, match="avg, count, max, min, sum"):
+            agg("MATCH (a)-[]->(b) RETURN collect(b)")
+
+    def test_whole_node_sum_refused(self):
+        with pytest.raises(CypherError, match="whole node"):
+            agg("MATCH (a)-[]->(b) RETURN sum(b)")
+
+    def test_sum_star_refused(self):
+        with pytest.raises(CypherError, match="nothing in particular"):
+            agg("MATCH (a)-[]->(b) RETURN sum(*)")
+
+    def test_optional_match_cannot_feed_an_aggregation(self):
+        """count(DISTINCT c) over an OPTIONAL MATCH equals the count over
+        the required MATCH -- accepting the flag would let callers
+        believe it changed the number. The full head phrase is pinned:
+        a bare match on "OPTIONAL" also matched the word's second
+        occurrence at the message's tail, so case-mangling mutants of
+        the head survived."""
+        with pytest.raises(CypherError, match="an OPTIONAL MATCH cannot feed an aggregation"):
+            agg("MATCH (a)-[]->(b) OPTIONAL MATCH (b)-[]->(c) RETURN count(DISTINCT c)")
+
+    def test_with_distinct_must_name_the_last_node(self):
+        """The error names the node that WOULD be right -- `(b)` --
+        which is the actionable half; a mutant that replaced it with the
+        anonymous-node hint survived a match on the first half alone."""
+        with pytest.raises(CypherError,
+                           match=r"WITH DISTINCT a must name the last node of the chain \(b\)"):
+            agg("MATCH (a)-[]->(b) WITH DISTINCT a RETURN count(a)")
+
+    def test_with_distinct_wrong_var_and_anonymous_last_node(self):
+        """When the last node has no variable the error cannot name it,
+        so it says to add one -- the one WITH DISTINCT path no other
+        test walks."""
+        with pytest.raises(CypherError, match="give it a variable"):
+            agg("MATCH (a)-[]->() WITH DISTINCT a RETURN count(a)")
+
+    def test_general_with_still_refused(self):
+        """Only the `WITH DISTINCT <var> RETURN <aggregates>` unit is
+        recognized; every other WITH keeps its original refusal, now
+        naming that one exception."""
+        with pytest.raises(CypherError, match="WITH is not supported"):
+            agg("MATCH (a)-[]->(b) WITH b RETURN count(b)")
+
+    @pytest.mark.parametrize("query", [
+        "MATCH (a)-[]->(b) WITH DISTINCT RETURN count(b)",                       # no variable
+        "MATCH (a)-[]->(b) WITH DISTINCT b MATCH (b)-[]->(c) RETURN count(c)",   # no RETURN next
+        "MATCH (a)-[]->(b) WITH b b RETURN count(b)",                            # no DISTINCT
+        "MATCH (a)-[]->(b) WITH DISTINCT 5 RETURN count(b)",                     # not a name
+    ])
+    def test_near_miss_with_forms_get_the_canonical_refusal(self, query):
+        """Each of these is one boolean-operator slip away from the gate
+        accepting garbage -- consuming RETURN as the variable, or
+        silently reading `WITH b b` as WITH DISTINCT b. Mutation testing
+        produced exactly those slips and every one survived, because no
+        test fed the gate a near-miss. All must fall through to the one
+        honest WITH refusal."""
+        with pytest.raises(CypherError, match="WITH is not supported"):
+            agg(query)
+
+    def test_with_distinct_before_a_non_aggregating_return_expression(self):
+        """`RETURN 5` after the unit prefix: the gate accepts (a RETURN
+        does follow), and the missing aggregate is what refuses -- a
+        mutant that peeked one token past the gate re-routed this to the
+        generic WITH error instead."""
+        with pytest.raises(CypherError, match="aggregating RETURN"):
+            agg("MATCH (a)-[]->(b) WITH DISTINCT b RETURN 5")
+
+    def test_with_distinct_without_aggregates_refused(self):
+        with pytest.raises(CypherError, match="aggregating RETURN"):
+            agg("MATCH (a)-[]->(b) WITH DISTINCT b RETURN b")
+
+    def test_order_by_after_aggregates_still_refused(self):
+        with pytest.raises(CypherError, match="ORDER BY is not supported"):
+            agg("MATCH (a)-[]->(b) RETURN count(DISTINCT b) ORDER BY b.x")
+
+    def test_aggregate_after_a_write_refused(self):
+        """A write produces an IngestResult; quietly dropping the count
+        would be worse than either running it or refusing."""
+        from hopai import cypher_to_operations
+        with pytest.raises(CypherError, match="after a write"):
+            cypher_to_operations("CREATE (a:person {email: 'a@x.com'}) RETURN count(a)")
+
+    def test_a_plain_traversal_is_refused_by_the_aggregation_translator(self):
+        """The mirror of cypher_to_traversal's refusal: each entry point
+        names the other, so the caller is never stranded."""
+        with pytest.raises(CypherError, match="no aggregating RETURN"):
+            cypher_to_aggregation("MATCH (a)-[]->(b) RETURN b")
 
 
 class TestSyntaxErrors:
@@ -476,3 +716,84 @@ class TestAgainstFixtureGraph:
         result = traverse_cypher(graph, "MATCH (a {type: 'hub'}) RETURN a")
         assert hasattr(result, "to_networkx")
         assert result.to_dict()["nodes"]
+
+    def test_aggregation_matches_python_api_exactly(self, graph):
+        """The aggregating counterpart of the contract test above -- and
+        the fan-in check that matters most: two parents feed m1, and a
+        per-path count would say 3 where the answer is 2."""
+        from hopai import Avg, Count, Max, Min, Sum
+
+        via_cypher = aggregate_cypher(graph, """
+            MATCH (a {type: 'leaf'})-[:knows]->(m)
+            WITH DISTINCT m RETURN count(m) AS n
+        """)
+        via_python = graph.aggregate(
+            Start(where={"type": "leaf"}),
+            Hop(via={"kind": "knows"}, label="m"),
+            aggregates={"n": Count()},
+        )
+        assert via_cypher == via_python == {"n": 2}
+
+        stats = aggregate_cypher(graph, """
+            MATCH (a:leaf) RETURN count(a), avg(a.priority) AS mean,
+                min(a.priority), max(a.priority), sum(DISTINCT a.priority) AS total
+        """)
+        assert stats == graph.aggregate(
+            Start(where={"type": "leaf"}),
+            aggregates={"count": Count(), "mean": Avg("priority"),
+                        "min_priority": Min("priority"), "max_priority": Max("priority"),
+                        "total": Sum("priority", distinct=True)},
+        )
+        assert stats["count"] == 4 and stats["min_priority"] == 3 and stats["max_priority"] == 15
+
+    def test_graph_cypher_dispatches_aggregation_to_a_dict(self, graph):
+        """graph.cypher() returns a Subgraph, an IngestResult, or -- new
+        -- a plain dict of numbers, decided by what the query says."""
+        result = graph.cypher("MATCH (a:leaf) RETURN count(a)")
+        assert result == {"count": 4}
+
+
+class TestOptionForwarding:
+    """Every dispatching entry point takes the same keyword options as
+    cypher_to_traversal(), and each must actually pass them through --
+    mutation testing caught graph.cypher() variants that dropped
+    **options in one branch and nothing failed, because no test passed
+    an option whose loss changes the answer. node_label_key=None makes
+    `(a:leaf)` match all 7 fixture nodes instead of the 4 leaves, which
+    is exactly such an option."""
+
+    def test_graph_cypher_forwards_options_to_a_traversal(self, graph):
+        assert len(graph.cypher("MATCH (a:leaf) RETURN a").nodes) == 4
+        assert len(graph.cypher("MATCH (a:leaf) RETURN a", node_label_key=None).nodes) == 7
+
+    def test_graph_cypher_forwards_options_to_an_aggregation(self, graph):
+        assert graph.cypher("MATCH (a:leaf) RETURN count(a)") == {"count": 4}
+        assert graph.cypher("MATCH (a:leaf) RETURN count(a)",
+                            node_label_key=None) == {"count": 7}
+
+    def test_graph_cypher_forwards_options_to_a_write(self, fresh_graph):
+        fresh_graph.cypher("CREATE (a:person {x: 1})", node_label_key=None)
+        result = fresh_graph.traverse(Start(where={"x": 1}))
+        assert result.nodes[0]["properties"] == {"x": 1}   # label ignored, no "type"
+
+    def test_traverse_cypher_forwards_options(self, graph):
+        result = traverse_cypher(graph, "MATCH (a:leaf) RETURN a", node_label_key=None)
+        assert len(result.nodes) == 7
+
+    def test_aggregate_cypher_forwards_options(self, graph):
+        assert aggregate_cypher(graph, "MATCH (a:leaf) RETURN count(a)",
+                                node_label_key=None) == {"count": 7}
+
+    def test_cypher_to_aggregation_forwards_every_option(self):
+        """One query whose translation visibly consumes all three
+        options: without node_label_key=None the label filters, without
+        edge_type_key=None the type filters, and without max_var_length
+        the unbounded `*` raises."""
+        start, hops, aggregates = cypher_to_aggregation(
+            "MATCH (a:leaf)-[r:knows*]->(b) RETURN count(DISTINCT b)",
+            node_label_key=None, edge_type_key=None, max_var_length=3,
+        )
+        assert start.where is None
+        assert hops[0].via is None
+        assert (hops[0].min_hops, hops[0].max_hops) == (1, 3)
+        assert list(aggregates) == ["count"]
