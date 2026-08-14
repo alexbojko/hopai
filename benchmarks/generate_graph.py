@@ -53,7 +53,10 @@ def generate(n_nodes: int, seed: int, out_dir: Path, hub_id: int | None = None,
     # edges is a dict nobody needs
     parents_of: dict[int, list[int]] = {}
 
-    edge_file = open(out_dir / "edges.csv", "w", newline="")
+    # not a `with`: the writer is used by the nested emit() across two
+    # separate generation phases, and closed explicitly once both are
+    # done. contextlib.ExitStack would buy nothing here.
+    edge_file = open(out_dir / "edges.csv", "w", newline="")  # noqa: SIM115
     edge_writer = csv.writer(edge_file)
 
     def emit(a: int, b: int, tag: str, remember: bool = False) -> None:

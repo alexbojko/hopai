@@ -517,6 +517,7 @@ def render(results: list, profile: dict, dataset: dict | None = None,
     # Neo4j and AGE are the comparison; raw SQL is a floor, not a rival,
     # so it sits last in the chart and last in the table.
     has_raw = any(r.get("raw_sql_ms") for r in results)
+    systems_present = any(k in r for r in results for k in ("neo4j_ms", "age_ms"))
     series = [("warm_ms", "hopai")]
     for key, label in (("neo4j_ms", "Neo4j"), ("age_ms", "AGE")):
         if any(key in r for r in results):
@@ -559,11 +560,19 @@ def render(results: list, profile: dict, dataset: dict | None = None,
         "",
         _table(results),
         "",
-        "`Neo4j / hopai` and `AGE / hopai` are ratios: **above 1 the other engine was",
-        "slower, below 1 it was faster.** `Raw SQL` is hopai's own statement through the",
-        "driver -- a floor, not a rival.",
-        "",
     ]
+    if systems_present:
+        parts += [
+            "The ratio columns read one way: **above 1 the other engine was slower, "
+            "below 1 it was faster.**",
+            "",
+        ]
+    if has_raw:
+        parts += [
+            "`Raw SQL` is hopai's own statement executed straight through the driver --",
+            "a floor showing what the API layer costs, not a rival.",
+            "",
+        ]
     if has_raw:
         parts += [
             "`raw SQL` is hopai's own statement executed straight through the driver — no",
