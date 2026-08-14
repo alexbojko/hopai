@@ -153,9 +153,10 @@ class TestCustomSchema:
                   Column("properties", JSONB))
         g = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/x",
                   node_table=v, edge_table=e, node_id_col="vid", edge_id_col="lid",
-                  edge_start_col="src", edge_end_col="dst")
+                  edge_start_col="src", edge_end_col="dst", graph_col=None)
 
         sql = norm(g.build_query(Start(where={"a": 1}), [Hop(hops=(1, 2))]))
+        assert "graph_id" not in sql   # graph_col=None means no discriminator at all
         for name in ("vertex", "link", "vid", "lid", "src", "dst"):
             assert name in sql
         for default in ("nodes.id", "edges.start_id", "edges.end_id"):

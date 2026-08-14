@@ -80,6 +80,30 @@ the same class of reason — on macOS libpq's Kerberos probe goes through XPC,
 which is not fork-safe, and mutmut's forked children segfault before reaching
 Postgres.
 
+## Many graphs in one database
+
+One pair of tables holds every graph, discriminated by a `graph_id` column;
+`Graph(engine, graph="x")` / `graph.in_graph("x")` scopes a handle to one.
+
+**The one bug this design can produce is silent.** A query that forgets the
+discriminator does not error — it returns or writes another graph's rows. So
+every read and every write goes through `Graph._scoped()`, and any new query
+path must too. Tests assert the *other* graph is untouched, not merely that
+this one worked (`tests/test_multi_graph.py`).
+
+- `graph_id` leads `ix_edges_graph_start_id` / `..._end_id`. A trailing position
+  would make those indexes useless the moment a second graph exists, which is
+  the whole cost model of this design.
+- Cross-graph edges are prevented by a composite foreign key, not by Python.
+- `Unique`/`Index` get `graph_id` prepended (`_Target.scope_index`), so one
+  index serves every graph with per-graph semantics. `Required`/`Check`/
+  `PropertyType` compile to `graph_id <> '<g>' OR <predicate>`
+  (`_Target.scope_check`) — an unguarded CHECK covers the whole table and would
+  make one graph's rules law everywhere.
+- `merge_*` conflict targets go through the same `scope_index()`, because
+  Postgres can only infer an index when the target is spelled identically.
+- `graph_col=None` disables all of it for callers bringing their own tables.
+
 ## Commit messages are load-bearing
 
 Releases are cut by **release-please** from **Conventional Commits**, so the subject

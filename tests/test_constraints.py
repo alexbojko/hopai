@@ -223,20 +223,22 @@ class TestLifecycle:
     def test_constraint_ddl_does_not_execute(self, fresh_graph):
         ddl = fresh_graph.constraint_ddl(nodes=[Unique("email")])
         assert ddl == ['CREATE UNIQUE INDEX IF NOT EXISTS "uq_nodes_email" '
-                       'ON "nodes" ((properties ->> \'email\'))']
+                       'ON "nodes" (graph_id, (properties ->> \'email\'))'], ddl
         assert "uq_nodes_email" not in indexes(fresh_graph)
 
     def test_create_schema_is_idempotent(self, fresh_graph):
         fresh_graph.create_schema()
         fresh_graph.create_schema()
-        assert "ix_edges_start_id" in indexes(fresh_graph)
+        assert "ix_edges_graph_start_id" in indexes(fresh_graph)
 
     def test_create_schema_makes_the_traversal_indexes(self, fresh_graph):
         """Without these every hop is a sequential scan. They are part of
         the schema, not a tuning step the caller has to remember."""
         made = indexes(fresh_graph)
-        assert {"ix_edges_start_id", "ix_edges_end_id",
-                "ix_nodes_properties", "ix_edges_properties"} <= set(made)
+        assert {"ix_edges_graph_start_id", "ix_edges_graph_end_id",
+                "ix_nodes_graph", "ix_nodes_properties", "ix_edges_properties"} <= set(made)
+        # graph_id must LEAD, or a second graph makes the index useless
+        assert made["ix_edges_graph_start_id"].endswith("(graph_id, start_id)")
         assert "gin" in made["ix_nodes_properties"].lower()
 
     def test_drop_schema(self, fresh_graph):

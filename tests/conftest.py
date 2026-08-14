@@ -29,15 +29,23 @@ SCHEMA = "hopai_test"
 SETUP_SQL = f"""
 DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;
 CREATE SCHEMA {SCHEMA};
-CREATE TABLE {SCHEMA}.nodes (id BIGINT PRIMARY KEY, properties JSONB NOT NULL DEFAULT '{{}}');
+CREATE TABLE {SCHEMA}.nodes (
+    id BIGINT PRIMARY KEY,
+    graph_id TEXT NOT NULL DEFAULT 'default',
+    properties JSONB NOT NULL DEFAULT '{{}}',
+    UNIQUE (id, graph_id)
+);
 CREATE TABLE {SCHEMA}.edges (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    start_id BIGINT NOT NULL REFERENCES {SCHEMA}.nodes(id),
-    end_id BIGINT NOT NULL REFERENCES {SCHEMA}.nodes(id),
-    properties JSONB NOT NULL DEFAULT '{{}}'
+    graph_id TEXT NOT NULL DEFAULT 'default',
+    start_id BIGINT NOT NULL,
+    end_id BIGINT NOT NULL,
+    properties JSONB NOT NULL DEFAULT '{{}}',
+    FOREIGN KEY (start_id, graph_id) REFERENCES {SCHEMA}.nodes(id, graph_id),
+    FOREIGN KEY (end_id, graph_id) REFERENCES {SCHEMA}.nodes(id, graph_id)
 );
-CREATE INDEX ON {SCHEMA}.edges (start_id);
-CREATE INDEX ON {SCHEMA}.edges (end_id);
+CREATE INDEX ON {SCHEMA}.edges (graph_id, start_id);
+CREATE INDEX ON {SCHEMA}.edges (graph_id, end_id);
 CREATE INDEX ON {SCHEMA}.nodes USING GIN (properties);
 CREATE INDEX ON {SCHEMA}.edges USING GIN (properties);
 """
