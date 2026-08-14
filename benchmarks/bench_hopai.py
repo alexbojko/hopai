@@ -115,6 +115,7 @@ def run_suite(graph, hub_id: int):
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
+    sys.path.insert(0, str(Path(__file__).parent))
     from hopai import Graph
 
     ap = argparse.ArgumentParser()
@@ -138,6 +139,22 @@ if __name__ == "__main__":
     print("-" * 90)
     results = run_suite(graph, args.hub_id or 0)
 
-    with open("bench_results.json", "w") as f:
-        json.dump(results, f, indent=2)
-    print("\nSaved to bench_results.json")
+    from report import machine_profile, render
+
+    # The profile is read from the server that just answered the
+    # queries, not from a config file, so the report describes the run
+    # that actually happened.
+    with engine_scoped.connect() as conn:
+        profile = machine_profile(conn)
+        counts = {
+            "nodes": conn.execute(text(f"SELECT count(*) FROM {args.schema}.nodes")).scalar(),
+            "edges": conn.execute(text(f"SELECT count(*) FROM {args.schema}.edges")).scalar(),
+            "schema": args.schema,
+        }
+
+    results_path = Path(__file__).parent / "bench_results.json"
+    report_path = Path(__file__).parent / "RESULTS.md"
+    results_path.write_text(json.dumps(results, indent=2) + "\n")
+    report_path.write_text(render(results, profile, counts))
+
+    print(f"\nSaved {results_path.name} and {report_path.name} (both overwritten)")

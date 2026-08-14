@@ -17,7 +17,24 @@ convergent fan-in that real dependency graphs do.
 
 `bench_hopai.py` loads it and times nine queries covering direction,
 multi-hop bounds, compound chains, `OR`, `NOT`, range comparisons, and
-`OPTIONAL` — cold and warm, writing results to `bench_results.json`.
+`OPTIONAL` — cold and warm.
+
+Each run writes two files, **both overwritten every time**:
+
+- `RESULTS.md` — the report: ASCII charts of cold and warm latency with
+  the numbers beside them, a table of every measurement, and the machine
+  it ran on (CPU, cores, RAM, OS, Python, PostgreSQL version, and the
+  server settings that actually move these numbers — `shared_buffers`,
+  `work_mem`, `effective_cache_size`, parallel workers, JIT).
+- `bench_results.json` — the same measurements, raw.
+
+Both are git-ignored, because a benchmark number belongs to the machine
+that produced it. Commit one deliberately (`git add -f`) when you want to
+publish a specific run.
+
+**A query that returns zero rows is called out, in the chart and at the
+top of the report.** Its timing is real and meaningless — finding nothing
+is always fast — so the report refuses to let it read as the winner.
 
 ## Comparing against Neo4j and Apache AGE
 
