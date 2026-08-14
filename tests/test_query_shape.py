@@ -516,8 +516,13 @@ class TestFilterCompilation:
         [],
     ])
     def test_bare_list_is_rejected(self, bad):
-        with pytest.raises(TypeError, match="ambiguous"):
+        """The message's rewrite is `OR(...)`, spelled the way it must be
+        typed -- lowercase `or(...)` (mutant x_resolve__mutmut_10) would
+        send the caller to a Python keyword that cannot be called."""
+        with pytest.raises(TypeError) as exc:
             filter_sql(bad)
+        assert "ambiguous" in str(exc.value)
+        assert "use OR(...)" in str(exc.value)
 
     @pytest.mark.parametrize("bad", ["a string", 42, object()])
     def test_unsupported_filter_types_are_rejected(self, bad):
