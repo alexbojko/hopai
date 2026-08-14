@@ -340,8 +340,11 @@ def _defined(graph, target: str, caller: str) -> dict:
 def _field(graph, target: str, name: str, caller: str) -> Vector:
     fields = _defined(graph, target, caller)
     if name not in fields:
+        # Led by the caller, like every other message here: in a chain
+        # of hops "no vector field 'body'" alone leaves the reader
+        # counting Hops by hand to find which one said it.
         raise ValueError(
-            f"no vector field {name!r} is defined for {target} in this graph -- "
+            f"{caller}: no vector field {name!r} is defined for {target} in this graph -- "
             f"defined: {sorted(fields)}. define_vectors() declares a new one"
         )
     return fields[name]

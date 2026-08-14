@@ -265,8 +265,19 @@ class TestNearValidation:
             vg.build_vector_search_query(Near("body", [1.0, 0.0, 0.0]))
 
     def test_no_registry_at_all_names_define_vectors(self):
-        with pytest.raises(ValueError, match="define_vectors"):
+        """The message leads with the CALLER, so someone holding a
+        traceback knows which call to fix -- pinned, because a mutant
+        that passed None in place of the caller name still matched a
+        test looking only for 'define_vectors'."""
+        with pytest.raises(ValueError, match=r"^vector_search\(\) needs vector fields"):
             offline().build_vector_search_query(Near("summary", [1.0]))
+
+    def test_undefined_field_from_a_hop_names_the_hop(self, vg):
+        """The same caller-naming contract on the traversal side: a
+        chain of five hops must say WHICH one named a field that does
+        not exist."""
+        with pytest.raises(ValueError, match=r"^hop 1 \(ranked\): no vector field 'body'"):
+            vg.build_query(Start(), [Hop(), Hop(near=Near("body", [1.0]), k=2, label="ranked")])
 
     def test_dimension_mismatch_names_both_sizes(self, vg):
         with pytest.raises(ValueError, match="has 2 dimensions, the field is defined with 3"):
@@ -350,6 +361,22 @@ class TestSearchQueryShape:
 
     def test_single_statement_one_round_trip(self, vg):
         assert ";" not in self.sql(vg, Near("summary", [1.0, 2.0, 3.0]))
+
+    def test_default_k_is_ten_and_the_two_entry_points_agree(self, vg):
+        """build_vector_search_query() is documented as *the statement
+        vector_search() runs*, so a drifted default would make the
+        preview a different query than the one executed -- silently, in
+        exactly the call someone reaches for to check what will run.
+        Mutants on either default survived the suite."""
+        import inspect
+
+        sql = self.sql(vg, Near("summary", [1.0, 2.0, 3.0]), literal_binds=True)
+        assert "LIMIT 10" in sql
+        defaults = {
+            name: inspect.signature(getattr(Graph, name)).parameters["k"].default
+            for name in ("vector_search", "build_vector_search_query")
+        }
+        assert defaults == {"vector_search": 10, "build_vector_search_query": 10}
 
     def test_multivector_weights_land_in_the_combined_score(self, vg):
         sql = self.sql(vg, Near("summary", [1.0, 0.0, 0.0], weight=0.7),

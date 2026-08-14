@@ -56,6 +56,18 @@ class TestQueryStructure:
         assert "RECURSIVE" not in sql
         assert "walk_0" not in sql
 
+    def test_seed_only_query_is_graph_scoped(self, offline_graph):
+        """The no-hops branch hydrates by joining `nodes` back to `seed`,
+        and that join needs the discriminator like every other table
+        access -- the aggregate path has the same proof. It is only
+        *currently* redundant because `id` is the table's primary key
+        and therefore globally unique; a caller's own tables keyed
+        (id, graph_id) would return another graph's row instead. A
+        mutant that dropped this predicate survived the whole suite."""
+        sql = norm(offline_graph.build_query(Start(where={"type": "person"}), []),
+                   literal_binds=True)
+        assert sql.count("graph_id = 'default'") == 2   # seed CTE, and the join back
+
     @pytest.mark.parametrize("n", [1, 2, 3, 4, 7])
     def test_one_cte_per_hop(self, offline_graph, n):
         """Chains longer than two hops used to raise AttributeError:
