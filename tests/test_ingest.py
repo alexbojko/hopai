@@ -15,6 +15,8 @@ import json
 
 import pytest
 
+from sqlalchemy import text
+
 from hopai import (
     INGEST_TOOL_SCHEMA, ConstraintViolation, Hop, IngestResult, Required, Start, Unique,
 )
@@ -240,6 +242,36 @@ class TestMerge:
     def test_merge_needs_keys(self, fresh_graph):
         with pytest.raises(ValueError, match="needs the keys"):
             fresh_graph.merge_nodes([{"email": "a@x.com"}], on=[])
+
+    def test_merge_edges_needs_keys_and_names_its_own_call(self, fresh_graph):
+        """The message interpolates merge_{what}s, so the edge path must
+        say merge_edges -- and Graph.merge_edges must actually forward
+        (mutant xǁIngestorǁmerge_edgesǁ__mutmut_22 upcased the label,
+        and nothing pinned it)."""
+        fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+        with pytest.raises(ValueError, match=r"merge_edges\(on="):
+            fresh_graph.merge_edges([{"start_id": 1, "end_id": 2, "kind": "x"}], on=[])
+
+    def test_merge_edges_forwards_replace(self, fresh_graph):
+        """Graph.merge_edges is a one-line delegation, and delegation
+        kwargs are exactly where mutation testing keeps finding dropped
+        arguments (xǁGraphǁmerge_edgesǁ__mutmut_4/7 dropped replace=):
+        replace=True must swap the whole bag, and the default must
+        keep unmentioned properties."""
+        from hopai import Col
+        fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+        fresh_graph.define_constraints(edges=[Unique(Col("start_id"), Col("end_id"), "kind")])
+        on = [Col("start_id"), Col("end_id"), "kind"]
+        base = {"start_id": 1, "end_id": 2, "kind": "knows"}
+        fresh_graph.merge_edges([{**base, "weight": 1, "keep": True}], on=on)
+        fresh_graph.merge_edges([{**base, "weight": 2}], on=on)   # default: || merge
+        with fresh_graph.engine.connect() as conn:
+            props = conn.execute(text("SELECT properties FROM edges")).scalar()
+        assert props == {"kind": "knows", "weight": 2, "keep": True}
+        fresh_graph.merge_edges([{**base, "weight": 3}], on=on, replace=True)
+        with fresh_graph.engine.connect() as conn:
+            props = conn.execute(text("SELECT properties FROM edges")).scalar()
+        assert props == {"kind": "knows", "weight": 3}   # 'keep' replaced away
 
 
 # ---------------------------------------------------------------------

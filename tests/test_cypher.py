@@ -148,6 +148,52 @@ class TestPatternTranslation:
         assert start.where == {"type": "person"}
         assert repr(hops[0].where) == "GT('age', 18)"
 
+    def test_a_trailing_comment_with_no_newline_terminates(self):
+        """The tokenizer's comment branch has an at-end-of-input arm that
+        only a comment ending the query exercises; mutant
+        x__tokenize__mutmut_26 turned it into an infinite loop and
+        nothing noticed."""
+        start, _ = tr("MATCH (a:person) // that's everyone")
+        assert start.where == {"type": "person"}
+
+    def test_decimal_literals_stay_floats(self):
+        """`1.5` must come through as the float 1.5 -- mutants
+        x__tokenize__mutmut_97/98 broke the float branch and no test had
+        a single decimal point in it."""
+        start, _ = tr("MATCH (a {score: 1.5, count: 2})")
+        assert start.where == {"score": 1.5, "count": 2}
+        assert isinstance(start.where["score"], float)
+
+    def test_capital_x_is_not_whitespace(self):
+        """Mutant x__tokenize__mutmut_7 wrapped the whitespace set in XX,
+        which silently made the letter X a token separator -- any name
+        containing X would tokenize shredded."""
+        start, hops = tr("MATCH (aXa:Xperson)-[:foo]->(b) WHERE aXa.Xfactor > 1 RETURN b")
+        assert repr(start.where) in (
+            "AND({'type': 'Xperson'}, GT('Xfactor', 1))",
+            "AND(GT('Xfactor', 1), {'type': 'Xperson'})",
+        )
+
+    def test_type_alternation_with_repeated_colon(self):
+        """`[:a|:b]` is the second legal spelling of alternation; the
+        `|:` branch was never exercised."""
+        _, hops = tr("MATCH (a)-[:knows|:likes]->(b) RETURN b")
+        assert hops[0].via == {"kind": ["knows", "likes"]}
+
+    def test_spaced_arrow_is_a_single_hop(self):
+        """`(a)- ->(b)` reaches the no-bracket arm of _parse_rel, the one
+        place the default hop bounds apply -- mutant _parse_rel__mutmut_44
+        changed the default to 2 and no test went through that arm."""
+        _, hops = tr("MATCH (a)- ->(b) RETURN b")
+        assert bounds(hops[0]) == (1, 1)
+
+    def test_null_literal_in_a_property_map(self):
+        """NULL (any case) is a literal, mapping to JSON null -- mutant
+        _parse_literal__mutmut_29 broke the keyword comparison and NULL
+        fell through to the not-a-literal refusal."""
+        start, _ = tr("MATCH (a {gone: NULL, missing: null})")
+        assert start.where == {"gone": None, "missing": None}
+
 
 class TestLabelMapping:
     def test_custom_keys(self):
@@ -244,6 +290,56 @@ class TestWhereTranslation:
         """)
         assert start.where == {"x": 1}
         assert hops[1].where == {"y": 2}
+
+    def test_a_whereless_clause_does_not_stop_later_wheres(self):
+        """_attach_where skips clauses with no WHERE via `continue`;
+        mutant _attach_where__mutmut_5 turned it into `break` and every
+        WHERE after the first bare MATCH silently vanished -- a filter
+        dropped without an error, the worst failure mode there is."""
+        start, hops = tr("""
+            MATCH (a)-[]->(b)
+            MATCH (b)-[]->(c) WHERE c.y = 2
+            RETURN c
+        """)
+        assert start.where is None
+        assert hops[1].where == {"y": 2}
+
+    def test_parenthesized_groups_translate(self):
+        """`(x OR y) AND z` exercises the grouping branch of
+        _parse_predicate, which no test entered -- without it the paren
+        would be a syntax error and precedence inexpressible."""
+        start, _ = tr("MATCH (a) WHERE (a.x = 1 OR a.y = 2) AND a.z = 3")
+        assert repr(start.where) == "AND({'z': 3}, OR({'x': 1}, {'y': 2}))"
+
+    @staticmethod
+    def compiled(filt) -> str:
+        from sqlalchemy import column as sa_column
+        from sqlalchemy.dialects import postgresql
+        from sqlalchemy.dialects.postgresql import JSONB
+        from hopai.filters import resolve
+        return str(resolve(sa_column("properties", type_=JSONB), filt).compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+
+    def test_is_not_null_compiles_to_a_key_presence_test(self):
+        """IS NOT NULL means `properties ? 'key'` -- and IS NULL its
+        negation. The NOT-detection inside the IS parse was never
+        asserted, so flipping `negated` (mutants _parse_predicate 29-40)
+        swapped present for missing and every test still passed."""
+        start, _ = tr("MATCH (a) WHERE a.email IS NOT NULL")
+        sql = self.compiled(start.where)
+        assert "properties ? 'email'" in sql and "NOT" not in sql
+        start, _ = tr("MATCH (a) WHERE a.email IS NULL")
+        assert "NOT (properties ? 'email')" in self.compiled(start.where)
+
+    def test_an_or_that_is_not_the_null_safe_idiom_stays_an_or(self):
+        """Only `x.k IS NULL OR x.k <> v` collapses to NOT({k: v});
+        loosening the detection (mutant _null_safe_negation__mutmut_8)
+        made any OR with an IS NULL half collapse -- silently answering
+        a different question."""
+        start, _ = tr("MATCH (a) WHERE a.k IS NULL OR a.n > 5")
+        sql = self.compiled(start.where)
+        assert "properties ? 'k'" in sql and "NOT" in sql   # the IS NULL half, intact
+        assert "> 5" in sql                                  # the comparison half, intact
 
 
 # ---------------------------------------------------------------------
@@ -522,12 +618,12 @@ class TestAggregationRefusals:
     def test_optional_match_cannot_feed_an_aggregation(self):
         """count(DISTINCT c) over an OPTIONAL MATCH equals the count over
         the required MATCH -- accepting the flag would let callers
-        believe it changed the number. The full head phrase is pinned:
-        a bare match on "OPTIONAL" also matched the word's second
-        occurrence at the message's tail, so case-mangling mutants of
-        the head survived."""
-        with pytest.raises(CypherError, match="an OPTIONAL MATCH cannot feed an aggregation"):
+        believe it changed the number. The head phrase is pinned AT THE
+        START: a substring match also matched it mid-message, so the
+        XX-padding mutant (emit_aggregates__mutmut_6) survived."""
+        with pytest.raises(CypherError) as exc:
             agg("MATCH (a)-[]->(b) OPTIONAL MATCH (b)-[]->(c) RETURN count(DISTINCT c)")
+        assert str(exc.value).startswith("an OPTIONAL MATCH cannot feed an aggregation")
 
     def test_with_distinct_must_name_the_last_node(self):
         """The error names the node that WOULD be right -- `(b)` --
@@ -596,6 +692,102 @@ class TestAggregationRefusals:
         with pytest.raises(CypherError, match="no aggregating RETURN"):
             cypher_to_aggregation("MATCH (a)-[]->(b) RETURN b")
 
+    # The refusal texts below are pinned by their ACTIONABLE phrase, not
+    # just their exception type: mutation testing showed most of these
+    # messages could be arbitrarily rewritten (XX-padded, case-flipped,
+    # variables dropped) with every test still green -- and for an API
+    # whose contract is "errors that name the fix", the message IS the
+    # behavior.
+
+    @pytest.mark.parametrize("word", ["any", "none", "single"])
+    def test_existential_list_predicates_refused_by_name(self, word):
+        with pytest.raises(CypherError) as exc:
+            tr(f"MATCH (a) WHERE {word}(x IN a.tags WHERE x.v = 1) RETURN a")
+        assert f"{word}(...) is not supported" in str(exc.value)
+        assert "Hop.via filters every edge" in str(exc.value)
+
+    def test_exists_refused_with_the_is_not_null_rewrite(self):
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a) WHERE exists(a.email) RETURN a")
+        assert "exists(...) is not supported" in str(exc.value)
+        assert "IS NOT NULL" in str(exc.value)
+
+    def test_comma_separated_patterns_refused(self):
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a {x: 1}), (b {y: 2}) RETURN a")
+        assert str(exc.value).startswith("comma-separated patterns describe disjoint")
+
+    def test_optional_match_must_be_last(self):
+        with pytest.raises(CypherError) as exc:
+            tr("OPTIONAL MATCH (a)-[:x]->(b) MATCH (b)-[:y]->(c) RETURN c")
+        assert str(exc.value).startswith("OPTIONAL MATCH must be the last clause")
+
+    def test_later_match_must_continue_from_a_bound_variable(self):
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a)-[:x]->(b) MATCH (c)-[:y]->(d) RETURN d")
+        assert str(exc.value).startswith("every MATCH after the first must continue the chain")
+
+    def test_cross_variable_refusal_names_the_variables(self):
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a)-[]->(b) WHERE a.x = 1 OR b.y = 2 RETURN b")
+        assert "several variables (a, b)" in str(exc.value)
+
+    def test_undirected_refusal_names_hop_direction(self):
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a)-[]-(b) RETURN b")
+        assert "Hop.direction is 'forward' or 'backward'" in str(exc.value)
+
+    def test_rel_variable_reusing_a_node_variable_refused(self):
+        """The already-bound check is an OR of two indexes; mutant
+        _add_rel__mutmut_5 made it an AND, so a relationship reusing a
+        NODE's variable slipped straight through."""
+        with pytest.raises(CypherError, match="'a' is already bound"):
+            tr("MATCH (a)-[a:knows]->(b) RETURN b")
+
+    def test_anonymous_node_is_named_as_such_in_refusals(self):
+        """Every message interpolating `var or '(anonymous)'` must
+        actually say (anonymous) when the node has no variable -- the
+        or-to-and mutants printed None instead."""
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (:A:B)")
+        assert "node (anonymous) has multiple labels" in str(exc.value)
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (:person {type: 'robot'})")
+        assert "node (anonymous) requires" in str(exc.value)
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a)-[:x]->(:person {type: 'robot'})")
+        assert "node (anonymous) requires" in str(exc.value)
+
+    def test_unbounded_star_refusal_names_hop_and_rewrite(self):
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a)-[*]->(b) RETURN b")
+        assert str(exc.value).startswith("hop 0: an unbounded")
+        assert "*1..N" in str(exc.value)
+
+    def test_in_is_reserved_in_relationship_variable_position(self):
+        """`-[IN:knows]->` is refused (IN is a keyword there); mutant
+        _parse_rel_detail__mutmut_8 lowercased the guard's argument,
+        which silently un-reserved it."""
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a)-[IN:knows]->(b) RETURN b")
+        assert "got 'IN'" in str(exc.value)
+
+    def test_with_distinct_on_an_anonymous_last_node_says_to_name_it(self):
+        with pytest.raises(CypherError) as exc:
+            cypher_to_aggregation("MATCH (a)-[:x]->() WITH DISTINCT a RETURN count(a)")
+        assert "give it a variable" in str(exc.value)
+
+    def test_entry_point_refusals_lead_with_the_diagnosis(self):
+        """Both wrong-entry-point messages must OPEN with what the query
+        does -- an XX-padded or reshuffled message still contained the
+        matched fragment, so the loose pins let it drift."""
+        with pytest.raises(CypherError) as exc:
+            tr("CREATE (a:person {x: 1})")
+        assert str(exc.value).startswith("this query writes")
+        with pytest.raises(CypherError) as exc:
+            cypher_to_aggregation("MATCH (a)-[]->(b) RETURN b")
+        assert str(exc.value).startswith("this query has no aggregating RETURN")
+
 
 class TestSyntaxErrors:
     @pytest.mark.parametrize("query,message", [
@@ -615,6 +807,32 @@ class TestSyntaxErrors:
         """Callers already catching ValueError from Hop/Start validation
         keep working."""
         assert issubclass(CypherError, ValueError)
+
+    @pytest.mark.parametrize("query,phrase", [
+        # Every token kind carries its source position, and _describe()
+        # renders the offender -- the ONLY consumers are these error
+        # messages, so unless one error per token kind is pinned
+        # verbatim, position-dropping and description mutants all
+        # survive (x__tokenize 54/74/91/110/122, _describe 1-6).
+        ("MATCH (a", "expected ')' at position 8, got end of query"),
+        ("MATCH (5)", "expected ')' at position 7, got 5"),
+        ("MATCH ('x')", "expected ')' at position 7, got 'x'"),
+        ("MATCH (a b)", "expected ')' at position 9, got 'b'"),
+        ("MATCH (a) )", "unexpected ')' at position 10"),
+        # path-variable detection peeks two tokens ahead; these two pin
+        # which token each check reads (mutants _parse_match 3/5)
+        ("MATCH foo (a)", "expected '(' at position 6, got 'foo'"),
+        ("MATCH p = q", "got 'q'"),
+        # the escape lookahead's boundary: a backslash-quote right at end
+        # of input is still an unterminated string, not a closed one
+        # (mutant x__tokenize__mutmut_43)
+        ("MATCH (a {s: 'oops", "unterminated string literal at position 13"),
+        ("MATCH (a {s: 'ab\\'", "unterminated string literal at position 13"),
+    ])
+    def test_error_positions_and_token_descriptions(self, query, phrase):
+        with pytest.raises(CypherError) as exc:
+            tr(query)
+        assert phrase in str(exc.value)
 
 
 # ---------------------------------------------------------------------
@@ -797,3 +1015,13 @@ class TestOptionForwarding:
         assert hops[0].via is None
         assert (hops[0].min_hops, hops[0].max_hops) == (1, 3)
         assert list(aggregates) == ["count"]
+
+    def test_cypher_operations_forwards_options(self, offline_graph):
+        """Same **options gap as graph.cypher() had: cypher_operations()
+        dropped them (mutant xǁGraphǁcypher_operationsǁ__mutmut_3) and no
+        test passed an option whose loss changes the plan."""
+        with_label = offline_graph.cypher_operations("CREATE (a:person {x: 1})")
+        assert with_label[0]["rows"] == [{"type": "person", "x": 1}]
+        without = offline_graph.cypher_operations("CREATE (a:person {x: 1})",
+                                                  node_label_key=None)
+        assert without[0]["rows"] == [{"x": 1}]

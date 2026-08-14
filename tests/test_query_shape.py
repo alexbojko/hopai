@@ -670,6 +670,45 @@ class TestJsonSpecTranslation:
         })
         assert repr(hops[0].where) == repr(BETWEEN("age", 18, 65))
 
+    def test_an_empty_hop_object_gets_every_documented_default(self):
+        """{} is a legal hop, and each default is part of the JSON
+        contract the tool schema documents -- mutants replacing any of
+        them (hops=2, optional=None, direction mangled) survived because
+        no test spelled a hop with everything omitted."""
+        _, hops = spec_to_traversal({"start": {"where": {"a": 1}}, "hops": [{}]})
+        (hop,) = hops
+        assert (hop.min_hops, hop.max_hops) == (1, 1)
+        assert hop.direction == "forward"
+        assert hop.optional is False
+        assert hop.where is None and hop.via is None and hop.label is None
+
+    def test_hop_range_and_label_forwarding(self):
+        _, hops = spec_to_traversal({
+            "start": {"where": {"a": 1}},
+            "hops": [{"hops": [2, 3], "label": "L"}],
+        })
+        assert (hops[0].min_hops, hops[0].max_hops) == (2, 3)
+        assert hops[0].label == "L"
+
+    def test_spec_errors_lead_with_the_missing_key(self):
+        """XX-padding mutants kept the matched fragment mid-string, so
+        the pins must anchor at the start of the message."""
+        with pytest.raises(ValueError) as exc:
+            spec_to_traversal({"hops": []})
+        assert str(exc.value).startswith("spec must have a 'start' key")
+        with pytest.raises(ValueError) as exc:
+            spec_to_aggregation({"start": {"where": {"a": 1}}})
+        assert str(exc.value).startswith('spec must have a non-empty "aggregates"')
+
+    def test_aggregate_query_needs_a_non_empty_dict(self):
+        """The same start-anchored pin for build_aggregate_query's own
+        refusal (mutant xǁGraphǁbuild_aggregate_query__mutmut_5)."""
+        from hopai import Graph, Start
+        offline = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline")
+        with pytest.raises(ValueError) as exc:
+            offline.build_aggregate_query(Start(), [], {})
+        assert str(exc.value).startswith("aggregates must be a non-empty dict")
+
 
 class TestToolSchema:
     """The schema is what an agent reads instead of documentation, so it
