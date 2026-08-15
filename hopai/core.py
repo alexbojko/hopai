@@ -1000,7 +1000,8 @@ class Graph:
         from .vectors import get_vectors
         return get_vectors(self, node_ids, edge_ids, node_fields, edge_fields)
 
-    def stale_vectors(self, node_fields=None, edge_fields=None, limit=None) -> dict:
+    def stale_vectors(self, node_fields=None, edge_fields=None, limit=None,
+                      after=None) -> dict:
         """Which rows need (re-)embedding, per field: those with no
         vector, and those whose stored vector no longer matches the
         declared dimensions.
@@ -1014,11 +1015,16 @@ class Graph:
         closes it without hand-writing the catalog query.
 
         embed_stale() runs that whole loop for fields that declare an
-        embed=; this is the report for the ones you fill in yourself."""
-        from .vectors import stale_vectors
-        return stale_vectors(self, node_fields, edge_fields, limit)
+        embed=; this is the report for the ones you fill in yourself.
 
-    def embed_stale(self, node_fields=None, edge_fields=None, limit=None) -> dict:
+        To walk a large field, page with `limit` AND `after=<the
+        largest id you saw>`. `limit` alone repeats itself: a row with
+        nothing to embed stays stale forever and holds the window."""
+        from .vectors import stale_vectors
+        return stale_vectors(self, node_fields, edge_fields, limit, after)
+
+    def embed_stale(self, node_fields=None, edge_fields=None, limit=None,
+                    batch: int = 1000) -> dict:
         """Fill in every stale vector from its source property, for the
         fields that declare an embed=. The backfill loop stale_vectors()
         leaves you to write:
@@ -1032,10 +1038,14 @@ class Graph:
 
         `skipped` is the rows whose source property is absent or blank
         -- reported rather than raised, since there is nothing to embed,
-        but never silent. `limit` caps the rows taken per field; re-run
-        until every list comes back empty."""
+        but never silent.
+
+        Walks each field in pages of `batch`, one embed call and one
+        transaction each, so any size of backfill costs bounded memory
+        and a re-run resumes rather than restarting. `limit` caps the
+        rows one call takes on per field; the default is all of them."""
         from .vectors import embed_stale
-        return embed_stale(self, node_fields, edge_fields, limit)
+        return embed_stale(self, node_fields, edge_fields, limit, batch)
 
     def pgvector_exit_ddl(self, index: Optional[str] = "hnsw") -> list:
         """The migration off this library's exact search and onto

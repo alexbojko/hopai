@@ -672,10 +672,18 @@ graph.embed_stale()      # embed every row that has no vector yet
 `source=` names the **property** holding the text and defaults to the
 field's own name, so `Vector("title", 768, embed=…)` embeds each row's
 `title`. `embed_stale()` reads that property for every row
-`stale_vectors()` reports, embeds them per field in one batched call,
-and writes them; rows whose property is missing or blank come back
-under `skipped` rather than raising, because a paper with no abstract
-legitimately has no abstract vector.
+`stale_vectors()` reports, embeds them, and writes them; rows whose
+property is missing or blank come back under `skipped` rather than
+raising, because a paper with no abstract legitimately has no abstract
+vector.
+
+It is a **backfill, not a one-shot**: one call walks the whole field in
+pages of `batch` (default 1000), each its own embed call and its own
+transaction, so a million rows cost bounded memory and a run that dies
+partway resumes instead of restarting. That paging is a keyset cursor
+rather than a `LIMIT` window on purpose — rows that can never be filled
+in stay stale forever, and a window would hand back those same rows on
+every pass and never reach the work behind them.
 
 **No new dependency.** hopai imports no provider package — not even to
 recognize one; clients are matched by module name and duck typing. The

@@ -1286,7 +1286,7 @@ def pgvector_exit_ddl(graph, index: Optional[str] = "hnsw") -> list:
 
 
 def stale_vectors(graph, node_fields=None, edge_fields=None,
-                  limit: Optional[int] = None) -> dict:
+                  limit: Optional[int] = None, after=None) -> dict:
     """Which rows need (re-)embedding, per field:
 
         {"nodes": {"summary": {"missing": ["4"], "wrong_dimensions": ["7"]}},
@@ -1301,10 +1301,16 @@ def stale_vectors(graph, node_fields=None, edge_fields=None,
     the catalog query by hand.
 
     Ids come back as strings, like every other result, so they feed
-    straight back into set_vectors(). `limit` caps each field's lists
-    for a graph too large to enumerate at once; re-run until empty.
-    `node_fields`/`edge_fields` name FIELDS (not ids, not rows) and
-    default to every declared field of that target."""
+    straight back into set_vectors(). `node_fields`/`edge_fields` name
+    FIELDS (not ids, not rows) and default to every declared field of
+    that target.
+
+    `limit` caps each field's lists, and `after` reads only ids beyond
+    the one given -- a keyset cursor over the same id order this always
+    returned. Paging needs BOTH: a row that can never be filled in (no
+    source text to embed) stays stale forever, so `limit` alone hands
+    back the same leading rows on every call and never reaches the work
+    behind them. Walk with `after=<the largest id you saw>` instead."""
     if graph._vectors is None:
         raise ValueError("stale_vectors() needs vector fields and none are defined -- "
                          "call define_vectors(...) first")
@@ -1326,6 +1332,11 @@ def stale_vectors(graph, node_fields=None, edge_fields=None,
                            func.array_length(column, 1).is_distinct_from(field.dimensions)))
                 .order_by(id_column)
             )
+            if after is not None:
+                # On the RAW id, matching the ORDER BY: compared as text
+                # '10' sorts before '9', and a cursor that disagrees with
+                # the order it walks skips rows and repeats others.
+                query = query.where(id_column > _coerce_id(after))
             if limit is not None:
                 query = query.limit(limit)
             missing, wrong = [], []
@@ -1336,27 +1347,38 @@ def stale_vectors(graph, node_fields=None, edge_fields=None,
     return result
 
 
-def embed_stale(graph, node_fields=None, edge_fields=None, limit=None) -> dict:
+def embed_stale(graph, node_fields=None, edge_fields=None, limit=None,
+                batch: int = 1000) -> dict:
     """Fill in every stale vector from its source property:
 
         {"nodes": {"summary": {"embedded": ["1", "2"], "skipped": ["7"]}},
          "edges": {}}
 
     stale_vectors() says which rows need a vector; this reads each
-    one's `source` property, embeds them per field in one batched call,
-    and writes them. `skipped` is the rows whose source property is
-    absent, null, or blank -- not an error, since a node with no
-    abstract legitimately has no abstract vector, but reported so it
-    is never mistaken for work done.
+    one's `source` property, embeds them, and writes them. `skipped`
+    is the rows whose source property is absent, null, blank, or not a
+    JSON string -- not an error, since a node with no abstract
+    legitimately has no abstract vector, but reported so it is never
+    mistaken for work done.
 
     Fields with no embed= are not touched by the default sweep and
     cannot be named: this call is only about the ones that declare how
     to embed themselves. Naming one that does not raises rather than
     returning a zero for it.
 
-    `limit` caps how many rows PER FIELD one call takes on, for a
-    backfill too large to do in one go -- re-run until every list is
-    empty."""
+    WALKS THE FIELD IN PAGES of `batch` rows, each its own embed call
+    and its own transaction, so a backfill of any size costs bounded
+    memory and resumes where it stopped -- re-running simply finds
+    what is still stale. That is a deliberate exception to "writes are
+    one transaction": a backfill is many independent writes, and a
+    retry after a failure collides with nothing, it continues.
+
+    The paging is a keyset cursor rather than a window, because rows
+    that can NEVER be filled in are stale forever: a plain LIMIT hands
+    back the same unembeddable leading rows on every pass and never
+    reaches the work behind them, reporting success while doing
+    nothing. `limit` caps the rows one call takes on per field; the
+    default is the whole field."""
     if graph._vectors is None:
         raise ValueError("embed_stale() needs vector fields and none are defined -- "
                          "call define_vectors(...) first")
@@ -1380,27 +1402,39 @@ def embed_stale(graph, node_fields=None, edge_fields=None, limit=None) -> dict:
             "embed=<your embedding client>), or write vectors with set_vectors()"
         )
 
-    stale = stale_vectors(graph, node_fields=chosen["nodes"],
-                          edge_fields=chosen["edges"], limit=limit)
+    if not isinstance(batch, int) or isinstance(batch, bool) or batch < 1:
+        raise ValueError(f"embed_stale(): batch must be a positive integer, got {batch!r}")
+
     result: dict = {"nodes": {}, "edges": {}}
     for target_name, names in chosen.items():
+        key = "node_fields" if target_name == "nodes" else "edge_fields"
         for name in names:
             field = _field(graph, target_name, name, "embed_stale()")
-            ids = stale[target_name][name]["missing"] \
-                + stale[target_name][name]["wrong_dimensions"]
-            texts = _source_texts(graph, target_name, field.source, ids)
-            embedded = [row_id for row_id in ids if texts.get(row_id)]
-            result[target_name][name] = {
-                "embedded": embedded,
-                "skipped": [row_id for row_id in ids if not texts.get(row_id)],
-            }
-            if embedded:
-                # set_vectors() batches the embedding itself and keeps
-                # it outside the transaction, so handing it the text is
-                # both shorter and the one place that ordering lives.
-                set_vectors(graph, **{target_name: [
-                    {"id": row_id, name: texts[row_id]} for row_id in embedded
-                ]})
+            embedded, skipped, cursor = [], [], None
+            while limit is None or len(embedded) + len(skipped) < limit:
+                page = batch if limit is None \
+                    else min(batch, limit - len(embedded) - len(skipped))
+                report = stale_vectors(graph, limit=page, after=cursor,
+                                       **{key: [name]})[target_name][name]
+                ids = report["missing"] + report["wrong_dimensions"]
+                if not ids:
+                    break
+                # The two lists are ordered within themselves but
+                # concatenated out of order, so the cursor is the
+                # largest id in the page, not its last element.
+                cursor = max(ids, key=_coerce_id)
+                texts = _source_texts(graph, target_name, field.source, ids)
+                fillable = [row_id for row_id in ids if texts.get(row_id)]
+                embedded.extend(fillable)
+                skipped.extend(row_id for row_id in ids if not texts.get(row_id))
+                if fillable:
+                    # set_vectors() batches the embedding itself and keeps
+                    # it outside the transaction, so handing it the text is
+                    # both shorter and the one place that ordering lives.
+                    set_vectors(graph, **{target_name: [
+                        {"id": row_id, name: texts[row_id]} for row_id in fillable
+                    ]})
+            result[target_name][name] = {"embedded": embedded, "skipped": skipped}
     return result
 
 

@@ -2149,6 +2149,27 @@ class TestStaleVectorsLive:
         with pytest.raises(ValueError, match="no vector field 'ghost'"):
             g.stale_vectors(node_fields=["ghost"])
 
+    def test_after_walks_past_the_ids_already_seen(self, fresh_graph):
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": i} for i in range(1, 6)])
+        assert g.stale_vectors(node_fields=["docvec"], limit=2,
+                               after=None)["nodes"]["docvec"]["missing"] == ["1", "2"]
+        assert g.stale_vectors(node_fields=["docvec"], limit=2,
+                               after="2")["nodes"]["docvec"]["missing"] == ["3", "4"]
+        assert g.stale_vectors(node_fields=["docvec"],
+                               after="5")["nodes"]["docvec"]["missing"] == []
+
+    def test_the_cursor_compares_ids_the_way_it_orders_them(self, fresh_graph):
+        """Ids come back as strings but the walk is ordered by the raw
+        column, where 9 < 10. A cursor comparing the TEXT would put
+        '10' before '9', so paging past '9' would skip every id from 10
+        up -- rows silently never returned, which is how a backfill
+        finishes while leaving work behind."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": i} for i in (8, 9, 10, 11)])
+        assert g.stale_vectors(node_fields=["docvec"],
+                               after="9")["nodes"]["docvec"]["missing"] == ["10", "11"]
+
 
 def _embedding_graph(fresh_graph, log=None, source=None, dimensions=3):
     """A migrated graph whose `docvec` field knows how to embed itself."""
@@ -2372,6 +2393,58 @@ class TestEmbedStaleLive:
         g = _embedding_graph(fresh_graph)
         g.add_nodes([{"id": i, "docvec": f"text-{i}"} for i in range(1, 6)])
         assert len(g.embed_stale(limit=2)["nodes"]["docvec"]["embedded"]) == 2
+
+    def test_it_reaches_work_behind_rows_that_can_never_be_filled(self, fresh_graph):
+        """The bug a plain LIMIT window has, and the reason paging is a
+        keyset cursor: a row with no source text is stale FOREVER, so
+        the same leading rows fill the window on every pass and the
+        work behind them is never reached. It reported success and
+        embedded nothing -- silent, permanent incompleteness."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}, {"id": 2}, {"id": 3},          # nothing to embed
+                     {"id": 4, "docvec": "apple"}, {"id": 5, "docvec": "banana"}])
+        result = g.embed_stale(node_fields=["docvec"], batch=2)["nodes"]["docvec"]
+        assert result == {"embedded": ["4", "5"], "skipped": ["1", "2", "3"]}
+        assert g.get_vectors(node_ids=[4])["nodes"]["4"]["docvec"] == [97.0, 0.0, 0.0]
+
+    def test_a_page_smaller_than_the_field_still_finishes_it(self, fresh_graph):
+        """batch= bounds memory and transaction size, not how much gets
+        done: one call still walks the whole field."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": i, "docvec": f"text-{i}"} for i in range(1, 8)])
+        result = g.embed_stale(node_fields=["docvec"], batch=2)["nodes"]["docvec"]
+        assert result["embedded"] == [str(i) for i in range(1, 8)]
+        assert g.embed_stale(node_fields=["docvec"], batch=2)["nodes"]["docvec"]["embedded"] == []
+
+    def test_each_page_is_its_own_provider_call_and_transaction(self, fresh_graph):
+        """What bounds the memory: 500k rows must not become one embed
+        call holding 500k vectors, nor one transaction holding every
+        row lock until the last provider round trip returns."""
+        log, opened = [], []
+        g = _embedding_graph(fresh_graph, log=log)
+        g.add_nodes([{"id": i, "docvec": f"text-{i}"} for i in range(1, 7)])
+
+        def on_begin(conn):
+            opened.append(len(log))
+
+        event.listen(g.engine, "begin", on_begin)
+        try:
+            g.embed_stale(node_fields=["docvec"], batch=2)
+        finally:
+            event.remove(g.engine, "begin", on_begin)
+        assert log == [["text-1", "text-2"], ["text-3", "text-4"], ["text-5", "text-6"]]
+        # Read as: one transaction opened before any embedding (the
+        # first stale query), then more after each page. Embedding
+        # everything first and writing once would put every `begin` at
+        # the same count instead of walking 0, 1, 2, 3.
+        assert sorted(set(opened)) == [0, 1, 2, 3]
+
+    @pytest.mark.parametrize("bad", [0, -1, 1.5, True, "10"])
+    def test_a_meaningless_batch_is_refused(self, fresh_graph, bad):
+        """batch=0 would spin forever asking for zero rows."""
+        g = _embedding_graph(fresh_graph)
+        with pytest.raises(ValueError, match="batch must be a positive integer"):
+            g.embed_stale(node_fields=["docvec"], batch=bad)
 
     def test_it_stays_inside_its_own_graph(self, fresh_graph):
         """Every read and write goes through _scoped(); the property
