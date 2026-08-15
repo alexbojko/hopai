@@ -20,6 +20,7 @@ import os
 import re
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from hopai import (
     AGGREGATE_TOOL_SCHEMA, CypherError, EdgeType, Graph,
@@ -613,6 +614,23 @@ class TestToolSchemas:
         with pytest.raises(ValueError, match="search_similar: this graph defines several"):
             spec.call(query="x")
 
+    def test_the_advertised_enums_are_values_the_handler_takes(self, vector_graph):
+        """An `enum` is the tightest promise a schema makes: a model
+        picks from it verbatim and nothing else. `target` advertising
+        "NODES" while the handler branches on "nodes" is a tool that
+        fails on every well-formed call -- and the mutant that wrote it
+        survived, because every test until now passed `target` by hand
+        or left it out.
+
+        Asserted by CALLING with each advertised value, not by
+        comparing the list to a second copy of itself."""
+        spec = named(vector_graph, embed=embedder())["search_similar"]
+        for value in spec.parameters["properties"]["target"]["enum"]:
+            # reaches the database that is not there, which is proof the
+            # value was understood rather than rejected as unknown
+            with pytest.raises(OperationalError):
+                spec.call(query="x", target=value)
+
     def test_search_names_itself_when_the_graph_is_unknown(self):
         graphs = {"docs": offline().in_graph("docs"), "crm": offline().in_graph("crm")}
         graphs["docs"].define_vectors(nodes=[Vector("summary", 3)])
@@ -731,17 +749,24 @@ class TestToolSchemas:
 # ---------------------------------------------------------------------
 
 class TestVectorsNeverComeFromTheModel:
-    def test_a_start_near_is_refused(self):
+    @pytest.mark.parametrize("tool, arguments", [
+        ("traverse_graph", {}),
+        ("aggregate_graph", {"aggregates": {"n": {"fn": "count"}}}),
+    ])
+    def test_a_start_near_is_refused(self, tool, arguments):
         """The whole reason this server embeds text itself. Without this
         the tool would happily rank against invented floats and return a
         plausible subgraph, which is the worst thing this library can
         produce."""
-        spec = named(offline())["traverse_graph"]
+        spec = named(offline())[tool]
         # the refusal names the TOOL that made it, not just the rule:
         # "which of my calls was this?" is the first thing a model has
-        # to answer, and a mutation blanking the caller survived
-        with pytest.raises(ValueError, match=r"traverse_graph: \['near'\] cannot come from"):
-            spec.call(start={"near": {"field": "summary", "vector": [0.1, 0.2, 0.3]}})
+        # to answer, and a mutation blanking the caller survived. Both
+        # tools, because they pass their own name to _seed and a mutant
+        # mangled aggregate_graph's while traverse_graph's was pinned.
+        with pytest.raises(ValueError, match=rf"{tool}: \['near'\] cannot come from"):
+            spec.call(start={"near": {"field": "summary", "vector": [0.1, 0.2, 0.3]}},
+                      **arguments)
 
     @pytest.mark.parametrize("key", ["near", "keep", "via_near", "via_keep", "boost"])
     @pytest.mark.parametrize("tool, arguments", [
@@ -787,8 +812,6 @@ class TestVectorsNeverComeFromTheModel:
         the connection that is not there is what proves the whole call
         was built -- the embedding made, the spec assembled, the query
         compiled -- with only the database missing."""
-        from sqlalchemy.exc import OperationalError
-
         spec = named(vector_graph, embed=embedder())[tool]
         with pytest.raises(OperationalError):
             spec.call(start={"search": "graph databases"}, **arguments)
@@ -899,8 +922,6 @@ class TestCypherTool:
         looser form passes for any failure at all, including a handler
         mutated into a TypeError. This one proves the query was
         translated and compiled, with only the database missing."""
-        from sqlalchemy.exc import OperationalError
-
         spec = named(offline(), allow_mutations=True)["cypher"]
         with pytest.raises(OperationalError):
             spec.call(query="MATCH (a:person) DETACH DELETE a")
@@ -1409,6 +1430,10 @@ class TestWriteToolsLive:
         report = spec.call()
         assert report["dry_run"] is True and report["clean"] is False
         assert report["rules"] and report["rules"][0]["rows"]
+        # the prose summary too: it is what a model reads before the
+        # rules array, and a mutant renaming the KEY dropped it in
+        # silence while every other assertion here still passed
+        assert report["summary"]
 
         from sqlalchemy.exc import IntegrityError
         with pytest.raises(IntegrityError):
