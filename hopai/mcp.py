@@ -325,7 +325,15 @@ def _describe_tool(graph: Graph, read_only: bool, allow_ddl: bool,
             "schema": schema.to_json() if schema is not None else None,
             "schema_mermaid": schema.to_mermaid() if schema is not None else None,
             "vector_fields": vectors,
-            "search_by_meaning": bool(embed) and bool(vectors["nodes"]),
+            # Two capabilities, not one: search_similar needs an
+            # embedder (tools() refuses one without a field to rank),
+            # while seeding a traversal additionally needs a NODE
+            # field. Reporting them as a single flag told a model with
+            # edge-only vectors that it could not search at all -- and
+            # a mutation that made the two interchangeable survived,
+            # which is how the conflation surfaced.
+            "search_by_meaning": bool(embed),
+            "seed_traversal_by_meaning": _seeds_from_text(graph, embed),
             "writes_allowed": not read_only,
             "ddl_allowed": allow_ddl,
             "refusals": [

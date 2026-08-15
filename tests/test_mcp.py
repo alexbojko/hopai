@@ -285,12 +285,28 @@ class TestToolSchemas:
         assert "search" in spec.parameters["properties"]["start"]["properties"]
         assert "start.search" in spec.description
 
-    def test_every_built_schema_is_a_well_formed_object_schema(self):
+    def test_search_similar_advertises_the_fields_that_exist(self):
+        """The enum is what stops a model inventing a field name. It is
+        built from the registry, and a mutation that read the registry
+        under a target name that does not exist -- leaving the enum
+        short -- survived until this asserted the contents."""
+        g = offline()
+        g.define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)],
+                         edges=[Vector("rel", 3)])
+        spec = named(g, embed=embedder())["search_similar"]
+        assert spec.parameters["properties"]["field"]["enum"] == ["rel", "summary", "title"]
+        assert spec.parameters["required"] == ["query"]
+
+    @pytest.mark.parametrize("options", [{}, {"allow_ddl": True}, {"read_only": True},
+                                         {"embed": embedder()}])
+    def test_every_built_schema_is_a_well_formed_object_schema(self, options, vector_graph):
         """The tools this module writes itself build their schemas
         rather than copying hopai's. A malformed one is not rejected by
         anything -- the SDK ships whatever it is given, and the model
-        gets a schema it cannot satisfy."""
-        for spec in tools(offline(), allow_ddl=False):
+        gets a schema it cannot satisfy. Every configuration, because
+        `search_similar` only exists in one of them -- and that is the
+        tool whose schema a mutation broke."""
+        for spec in tools(vector_graph, **options):
             assert spec.parameters["type"] == "object", spec.name
             assert isinstance(spec.parameters["properties"], dict), spec.name
             assert isinstance(spec.parameters.get("required", []), list), spec.name
@@ -323,7 +339,10 @@ class TestVectorsNeverComeFromTheModel:
         plausible subgraph, which is the worst thing this library can
         produce."""
         spec = named(offline())["traverse_graph"]
-        with pytest.raises(ValueError, match="cannot come from a tool call"):
+        # the refusal names the TOOL that made it, not just the rule:
+        # "which of my calls was this?" is the first thing a model has
+        # to answer, and a mutation blanking the caller survived
+        with pytest.raises(ValueError, match=r"traverse_graph: \['near'\] cannot come from"):
             spec.call(start={"near": {"field": "summary", "vector": [0.1, 0.2, 0.3]}})
 
     @pytest.mark.parametrize("key", ["near", "keep", "via_near", "via_keep", "boost"])
@@ -332,7 +351,7 @@ class TestVectorsNeverComeFromTheModel:
         path calls it with allow_vectors=True -- so the hops have to be
         refused here or the invariant would hold only for `start`."""
         spec = named(offline())["traverse_graph"]
-        with pytest.raises(ValueError, match="cannot come from a tool call"):
+        with pytest.raises(ValueError, match=rf"traverse_graph: \['{key}'\] cannot come from"):
             spec.call(start={"where": {"type": "person"}}, hops=[{key: 3}])
 
     def test_a_seeded_server_still_refuses_an_invented_near(self, vector_graph):
@@ -369,15 +388,15 @@ class TestVectorsNeverComeFromTheModel:
     def test_an_ambiguous_field_is_refused(self):
         g = offline()
         g.define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)])
-        with pytest.raises(ValueError, match="name the one to search"):
-            _seed(g, embedder(), {"search": "x"}, "t")
+        with pytest.raises(ValueError, match="aggregate_graph: this graph defines several"):
+            _seed(g, embedder(), {"search": "x"}, "aggregate_graph")
 
     def test_an_unknown_field_lists_the_real_ones(self, vector_graph):
         with pytest.raises(ValueError, match=r"defined: \['summary'\]"):
             _seed(vector_graph, embedder(), {"search": "x", "search_field": "sumary"}, "t")
 
     def test_a_start_that_is_not_an_object_says_so(self):
-        with pytest.raises(TypeError, match="must be an object"):
+        with pytest.raises(TypeError, match="traverse_graph: `start` must be an object, got list"):
             _seed(offline(), None, ["type", "person"], "traverse_graph")
 
     def test_searching_a_target_with_no_vectors_names_the_target(self):
@@ -453,7 +472,25 @@ class TestDescribeGraph:
         assert described["writes_allowed"] is False
         assert described["ddl_allowed"] is False
         assert described["search_by_meaning"] is True
+        assert described["seed_traversal_by_meaning"] is True
         assert described["vector_fields"] == {"nodes": {"summary": 3}, "edges": {"rel": 3}}
+
+    def test_searching_and_seeding_are_reported_as_the_two_things_they_are(self):
+        """Edge-only vectors can be SEARCHED but cannot SEED a
+        traversal, which ranks node vectors. Reported as one flag, that
+        graph was told it could not search by meaning at all -- and a
+        mutation making the two interchangeable survived, which is how
+        the conflation surfaced."""
+        edges_only = offline()
+        edges_only.define_vectors(edges=[Vector("rel", 3)])
+        described = named(edges_only, embed=embedder())["describe_graph"].call()
+        assert described["search_by_meaning"] is True
+        assert described["seed_traversal_by_meaning"] is False
+
+    def test_neither_is_claimed_without_an_embedder(self):
+        described = named(offline())["describe_graph"].call()
+        assert described["search_by_meaning"] is False
+        assert described["seed_traversal_by_meaning"] is False
 
     def test_it_says_when_there_is_no_schema_to_describe(self):
         described = named(offline())["describe_graph"].call()
