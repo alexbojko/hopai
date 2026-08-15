@@ -211,6 +211,9 @@ class TestManyGraphs:
         assert listed[0]["node_types"] == ["author", "paper"]
         assert listed[0]["vector_fields"] == {"nodes": ["summary"], "edges": []}
         assert listed[1]["schema_declared"] is False and listed[1]["node_types"] is None
+        # the reminder rides in the RESULT too, where a model is looking
+        # when it picks a name -- a renamed key would drop it silently
+        assert "graph` argument" in named(graphs)["list_graphs"].call()["note"]
 
     def test_an_unnamed_call_is_refused_rather_than_guessed(self):
         with pytest.raises(ValueError, match="every call names one -- pass graph="):

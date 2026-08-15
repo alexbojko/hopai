@@ -272,16 +272,18 @@ class Served:
             )
         return self.graphs[name]
 
-    def vector_fields(self, target: str) -> dict:
+    def vector_fields(self, target: str) -> set:
         """Every vector field name declared for `target` by ANY served
-        graph, mapped to the graphs that declare it. The union is what
-        a tool schema can advertise; picking the wrong one for a given
-        graph is refused per call by _resolve_field(), by name."""
-        found: dict = {}
-        for name, graph in self.graphs.items():
-            for field in _vector_fields(graph, target):
-                found.setdefault(field, []).append(name)
-        return found
+        graph. The union is what a tool schema can advertise; picking
+        one the CHOSEN graph does not declare is refused per call by
+        _resolve_field(), naming that graph's own fields.
+
+        Names only. This carried which graphs declared each field until
+        a mutant replaced those names with None and nothing noticed --
+        because nothing read them. Data no caller uses is where mutants
+        live, so it is gone rather than asserted into relevance."""
+        return {field for graph in self.graphs.values()
+                for field in _vector_fields(graph, target)}
 
     def seeds_from_text(self, embed: Optional[Callable]) -> bool:
         return any(_seeds_from_text(graph, embed) for graph in self.graphs.values())
@@ -304,12 +306,13 @@ def _static_schemas(served: Served) -> dict:
 
     from .ingest import INGEST_TOOL_SCHEMA
     from .json_api import AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA
-    schemas = {}
-    for tool in (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA):
-        tool = copy.deepcopy(tool)
-        tool["description"] = _described(served, tool["description"])
-        schemas[tool["name"]] = tool
-    return schemas
+    # Their descriptions are left exactly as written: _described() adds a
+    # single graph's vocabulary and has nothing to add here, and tools()
+    # appends the line that names the graphs to every spec. Running them
+    # through _described() anyway was a no-op that read like a step --
+    # a mutant broke the assignment and no test could tell.
+    return {tool["name"]: copy.deepcopy(tool)
+            for tool in (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA)}
 
 
 def _graph_key(served: Served) -> dict:
