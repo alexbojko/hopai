@@ -578,7 +578,19 @@ Filters accept the same grammar, spelled as JSON operators:
 `{"gte": [...]}`, `{"lt": [...]}`, `{"lte": [...]}`, `{"between": [key, lo, hi]}`.
 
 `hopai.TRAVERSE_TOOL_SCHEMA` is a ready-to-use JSON Schema for wiring
-this into an LLM function-calling definition directly.
+this into an LLM function-calling definition directly — and with a
+[graph schema](#-graph-schema) defined, `graph.tool_schemas()` returns
+all four tool definitions with *your* node types, edge kinds and
+properties summarized into the descriptions, so the model stops
+hallucinating labels:
+
+```python
+tools = graph.tool_schemas()   # traverse / aggregate / ingest / mutate,
+                               # each describing what this graph holds
+```
+
+That is every front end, `mutate_graph` included — hand over the subset
+you actually want the model to have.
 
 ## 🗣️ Cypher as input syntax
 

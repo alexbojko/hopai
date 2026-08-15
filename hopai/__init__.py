@@ -98,7 +98,10 @@ over the distinct nodes the last step matched; the same three notations:
 FOR TOOL-CALLING MODELS: TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
 INGEST_TOOL_SCHEMA and MUTATE_TOOL_SCHEMA are JSON Schemas ready to hand
 to a function-calling definition, covering reading, aggregating,
-writing, and changing or deleting what is already there.
+writing, and changing or deleting what is already there -- and
+`graph.tool_schemas()` returns the same four with THIS graph's declared
+schema summarized into each description, so the model knows what exists
+instead of guessing labels.
 
 SCHEMA -- declare the shape of the graph (node types, edge kinds, typed
 properties) as plain dataclasses or NodeType/EdgeType primitives, read

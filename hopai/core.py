@@ -570,6 +570,38 @@ class Graph:
         return (_Target(self.nodes_tbl, "nodes", self.graph, self.graph_col),
                 _Target(self.edges_tbl, "edges", self.graph, self.graph_col))
 
+    def tool_schemas(self) -> list:
+        """The four LLM tool definitions -- traverse, aggregate, ingest,
+        mutate -- as deep copies, with THIS graph's declared schema
+        summarized into each description so a function-calling model
+        sees what exists instead of guessing labels and property names.
+        With no schema defined, the static definitions come back
+        unchanged (as copies): the schema stays optional.
+
+        Every front end hopai has, including the one that deletes --
+        handing a model three of four and leaving it to discover
+        MUTATE_TOOL_SCHEMA would be worse than the decision being
+        visible. Pick the subset you want to expose; this is the whole
+        list.
+
+        Only descriptions differ from the module constants; the
+        `parameters` sections are identical, because what the parsers
+        accept has not changed -- this is presentation, not grammar."""
+        import copy
+
+        from .ingest import INGEST_TOOL_SCHEMA
+        from .json_api import AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA
+        from .mutate import MUTATE_TOOL_SCHEMA
+        tools = [copy.deepcopy(tool) for tool in
+                 (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA,
+                  MUTATE_TOOL_SCHEMA)]
+        if self._schema is not None:
+            from .schema import tool_summary
+            summary = tool_summary(self._schema)
+            for tool in tools:
+                tool["description"] = f"{tool['description']} {summary}"
+        return tools
+
     def schema_violations(self, sample: int = 5):
         """What enforce_schema() would reject, found by READING -- per
         violated rule, its would-be constraint name, a row count and up
