@@ -419,7 +419,10 @@ class TestSearchQueryShape:
         sql = self.sql(vg, Near("rel", [1.0, 2.0, 3.0]), target="edges")
         assert "FROM edges" in sql
         assert "vec_rel" in sql
-        assert "start_id" in sql and "end_id" in sql
+        # The LABELS, not the bare names: "start_id" is also the edges
+        # column, so `edges.start_id AS _start` satisfies the substring
+        # whether or not the endpoints are actually selected.
+        assert "AS start_id" in sql and "AS end_id" in sql
 
     def test_single_statement_one_round_trip(self, vg):
         assert ";" not in self.sql(vg, Near("summary", [1.0, 2.0, 3.0]))
@@ -1337,6 +1340,22 @@ class TestSearchManyShape:
                    literal_binds=True)
         assert "graph_id = 'default'" in sql
 
+    def test_edges_target_reports_endpoints_here_too(self, vg):
+        """The single-query path pins this; the batch path did not, so
+        `_result_columns(inner, target)` could be handed anything and
+        every batch edge hit would come back without the endpoints that
+        make it usable.
+
+        Asserted on the OUTPUT labels, not on "start_id" anywhere in the
+        statement: that is also the literal edges column name, so the
+        bare substring is already there via `edges.start_id AS _start`
+        and matches whether the endpoints are selected or not."""
+        sql = norm(vg.build_vector_search_many_query(
+            [Near("rel", [1.0, 0.0, 0.0])], target="edges", k=1))
+        assert "FROM edges" in sql and "vec_rel" in sql
+        assert "AS start_id" in sql and "AS end_id" in sql
+        assert "hits.start_id" in sql and "hits.end_id" in sql
+
     def test_rows_without_a_vector_are_filtered_before_the_cosine(self, vg):
         """The single-query path has this guard pinned; the batch path
         did not, and dropping it changes no ANSWER -- the outer
@@ -1400,6 +1419,24 @@ class TestSearchManyLive:
              Near("docvec", [0.0, 0.0, 1.0], min_similarity=0.99)], k=5)
         assert [len(one) for one in batch] == [2, 0]
 
+    def test_edge_hits_carry_their_endpoints(self, fresh_graph):
+        """The single-query path has had this since it was written; the
+        batch path was only ever exercised against nodes, so nothing
+        noticed if an edge hit came back as a bare id."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "t": "a"}, {"id": 2, "t": "b"}])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "close"},
+                     {"start_id": 2, "end_id": 1, "kind": "far"}])
+        with g.engine.connect() as conn:
+            ids = dict(conn.execute(text(
+                "SELECT properties->>'kind', id FROM edges")).all())
+        g.set_vectors(edges=[{"id": ids["close"], "relvec": [1.0, 0.0, 0.0]},
+                             {"id": ids["far"], "relvec": [0.0, 1.0, 0.0]}])
+        batch = g.vector_search_many(
+            [Near("relvec", QUERY), Near("relvec", [0.0, 1.0, 0.0])], target="edges", k=1)
+        assert [(h["start_id"], h["end_id"]) for one in batch for h in one] \
+            == [("1", "2"), ("2", "1")]
+
     def test_one_round_trip(self, fresh_graph):
         """Two queries, one statement -- the reason this exists rather
         than a Python loop."""
@@ -1455,6 +1492,16 @@ class TestBoost:
     def test_the_zero_weight_message_names_the_type(self):
         with pytest.raises(ValueError, match=r"^Boost weight must be non-zero"):
             Boost("score", 0)
+
+    def test_the_default_weight_is_one_in_both_spellings(self):
+        """Every test passed `weight` explicitly, so the default could
+        be any number. It is spelled TWICE -- once on Boost, once in
+        parse_boost's `spec.get("weight", 1.0)` -- and two copies of a
+        default that nothing compares is how the JSON form and the
+        Python form come to mean different things."""
+        assert Boost("score").weight == 1.0
+        assert Boost("score").default == 0.0
+        assert parse_boost({"property": "score"}).weight == Boost("score").weight
 
     @pytest.mark.parametrize("bad", [None, 42, b"x", ""])
     def test_boost_key_must_be_a_property_or_callable(self, bad):
