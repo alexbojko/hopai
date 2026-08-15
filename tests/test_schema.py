@@ -838,3 +838,107 @@ class TestSchemaInference:
         from sqlalchemy.exc import OperationalError
         with pytest.raises(OperationalError):
             offgraph.infer_schema()
+
+
+class TestEndpointEnforcement:
+    def declare(self, graph) -> None:
+        graph.add_nodes([
+            {"id": 1, "type": "person", "email": "a@x.com"},
+            {"id": 2, "type": "company", "name": "acme"},
+            {"id": 3, "type": "robot"},
+            {"id": 4, "name": "untyped"},
+        ])
+        graph.define_schema(
+            nodes=[NodeType("person"), NodeType("company"), NodeType("robot")],
+            edges=[EdgeType("works_at", source="person", target="company"),
+                   EdgeType("likes", source="person", target="person"),
+                   EdgeType("likes", source="person", target="company")],
+        )
+
+    @staticmethod
+    def trigger_count(graph) -> int:
+        with graph.engine.connect() as conn:
+            return conn.execute(text(
+                "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = 'hopai_write' AND t.tgname LIKE 'ck\\_schema\\_end%'"
+            )).scalar()
+
+    def test_wrong_endpoint_rejected_on_every_write_path(self, fresh_graph):
+        """The whole point of a trigger over a Python check: the SERVER
+        rejects the edge whichever door it came through, and the error
+        names the kind, the observed types, and the declared triples --
+        an error that names the fix."""
+        self.declare(fresh_graph)
+        fresh_graph.enforce_schema(endpoints=True)
+        fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "works_at"}])
+        with pytest.raises(ConstraintViolation) as exc:
+            fresh_graph.add_edges([{"start_id": 3, "end_id": 2, "kind": "works_at"}])
+        assert exc.value.constraint == "ck_schema_end_default"
+        assert "works_at connects robot -> company" in str(exc.value)
+        assert "works_at: person -> company" in str(exc.value)
+        with pytest.raises(ConstraintViolation):
+            fresh_graph.cypher(
+                "MATCH (a {type: 'robot'}), (b {name: 'acme'}) CREATE (a)-[:works_at]->(b)")
+
+    def test_a_kind_with_several_pairs_accepts_each_and_only_each(self, fresh_graph):
+        """Edge identity is the (kind, source, target) triple, and the
+        trigger must honor every declared triple of a kind -- while an
+        UNdeclared pair of a declared kind stays rejected."""
+        self.declare(fresh_graph)
+        fresh_graph.enforce_schema(endpoints=True)
+        fresh_graph.add_edges([{"start_id": 1, "end_id": 1, "kind": "likes"},
+                               {"start_id": 1, "end_id": 2, "kind": "likes"}])
+        with pytest.raises(ConstraintViolation):
+            fresh_graph.add_edges([{"start_id": 3, "end_id": 1, "kind": "likes"}])
+
+    def test_undeclared_and_kindless_pass_untyped_endpoint_fails(self, fresh_graph):
+        """Only declared kinds are policed -- consistent with the
+        per-type CHECKs. But a DECLARED kind into an untyped node cannot
+        satisfy any triple, and the error must say (untyped), not
+        pretend a type."""
+        self.declare(fresh_graph)
+        fresh_graph.enforce_schema(endpoints=True)
+        fresh_graph.add_edges([{"start_id": 3, "end_id": 1, "kind": "undeclared"}])
+        fresh_graph.add_edges([{"start_id": 4, "end_id": 1}])
+        with pytest.raises(ConstraintViolation) as exc:
+            fresh_graph.add_edges([{"start_id": 1, "end_id": 4, "kind": "works_at"}])
+        assert "person -> (untyped)" in str(exc.value)
+
+    def test_idempotent_scoped_and_reconciled_away(self, fresh_graph):
+        """Re-running converges; another graph's edges are never
+        validated; and enforce_schema() WITHOUT the flag removes the
+        trigger and its function -- a stale trigger would keep policing
+        a rule the caller just opted out of."""
+        self.declare(fresh_graph)
+        first = fresh_graph.enforce_schema(endpoints=True)
+        assert fresh_graph.enforce_schema(endpoints=True) == first
+        assert "ck_schema_end_default" in first
+        assert self.trigger_count(fresh_graph) == 1
+
+        other = fresh_graph.in_graph("elsewhere")
+        other.add_nodes([{"id": 100, "type": "robot"}, {"id": 101, "type": "company"}])
+        assert other.add_edges([{"start_id": 100, "end_id": 101, "kind": "works_at"}]) == 1
+
+        fresh_graph.enforce_schema()   # endpoints=False -> converge to unpoliced
+        assert self.trigger_count(fresh_graph) == 0
+        with fresh_graph.engine.connect() as conn:
+            functions = conn.execute(text(
+                "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = 'hopai_write' AND p.proname LIKE 'ck\\_schema\\_endf%'"
+            )).scalar()
+        assert functions == 0
+        assert fresh_graph.add_edges(
+            [{"start_id": 3, "end_id": 2, "kind": "works_at"}]) == 1   # unpoliced again
+
+    def test_default_stays_off_and_ddl_previews_without_executing(self, fresh_graph):
+        """endpoints=True is an opt-in with a per-row write cost, so the
+        default must create NO trigger -- and schema_ddl(endpoints=True)
+        must show the exact SQL while executing none of it."""
+        self.declare(fresh_graph)
+        fresh_graph.enforce_schema()
+        assert self.trigger_count(fresh_graph) == 0
+        ddl = fresh_graph.schema_ddl(endpoints=True)
+        assert any("CREATE CONSTRAINT TRIGGER" in statement for statement in ddl)
+        assert any("CREATE OR REPLACE FUNCTION" in statement for statement in ddl)
+        assert self.trigger_count(fresh_graph) == 0   # preview executed nothing

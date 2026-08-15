@@ -79,14 +79,16 @@ construction. IS DISTINCT FROM, not <>, because <> is NULL for a missing
 key and a CHECK passes on NULL either way -- DISTINCT just says what is
 meant.
 
-WHAT ENFORCEMENT DOES NOT COVER: endpoint types. "works_at connects only
-person -> company" needs a subquery against nodes, which a CHECK cannot
-contain. Declaring it documents intent and feeds every representation,
-but the database does not police it (a trigger could -- tracked as a
-follow-up, still pure Postgres). Also uncovered: two edge types sharing
-a kind with DIFFERENT property schemas. Enforcement is keyed on the kind
-alone (endpoints being unenforceable, above), so it refuses that shape
-outright rather than enforcing the wrong merge of the two.
+ENDPOINT TYPES are policed only on request: "works_at connects only
+person -> company" needs a look at the endpoint nodes, which a CHECK
+cannot contain -- enforce_schema(endpoints=True) does it with a
+CONSTRAINT TRIGGER (still plain Postgres). It fires per edge write,
+which is why it is an opt-in with the cost stated rather than the
+default; it validates edges as they are written, and retyping a NODE
+under existing edges is not re-checked. Still uncovered: two edge types
+sharing a kind with DIFFERENT property schemas. Property enforcement is
+keyed on the kind alone, so it refuses that shape outright rather than
+enforcing the wrong merge of the two.
 
 The node discriminator is the `type` property and the edge discriminator
 is `kind` -- the convention the Cypher front end already uses for
@@ -643,6 +645,102 @@ def compile_node_constraints(schema: GraphSchema, target: _Target) -> list:
 def compile_edge_constraints(schema: GraphSchema, target: _Target) -> list:
     return [pair for kind, properties in _properties_per_kind(schema.edge_types).items()
             for pair in _type_constraints(target, "kind", kind, properties)]
+
+
+# ---------------------------------------------------------------------
+# Endpoint-type enforcement: (kind, source, target) as a trigger
+# ---------------------------------------------------------------------
+# A CHECK cannot subquery nodes, so "works_at connects only person ->
+# company" needs a CONSTRAINT TRIGGER -- still plain Postgres, still no
+# extension. It fires per edge row, which is why endpoints=True is an
+# explicit opt-in on enforce_schema() rather than the default.
+
+def _quote(value: str) -> str:
+    """A string literal for DDL. Same rationale as constraints._literal:
+    DDL cannot carry bind parameters, and these values come from schema
+    declarations written by a developer, not from ingested data."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def endpoint_names(graph) -> tuple:
+    """(trigger name, function name) for this graph's endpoint trigger.
+    The function name carries the table too: trigger names are scoped
+    per table, but function names are schema-global, and two custom
+    edge tables must not share one function."""
+    token = _graph_token(graph.graph if graph.graph_col is not None else None)
+    trigger = f"ck_schema_end_{token}"[:63]
+    function = f"ck_schema_endf_{token}_{_slug(graph.edges_tbl.name)}"[:63]
+    return trigger, function
+
+
+def compile_endpoint_ddl(schema: GraphSchema, graph) -> list:
+    """The function + trigger DDL policing declared (kind, source,
+    target) triples on this graph's edges table. Untyped/undeclared
+    kinds pass; a DECLARED kind must connect a declared pair, and an
+    untyped endpoint cannot satisfy any triple -- the error says which.
+
+    Raises with ERRCODE 23514 (check_violation) and the trigger's name
+    as CONSTRAINT, so the driver's diagnostics carry it and the write
+    path's existing translation surfaces a ConstraintViolation naming
+    it, like every other schema rule."""
+    trigger_name, function_name = endpoint_names(graph)
+    et, nt = graph.edges_tbl, graph.nodes_tbl
+    edges_q = f'"{et.schema}"."{et.name}"' if et.schema else f'"{et.name}"'
+    nodes_q = f'"{nt.schema}"."{nt.name}"' if nt.schema else f'"{nt.name}"'
+    function_q = f'"{et.schema}"."{function_name}"' if et.schema else f'"{function_name}"'
+
+    triples = sorted((e.kind, e.source, e.target) for e in schema.edge_types)
+    kinds = sorted({k for k, _, _ in triples})
+    values = ", ".join(f"({_quote(k)}, {_quote(s)}, {_quote(t)})" for k, s, t in triples)
+    declared = "; ".join(f"{k}: {s} -> {t}" for k, s, t in triples)
+
+    graph_guard = ""
+    node_scope = ""
+    if graph.graph_col is not None:
+        graph_guard = (f"  IF NEW.{graph.graph_col} IS DISTINCT FROM "
+                       f"{_quote(graph.graph)} THEN RETURN NEW; END IF;\n")
+        node_scope = f" AND n.{graph.graph_col} = NEW.{graph.graph_col}"
+
+    function_ddl = f"""CREATE OR REPLACE FUNCTION {function_q}() RETURNS trigger AS $ck$
+DECLARE
+  edge_kind text; src_type text; dst_type text;
+BEGIN
+{graph_guard}  edge_kind := NEW.properties->>'kind';
+  IF edge_kind IS NULL OR edge_kind NOT IN ({", ".join(_quote(k) for k in kinds)}) THEN
+    RETURN NEW;  -- undeclared and kindless edges are not policed
+  END IF;
+  SELECT n.properties->>'type' INTO src_type FROM {nodes_q} n
+    WHERE n.{graph.node_id_col} = NEW.{graph.edge_start_col}{node_scope};
+  SELECT n.properties->>'type' INTO dst_type FROM {nodes_q} n
+    WHERE n.{graph.node_id_col} = NEW.{graph.edge_end_col}{node_scope};
+  IF (edge_kind, src_type, dst_type) IN (VALUES {values}) THEN
+    RETURN NEW;
+  END IF;
+  -- the observed types and the declared triples go in DETAIL: the
+  -- driver-error translation keeps diagnostics, not the primary text,
+  -- and the DETAIL is what reaches ConstraintViolation's message
+  RAISE EXCEPTION 'edge violates the declared endpoint types'
+    USING ERRCODE = '23514', CONSTRAINT = {_quote(trigger_name)},
+      DETAIL = format('%s connects %s -> %s, but the schema declares: '
+                      {_quote(declared)},
+                      edge_kind, coalesce(src_type, '(untyped)'),
+                      coalesce(dst_type, '(untyped)'));
+END $ck$ LANGUAGE plpgsql"""
+
+    # No CREATE OR REPLACE for CONSTRAINT triggers, so idempotency is
+    # the DROP/CREATE pair, run in enforce_schema()'s one transaction.
+    return [
+        function_ddl,
+        f'DROP TRIGGER IF EXISTS "{trigger_name}" ON {edges_q}',
+        f'CREATE CONSTRAINT TRIGGER "{trigger_name}" AFTER INSERT OR UPDATE ON {edges_q} '
+        f'FOR EACH ROW EXECUTE FUNCTION {function_q}()',
+    ]
+
+
+ENDPOINT_TRIGGER_EXISTS = text("""
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = :name AND tgrelid = CAST(:table AS regclass)
+""")
 
 
 # ---------------------------------------------------------------------
