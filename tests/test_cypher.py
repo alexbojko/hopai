@@ -865,6 +865,19 @@ class TestSyntaxErrors:
         keep working."""
         assert issubclass(CypherError, ValueError)
 
+    def test_a_list_in_a_property_map_is_refused_by_the_literal_parser(self):
+        """`{tags: [1, 2]}` is not a literal, and the refusal has to come
+        from the literal parser naming the offending token. The
+        negative-number branch guards on BOTH the '-' and the number
+        after it: loosen that conjunction (mutant _parse_literal_7) and
+        a '[' followed by a number is swallowed as if it were a minus
+        sign, turning the map into {tags: -1} plus a confusing error
+        further along. A list of STRINGS cannot catch it -- the second
+        conjunct is what differs."""
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a {tags: [1, 2]}) RETURN a")
+        assert "expected a literal value at position 16, got '['" in str(exc.value)
+
     @pytest.mark.parametrize("query,phrase", [
         # Every token kind carries its source position, and _describe()
         # renders the offender -- the ONLY consumers are these error
