@@ -79,13 +79,18 @@ what exists instead of guessing labels.
 
 SCHEMA -- declare the shape of the graph (node types, edge kinds, typed
 properties) as plain dataclasses or NodeType/EdgeType primitives, read
-it back as dataclasses, JSON Schema, networkx or pydantic models, and
-optionally have Postgres enforce it on every write path:
+it back as dataclasses, JSON Schema, networkx, pydantic models or a
+Mermaid diagram, and optionally have Postgres enforce it on every write
+path:
 
     graph.define_schema(nodes=[Person, Company], edges=[WorksAt])
     graph.schema_json        # for a system prompt or tool result
+    graph.schema_mermaid     # paste into a ```mermaid fence
     graph.enforce_schema()   # CHECK constraints; violations raise
                              # ConstraintViolation
+    graph.save_schema()      # persist the contract in the database...
+    graph.load_schema()      # ...so another process adopts it, not
+                             # re-declares it
 
 See hopai/schema.py for both notations and the annotation mapping.
 """
