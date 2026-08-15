@@ -331,6 +331,22 @@ class TestUpdateEdges:
         with pytest.raises(ConstraintViolation, match="edge rejected by constraint"):
             fresh_graph.update_edges(where={"kind": "knows"}, set={"weight": "heavy"})
 
+    def test_replace_and_all_reach_the_edge_path(self, people):
+        """The Graph facade forwards seven arguments per call, and only
+        the ones a test passes are really wired: dropping `replace=` and
+        `all=` from update_edges (and `all=` from delete_edges) left the
+        whole suite green, because no test had ever sent them through
+        the edge methods."""
+        people.update_edges(where={"kind": "knows"}, set={"weight": 9})
+        assert people.update_edges(set={"kind": "knew"}, replace=True,
+                                   all=True).updated_edges == 3
+        # Every bag is exactly the map: asserting on `kind` alone could
+        # not tell replace from merge, since the map overwrites it either
+        # way -- the weight is the property that has to be gone.
+        assert [e["properties"] for e in people.traverse(Start(), Hop()).edges] == (
+            [{"kind": "knew"}] * 3)
+        assert people.delete_edges(all=True).deleted_edges == 3
+
     def test_remove_drops_an_edge_property(self, people):
         people.update_edges(where={"kind": "works_at"}, set={"since": 2019})
         people.update_edges(where={"kind": "works_at"}, remove=["since"])
