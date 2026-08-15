@@ -2098,6 +2098,27 @@ class TestEdgeBeamLive:
         assert {n["id"] for n in result.nodes} == {"1", "2", "3"}
         assert len(result.edges) == 2
 
+    def test_cycle_guard_runs_inside_the_beam_not_after_it(self, fresh_graph):
+        """The back edge is the MOST similar one, so a beam that ranks
+        before excluding it spends its only slot walking home and never
+        reaches node 3. Filtering after the beam cannot recover that:
+        the slot is already gone, and how many were wasted is invisible
+        from the outside."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": i, "n": str(i), "seed": i == 1} for i in (1, 2, 3)])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "out"},
+                     {"start_id": 2, "end_id": 1, "kind": "back"},
+                     {"start_id": 2, "end_id": 3, "kind": "onward"}])
+        ids = self._edges(g)
+        g.set_vectors(edges=[{"id": ids["out"], "relvec": [1.0, 0.0, 0.0]},
+                             {"id": ids["back"], "relvec": [1.0, 0.0, 0.0]},
+                             {"id": ids["onward"], "relvec": [0.8, 0.6, 0.0]}])
+        result = g.traverse(Start(where={"seed": True}),
+                            Hop(via_near=Near("relvec", QUERY), via_keep=1,
+                                hops=(1, 2)))
+        assert {n["id"] for n in result.nodes} == {"1", "2", "3"}
+        assert sorted(e["properties"]["kind"] for e in result.edges) == ["onward", "out"]
+
     def test_beam_does_not_leak_across_graphs(self, fresh_graph):
         g = self._fixture(fresh_graph)
         other = g.in_graph("other")
