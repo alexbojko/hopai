@@ -74,6 +74,11 @@ because of bugs, not taste:
   mutation by hand and run the suite: `hopai.mutate.xǁMutatorǁdelete_edges__mutmut_18`
   came back `timeout` and fails the suite in nine seconds on its own.
 
+- **A `survived` verdict is only as fresh as the last run against that source.** mutmut
+  caches per mutant and re-runs one only when its source changed — so adding the test
+  that kills a mutant leaves the old verdict in `mutmut results` until that function is
+  edited. Three verdicts here were stale in exactly that way; applying the mutation by
+  hand is what showed it. `rm -rf mutants/` for a clean read.
 - **A module-level constant's builder comes back `no tests`.** `MUTATE_TOOL_SCHEMA` is
   built by `_operation_schema()` at import time, so no *test* executes those lines and
   `mutate_only_covered_lines` skips them — they are unchecked, not survived, and CI's

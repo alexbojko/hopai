@@ -453,6 +453,15 @@ class TestRefusals:
         with pytest.raises(ValueError, match="both sets and removes"):
             people.update_nodes(where={"type": "person"}, set={"age": 1}, remove=["age"])
 
+    def test_an_edge_refusal_names_the_edge_call(self, people):
+        """Both update methods share _new_properties(), which is handed
+        the caller's name for its messages -- and every test that
+        provoked one used update_nodes, so the edge path could have
+        reported itself as anything at all."""
+        with pytest.raises(ValueError) as exc:
+            people.update_edges(where={"kind": "knows"}, set={"x": 1}, remove=["x"])
+        assert str(exc.value).startswith("update_edges() both sets and removes")
+
     @pytest.mark.parametrize("arguments,message", [
         ({"set": ["age"]}, "must be a dict"),
         ({"remove": "age"}, "not one string"),
