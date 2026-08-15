@@ -161,6 +161,110 @@ class TestToolInventory:
             tools(offline(), strict_schema=True)
 
 
+class TestManyGraphs:
+    """One server, several graphs -- because `Graph` is a cheap handle
+    and `in_graph()` shares the engine's pool, so the alternative was
+    making an operator run one process per graph to get back what the
+    library gives away."""
+
+    @staticmethod
+    def two() -> dict:
+        base = offline()
+        return {"docs": base.in_graph("docs"), "crm": base.in_graph("crm")}
+
+    def test_one_graph_never_mentions_graphs_at_all(self):
+        """The single-graph server is the common case and must stay
+        exactly as it was: an argument that has one legal value is noise
+        in front of a model, and the schemas here are hand-written, so
+        nothing else would notice it appearing."""
+        for spec in tools(offline(), allow_ddl=True):
+            assert "graph" not in spec.parameters["properties"], spec.name
+
+    def test_several_graphs_put_the_choice_on_every_tool(self):
+        specs = tools(self.two(), allow_ddl=True)
+        assert specs, "expected the usual inventory"
+        for spec in specs:
+            key = spec.parameters["properties"].get("graph")
+            assert key and key["enum"] == ["docs", "crm"], spec.name
+            assert "graph" not in spec.parameters.get("required", []), spec.name
+
+    def test_the_first_graph_is_the_default(self):
+        described = named(self.two())["describe_graph"].call()
+        assert described["graph"] == "docs"
+        assert (described["graphs"], described["default_graph"]) == (["docs", "crm"], "docs")
+
+    def test_a_named_graph_is_the_one_used(self):
+        described = named(self.two())["describe_graph"].call(graph="crm")
+        assert described["graph"] == "crm"
+
+    def test_an_unserved_name_is_refused_with_the_list(self):
+        """Never answered from the default: reporting one graph's rows
+        as another's is the single bug multi-graph scoping can produce,
+        and `_scoped()` exists to stop exactly that."""
+        with pytest.raises(ValueError, match=r"does not serve a graph named 'crn'.*"
+                                             r"it serves \['docs', 'crm'\]"):
+            named(self.two())["describe_graph"].call(graph="crn")
+
+    def test_each_graph_keeps_its_own_schema(self):
+        """in_graph() carries neither schema nor vector fields on
+        purpose -- a different graph is allowed a different shape -- so
+        the server holds handles, not one handle and a list of names."""
+        graphs = self.two()
+        graphs["docs"].define_schema(nodes=[NodeType("paper")])
+        graphs["crm"].define_schema(nodes=[NodeType("account")])
+        describe = named(graphs)["describe_graph"]
+        assert set(describe.call(graph="docs")["schema"]["nodes"]) == {"paper"}
+        assert set(describe.call(graph="crm")["schema"]["nodes"]) == {"account"}
+
+    def test_descriptions_name_the_graphs_instead_of_one_vocabulary(self):
+        """With several graphs there is no single vocabulary to append,
+        and appending the default's would present one graph's type names
+        as every graph's. This library supports thousands of graphs, so
+        a per-graph summary in every description is not an option
+        either -- they are named, and describe_graph has the rest."""
+        graphs = self.two()
+        graphs["docs"].define_schema(nodes=[NodeType("paper")])
+        for spec in tools(graphs):
+            assert "'docs', 'crm'" in spec.description, spec.name
+            assert "Node types: paper" not in spec.description, spec.name
+
+    def test_strict_schema_needs_one_on_every_served_graph(self):
+        """A per-call `graph` argument would otherwise reach a graph
+        that cannot be strict, and the refusal would name Cypher rather
+        than the missing schema."""
+        graphs = self.two()
+        graphs["docs"].define_schema(nodes=[NodeType("paper")])
+        with pytest.raises(ValueError, match=r"\['crm'\] has none"):
+            tools(graphs, strict_schema=True)
+
+    def test_the_search_field_enum_is_the_union_across_graphs(self):
+        """One schema serves every graph, so the enum is the union;
+        naming a field the CHOSEN graph does not declare is refused per
+        call, by that graph's own field list."""
+        graphs = self.two()
+        graphs["docs"].define_vectors(nodes=[Vector("summary", 3)])
+        graphs["crm"].define_vectors(nodes=[Vector("notes", 3)])
+        specs = named(graphs, embed=embedder())
+        start = specs["traverse_graph"].parameters["properties"]["start"]
+        assert start["properties"]["search_field"]["enum"] == ["notes", "summary"]
+        with pytest.raises(ValueError, match=r"defined: \['notes'\]"):
+            specs["search_similar"].call(query="x", field="summary", graph="crm")
+
+    def test_an_embedder_needs_vectors_on_only_one_of_them(self):
+        graphs = self.two()
+        graphs["docs"].define_vectors(nodes=[Vector("summary", 3)])
+        specs = named(graphs, embed=embedder())
+        assert "search_similar" in specs
+        # ...and the graph without them says so rather than ranking nothing
+        with pytest.raises(ValueError, match="no vector fields are defined for nodes"):
+            specs["search_similar"].call(query="x", graph="crm")
+
+    def test_an_empty_or_malformed_registry_is_refused(self):
+        for bad in ({}, [], "docs", {"docs": "not a graph"}, {"": offline()}):
+            with pytest.raises((TypeError, ValueError)):
+                tools(bad)
+
+
 # ---------------------------------------------------------------------
 # What the model is told
 # ---------------------------------------------------------------------
@@ -530,11 +634,15 @@ class TestCommandLine:
     def test_vector_fields_are_declared_on_the_command_line(self):
         """They are per-handle, not stored in the database like a saved
         schema, so a CLI server has no other way to know about them."""
-        target, field = build_parser().parse_args(["--vector", "nodes:summary:1536"]).vector[0]
-        assert (target, field.name, field.dimensions) == ("nodes", "summary", 1536)
+        chosen, target, field = build_parser().parse_args(
+            ["--vector", "nodes:summary:1536"]).vector[0]
+        assert (chosen, target, field.name, field.dimensions) == (None, "nodes", "summary", 1536)
+        chosen, target, field = build_parser().parse_args(
+            ["--vector", "crm:edges:rel:8"]).vector[0]
+        assert (chosen, target, field.name, field.dimensions) == ("crm", "edges", "rel", 8)
 
     @pytest.mark.parametrize("value", ["summary:1536", "nodes:summary", "rows:summary:8",
-                                       "nodes:summary:many"])
+                                       "nodes:summary:many", "a:b:rows:summary:8"])
     def test_a_malformed_vector_spec_is_rejected_with_the_form(self, value, capsys):
         with pytest.raises(SystemExit):
             build_parser().parse_args(["--vector", value])
@@ -576,8 +684,10 @@ class TestCommandLine:
                      "--vector", "edges:rel:8", "--transport", "http", "--host", "0.0.0.0",
                      "--port", "9999", "--path", "/graph", "--name", "kg",
                      "--allow-ddl", "--embed", "json:dumps"]) == 0
-        assert served["graph"].vectors["nodes"]["summary"].dimensions == 1536
-        assert served["graph"].vectors["edges"]["rel"].dimensions == 8
+        assert set(served["graph"]) == {"default"}
+        only = served["graph"]["default"]
+        assert only.vectors["nodes"]["summary"].dimensions == 1536
+        assert only.vectors["edges"]["rel"].dimensions == 8
         assert served["transport"] == "http"
         assert (served["host"], served["port"], served["path"]) == ("0.0.0.0", 9999, "/graph")
         assert (served["name"], served["read_only"], served["allow_ddl"]) == ("kg", False, True)
@@ -592,7 +702,7 @@ class TestCommandLine:
         monkeypatch.setattr("hopai.core.Graph.load_schema",
                             lambda self: (_ for _ in ()).throw(ValueError("no saved schema")))
         main(["--dsn", "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline"])
-        assert "serving without a declared schema" in capsys.readouterr().err
+        assert "serving 'default' without a declared schema" in capsys.readouterr().err
 
 
 class TestServeArguments:
@@ -767,6 +877,42 @@ class TestWriteToolsLive:
             Property("email", "string", required=True)])])
         names = named(fresh_graph, allow_ddl=True)["enforce_schema"].call(dry_run=False)
         assert names["dry_run"] is False and names["constraints"]
+
+
+class TestManyGraphsLive:
+    def test_two_graphs_stay_invisible_to_each_other_through_the_tools(self, fresh_graph):
+        """The `graph` argument is not a label -- it selects the handle,
+        and every read and write goes through that handle's
+        `_scoped()`. Writing into one graph and finding it in the other
+        would be the one bug multi-graph scoping can produce."""
+        graphs = {"docs": fresh_graph, "crm": fresh_graph.in_graph("crm")}
+        specs = named(graphs)
+
+        specs["ingest_graph"].call(nodes=[{"id": 1, "type": "paper", "title": "graphs"}])
+        specs["ingest_graph"].call(nodes=[{"id": 2, "type": "account", "name": "acme"}],
+                                   graph="crm")
+
+        in_docs = specs["traverse_graph"].call(start={"where": {"type": "paper"}})
+        assert [n["id"] for n in in_docs["nodes"]] == ["1"]
+        assert specs["traverse_graph"].call(
+            start={"where": {"type": "paper"}}, graph="crm")["nodes"] == []
+        assert specs["aggregate_graph"].call(
+            start={"where": {"type": "account"}}, aggregates={"n": {"fn": "count"}},
+            graph="crm") == {"n": 1}
+
+    def test_a_schema_saved_through_one_graph_is_that_graphs_alone(self, fresh_graph):
+        """define_schema persists per graph_id, so the second server
+        process loads each graph's own contract -- not the first one it
+        happens to find."""
+        graphs = {"docs": fresh_graph, "crm": fresh_graph.in_graph("crm")}
+        specs = named(graphs)
+        document = {"nodes": {"paper": {"type": "object", "properties": {}}}, "edges": []}
+        specs["define_schema"].call(schema=document)
+
+        assert set(specs["describe_graph"].call()["schema"]["nodes"]) == {"paper"}
+        assert specs["describe_graph"].call(graph="crm")["schema"] is None
+        with pytest.raises(ValueError, match="no saved schema for graph 'crm'"):
+            fresh_graph.in_graph("crm").load_schema()
 
 
 class TestSearchLive:

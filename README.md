@@ -818,6 +818,7 @@ pip install "hopai[mcp]"
 
 hopai-mcp --dsn postgresql+psycopg2://user:pass@localhost/db            # stdio
 hopai-mcp --dsn ... --transport http --port 8000                       # HTTP
+hopai-mcp --dsn ... --graph docs --graph crm    # several graphs, one pool
 ```
 
 ```jsonc
@@ -850,6 +851,23 @@ Nine tools, each one a call this README already documents:
 `--read-only` registers the reading tools only, the default adds writing,
 and DDL takes `--allow-ddl` on top. A tool a model cannot see is one it
 cannot be talked into calling.
+
+**One server, as many graphs as you like** — `Graph` is a cheap handle and
+[`in_graph()`](#-many-graphs-one-database) shares the pool, so serving one
+graph per process would mean N processes for something this library gives
+away. Repeat `--graph`, or pass a mapping:
+
+```python
+serve({"docs": graph, "crm": graph.in_graph("crm")})
+```
+
+Every tool then takes an optional `graph` (an enum of the served names,
+defaulting to the first) and every description names them; with a single
+graph, no tool mentions graphs at all. Each keeps its own schema and
+vector fields, because `in_graph()` deliberately carries neither. What one
+server *cannot* do is give two graphs different permissions —
+`--read-only` is a property of the server, so "read `docs`, write `crm`"
+is two servers, which is the honest boundary anyway.
 
 **Search by meaning takes text, never vectors.** A model asked to fill in
 an embedding invents one, and an invented embedding finds confidently

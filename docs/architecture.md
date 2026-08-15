@@ -155,7 +155,15 @@ are not obvious from the outside.
   injected, which is why that function lost its underscore.
 - **Permissions decide which tools are registered**, rather than being checked inside a
   handler. `read_only` drops every write tool, `allow_ddl` is what adds `enforce_schema`,
-  and `serve()` never mixes the two.
+  and `serve()` never mixes the two. They belong to the server, not to a graph — two
+  graphs needing different permissions are two servers.
+- **One server holds many graphs**, because `Graph` is a handle and `in_graph()` shares
+  the engine's pool: `Served` keeps `{name: Graph}` and every tool takes an optional
+  `graph`, resolved by `Served.pick()` so an unserved name is refused rather than
+  answered from the default. Each handle keeps its own schema and vector fields, which
+  is why the registry holds handles rather than one handle and a list of names. With a
+  single graph nothing is advertised — the same rule as `search_field`, and the reason
+  the single-graph tool surface is byte-identical to what it was before this existed.
 
 Handlers are synchronous and are wrapped to run in a worker thread: a blocking database
 call in an async server would stall every other request on the connection. The SDK's

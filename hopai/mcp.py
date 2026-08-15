@@ -9,8 +9,9 @@ a set of tools for reading, writing and shaping this graph.
 
     hopai-mcp --dsn postgresql+psycopg2://user:pass@host/db
     hopai-mcp --dsn ... --transport http --port 8000
+    hopai-mcp --dsn ... --graph docs --graph crm      # several, one pool
 
-...or from Python, which is what you want as soon as the graph needs
+...or from Python, which is what you want as soon as the graphs need
 setting up first -- or an embedding function (see SIMILARITY):
 
     from hopai import Graph
@@ -19,6 +20,25 @@ setting up first -- or an embedding function (see SIMILARITY):
     graph = Graph(dsn)
     graph.define_schema(nodes=[Person, Company], edges=[WorksAt])
     serve(graph, embed=my_embedder)          # stdio; transport="http" for HTTP
+    serve({"docs": graph, "crm": graph.in_graph("crm")})
+
+MANY GRAPHS, ONE SERVER. `graph=` takes one Graph or a {name: Graph}
+mapping, because that is what the library already does: `Graph` is a
+cheap handle and `in_graph()` shares the engine and its pool, so N
+graphs cost N handles rather than N connection pools. Serving one graph
+per process would have made an operator run N processes to get back
+something hopai gives away.
+
+With several, every tool grows an optional `graph` argument (an enum of
+the served names, defaulting to the first) and every description names
+them; with one, no tool mentions graphs at all. Each graph keeps its
+OWN schema and vector fields -- `in_graph()` carries neither on purpose,
+since a different graph is allowed a different shape.
+
+What one server cannot do is give two graphs DIFFERENT permissions:
+read_only and allow_ddl are properties of the server, not of a graph.
+An agent that may read `docs` and write `crm` is two servers, and that
+is the honest boundary -- a per-call argument was never one.
 
 THE TOOLS, and the call each one is:
 
@@ -88,8 +108,8 @@ import functools
 import inspect
 import os
 import sys
-from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Optional, get_type_hints
 
 from .core import Graph
@@ -99,9 +119,8 @@ from .models import DEFAULT_GRAPH
 #: Server-level guidance, sent to the client at connection time. What a
 #: model has to know before its first call and cannot see in any single
 #: tool's schema.
-SERVER_INSTRUCTIONS = """\
-This server exposes one property graph stored in PostgreSQL.
-
+_ONE_GRAPH = "This server exposes one property graph stored in PostgreSQL."
+_ADVICE = """\
 Call describe_graph first. It returns the node types, edge kinds and
 property names that actually exist here, and guessing those is the main
 way these tools return an empty result instead of an answer.
@@ -113,6 +132,7 @@ chain -- not a ranked list, and ids come back as strings.
 Errors from these tools name the fix. Read the message and correct the
 call rather than retrying it unchanged.\
 """
+SERVER_INSTRUCTIONS = f"{_ONE_GRAPH}\n\n{_ADVICE}"
 
 #: The sentence TRAVERSE_TOOL_SCHEMA/AGGREGATE_TOOL_SCHEMA use to tell a
 #: model that meaning-based lookup is not available. It stops being true
@@ -162,14 +182,159 @@ def _object(properties: dict, required: Optional[list] = None) -> dict:
     return {"type": "object", "properties": properties, "required": required or []}
 
 
-def _described(graph: Graph, description: str) -> str:
-    """A description with this graph's declared vocabulary appended --
-    the same treatment Graph.tool_schemas() gives the three static
-    schemas, applied to the tools this module defines itself."""
-    if graph.schema is None:
+class Served:
+    """The graphs one server exposes, in the order they were given --
+    the first is the default, and the only one a single-graph server
+    ever mentions.
+
+    One process serves many graphs because that is what the library
+    already does: `Graph` is a cheap handle and `in_graph()` shares the
+    engine and its pool, so N graphs cost N handles rather than N
+    connection pools (README, "Many graphs, one database"). Pinning a
+    server to one graph would have made the operator run N processes to
+    get back what hopai gives away.
+
+    Each graph keeps its OWN schema and vector fields, because
+    `in_graph()` deliberately carries neither: a different graph is
+    allowed a different shape. That is why this holds handles rather
+    than one handle and a list of names."""
+
+    def __init__(self, graphs):
+        if isinstance(graphs, Served):
+            graphs = graphs.graphs
+        if isinstance(graphs, Graph):
+            graphs = {graphs.graph: graphs}
+        if not isinstance(graphs, Mapping) or not graphs:
+            raise TypeError(
+                "serve a Graph, or a non-empty {name: Graph} mapping of the graphs this "
+                f"server exposes -- got {graphs!r}"
+            )
+        for name, graph in graphs.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"a graph name must be a non-empty string, got {name!r}")
+            if not isinstance(graph, Graph):
+                raise TypeError(f"graph {name!r} must be a Graph, got {type(graph).__name__}")
+        self.graphs = dict(graphs)
+
+    @property
+    def names(self) -> list:
+        return list(self.graphs)
+
+    @property
+    def default_name(self) -> str:
+        return self.names[0]
+
+    @property
+    def default(self) -> Graph:
+        return self.graphs[self.default_name]
+
+    @property
+    def many(self) -> bool:
+        return len(self.graphs) > 1
+
+    def pick(self, name: Optional[str], caller: str) -> Graph:
+        """The named graph, or the default. A name this server does not
+        serve is refused with the list -- never silently answered from
+        the default, which would report another graph's rows as this
+        one's."""
+        if name is None:
+            return self.default
+        if name not in self.graphs:
+            raise ValueError(
+                f"{caller}: this server does not serve a graph named {name!r} -- "
+                f"it serves {self.names}"
+            )
+        return self.graphs[name]
+
+    def vector_fields(self, target: str) -> dict:
+        """Every vector field name declared for `target` by ANY served
+        graph, mapped to the graphs that declare it. The union is what
+        a tool schema can advertise; picking the wrong one for a given
+        graph is refused per call by _resolve_field(), by name."""
+        found: dict = {}
+        for name, graph in self.graphs.items():
+            for field in _vector_fields(graph, target):
+                found.setdefault(field, []).append(name)
+        return found
+
+    def seeds_from_text(self, embed: Optional[Callable]) -> bool:
+        return any(_seeds_from_text(graph, embed) for graph in self.graphs.values())
+
+
+def _static_schemas(served: Served) -> dict:
+    """hopai's three hand-written tool schemas, keyed by name, with
+    their descriptions fitted to what this server serves.
+
+    One graph: `Graph.tool_schemas()`, which is the library's own way of
+    summarizing THIS graph's declared vocabulary into each description.
+    Several: the module constants instead, because tool_schemas() would
+    stamp the default graph's type names onto tools that also answer
+    for every other graph -- a summary that is wrong for all but one of
+    them is worse than none. _described() names the graphs instead."""
+    if not served.many:
+        return {tool["name"]: tool for tool in served.default.tool_schemas()}
+
+    import copy
+
+    from .ingest import INGEST_TOOL_SCHEMA
+    from .json_api import AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA
+    schemas = {}
+    for tool in (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA):
+        tool = copy.deepcopy(tool)
+        tool["description"] = _described(served, tool["description"])
+        schemas[tool["name"]] = tool
+    return schemas
+
+
+def _graph_key(served: Served) -> dict:
+    """The `graph` parameter, offered only when there is a choice --
+    the same rule as `search_field`. A single-graph server's tools look
+    exactly as they did before this existed."""
+    if not served.many:
+        return {}
+    return {
+        "graph": {
+            "type": "string",
+            "enum": served.names,
+            "description": f"Which graph to use. Defaults to {served.default_name!r}. "
+                           f"Graphs are separate: nothing in one is visible from another.",
+        },
+    }
+
+
+def _described(served: Served, description: str) -> str:
+    """A description with the served graph's declared vocabulary
+    appended -- the same treatment Graph.tool_schemas() gives the three
+    static schemas, applied to the tools this module defines itself.
+
+    Nothing is appended when several graphs are served: there is no
+    single vocabulary, and the default's would read as every graph's.
+    _named_graphs() says what IS true of all of them instead."""
+    if served.many or served.default.schema is None:
         return description
     from .schema import tool_summary
-    return f"{description} {tool_summary(graph.schema)}"
+    return f"{description} {tool_summary(served.default.schema)}"
+
+
+def _instructions(served: Served) -> str:
+    """The server-level guidance a client sees at connection time. The
+    opening sentence is the only part a second graph changes, so it is
+    a separate string rather than something to rewrite by search."""
+    if not served.many:
+        return SERVER_INSTRUCTIONS
+    return f"{_named_graphs(served)} They share one PostgreSQL database.\n\n{_ADVICE}"
+
+
+def _named_graphs(served: Served) -> str:
+    """The line every tool description carries when there is more than
+    one graph. Naming them beats summarizing them: this library
+    supports thousands of graphs, so a per-graph schema summary in
+    every tool description is not a thing that scales -- and
+    describe_graph returns one graph's schema in full."""
+    return (f"This server exposes {len(served.names)} separate graphs "
+            f"({', '.join(repr(n) for n in served.names)}), each with its own schema and "
+            f"invisible to the others; the default is {served.default_name!r}. Pass `graph` "
+            f"to choose, and call describe_graph for what one contains.")
 
 
 def _vector_fields(graph: Graph, target: str) -> dict:
@@ -255,10 +420,15 @@ def _seeds_from_text(graph: Graph, embed: Optional[Callable]) -> bool:
     return embed is not None and bool(_vector_fields(graph, "nodes"))
 
 
-def _search_keys(graph: Graph) -> dict:
+def _search_keys(served: Served) -> dict:
     """The `search` half of a start object's schema, offered only when
-    this server can actually embed text."""
-    fields = _vector_fields(graph, "nodes")
+    this server can actually embed text.
+
+    The field enum is the union across served graphs: a schema is one
+    document however many graphs are behind it, and naming a field the
+    CHOSEN graph does not declare is refused per call by
+    _resolve_field(), which lists that graph's own fields."""
+    fields = served.vector_fields("nodes")
     keys = {
         "search": {
             "type": "string",
@@ -283,7 +453,7 @@ def _search_keys(graph: Graph) -> dict:
     return keys
 
 
-def _with_search(schema: dict, graph: Graph, sentence: str) -> dict:
+def _with_search(schema: dict, served: Served, sentence: str) -> dict:
     """A traversal/aggregation tool schema, taught about start.search.
 
     The `cannot find nodes by meaning` sentence is replaced rather than
@@ -299,7 +469,7 @@ def _with_search(schema: dict, graph: Graph, sentence: str) -> dict:
         )
     schema["description"] = schema["description"].replace(sentence, _WITH_MEANING)
     start = schema["parameters"]["properties"]["start"]
-    start["properties"].update(_search_keys(graph))
+    start["properties"].update(_search_keys(served))
     # `where` alone is required on start in the static schema. With
     # `search` as a second way in, keeping that would forbid a purely
     # semantic seed -- and dropping it without a replacement would stop
@@ -313,15 +483,18 @@ def _with_search(schema: dict, graph: Graph, sentence: str) -> dict:
 # The tools
 # ---------------------------------------------------------------------
 
-def _describe_tool(graph: Graph, read_only: bool, allow_ddl: bool,
+def _describe_tool(served: Served, read_only: bool, allow_ddl: bool,
                    embed: Optional[Callable]) -> ToolSpec:
-    def describe_graph(counts: bool = False) -> dict:
+    def describe_graph(graph: Optional[str] = None, counts: bool = False) -> dict:
+        graph = served.pick(graph, "describe_graph")
         schema = graph.schema
         vectors = {target: {name: field.dimensions
                             for name, field in _vector_fields(graph, target).items()}
                    for target in ("nodes", "edges")}
         result = {
             "graph": graph.graph,
+            "graphs": served.names,
+            "default_graph": served.default_name,
             "schema": schema.to_json() if schema is not None else None,
             "schema_mermaid": schema.to_mermaid() if schema is not None else None,
             "vector_fields": vectors,
@@ -332,7 +505,8 @@ def _describe_tool(graph: Graph, read_only: bool, allow_ddl: bool,
             # edge-only vectors that it could not search at all -- and
             # a mutation that made the two interchangeable survived,
             # which is how the conflation surfaced.
-            "search_by_meaning": bool(embed),
+            "search_by_meaning": bool(embed) and bool(
+                _vector_fields(graph, "nodes") or _vector_fields(graph, "edges")),
             "seed_traversal_by_meaning": _seeds_from_text(graph, embed),
             "writes_allowed": not read_only,
             "ddl_allowed": allow_ddl,
@@ -361,9 +535,12 @@ def _describe_tool(graph: Graph, read_only: bool, allow_ddl: bool,
             "edge kinds, property names and types), its vector fields, what this server "
             "is permitted to do, and what it refuses. Call this first -- the other tools "
             "match property values EXACTLY, so a guessed type name returns an empty "
-            "result rather than an error."
+            "result rather than an error. It also lists every graph this server exposes; "
+            "each is a separate graph with its own schema, and nothing in one is visible "
+            "from another."
         ),
         parameters=_object({
+            **_graph_key(served),
             "counts": {
                 "type": "boolean",
                 "description": "Also count the nodes in this graph. Costs a scan; "
@@ -374,44 +551,52 @@ def _describe_tool(graph: Graph, read_only: bool, allow_ddl: bool,
     )
 
 
-def _traverse_tool(graph: Graph, schema: dict, embed: Optional[Callable]) -> ToolSpec:
-    if _seeds_from_text(graph, embed):
-        schema = _with_search(schema, graph, _NO_MEANING)
+def _traverse_tool(served: Served, schema: dict, embed: Optional[Callable]) -> ToolSpec:
+    if served.seeds_from_text(embed):
+        schema = _with_search(schema, served, _NO_MEANING)
+    schema["parameters"]["properties"].update(_graph_key(served))
 
-    def traverse_graph(start: dict, hops: Optional[list] = None) -> dict:
-        spec = {"start": _seed(graph, embed, start, "traverse_graph"), "hops": hops or []}
+    def traverse_graph(start: dict, hops: Optional[list] = None,
+                       graph: Optional[str] = None) -> dict:
+        chosen = served.pick(graph, "traverse_graph")
+        spec = {"start": _seed(chosen, embed, start, "traverse_graph"), "hops": hops or []}
         refuse_vectors({"hops": spec["hops"]}, "traverse_graph")
         # allow_vectors: every vector in this spec was put there by
         # _seed() from an embedding of the model's TEXT, and both
         # refusals above have already run against what the model sent.
-        return traverse_json(graph, spec, allow_vectors=True)
+        return traverse_json(chosen, spec, allow_vectors=True)
 
     return ToolSpec(schema["name"], schema["description"], schema["parameters"], traverse_graph)
 
 
-def _aggregate_tool(graph: Graph, schema: dict, embed: Optional[Callable]) -> ToolSpec:
-    if _seeds_from_text(graph, embed):
-        schema = _with_search(schema, graph, _NO_MEANING_AGGREGATE)
+def _aggregate_tool(served: Served, schema: dict, embed: Optional[Callable]) -> ToolSpec:
+    if served.seeds_from_text(embed):
+        schema = _with_search(schema, served, _NO_MEANING_AGGREGATE)
+    schema["parameters"]["properties"].update(_graph_key(served))
 
-    def aggregate_graph(start: dict, aggregates: dict, hops: Optional[list] = None) -> dict:
-        spec = {"start": _seed(graph, embed, start, "aggregate_graph"),
+    def aggregate_graph(start: dict, aggregates: dict, hops: Optional[list] = None,
+                        graph: Optional[str] = None) -> dict:
+        chosen = served.pick(graph, "aggregate_graph")
+        spec = {"start": _seed(chosen, embed, start, "aggregate_graph"),
                 "hops": hops or [], "aggregates": aggregates}
         refuse_vectors({"hops": spec["hops"]}, "aggregate_graph")
-        return aggregate_json(graph, spec, allow_vectors=True)
+        return aggregate_json(chosen, spec, allow_vectors=True)
 
     return ToolSpec(schema["name"], schema["description"], schema["parameters"], aggregate_graph)
 
 
-def _search_tool(graph: Graph, embed: Callable) -> ToolSpec:
-    node_fields = sorted(_vector_fields(graph, "nodes"))
-    edge_fields = sorted(_vector_fields(graph, "edges"))
+def _search_tool(served: Served, embed: Callable) -> ToolSpec:
+    node_fields = sorted(served.vector_fields("nodes"))
+    edge_fields = sorted(served.vector_fields("edges"))
 
     def search_similar(query: str, k: int = 10, target: str = "nodes",
-                       where: Optional[dict] = None, field: Optional[str] = None) -> dict:
+                       where: Optional[dict] = None, field: Optional[str] = None,
+                       graph: Optional[str] = None) -> dict:
         if not isinstance(query, str) or not query.strip():
             raise ValueError(f"search_similar: query must be a non-empty string, got {query!r}")
-        name = _resolve_field(graph, target, field, "search_similar")
-        return vector_search_json(graph, {
+        chosen = served.pick(graph, "search_similar")
+        name = _resolve_field(chosen, target, field, "search_similar")
+        return vector_search_json(chosen, {
             "near": {"field": name, "vector": embed(query)},
             "target": target,
             "k": k,
@@ -431,6 +616,7 @@ def _search_tool(graph: Graph, embed: Callable) -> ToolSpec:
                   "description": "Exact-match property filter applied BEFORE ranking, in the "
                                  "same filter language as traverse_graph."},
     }
+    properties.update(_graph_key(served))
     if len(node_fields) + len(edge_fields) > 1:
         properties["field"] = {
             "type": "string",
@@ -440,7 +626,7 @@ def _search_tool(graph: Graph, embed: Callable) -> ToolSpec:
         }
     return ToolSpec(
         name="search_similar",
-        description=_described(graph, (
+        description=_described(served, (
             "Find the nodes (or edges) whose stored embedding is closest in MEANING to a "
             "piece of text -- the way in when you do not know the exact property values to "
             "filter on. Returns each match with a `similarity` score, most similar first, "
@@ -452,16 +638,17 @@ def _search_tool(graph: Graph, embed: Callable) -> ToolSpec:
     )
 
 
-def _cypher_tool(graph: Graph, read_only: bool, strict_schema: bool) -> ToolSpec:
+def _cypher_tool(served: Served, read_only: bool, strict_schema: bool) -> ToolSpec:
     from .cypher import classify_cypher
 
-    def cypher(query: str) -> dict:
+    def cypher(query: str, graph: Optional[str] = None) -> dict:
+        chosen = served.pick(graph, "cypher")
         if read_only and classify_cypher(query) == "write":
             raise ValueError(
                 "this server is read-only and that query writes -- run a MATCH instead, "
                 "or ask the operator for a server started without read_only=True"
             )
-        result = graph.cypher(query, **({"strict_schema": True} if strict_schema else {}))
+        result = chosen.cypher(query, **({"strict_schema": True} if strict_schema else {}))
         # Subgraph and IngestResult both know how to serialize themselves;
         # an aggregating RETURN already comes back as a plain dict.
         return result.to_dict() if hasattr(result, "to_dict") else result
@@ -479,7 +666,7 @@ def _cypher_tool(graph: Graph, read_only: bool, strict_schema: bool) -> ToolSpec
     )
     return ToolSpec(
         name="cypher",
-        description=_described(graph, (
+        description=_described(served, (
             f"Run a Cypher query against this graph. Supported: {reading}{writing} "
             f"Labels compile to the `type` property and relationship types to `kind`. "
             f"Anything outside the supported subset is REFUSED with a message naming the "
@@ -489,19 +676,23 @@ def _cypher_tool(graph: Graph, read_only: bool, strict_schema: bool) -> ToolSpec
         )),
         parameters=_object({
             "query": {"type": "string", "description": "The Cypher query."},
+            **_graph_key(served),
         }, ["query"]),
         call=cypher,
     )
 
 
-def _ingest_tool(graph: Graph, schema: dict) -> ToolSpec:
+def _ingest_tool(served: Served, schema: dict) -> ToolSpec:
     def ingest_graph(nodes: Optional[list] = None, edges: Optional[list] = None,
                      merge_nodes_on: Optional[list] = None,
-                     merge_edges_on: Optional[list] = None) -> dict:
+                     merge_edges_on: Optional[list] = None,
+                     graph: Optional[str] = None) -> dict:
         document = {"nodes": nodes or [], "edges": edges or []}
-        result = graph.ingest(document, merge_nodes_on=merge_nodes_on,
-                              merge_edges_on=merge_edges_on)
+        result = served.pick(graph, "ingest_graph").ingest(
+            document, merge_nodes_on=merge_nodes_on, merge_edges_on=merge_edges_on)
         return result.to_dict()
+
+    schema["parameters"]["properties"].update(_graph_key(served))
 
     schema["parameters"]["properties"]["merge_nodes_on"] = {
         "type": "array",
@@ -520,9 +711,11 @@ def _ingest_tool(graph: Graph, schema: dict) -> ToolSpec:
     return ToolSpec(schema["name"], schema["description"], schema["parameters"], ingest_graph)
 
 
-def _infer_schema_tool(graph: Graph) -> ToolSpec:
-    def infer_schema(sample_percent: Optional[float] = None) -> dict:
-        schema, report = graph.infer_schema(sample_percent=sample_percent)
+def _infer_schema_tool(served: Served) -> ToolSpec:
+    def infer_schema(sample_percent: Optional[float] = None,
+                     graph: Optional[str] = None) -> dict:
+        schema, report = served.pick(graph, "infer_schema").infer_schema(
+            sample_percent=sample_percent)
         return {"schema": schema.to_json(), "report": asdict(report), "adopted": False,
                 "note": "Nothing was declared: this is an observation of the rows that "
                         "exist. define_schema adopts it as the contract."}
@@ -539,6 +732,7 @@ def _infer_schema_tool(graph: Graph) -> ToolSpec:
             "sample_percent on a large graph."
         ),
         parameters=_object({
+            **_graph_key(served),
             "sample_percent": {
                 "type": "number",
                 "description": "Read a random sample of this percentage of rows instead of "
@@ -550,13 +744,15 @@ def _infer_schema_tool(graph: Graph) -> ToolSpec:
     )
 
 
-def _define_schema_tool(graph: Graph) -> ToolSpec:
+def _define_schema_tool(served: Served) -> ToolSpec:
     from .schema import schema_from_document
 
-    def define_schema(schema: dict, save: bool = True) -> dict:
-        declared = graph.define_schema(schema=schema_from_document(schema))
+    def define_schema(schema: dict, save: bool = True,
+                      graph: Optional[str] = None) -> dict:
+        chosen = served.pick(graph, "define_schema")
+        declared = chosen.define_schema(schema=schema_from_document(schema))
         if save:
-            graph.save_schema()
+            chosen.save_schema()
         return {"schema": declared.to_json(), "saved": bool(save),
                 "mermaid": declared.to_mermaid(),
                 "note": "Declared, not enforced: existing rows were not checked and future "
@@ -575,7 +771,7 @@ def _define_schema_tool(graph: Graph) -> ToolSpec:
     }
     return ToolSpec(
         name="define_schema",
-        description=_described(graph, (
+        description=_described(served, (
             "Declare what this graph is supposed to contain: node types with typed "
             "properties, and edge kinds with the (source type -> target type) pairs they "
             "connect. The declaration is the contract other tools describe and validate "
@@ -607,18 +803,21 @@ def _define_schema_tool(graph: Graph) -> ToolSpec:
                 "type": "boolean",
                 "description": "Persist the declaration for other processes. Default true.",
             },
+            **_graph_key(served),
         }, ["schema"]),
         call=define_schema,
     )
 
 
-def _enforce_schema_tool(graph: Graph) -> ToolSpec:
-    def enforce_schema(dry_run: bool = True, endpoints: bool = False) -> dict:
+def _enforce_schema_tool(served: Served) -> ToolSpec:
+    def enforce_schema(dry_run: bool = True, endpoints: bool = False,
+                       graph: Optional[str] = None) -> dict:
+        chosen = served.pick(graph, "enforce_schema")
         if dry_run:
-            violations = graph.schema_violations()
+            violations = chosen.schema_violations()
             return {"dry_run": True, "clean": not violations,
                     "summary": str(violations), "rules": asdict(violations)["rules"]}
-        return {"dry_run": False, "constraints": graph.enforce_schema(endpoints=endpoints)}
+        return {"dry_run": False, "constraints": chosen.enforce_schema(endpoints=endpoints)}
 
     return ToolSpec(
         name="enforce_schema",
@@ -632,6 +831,7 @@ def _enforce_schema_tool(graph: Graph) -> ToolSpec:
             "there are."
         ),
         parameters=_object({
+            **_graph_key(served),
             "dry_run": {
                 "type": "boolean",
                 "description": "True (the default) reports what enforcement would reject "
@@ -647,50 +847,67 @@ def _enforce_schema_tool(graph: Graph) -> ToolSpec:
     )
 
 
-def tools(graph: Graph, *, read_only: bool = False, allow_ddl: bool = False,
+def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
           embed: Optional[Callable] = None, strict_schema: bool = False) -> list:
     """Every tool this server would register, as ToolSpecs -- the single
     source of what hopai offers over MCP.
 
+    `graph` is one Graph, or a {name: Graph} mapping to serve several
+    over one connection pool (the first is the default). With several,
+    every tool grows an optional `graph` parameter naming which to use;
+    with one, no tool mentions graphs at all.
+
     Separated from build_server() so the tools can be inspected, tested
     and called with no SDK installed and no server running: `call` is an
     ordinary function whose parameters are the tool's arguments."""
+    served = Served(graph)
     if embed is not None:
         if not callable(embed):
             raise TypeError(f"embed must be a callable taking text and returning a vector, "
                             f"got {type(embed).__name__}")
-        if not _vector_fields(graph, "nodes") and not _vector_fields(graph, "edges"):
+        if not served.vector_fields("nodes") and not served.vector_fields("edges"):
             raise ValueError(
-                "embed= was given but this graph has no vector fields, so there is nothing "
-                "to search -- call graph.define_vectors(nodes=[Vector('summary', 1536)]) "
-                "(or pass --vector nodes:summary:1536) before serving"
+                f"embed= was given but no served graph has vector fields, so there is "
+                f"nothing to search -- call define_vectors(nodes=[Vector('summary', 1536)]) "
+                f"on {served.names} (or pass --vector nodes:summary:1536) before serving"
             )
-    if strict_schema and graph.schema is None:
-        raise ValueError(
-            "strict_schema=True needs a declared schema and this graph has none -- call "
-            "define_schema() before serving, or start the server without it"
-        )
+    if strict_schema:
+        # Every graph, not just the default: a per-call `graph` argument
+        # would otherwise reach one that cannot be strict, and the
+        # refusal would name Cypher rather than the missing schema.
+        without = [name for name, g in served.graphs.items() if g.schema is None]
+        if without:
+            raise ValueError(
+                f"strict_schema=True needs a declared schema and {without} "
+                f"{'has' if len(without) == 1 else 'have'} none -- call define_schema() "
+                f"before serving, or start the server without it"
+            )
     if allow_ddl and read_only:
         raise ValueError(
             "allow_ddl=True and read_only=True contradict each other -- enforce_schema "
             "runs ALTER TABLE, which is not a read. Pick one"
         )
 
-    static = {tool["name"]: tool for tool in graph.tool_schemas()}
+    static = _static_schemas(served)
     specs = [
-        _describe_tool(graph, read_only, allow_ddl, embed),
-        _traverse_tool(graph, static["traverse_graph"], embed),
-        _aggregate_tool(graph, static["aggregate_graph"], embed),
-        _cypher_tool(graph, read_only, strict_schema),
-        _infer_schema_tool(graph),
+        _describe_tool(served, read_only, allow_ddl, embed),
+        _traverse_tool(served, static["traverse_graph"], embed),
+        _aggregate_tool(served, static["aggregate_graph"], embed),
+        _cypher_tool(served, read_only, strict_schema),
+        _infer_schema_tool(served),
     ]
     if embed is not None:
-        specs.append(_search_tool(graph, embed))
+        specs.append(_search_tool(served, embed))
     if not read_only:
-        specs.append(_ingest_tool(graph, static["ingest_graph"]))
-        specs.append(_define_schema_tool(graph))
+        specs.append(_ingest_tool(served, static["ingest_graph"]))
+        specs.append(_define_schema_tool(served))
     if allow_ddl:
-        specs.append(_enforce_schema_tool(graph))
+        specs.append(_enforce_schema_tool(served))
+    if served.many:
+        # On every tool, not a chosen few: each one takes `graph`, and a
+        # model that has to hunt for which graphs exist will guess.
+        line = _named_graphs(served)
+        specs = [replace(spec, description=f"{spec.description} {line}") for spec in specs]
     return specs
 
 
@@ -768,7 +985,7 @@ def _register(spec: ToolSpec, tool_class):
     return tool.model_copy(update={"parameters": spec.parameters})
 
 
-def build_server(graph: Graph, *, name: str = "hopai", read_only: bool = False,
+def build_server(graph, *, name: str = "hopai", read_only: bool = False,
                  allow_ddl: bool = False, embed: Optional[Callable] = None,
                  strict_schema: bool = False, http: Optional[dict] = None):
     """The configured MCP server object, not yet running.
@@ -776,6 +993,8 @@ def build_server(graph: Graph, *, name: str = "hopai", read_only: bool = False,
     For mounting hopai's tools inside an application that owns the
     transport (an existing ASGI app, a server that also serves other
     tools); serve() is the whole thing when it does not.
+
+    `graph` is one Graph or a {name: Graph} mapping -- see tools().
 
     `http` carries the HTTP bind settings, which mcp 1.x takes on the
     constructor and mcp 2.0 takes on run() -- serve() fills it in, and
@@ -785,15 +1004,17 @@ def build_server(graph: Graph, *, name: str = "hopai", read_only: bool = False,
                   for spec in tools(graph, read_only=read_only, allow_ddl=allow_ddl,
                                     embed=embed, strict_schema=strict_schema)]
     settings = http if (http and era == 1) else {}
-    return server_class(name, instructions=SERVER_INSTRUCTIONS, tools=registered, **settings)
+    return server_class(name, instructions=_instructions(Served(graph)), tools=registered,
+                        **settings)
 
 
-def serve(graph: Graph, *, transport: str = "stdio", host: str = "127.0.0.1",
+def serve(graph, *, transport: str = "stdio", host: str = "127.0.0.1",
           port: int = 8000, path: str = "/mcp", **options) -> None:
     """Build the server and run it until interrupted.
 
         serve(graph)                                    # stdio
         serve(graph, transport="http", port=8000)       # HTTP on /mcp
+        serve({"docs": docs, "crm": crm})               # several graphs, one pool
 
     Takes build_server()'s options (read_only, allow_ddl, embed,
     strict_schema, name). HTTP binds 127.0.0.1 unless told otherwise:
@@ -817,16 +1038,26 @@ def serve(graph: Graph, *, transport: str = "stdio", host: str = "127.0.0.1",
 # ---------------------------------------------------------------------
 
 def _vector(value: str):
-    """--vector nodes:summary:1536 -> ("nodes", Vector("summary", 1536)).
+    """--vector nodes:summary:1536      -> every served graph gets it
+       --vector crm:nodes:summary:1536  -> only the graph named `crm`
+
+    Returns (graph or None, target, Vector).
 
     Vector fields are declared per handle rather than stored in the
     database (see Graph.define_vectors), so a server started from the
-    command line has to be told about them or it cannot search."""
+    command line has to be told about them or it cannot search. The
+    optional graph prefix exists because in_graph() carries no vector
+    fields on purpose: two graphs in one server are allowed different
+    shapes, and applying one declaration to all of them by default
+    would be a guess -- so say which, or say it once for all."""
     from .vectors import Vector
     parts = value.split(":")
-    if len(parts) != 3:
+    if len(parts) not in (3, 4):
         raise argparse.ArgumentTypeError(
-            f"--vector takes TARGET:NAME:DIMENSIONS, e.g. nodes:summary:1536 -- got {value!r}")
+            f"--vector takes TARGET:NAME:DIMENSIONS (every served graph) or "
+            f"GRAPH:TARGET:NAME:DIMENSIONS (one of them), e.g. nodes:summary:1536 "
+            f"-- got {value!r}")
+    graph = parts.pop(0) if len(parts) == 4 else None
     target, field, dimensions = parts
     if target not in ("nodes", "edges"):
         raise argparse.ArgumentTypeError(
@@ -834,7 +1065,7 @@ def _vector(value: str):
     if not dimensions.isdigit():
         raise argparse.ArgumentTypeError(
             f"--vector dimensions must be a positive integer, got {dimensions!r}")
-    return target, Vector(field, int(dimensions))
+    return graph, target, Vector(field, int(dimensions))
 
 
 def _callable(value: str):
@@ -867,8 +1098,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dsn", default=os.environ.get("HOPAI_DSN"),
                         help="PostgreSQL DSN. Defaults to $HOPAI_DSN.")
-    parser.add_argument("--graph", default=DEFAULT_GRAPH,
-                        help=f"Which graph in those tables to serve (default {DEFAULT_GRAPH!r}).")
+    parser.add_argument("--graph", action="append", default=[], metavar="NAME",
+                        help=f"A graph in those tables to serve (default {DEFAULT_GRAPH!r}). "
+                             f"Repeatable: several graphs share one connection pool, and "
+                             f"the first is the default. Every tool then takes an optional "
+                             f"`graph` argument naming which to use.")
     parser.add_argument("--transport", choices=("stdio", "http"), default="stdio",
                         help="stdio (default) for a client that spawns this process; "
                              "http for a long-running server.")
@@ -884,8 +1118,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Refuse Cypher naming a label or kind the declared schema "
                              "does not have, instead of matching nothing.")
     parser.add_argument("--vector", action="append", type=_vector, default=[],
-                        metavar="TARGET:NAME:DIMENSIONS",
-                        help="Declare a vector field, e.g. nodes:summary:1536. Repeatable.")
+                        metavar="[GRAPH:]TARGET:NAME:DIMENSIONS",
+                        help="Declare a vector field, e.g. nodes:summary:1536 for every "
+                             "served graph, or crm:nodes:summary:1536 for one. Repeatable.")
     parser.add_argument("--embed", type=_callable, metavar="MODULE:FUNCTION",
                         help="A function taking text and returning a vector. Without it "
                              "there is no search by meaning -- a model cannot supply an "
@@ -897,29 +1132,47 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list] = None) -> int:
-    """`hopai-mcp`. Builds a Graph from the arguments and serves it."""
+    """`hopai-mcp`. Builds the graphs from the arguments and serves them."""
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.dsn:
         parser.error("no database to serve -- pass --dsn or set HOPAI_DSN")
 
-    graph = Graph(args.dsn, graph=args.graph)
-    if args.vector:
-        graph.define_vectors(
-            nodes=[field for target, field in args.vector if target == "nodes"],
-            edges=[field for target, field in args.vector if target == "edges"],
-        )
-    if args.load_schema:
-        try:
-            graph.load_schema()
-        except ValueError as exc:
-            # Absent is the normal case (nothing ever called save_schema);
-            # a corrupted document raises here too, and both leave the
-            # server usable without a schema -- so it says so on stderr
-            # rather than either dying or going quiet.
-            print(f"hopai-mcp: serving without a declared schema: {exc}", file=sys.stderr)
+    names = args.graph or [DEFAULT_GRAPH]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    if duplicates:
+        parser.error(f"--graph {duplicates} given more than once -- name each graph once")
+    unknown = {g for g, _, _ in args.vector if g is not None} - set(names)
+    if unknown:
+        parser.error(f"--vector names graph(s) {sorted(unknown)} that --graph does not "
+                     f"serve: {names}")
 
-    serve(graph, transport=args.transport, host=args.host, port=args.port, path=args.path,
+    # One engine, one pool: the first handle opens it and in_graph()
+    # shares it, which is the whole reason a server can hold many graphs
+    # without holding many pools.
+    first = Graph(args.dsn, graph=names[0])
+    graphs = {names[0]: first, **{name: first.in_graph(name) for name in names[1:]}}
+
+    for name, graph in graphs.items():
+        fields = [(target, field) for chosen, target, field in args.vector
+                  if chosen in (None, name)]
+        if fields:
+            graph.define_vectors(
+                nodes=[field for target, field in fields if target == "nodes"],
+                edges=[field for target, field in fields if target == "edges"],
+            )
+        if args.load_schema:
+            try:
+                graph.load_schema()
+            except ValueError as exc:
+                # Absent is the normal case (nothing ever called save_schema);
+                # a corrupted document raises here too, and both leave the
+                # server usable without a schema -- so it says so on stderr
+                # rather than either dying or going quiet.
+                print(f"hopai-mcp: serving {name!r} without a declared schema: {exc}",
+                      file=sys.stderr)
+
+    serve(graphs, transport=args.transport, host=args.host, port=args.port, path=args.path,
           name=args.name, read_only=args.read_only, allow_ddl=args.allow_ddl,
           embed=args.embed, strict_schema=args.strict_schema)
     return 0
