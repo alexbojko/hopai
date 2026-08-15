@@ -3,7 +3,12 @@ site_description: >-
   A knowledge graph in the PostgreSQL you already run: multi-hop traversal,
   ingestion and real constraints, with Python, JSON and Cypher interfaces --
   no graph database required.
-site_url: https://alexbojko.github.io/hopai/
+# Read the Docs serves every version at its own path -- /en/stable/,
+# /en/latest/, /en/v0.0.1/ -- so a hard-coded site_url would be correct for
+# exactly one of them and wrong for the rest. RTD stamps the per-version
+# canonical URL into the environment; the default is what a local
+# `mkdocs serve` and the CI build (which publishes nothing) use.
+site_url: !ENV [READTHEDOCS_CANONICAL_URL, "https://hopai.readthedocs.io/en/latest/"]
 repo_url: https://github.com/alexbojko/hopai
 repo_name: alexbojko/hopai
 copyright: MIT-licensed
