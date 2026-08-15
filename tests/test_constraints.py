@@ -234,6 +234,24 @@ class TestLifecycle:
         assert "uq_nodes_email" not in indexes(fresh_graph)
         assert fresh_graph.add_nodes([{"email": "a@x.com"}, {"email": "a@x.com"}]) == 2
 
+    def test_drop_constraints_reaches_the_edges_too(self, fresh_graph):
+        """Every drop_constraints test passed `nodes=` only, so the
+        edges half of `_targets(nodes, edges)` could be dropped
+        entirely -- `drop_constraints(edges=[...])` silently doing
+        nothing, returning [], and leaving the constraint enforcing.
+
+        Asserted by the write, not by the return value: a name in the
+        list proves the DDL was composed, not that it ran."""
+        fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+        declarations = {"edges": [Unique(Col("start_id"), Col("end_id"), "kind")]}
+        fresh_graph.define_constraints(**declarations)
+        fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}])
+        with pytest.raises(ConstraintViolation):
+            fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}])
+
+        assert fresh_graph.drop_constraints(**declarations) == ["uq_edges_start_id_end_id_kind"]
+        assert fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}]) == 1
+
     def test_dropping_what_was_never_created_is_fine(self, fresh_graph):
         fresh_graph.drop_constraints(nodes=[Unique("nothing_here")])
 
