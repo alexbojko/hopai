@@ -144,6 +144,27 @@ def _numeric_field(column, key: str):
     return cast(column[key].astext, Numeric)
 
 
+def _refuse_near(value: Any, at: str = "") -> None:
+    """Refuse a Near wherever a boolean filter is expected.
+
+    Checked by marker, not isinstance: importing hopai.vectors here
+    would be a cycle, and the mistake deserves a better answer than the
+    generic rejection resolve() ends with.
+
+    Called at the filter position AND at the value position, because
+    the value position is the likelier mistake: GT/BETWEEN live there,
+    so `where={"summary": Near(...)}` mirrors the shape the DSL
+    teaches. Only the filter position was guarded, and a Near as a
+    value fell through to json.dumps, surfacing as "Object of type Near
+    is not JSON serializable" -- which names nothing the caller can act
+    on."""
+    if getattr(value, "_is_near", False):
+        raise TypeError(
+            f"Near(...) ranks rows by similarity; it is not a boolean filter{at}. Pass it "
+            f"as near= on Start/Hop or to vector_search(), not inside where=/via="
+        )
+
+
 def resolve(column, filt: Any):
     """Compile a filter (Python form) into a real SQLAlchemy boolean
     expression bound to `column`. This is the single code path every
@@ -151,6 +172,8 @@ def resolve(column, filt: Any):
     through before it becomes SQL."""
     if filt is None:
         return literal(True)
+
+    _refuse_near(filt)
 
     if callable(filt) and not isinstance(filt, (OR, AND, NOT)):
         return filt(column)
@@ -189,10 +212,13 @@ def resolve(column, filt: Any):
         conditions = []
         for key, value in filt.items():
             if isinstance(value, list):
+                for item in value:
+                    _refuse_near(item, f" (in where={{{key!r}: [...]}})")
                 conditions.append(
                     or_(*(column.op("@>")(cast(literal(_json.dumps({key: v})), JSONB)) for v in value))
                 )
             else:
+                _refuse_near(value, f" (in where={{{key!r}: ...}})")
                 conditions.append(column.op("@>")(cast(literal(_json.dumps({key: value})), JSONB)))
         return and_(*conditions)
 

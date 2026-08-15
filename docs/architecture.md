@@ -38,6 +38,64 @@ PG both do) instead of aborting the whole statement.
 Why only the final match may be aggregated — and which Cypher spellings translate
 exactly versus refuse — is the AGGREGATION section of `hopai/cypher.py`'s docstring.
 
+## The vector path
+
+`vectors.py` owns everything similarity-shaped; `core.py` only decides *where* a ranked
+set plugs into the walk.
+
+- A vector field is a `vec_<name> real[]` column **beside** `properties`, never inside
+  it — JSONB storage would bloat the GIN index and every result. Dimensions are a
+  per-graph scoped CHECK (`scope_check`), which is what lets two graphs give one shared
+  column different dimensionality — the reason the column is `real[]` and not a typed
+  `vector(d)`.
+- Similarity is exact cosine as an `unnest`+`sum` **LATERAL**, one per field. LATERAL
+  rather than a correlated scalar subquery is a measurement: a scalar subquery gets
+  pulled up and re-evaluated at every site the outer query names it (filter, score,
+  `ORDER BY`), which cost 2× for identical results. It also makes the value readable as
+  a column, which is what the missing/wrong-length guards need. The query vector's norm
+  is precomputed in Python (one `sqrt` in the SQL, not two), and the products are cast
+  to float8 **before** summing — `sum(real)` accumulates in float4 and drifts over
+  embedding-length arrays. All pinned by shape tests.
+- A similarity is NULL — read everywhere as "missing" — when the stored vector is NULL,
+  all zeros, or **not the declared length**. That last one is not defensive noise:
+  `unnest(a, b)` pads the shorter array with NULLs, so a mis-sized vector would
+  otherwise score a confident cosine over the shared prefix.
+- The dimension CHECK's name carries a `_graph_token` (schema.py's, reused) rather than
+  a slugged graph suffix. Independent truncation of base and suffix let two graphs share
+  one constraint — silently disabling one graph's enforcement and letting its
+  `drop_vectors()` remove the other's.
+- `ranked_ids()` is the one shape behind `Start(near=)` and `Hop(near=)`: an inner
+  select computing labeled per-field similarities over deduplicated candidates, an
+  outer select filtering/ordering/limiting. In `_walk_matches` it simply **becomes**
+  the `seed` / `match_i` CTE, so everything downstream (edge reconstruction, dead-end
+  pruning, aggregation) is unchanged — and a traversal without `near` emits
+  byte-identical SQL to the pre-vector code, which a test asserts.
+- `search_many()` puts the queries in a VALUES list and hangs the per-query top-k off it
+  as a LATERAL, so N queries are one round trip. `_similarity()` therefore takes its
+  query vector and norm either as Python constants (single search) or as expressions
+  from that VALUES row. Both the inner cosine and the beam use `correlate`/
+  `correlate_except`: left to infer, SQLAlchemy copies the outer FROM element into the
+  subquery, which cross-joins the VALUES list and makes Postgres reject a recursive
+  reference outright.
+- `Boost` adds property terms to the score. They are coalesced, which is what keeps
+  `combined IS NOT NULL` meaning "some similarity had a direction" — but a boost is not
+  consequence-free: it reorders, and with a `keep`/`k` limit reordering decides
+  membership, so a boosted `similarity` is the combined score and can exceed 1.
+- `Hop(via_near=)` compiles to `edge_beam()`: a LATERAL, per anchor row, yielding the
+  `(edge_id, move_id)` pair the plain join produced — so depth, the local path and edge
+  reconstruction are untouched. The cycle guard goes *inside* the beam, or a top-`via_keep`
+  beam would spend slots on edges leading back into the path.
+- Writes go through `set_vectors()` only (UPDATE … FROM VALUES … RETURNING, one
+  transaction, missing ids fail the call); ingestion rows never carry vectors.
+  `stale_vectors()` reports what needs re-embedding; `pgvector_exit_ddl()` emits the one-way
+  migration off this engine without importing the extension.
+- The JSON forms exist (`"near"`/`"keep"`/`"via_near"`/`"via_keep"`/`"boost"` in specs,
+  `vector_search_json`) but the LLM tool schemas deliberately omit them, and
+  `traverse_json`/`aggregate_json` **refuse** them without `allow_vectors=True` — a model
+  fills a `"vector"` parameter by inventing floats, so the invariant is enforced rather
+  than advertised. `tests/test_vectors.py::TestToolSchemasStayVectorFree` pins both the
+  omission and the per-graph `tool_schemas()` staying vector-free.
+
 ## The write path
 
 `Graph` exposes the writes; `ingest.py` and `constraints.py` implement them; `core.py`
@@ -137,6 +195,7 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/ingest.py` | The two row spellings, edge-by-property references, merge semantics |
 | `hopai/mutate.py` | What `where=` selects, why a blank filter refuses, the three update semantics and what `detach` does |
 | `hopai/constraints.py` | What each constraint compiles to, and the SQL semantics that surprise people |
+| `hopai/vectors.py` | Why no pgvector, the storage and cost model, cosine-only, multivector semantics, and why vectors never pass through a tool schema |
 | `hopai/schema.py` | The graph-schema notations, the annotation mapping, what enforcement compiles to and the endpoint-type limit, and why inference is an observation rather than a `.schema` fallback |
 | `hopai/cypher.py` | The translatable subset — read, write and aggregate — and why each refusal is a refusal |
 | `tests/conftest.py` | The fixture graph's shape |

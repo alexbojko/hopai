@@ -96,13 +96,33 @@ over the distinct nodes the last step matched; the same three notations:
         MATCH (a:person)-[:friend*1..4]->(b) RETURN count(DISTINCT b)
     ''')
 
+VECTOR SEARCH -- exact cosine similarity on plain real[] columns, no
+pgvector, no extension; declare named fields, migrate, store, search,
+or seed a traversal from similarity:
+
+    from hopai import Vector, Near
+
+    graph.define_vectors(nodes=[Vector("summary", 1536)])
+    graph.migrate_vectors()                       # ALTER TABLE, idempotent
+    graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
+    graph.vector_search(Near("summary", query_embedding), k=10,
+                        where={"type": "person"})
+    graph.traverse(Start(near=Near("summary", query_embedding), keep=25),
+                   Hop(via={"kind": "cites"}))
+
+Several Near specs combine into one weighted score (multivector
+search). See hopai/vectors.py for the storage model, the cost model,
+and every deliberate refusal.
+
 FOR TOOL-CALLING MODELS: TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
 INGEST_TOOL_SCHEMA and MUTATE_TOOL_SCHEMA are JSON Schemas ready to hand
 to a function-calling definition, covering reading, aggregating,
 writing, and changing or deleting what is already there -- and
 `graph.tool_schemas()` returns the same four with THIS graph's declared
 schema summarized into each description, so the model knows what exists
-instead of guessing labels.
+instead of guessing labels. (Vector search has no tool schema on
+purpose, in either form -- a model asked for an embedding invents one;
+vectors.py explains.)
 
 SCHEMA -- declare the shape of the graph (node types, edge kinds, typed
 properties) as plain dataclasses or NodeType/EdgeType primitives, read
@@ -136,13 +156,14 @@ from .hop import Hop, Start
 from .ingest import INGEST_TOOL_SCHEMA, IngestResult
 from .json_api import (
     AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, aggregate_json, spec_to_aggregation,
-    spec_to_traversal, traverse_json,
+    spec_to_traversal, traverse_json, vector_search_json,
 )
 from .models import Edge, Node
 from .mutate import MUTATE_TOOL_SCHEMA, MutationResult, spec_to_mutations
 from .schema import (
     EdgeType, GraphSchema, InferenceReport, NodeType, Property, SchemaViolations, TypeConflict,
 )
+from .vectors import Boost, Near, Vector, parse_boost, parse_near
 
 # The trailing annotation is load-bearing: release-please updates this
 # file with its GENERIC updater, which rewrites the version only on lines
@@ -165,6 +186,7 @@ __all__ = [
     "Unique", "Required", "Check", "Index", "PropertyType", "Col", "ConstraintViolation",
     "GraphSchema", "NodeType", "EdgeType", "Property", "InferenceReport", "TypeConflict",
     "SchemaViolations",
+    "Vector", "Near", "Boost", "parse_near", "parse_boost", "vector_search_json",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",
 ]

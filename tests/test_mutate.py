@@ -1002,6 +1002,40 @@ class TestCypherRefusals:
             cypher_to_operations("MERGE (a {n: 1}) ON MATCH SET a = {x: 2}")
 
 
+class TestVectorsSurviveMutations:
+    """Vectors live in real `vec_*` columns, not in `properties` -- so a
+    replacing update rewrites the bag beside them and leaves them
+    standing. Worth pinning rather than assuming: `replace=True` reads
+    like "replace the row", and a future `update_nodes` that helpfully
+    cleared the vector columns too would silently cost an embedding
+    nobody can regenerate from what is left."""
+
+    @pytest.fixture()
+    def vectored(self, fresh_graph):
+        from hopai import Vector
+        fresh_graph.define_vectors(nodes=[Vector("summary", 4)])
+        fresh_graph.migrate_vectors()
+        fresh_graph.add_nodes([{"id": 1, "type": "doc", "title": "a"},
+                               {"id": 2, "type": "doc", "title": "b"}])
+        fresh_graph.set_vectors(nodes=[{"id": 1, "summary": [1.0, 0.0, 0.0, 0.0]},
+                                       {"id": 2, "summary": [0.0, 1.0, 0.0, 0.0]}])
+        return fresh_graph
+
+    def test_a_replacing_update_keeps_the_stored_vector(self, vectored):
+        from hopai import Near
+        vectored.update_nodes(where={"title": "a"},
+                              set={"type": "doc", "title": "a2"}, replace=True)
+        found = vectored.vector_search(Near("summary", [1.0, 0.0, 0.0, 0.0]), k=1)
+        assert found[0]["id"] == "1"
+        assert found[0]["properties"] == {"type": "doc", "title": "a2"}
+
+    def test_deleting_a_node_takes_its_vector_with_it(self, vectored):
+        from hopai import Near
+        vectored.delete_nodes(where={"title": "b"}, detach=True)
+        found = vectored.vector_search(Near("summary", [0.0, 1.0, 0.0, 0.0]), k=2)
+        assert [row["id"] for row in found] == ["1"]
+
+
 class TestStrictSchema:
     """`strict_schema=True` reaches the mutation path too. It matters
     more here than on the read side: a hallucinated label returns an
