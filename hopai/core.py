@@ -570,6 +570,19 @@ class Graph:
         return (_Target(self.nodes_tbl, "nodes", self.graph, self.graph_col),
                 _Target(self.edges_tbl, "edges", self.graph, self.graph_col))
 
+    def schema_violations(self, sample: int = 5):
+        """What enforce_schema() would reject, found by READING -- per
+        violated rule, its would-be constraint name, a row count and up
+        to `sample` offending ids. Falsy when clean.
+
+        This is the step between defining and enforcing on a graph that
+        grew before the schema did: ADD CONSTRAINT validates existing
+        rows and fails opaquely on the first bad one, while this returns
+        the whole work list. Read-only -- no DDL, nothing registered."""
+        from .schema import find_violations
+        self._defined_schema("schema_violations()")
+        return find_violations(self, sample)
+
     def schema_ddl(self) -> list:
         """The exact SQL enforce_schema() would run, without running it.
         For review, for a migration file, or for showing an agent what

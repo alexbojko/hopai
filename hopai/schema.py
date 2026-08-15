@@ -601,32 +601,38 @@ def schema_constraint_prefixes(target: _Target) -> tuple:
     return (f"ck_schema_req_{token}_", f"ck_schema_typ_{token}_")
 
 
-def _type_constraints(target: _Target, discriminator: str, type_name: str,
-                      properties: tuple) -> list:
-    """(name, ddl) pairs for one node type or edge kind: one presence
-    CHECK covering every required property, plus one jsonb_typeof CHECK
-    per property. Distinct req_/typ_ name prefixes, so a property
-    named 'required' can never collide with the presence check."""
+def _type_rules(target: _Target, discriminator: str, type_name: str,
+                properties: tuple) -> list:
+    """(name, unscoped boolean expression) pairs for one node type or
+    edge kind: one presence rule covering every required property, plus
+    one jsonb_typeof rule per property. Shared by DDL compilation and
+    schema_violations(), so the dry-run and the CHECK can never disagree
+    about what violates. Distinct req_/typ_ name prefixes, so a property
+    named 'required' can never collide with the presence rule."""
     guard = target.properties_col[discriminator].astext.is_distinct_from(type_name)
     token = _graph_token(target.graph)
-    pairs = []
+    rules = []
     required = tuple(p.name for p in properties if p.required)
     if required:
         name = f"ck_schema_req_{token}_{_slug(type_name)}"[:63]
-        body = _literal(target.scope_check(
-            or_(guard, target.properties_col.has_all(postgresql.array(required)))))
-        pairs.append((name, _add_check(target, name, body)))
+        rules.append((name, or_(guard, target.properties_col.has_all(
+            postgresql.array(required)))))
     for p in properties:
         name = f"ck_schema_typ_{token}_{_slug(type_name)}_{_slug(p.name)}"[:63]
         typeof = func.jsonb_typeof(target.properties_col[p.name])
         # jsonb_typeof of a MISSING key is NULL and a CHECK passes on
         # NULL, so this constrains the type of a value that is there --
-        # presence is the req_ constraint's job, same split as
-        # PropertyType vs Required in constraints.py.
+        # presence is the req_ rule's job, same split as PropertyType vs
+        # Required in constraints.py.
         expression = typeof == p.json_type[0] if len(p.json_type) == 1 else typeof.in_(p.json_type)
-        body = _literal(target.scope_check(or_(guard, expression)))
-        pairs.append((name, _add_check(target, name, body)))
-    return pairs
+        rules.append((name, or_(guard, expression)))
+    return rules
+
+
+def _type_constraints(target: _Target, discriminator: str, type_name: str,
+                      properties: tuple) -> list:
+    return [(name, _add_check(target, name, _literal(target.scope_check(expression))))
+            for name, expression in _type_rules(target, discriminator, type_name, properties)]
 
 
 def compile_node_constraints(schema: GraphSchema, target: _Target) -> list:
@@ -637,6 +643,76 @@ def compile_node_constraints(schema: GraphSchema, target: _Target) -> list:
 def compile_edge_constraints(schema: GraphSchema, target: _Target) -> list:
     return [pair for kind, properties in _properties_per_kind(schema.edge_types).items()
             for pair in _type_constraints(target, "kind", kind, properties)]
+
+
+# ---------------------------------------------------------------------
+# Violations: the dry-run before enforcement
+# ---------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RuleViolations:
+    """Rows one schema rule would reject -- named exactly as the CHECK
+    enforce_schema() would create, so the report reads as the work list
+    for the enforcement that failed (or is about to)."""
+    constraint: str
+    table: str
+    rows: int
+    sample_ids: tuple
+
+
+@dataclass
+class SchemaViolations:
+    """What enforce_schema() would reject, found by reading. Falsy when
+    clean, so `if graph.schema_violations():` reads correctly."""
+    rules: tuple
+
+    def __bool__(self) -> bool:
+        return bool(self.rules)
+
+    def __str__(self) -> str:
+        if not self.rules:
+            return "no schema violations -- enforce_schema() would succeed"
+        lines = [f"{sum(r.rows for r in self.rules)} row(s) violate "
+                 f"{len(self.rules)} schema rule(s):"]
+        for r in self.rules:
+            ids = ", ".join(str(i) for i in r.sample_ids)
+            more = "" if r.rows <= len(r.sample_ids) else ", ..."
+            lines.append(f"  {r.constraint} ({r.table}): {r.rows} row(s), e.g. id {ids}{more}")
+        return "\n".join(lines)
+
+
+def find_violations(graph, sample: int = 5) -> SchemaViolations:
+    """Evaluate every rule the schema would enforce, as SELECTs. A row
+    the CHECK would reject is exactly a row where the scoped check body
+    is false -- NOT of it, with SQL's NULL-passes semantics matching the
+    CHECK's for free. Read-only: no DDL, nothing registered."""
+    from sqlalchemy import not_, select
+
+    schema = graph._schema
+    node_target, edge_target = graph._schema_targets()
+    groups = [
+        (node_target, graph.nodes_tbl, graph.node_id_col,
+         [rule for nt in schema.node_types
+          for rule in _type_rules(node_target, "type", nt.name, nt.properties)]),
+        (edge_target, graph.edges_tbl, graph.edge_id_col,
+         [rule for kind, properties in _properties_per_kind(schema.edge_types).items()
+          for rule in _type_rules(edge_target, "kind", kind, properties)]),
+    ]
+    violated = []
+    with graph.engine.connect() as connection:
+        for target, table, id_col_name, rules in groups:
+            id_col = getattr(table.c, id_col_name)
+            for name, expression in rules:
+                failing = not_(target.scope_check(expression))
+                rows = connection.execute(
+                    select(func.count()).select_from(table).where(failing)).scalar()
+                if not rows:
+                    continue
+                ids = tuple(row[0] for row in connection.execute(
+                    select(id_col).select_from(table).where(failing)
+                    .order_by(id_col).limit(sample)).all())
+                violated.append(RuleViolations(name, target.label, rows, ids))
+    return SchemaViolations(tuple(violated))
 
 
 # ---------------------------------------------------------------------
