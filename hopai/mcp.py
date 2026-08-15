@@ -1338,10 +1338,15 @@ def main(argv: Optional[list] = None) -> int:
     if duplicates:
         parser.error(f"--graph {duplicates} given more than once -- name each graph once")
 
-    # One engine, one pool: the first handle opens it and in_graph()
-    # shares it, which is the whole reason a server can hold many graphs
-    # without holding many pools.
-    first = Graph(args.dsn, graph=(args.graph or [DEFAULT_GRAPH])[0])
+    # One engine, one pool: this handle opens it and in_graph() shares
+    # it, which is the whole reason a server can hold many graphs
+    # without holding many pools. Its OWN scope never matters -- graphs()
+    # asks about the tables rather than about the caller, and every
+    # served handle comes from in_graph() below. Scoping it to the first
+    # name and then reusing it for that one saved an object and cost a
+    # branch that could not be wrong either way; a mutant deleted the
+    # scope entirely and nothing could tell, which is what said so.
+    base = Graph(args.dsn)
     if args.graph:
         names = args.graph
     else:
@@ -1352,7 +1357,7 @@ def main(argv: Optional[list] = None) -> int:
         # in 'docs' and 'crm' answered "nothing here", confidently and
         # wrongly, about graphs it simply had not been told to look at.
         try:
-            names = first.graphs()
+            names = base.graphs()
         except Exception as exc:            # noqa: BLE001 - any driver error, same fix
             parser.error(f"cannot list the graphs in this database: {exc}. Pass --graph "
                          f"to name the ones to serve without looking them up")
@@ -1367,8 +1372,7 @@ def main(argv: Optional[list] = None) -> int:
         parser.error(f"--vector names graph(s) {sorted(unknown)} that this server does "
                      f"not serve: {names}")
 
-    graphs = {names[0]: (first if names[0] == first.graph else first.in_graph(names[0])),
-              **{name: first.in_graph(name) for name in names[1:]}}
+    graphs = {name: base.in_graph(name) for name in names}
 
     for name, graph in graphs.items():
         fields = [(target, field) for chosen, target, field in args.vector
