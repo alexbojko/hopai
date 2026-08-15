@@ -1330,12 +1330,26 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
 
     node_types = [NodeType(name, properties=props)
                   for name, props in sorted(node_props.items())]
+    observed = {nt.name for nt in node_types}
     edge_types = []
     skipped = 0
     for row in sorted(triples, key=lambda r: (r.kind or "", r.source or "", r.target or "")):
         if not _named(row.kind):
             continue  # already counted as kindless below
         if not (_named(row.source) and _named(row.target)):
+            skipped += row.rows
+            continue
+        if row.source not in observed or row.target not in observed:
+            # ONLY reachable while sampling, and it used to raise. The
+            # triple join reads the full nodes table on purpose (see the
+            # docstring), while the node types come from the SAMPLED
+            # rows -- so a draw that missed every page of a type names
+            # an endpoint no NodeType backs, and GraphSchema rightly
+            # refuses that pair. Raising made infer_schema(sample_percent=5)
+            # fail at random on a small table, from a call whose whole
+            # contract is to return an observation. The honest answer is
+            # the one sampling gives everywhere else: this triple was
+            # not observed -- counted here, never dropped in silence.
             skipped += row.rows
             continue
         edge_types.append(EdgeType(row.kind, source=row.source, target=row.target,

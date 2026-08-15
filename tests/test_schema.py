@@ -1207,6 +1207,33 @@ class TestInferenceSampling:
         assert isinstance(schema, GraphSchema)
         assert report.sampled == 5
 
+    def test_a_sample_that_saw_no_nodes_still_returns_a_schema(self, fresh_graph, monkeypatch):
+        """The flake this test exists for: TABLESAMPLE draws PAGES, so a
+        5% sample of a small table can catch edge pages and no node
+        pages at all. The endpoint-triple join reads the FULL nodes
+        table on purpose, so it still names `person` as a source -- and
+        GraphSchema refuses an edge type whose endpoints no NodeType
+        backs. infer_schema(sample_percent=5) therefore raised, at
+        random, from a call whose whole contract is to return an
+        observation.
+
+        Simulated rather than waited for: whether a real 5% draw lands
+        in that state is luck, and a test that reproduces a bug one run
+        in ten is not a regression test. Emptying the node-side counts
+        is exactly what such a draw does."""
+        seed_chaotic(fresh_graph)
+        from hopai import schema as schema_module
+
+        counts = schema_module._observed_counts
+        monkeypatch.setattr(schema_module, "_observed_counts",
+                            lambda connection, graph, source, discriminator: (
+                                {} if discriminator == "type"
+                                else counts(connection, graph, source, discriminator)))
+
+        schema, report = fresh_graph.infer_schema(sample_percent=5)
+        assert schema.node_types == () and schema.edge_types == ()
+        assert report.skipped_endpoint_edges > 0     # counted, not dropped in silence
+
     def test_out_of_range_percent_is_refused_offline(self, offgraph):
         """Validation names the range and runs BEFORE anything connects
         -- TABLESAMPLE with a bad percentage would otherwise surface as
