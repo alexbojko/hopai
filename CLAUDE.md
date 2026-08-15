@@ -94,6 +94,10 @@ read.** When a design question comes up, these decide it, in order:
   `aggregate_json` refuse them without `allow_vectors=True` (see `vectors.py`).
   `cypher.py` has no vector spelling and is not expected to grow one — Cypher has no
   portable similarity syntax to translate, so there is nothing to refuse by name.
+- `notebooks/` is documentation that **runs**, executed by CI on every PR
+  (`python scripts/run_notebooks.py`). A change to a public API means re-running
+  them with `--save` and reading the output diff — a stale notebook is a broken
+  build, not a cosmetic lag.
 - Comments explain *why*, citing the bug or trade-off. Match that for non-obvious code;
   skip it for mechanical changes.
 - New tests join an existing `TestX` class and say what would break without the fix.
@@ -123,6 +127,7 @@ print(g.build_query(Start(where={"type": "person"}), [Hop(hops=(1, 3))])
 | Read | For |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | The read and write pipelines, multi-graph internals, result gotchas, and which module docstring explains what |
+| [notebooks/README.md](notebooks/README.md) | The eight runnable notebooks, how they are executed in CI, and how to regenerate their outputs |
 | [docs/testing.md](docs/testing.md) | Fixtures, the database-free suite, coverage gate, mutmut config and its fork-safety quirks |
 | [docs/releasing.md](docs/releasing.md) | release-please, PyPI trusted publishing, and the traps already hit |
 | [README.md](README.md) | The user-facing API |

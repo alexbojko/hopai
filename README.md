@@ -772,6 +772,23 @@ translating into something that answers a different question:
   past roughly 10 hops — see `benchmarks/` for the actual numbers rather
   than a guess.
 
+## 📓 Runnable documentation
+
+Everything above, as eight notebooks you can execute against a throwaway
+database — quick start, traversal semantics, aggregation, the JSON and
+Cypher front ends, constraints, graph schema, multi-graph, and the SQL
+underneath:
+
+```bash
+pip install -e ".[dev,notebooks]"
+docker compose up -d
+jupyter lab notebooks/
+```
+
+They are executed in CI on every PR, and they assert on the behaviours
+that matter, so a notebook cannot quietly document an API this library
+no longer has. See [`notebooks/README.md`](notebooks/README.md).
+
 ## 🛠️ Development
 
 ```bash
