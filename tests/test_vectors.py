@@ -18,6 +18,7 @@ import re
 import pytest
 from sqlalchemy import event, func, text
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateTable
 
 from hopai import (
     AGGREGATE_TOOL_SCHEMA, Count, Graph, Hop, INGEST_TOOL_SCHEMA, Near, Start, aggregate_json,
@@ -25,7 +26,9 @@ from hopai import (
     TRAVERSE_TOOL_SCHEMA, Vector, parse_near, spec_to_traversal, vector_search_json,
 )
 from hopai import Boost, Embedder
-from hopai.vectors import parse_boost
+from hopai.vectors import (
+    build_search_many_query, build_search_query, parse_boost, pgvector_exit_ddl,
+)
 from hopai.constraints import ConstraintViolation
 
 
@@ -176,6 +179,15 @@ class TestVectorDDL:
         assert len(checks) == 1
         assert "array_ndims(vec_summary) = 1" in checks[0]
         assert "array_length(vec_summary, 1) = 3" in checks[0]
+
+    def test_create_schema_emits_a_nullable_column(self, vg):
+        """define_vectors() attaches the vec_* columns to the shared
+        Table metadata, so create_schema() emits them -- and a NOT NULL
+        there would make the tables unusable outright. Vectors are
+        written only by set_vectors(), which UPDATEs rows that already
+        exist, so a row has to be insertable without one first."""
+        ddl = str(CreateTable(vg.nodes_tbl).compile(dialect=postgresql.dialect()))
+        assert re.search(r"vec_summary REAL\[\](?!\s+NOT NULL)", ddl), ddl
 
     def test_check_is_graph_scoped(self, vg):
         """A CHECK binds the whole table; without the guard one graph's
@@ -2463,6 +2475,23 @@ class TestBuilderDelegation:
         the README and both docstrings make."""
         assert "LIMIT 10" in norm(build(vg), literal_binds=True)
 
+    @pytest.mark.parametrize("build", [
+        lambda g: build_search_query(g, Near("summary", [1.0, 0.0, 0.0])),
+        lambda g: build_search_many_query(g, [Near("summary", [1.0, 0.0, 0.0])]),
+    ])
+    def test_the_same_default_holds_one_layer_down(self, vg, build):
+        """Each default is written TWICE -- once on the Graph method and
+        once on the function behind it -- so the tests above pin only
+        half of each pair, and the halves are free to drift apart. The
+        method always passes k explicitly, which is exactly what hides
+        a changed default underneath it."""
+        assert "LIMIT 10" in norm(build(vg), literal_binds=True)
+
+    def test_the_pgvector_index_default_holds_one_layer_down(self, vg):
+        """Same pair, same drift: Graph.pgvector_exit_ddl() passes
+        index= down, so only its own default was ever read."""
+        assert any("USING hnsw" in s for s in pgvector_exit_ddl(vg))
+
 
 # ---------------------------------------------------------------------
 # Text, embedded on the way in and on the way out
@@ -2595,6 +2624,21 @@ class TestNearText:
             [Near("summary", text="apple"), Near("summary", text="banana"),
              Near("summary", text="cherry")], k=1)
         assert log == [["apple", "banana", "cherry"]]
+
+    def test_resolution_carries_every_knob_across(self, vg):
+        """The resolved Near is a NEW object, so weight, min_similarity
+        and missing have to be copied onto it by hand -- and dropping
+        any one of them re-ranks the results in silence. Mutation found
+        all three unasserted at once."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder()),
+                                 Vector("title", 3, embed=counting_embedder())])
+        sql = norm(vg.build_vector_search_query(
+            Near("summary", text="apple", weight=0.25, min_similarity=0.75,
+                 missing="zero"),
+            Near("title", text="banana"), k=1), literal_binds=True)
+        assert "0.25" in sql                       # weight=
+        assert "0.75" in sql                       # min_similarity=
+        assert "coalesce" in sql.lower()           # missing="zero"
 
     def test_queries_keep_their_own_text_in_order(self, vg):
         """One batched answer has to be dealt back to the query it came
