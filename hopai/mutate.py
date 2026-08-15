@@ -54,6 +54,24 @@ document, one transaction -- see MUTATE_TOOL_SCHEMA:
         {"op": "update_nodes", "where": {"type": "person"}, "set": {"active": False}},
         {"op": "delete_nodes", "where": {"type": "draft"}, "detach": True},
     ]})
+
+SEEING THE SQL BEFORE IT RUNS, the same way build_query() is inspected,
+with no database and nothing executed:
+
+    from sqlalchemy.dialects import postgresql
+    from hopai.mutate import Mutator
+
+    print(Mutator(graph).delete_nodes_statement({"type": "draft"})
+          .compile(dialect=postgresql.dialect()))
+
+ONE THING THIS DOES NOT RE-CHECK: `enforce_schema(endpoints=True)`
+polices an edge's endpoint types with a trigger on the EDGES table, so
+changing a NODE's type here (or with merge_nodes(replace=True), which
+could already do it) can leave a declared edge connecting types the
+schema forbids, and nothing raises. `graph.schema_violations()` does not
+see it either -- it reads the same declarations the trigger does.
+Re-run enforce_schema() after retyping nodes, or check the edges you
+know point at them.
 """
 
 from __future__ import annotations
@@ -62,7 +80,7 @@ import json as _json
 import time
 from dataclasses import dataclass
 
-from sqlalchemy import ARRAY, Text, and_, cast, delete, literal, or_, select, update
+from sqlalchemy import ARRAY, Text, cast, delete, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, array
 from sqlalchemy.exc import IntegrityError
 
@@ -123,6 +141,23 @@ class MutationResult:
                 f"updated_edges={self.updated_edges}, elapsed_ms={self.elapsed_ms:.1f})")
 
 
+def _flag(value, call: str, name: str) -> bool:
+    """A boolean argument that decides whether rows are destroyed is
+    checked, never coerced.
+
+    `all="false"` is truthy in Python, and JSON booleans arriving as the
+    strings "true"/"false" is an ordinary tool-call failure -- so
+    coercing would let the string "false" mean "yes, every row", which
+    is the exact inversion of the refusal this library is built
+    around."""
+    if value is not True and value is not False:
+        raise TypeError(
+            f"{call}({name}=...) takes True or False, got {value!r}. Anything else is a "
+            f"guess about what you meant, and this argument decides how many rows change"
+        )
+    return value
+
+
 def _detach_hint(exc: IntegrityError) -> ConstraintViolation:
     """The foreign-key refusal, rewritten as the fix.
 
@@ -131,14 +166,19 @@ def _detach_hint(exc: IntegrityError) -> ConstraintViolation:
     the flag is spelled `detach`. Cypher's own error for this is the
     thing to imitate -- it names DETACH DELETE."""
     violation = constraint_violation(exc, "node")
+    # The fix first, the driver's text last. Postgres leads with "Key
+    # (id, graph_id)=(1, default) is still referenced from table edges",
+    # and two clauses of that before the answer is two clauses too many
+    # -- but it names the constraint and the row, so it is kept.
+    #
     # No __cause__ set here: the caller raises this `from exc`, which is
     # what chains the driver's error onto it. Assigning it as well was
     # dead code, and mutation testing is what noticed -- nothing could
     # observe the difference.
     return ConstraintViolation(
-        f"{violation} -- these nodes still have edges, and deleting them would leave "
-        f"edges pointing at nothing. Pass detach=True (Cypher: DETACH DELETE) to delete "
-        f"those edges with the nodes, or delete the edges first",
+        f"cannot delete a node that still has edges: deleting it would leave edges "
+        f"pointing at nothing. Pass detach=True (Cypher: DETACH DELETE) to delete those "
+        f"edges with the node, or delete the edges first -- {violation}",
         constraint=violation.constraint, detail=violation.detail,
     )
 
@@ -171,12 +211,13 @@ class Mutator:
         accident this exists for; all=True *with* a filter is a caller
         who believes one of the two is being honoured, and only one of
         them is."""
+        _flag(all, call, "all")
         unfiltered = all_(self._blank(f) for f in filters)
         if unfiltered and not all:
             raise ValueError(
-                f"{call}() was given no filter, which would match every {what} in graph "
-                f"{self.g.graph!r}. Filter it with where=..., pass all=True to say you "
-                f"really mean every {what}, or call graph.clear() to empty the graph"
+                f"{call}() was given no filter, which would match every {what} "
+                f"{self._scope_phrase()}. Filter it with where=..., pass all=True to say "
+                f"you really mean every {what}, or call graph.clear() to empty the graph"
             )
         if all and not unfiltered:
             raise ValueError(
@@ -184,18 +225,35 @@ class Mutator:
                 f"touch. Drop whichever one you did not mean"
             )
 
-    def _node_predicate(self, where):
+    def _scope_phrase(self) -> str:
+        """Where "every row" reaches. Naming a graph would be a lie on
+        tables that have no discriminator column."""
+        if self.g.graph_col is None:
+            return "in these tables"
+        return f"in graph {self.g.graph!r}"
+
+    def _scope(self, table) -> list:
+        """The graph predicate, as the list every statement starts from.
+
+        Empty for `graph_col=None` tables rather than `literal(True)`:
+        `WHERE true AND ...` is noise a reader has to look at twice, and
+        it is the whole predicate when the filter is empty too."""
+        return [] if self.g.graph_col is None else [self.g._scoped(table)]
+
+    def _node_conditions(self, where) -> list:
+        """The node rows a mutation targets: the graph, then the filter.
+
+        A blank filter is left out rather than resolved to TRUE -- it is
+        only ever reached with all=True, and `WHERE graph_id = 'x' AND
+        true` is a planner input as well as something a reader has to
+        look at twice."""
         nt = self.g.nodes_tbl
-        conditions = [self.g._scoped(nt)]
-        # A blank filter is left out rather than resolved to TRUE: it is
-        # only ever reached with all=True, and `WHERE graph_id = 'x' AND
-        # true` is a planner input as well as something a reader has to
-        # look twice at.
+        conditions = self._scope(nt)
         if not self._blank(where):
             conditions.append(resolve(nt.c.properties, where))
-        return and_(*conditions)
+        return conditions
 
-    def _edge_predicate(self, where, start, end):
+    def _edge_conditions(self, where, start, end) -> list:
         """The edge rows a mutation targets: its own properties, plus
         optional filters on the nodes at either end.
 
@@ -204,57 +262,59 @@ class Mutator:
         would have to be fetched and deleted by id, which is two round
         trips and a race between them."""
         et = self.g.edges_tbl
-        conditions = [self.g._scoped(et)]
+        conditions = self._scope(et)
         if not self._blank(where):
             conditions.append(resolve(et.c.properties, where))
         for column, filt in ((self.g.edge_start_col, start), (self.g.edge_end_col, end)):
             if not self._blank(filt):
                 conditions.append(getattr(et.c, column).in_(self._node_ids(filt)))
-        return and_(*conditions)
+        return conditions
 
     def _node_ids(self, filt):
         """The ids of this graph's nodes matching `filt`, as a subquery.
         Scoped like every other read: an unscoped one would let an
         endpoint filter match a node belonging to another graph."""
         nt = self.g.nodes_tbl
-        return select(getattr(nt.c, self.g.node_id_col)).where(self._node_predicate(filt))
+        return select(getattr(nt.c, self.g.node_id_col)).where(*self._node_conditions(filt))
 
     # -- statements -----------------------------------------------------
 
     def delete_nodes_statement(self, where=None, all: bool = False):
         self._guard([where], "delete_nodes", "node", all)
-        return delete(self.g.nodes_tbl).where(self._node_predicate(where))
+        return delete(self.g.nodes_tbl).where(*self._node_conditions(where))
 
     def detach_statement(self, where=None, all: bool = False):
         """Every edge incident to the nodes `where` matches, in either
-        direction. Run before the node delete, in the same transaction --
-        between two transactions an edge inserted in the gap would fail
-        the node delete with the error detach was supposed to prevent."""
+        direction. Run before the node delete and in the same
+        transaction, so no caller of this library can insert an edge
+        into the gap and fail the node delete with the error detach was
+        supposed to prevent. It narrows that window rather than closing
+        it: under READ COMMITTED a concurrent session can still commit
+        an edge that the node delete then trips over."""
         self._guard([where], "delete_nodes", "node", all)
         et = self.g.edges_tbl
         matched = self._node_ids(where)
-        return delete(et).where(and_(
-            self.g._scoped(et),
-            or_(getattr(et.c, self.g.edge_start_col).in_(matched),
-                getattr(et.c, self.g.edge_end_col).in_(matched)),
+        return delete(et).where(*self._scope(et), or_(
+            getattr(et.c, self.g.edge_start_col).in_(matched),
+            getattr(et.c, self.g.edge_end_col).in_(matched),
         ))
 
     def delete_edges_statement(self, where=None, start=None, end=None, all: bool = False):
         self._guard([where, start, end], "delete_edges", "edge", all)
-        return delete(self.g.edges_tbl).where(self._edge_predicate(where, start, end))
+        return delete(self.g.edges_tbl).where(*self._edge_conditions(where, start, end))
 
     def update_nodes_statement(self, where=None, set=None, remove=None,
                                replace: bool = False, all: bool = False):
         self._guard([where], "update_nodes", "node", all)
         nt = self.g.nodes_tbl
-        return update(nt).where(self._node_predicate(where)).values(
+        return update(nt).where(*self._node_conditions(where)).values(
             properties=_new_properties(nt.c.properties, set, remove, replace, "update_nodes"))
 
     def update_edges_statement(self, where=None, start=None, end=None, set=None,
                                remove=None, replace: bool = False, all: bool = False):
         self._guard([where, start, end], "update_edges", "edge", all)
         et = self.g.edges_tbl
-        return update(et).where(self._edge_predicate(where, start, end)).values(
+        return update(et).where(*self._edge_conditions(where, start, end)).values(
             properties=_new_properties(et.c.properties, set, remove, replace, "update_edges"))
 
     # -- execution ------------------------------------------------------
@@ -262,6 +322,7 @@ class Mutator:
     def delete_nodes(self, where=None, detach: bool = False, all: bool = False,
                      connection=None) -> MutationResult:
         started = time.perf_counter()
+        _flag(detach, "delete_nodes", "detach")
         # The statements are built before the transaction opens: a
         # refusal (no filter, contradictory arguments) should raise
         # without having taken a connection out of the pool.
@@ -326,8 +387,8 @@ class Mutator:
         started = time.perf_counter()
         nt, et = self.g.nodes_tbl, self.g.edges_tbl
         with one_transaction(self.g, connection) as conn:
-            edges = conn.execute(delete(et).where(self.g._scoped(et))).rowcount
-            nodes = conn.execute(delete(nt).where(self.g._scoped(nt))).rowcount
+            edges = conn.execute(delete(et).where(*self._scope(et))).rowcount
+            nodes = conn.execute(delete(nt).where(*self._scope(nt))).rowcount
         return MutationResult(deleted_nodes=nodes, deleted_edges=edges,
                               elapsed_ms=(time.perf_counter() - started) * 1000)
 
@@ -377,24 +438,33 @@ def _new_properties(column, set, remove, replace: bool, call: str):
     if bad := [k for k in remove if not isinstance(k, str)]:
         raise TypeError(f"{call}(remove=...) takes property names, got {bad!r}")
 
-    if not set and not remove:
-        raise ValueError(
-            f"{call}() was given nothing to change -- pass set={{...}} to write "
-            f"properties, remove=[...] to drop them, or both"
-        )
+    # The replace checks come FIRST, and diagnose remove= before an
+    # absent set=. Ordered the other way, replace=True with remove=[...]
+    # fell through to "nothing to change -- ... or use remove=[...]",
+    # which told the caller to do the thing they had just done.
+    _flag(replace, call, "replace")
     if replace:
-        if not set:
-            raise ValueError(
-                f"{call}(replace=True) with no set= would erase every property of every "
-                f"matched row. Pass the properties it should end up with, or use "
-                f"remove=[...] to drop specific keys"
-            )
         if remove:
             raise ValueError(
                 f"{call}(replace=True, remove=[...]) contradicts itself: replace already "
                 f"decides the whole property bag, so removing a key from it means "
                 f"leaving that key out of set="
             )
+        if set is None:
+            raise ValueError(
+                f"{call}(replace=True) with no set= would erase every property of every "
+                f"matched row. Pass the properties it should end up with -- set={{}} if "
+                f"that really is an empty bag -- or use remove=[...] to drop keys"
+            )
+    elif not set and not remove:
+        # `set is None` and `set={}` differ only here: an explicitly
+        # empty bag means something with replace=True (Cypher's
+        # `SET a = {}`, which clears every property) and nothing at all
+        # without it.
+        raise ValueError(
+            f"{call}() was given nothing to change -- pass set={{...}} to write "
+            f"properties, remove=[...] to drop them, or both"
+        )
     overlap = sorted(set_(set or {}) & set_(remove))
     if overlap:
         raise ValueError(
@@ -402,10 +472,14 @@ def _new_properties(column, set, remove, replace: bool, call: str):
         )
 
     value = column
-    if set:
+    if set is not None and (set or replace):
         try:
-            incoming = cast(literal(_json.dumps(set)), JSONB)
-        except TypeError as exc:
+            # allow_nan=False, or json.dumps happily emits the non-JSON
+            # tokens NaN and Infinity -- and the refusal below never
+            # fires, leaving the caller a driver error raised after the
+            # transaction opened, mid-plan.
+            incoming = cast(literal(_json.dumps(set, allow_nan=False)), JSONB)
+        except (TypeError, ValueError) as exc:
             raise TypeError(f"{call}(set=...) values must be JSON: {exc}") from exc
         value = incoming if replace else value.op("||")(incoming)
     if remove:
@@ -421,7 +495,7 @@ def _new_properties(column, set, remove, replace: bool, call: str):
 # The JSON front end
 # ---------------------------------------------------------------------
 
-def spec_to_mutations(spec: dict) -> list:
+def spec_to_mutations(document: dict) -> list:
     """Convert a JSON mutation document into the operation list
     Mutator.execute_operations() runs -- exposed on its own so a plan
     can be reviewed, logged or shown to a caller before it changes
@@ -431,14 +505,14 @@ def spec_to_mutations(spec: dict) -> list:
             {"op": "delete_nodes", "where": {"type": "draft"}, "detach": True},
         ]})
     """
-    if not isinstance(spec, dict):
+    if not isinstance(document, dict):
         raise TypeError(f"a mutation takes a dict with an 'operations' list, "
-                        f"got {type(spec).__name__}")
-    unknown = spec.keys() - {"operations"}
+                        f"got {type(document).__name__}")
+    unknown = document.keys() - {"operations"}
     if unknown:
         raise ValueError(f"unknown keys {sorted(unknown)} -- a mutation document has "
                          f"'operations', nothing else")
-    operations = spec.get("operations")
+    operations = document.get("operations")
     if not operations:
         raise ValueError('a mutation document needs a non-empty "operations" list, e.g. '
                          '{"operations": [{"op": "delete_nodes", "where": {...}}]}')
@@ -467,6 +541,73 @@ def spec_to_mutations(spec: dict) -> list:
     return plan
 
 
+#: The filter grammar, spelled out rather than referenced. A caller may
+#: be handed mutate_graph and nothing else (the README recommends
+#: exactly that), so "same grammar as traverse_graph" would be a
+#: dangling pointer -- and a model that cannot express "older than 65"
+#: reports zero rows changed and reaches for the one lever left, which
+#: is the one that empties the graph.
+_FILTER_GRAMMAR = (
+    'An object is equality, ANDed across its keys: {"type": "person"}. Operators are '
+    'objects too: {"and": [...]}, {"or": [...]}, {"not": {...}}, {"gt": [key, value]}, '
+    '{"gte": [...]}, {"lt": [...]}, {"lte": [...]}, {"between": [key, lo, hi]}. Any other '
+    'operator spelling is read as an equality test against a nested object and matches '
+    'nothing.'
+)
+
+_ENDPOINT = (
+    'Any number of nodes may match this, and every edge touching one of them is affected '
+    '-- unlike ingest_graph, where start/end must identify exactly one node. '
+)
+
+#: One description per argument, shared by the operations that take it.
+_ARGUMENT_SCHEMA = {
+    "where": {"type": "object",
+              "description": "Filter on the properties of the rows to change. "
+                             + _FILTER_GRAMMAR},
+    "start": {"type": "object",
+              "description": "Filter on the properties of the node the edge starts at. "
+                             + _ENDPOINT + _FILTER_GRAMMAR},
+    "end": {"type": "object",
+            "description": "Filter on the properties of the node the edge ends at. "
+                           + _ENDPOINT + _FILTER_GRAMMAR},
+    "set": {"type": "object",
+            "description": "Properties to write. Merged over the existing ones, leaving "
+                           "properties not mentioned here alone."},
+    "remove": {"type": "array", "items": {"type": "string"},
+               "description": "Property names to drop. Removing a name that is not there "
+                              "is not an error."},
+    "replace": {"type": "boolean",
+                "description": "If true, 'set' becomes the whole property bag and every "
+                               "property not in it is dropped."},
+    "detach": {"type": "boolean",
+               "description": "Also delete the edges attached to the deleted nodes. "
+                              "Without it, deleting a node that still has edges fails."},
+    "all": {"type": "boolean",
+            "description": "Apply to every row, with no filter at all. Must be said "
+                           "explicitly: an operation with neither a filter nor this flag "
+                           "raises, and so does one with both, since then one of the two "
+                           "is being ignored. Deleting is not reversible."},
+}
+
+
+def _operation_schema(op: str) -> dict:
+    """One branch of the document schema, built from the same _OP_KEYS
+    the parser validates against -- so the schema cannot advertise an
+    argument the parser rejects, or omit one it requires."""
+    return {
+        "type": "object",
+        "properties": {"op": {"const": op}, **{key: _ARGUMENT_SCHEMA[key]
+                                               for key in sorted(_OP_KEYS[op])}},
+        "required": ["op"],
+        # A constrained decoder follows the schema, not the prose. One
+        # flat object listing all eight arguments made
+        # {"op": "delete_nodes", "detach": true, "set": {...}} valid to
+        # the model and rejected by spec_to_mutations().
+        "additionalProperties": False,
+    }
+
+
 #: JSON Schema for the mutation document, the delete/update counterpart
 #: of INGEST_TOOL_SCHEMA. Operations run in the order given, in one
 #: transaction.
@@ -475,9 +616,9 @@ MUTATE_TOOL_SCHEMA: dict = {
     "description": (
         "Change or delete nodes and edges that are already in a property graph. Each "
         "operation selects rows with the same filters a traversal uses and updates or "
-        "deletes every row it matches. Operations run in order, in one transaction. "
-        "A filter is required: omitting it raises rather than matching the whole graph, "
-        "unless all=true says so explicitly."
+        "deletes every row it matches. Operations run in order, in one transaction: if "
+        "one fails, none of them happened. A filter is required -- omitting it raises "
+        "rather than matching the whole graph, unless all=true says so explicitly."
     ),
     "parameters": {
         "type": "object",
@@ -486,62 +627,7 @@ MUTATE_TOOL_SCHEMA: dict = {
                 "type": "array",
                 "minItems": 1,
                 "description": "Operations to apply, in order.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "op": {
-                            "type": "string",
-                            "enum": sorted(_OP_KEYS),
-                            "description": "Which rows to change: nodes or edges, "
-                                           "updated or deleted.",
-                        },
-                        "where": {
-                            "type": "object",
-                            "description": "Filter on the properties of the rows to "
-                                           "change. Same grammar as traverse_graph.",
-                        },
-                        "start": {
-                            "type": "object",
-                            "description": "Edges only: filter on the properties of the "
-                                           "node the edge starts at.",
-                        },
-                        "end": {
-                            "type": "object",
-                            "description": "Edges only: filter on the properties of the "
-                                           "node the edge ends at.",
-                        },
-                        "set": {
-                            "type": "object",
-                            "description": "Updates only: properties to write. Merged "
-                                           "over the existing ones, leaving properties "
-                                           "not mentioned here alone.",
-                        },
-                        "remove": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Updates only: property names to drop.",
-                        },
-                        "replace": {
-                            "type": "boolean",
-                            "description": "Updates only: if true, 'set' becomes the "
-                                           "whole property bag and anything not in it "
-                                           "is dropped.",
-                        },
-                        "detach": {
-                            "type": "boolean",
-                            "description": "delete_nodes only: also delete the edges "
-                                           "attached to the deleted nodes. Without it, "
-                                           "deleting a node that still has edges fails.",
-                        },
-                        "all": {
-                            "type": "boolean",
-                            "description": "Apply to every row, with no filter. Required "
-                                           "to be explicit -- an operation with neither "
-                                           "a filter nor this flag raises.",
-                        },
-                    },
-                    "required": ["op"],
-                },
+                "items": {"oneOf": [_operation_schema(op) for op in sorted(_OP_KEYS)]},
             },
         },
         "required": ["operations"],

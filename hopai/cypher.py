@@ -1,22 +1,28 @@
 """
 hopai.cypher
 
-Cypher as an input syntax, for reading and for writing.
+Cypher as an input syntax, for reading, writing and changing.
 
 MATCH translates into the same `(Start, [Hop, ...])` pair
 `hopai.json_api.spec_to_traversal()` produces. CREATE and MERGE translate
 into the same add_nodes/merge_nodes/add_edges operations the Python API
-calls. Neither has query logic of its own -- this module is a front end,
-and there is exactly one traversal engine and one write path underneath.
+calls; DELETE, DETACH DELETE, SET and REMOVE into the same
+delete_nodes/update_edges/... operations. None of them has query logic of
+its own -- this module is a front end, and there is exactly one traversal
+engine, one write path and one mutation path underneath.
 
     graph.cypher("MATCH (a:person)-[:friend*1..4]->(b {active: true}) RETURN b")
     graph.cypher("CREATE (a:person {email: 'a@x.com'})-[:friend]->(b:person {email: 'b@x.com'})")
     graph.cypher("MERGE (a:person {email: 'a@x.com'}) ON CREATE SET a.name = 'Alice'")
+    graph.cypher("MATCH (a:person) WHERE a.age > 65 SET a.retired = true")
+    graph.cypher("MATCH (a {email: 'a@x.com'}) DETACH DELETE a")
 
-`graph.cypher()` returns a Subgraph for a query that reads and an
-IngestResult for one that writes; traverse_cypher() and write_cypher()
-are the same thing when you would rather be explicit, and
-`graph.cypher_operations()` shows a write's plan without running it.
+`graph.cypher()` returns a Subgraph for a query that reads, an
+IngestResult for one that writes and a MutationResult for one that
+deletes or updates; traverse_cypher(), write_cypher() and
+mutate_cypher() are the same thing when you would rather be explicit,
+and `graph.cypher_operations()` / `cypher_to_mutations()` show a plan
+without running it.
 
 WRITES, and the three places they stop short of Cypher:
 
@@ -39,10 +45,45 @@ WRITES, and the three places they stop short of Cypher:
                           driven by a multi-hop match is a different
                           feature.
 
-SET on matched rows, DELETE and DETACH DELETE are not supported at all:
-there is no update-by-query or delete API here yet, in Cypher or in
-Python, and offering half of one through this door only would be a way
-to lose data quietly.
+MUTATIONS -- DELETE, DETACH DELETE, SET, REMOVE -- and what a MATCH
+means in front of them:
+
+  A MATCH binds a SET.   Before a CREATE it names ONE node, because an
+                         edge attaches to exactly one row and an
+                         ambiguous match is an error. Before a DELETE or
+                         a SET it names every row the pattern matches,
+                         which is what Cypher means by it too: `MATCH
+                         (a:person) SET a.active = false` updates every
+                         person.
+  One node or one rel.   The pattern is a single node, or a single
+                         relationship whose endpoints may be filtered.
+                         Changing the rows a multi-hop pattern reached
+                         is a traversal driving a write, and refuses.
+  `SET x = {...}`        replaces every property, so it refuses unless
+                         the map carries the property a label or
+                         relationship type maps onto: Cypher's SET never
+                         erases a label, and a relationship's type
+                         cannot be changed at all, but here both are
+                         ordinary properties and would go.
+  `SET x.k = null`       REMOVES the property, as it does in Cypher --
+                         not a stored JSON null, which Cypher would
+                         consider absent and `Required` would consider
+                         present.
+  SET and REMOVE order.  Applied in order, last writer wins per
+                         property, so `SET a.x = 1 REMOVE a.x` and
+                         `REMOVE a.x SET a.x = 1` differ, as they do in
+                         Cypher.
+  Labels ignored.        `node_label_key=None` discards labels. On the
+                         read path that widens a result set; in front of
+                         a DELETE it would widen it to the whole graph,
+                         so a query whose only constraint was discarded
+                         refuses instead of matching everything.
+  One change per query.  `DELETE a, r`, a SET and a DELETE together, or
+                         a CREATE and a DELETE together, each refuse and
+                         name the split.
+  A plain RETURN after a mutation is parsed and ignored, exactly as it
+  is after a write; an aggregating one refuses, because the result of a
+  mutation is a MutationResult and not a number.
 
 THE RULE THIS MODULE IS BUILT ON: refuse, don't approximate. Cypher can
 say things hopai cannot, and a few things it says in a shape hopai
@@ -599,6 +640,18 @@ class _Parser:
                 self._next()
                 self._expect_kw("SET")
                 for var, entry in self._parse_set().assignments.items():
+                    null_keys = sorted(k for k, v in entry["set"].items() if v is None)
+                    if null_keys:
+                        # In Cypher `= null` removes the property. A MERGE
+                        # writes properties; it has no way to remove one,
+                        # and storing a JSON null instead is the silent
+                        # divergence MATCH ... SET now refuses.
+                        raise CypherError(
+                            f"`SET {var}.{null_keys[0]} = null` removes a property in "
+                            f"Cypher, and a MERGE only writes them -- leave the key out, "
+                            f"and remove it afterwards with "
+                            f"`MATCH ({var} {{...}}) REMOVE {var}.{null_keys[0]}`"
+                        )
                     if entry["replace"]:
                         # `a += {...}` is accepted just above: merging is
                         # what ON MATCH SET already does. `a = {...}`
@@ -1649,8 +1702,15 @@ class _MutateTranslator:
     def __init__(self, opts: _Options):
         self.o = opts
         self.rel: Optional[_RelPat] = None
+        self._nodes: list = []
         self.filters: dict = {}      # ('node', i) | ('rel', 0) -> [filter, ...]
         self.positions: dict = {}    # variable -> that key
+        #: Constraints the caller wrote that node_label_key=None /
+        #: edge_type_key=None discarded. On the read path that only
+        #: widens a result set; here it would widen a DELETE to the
+        #: whole graph, so an operation left with nothing refuses
+        #: instead of claiming the caller meant every row.
+        self.discarded: list = []
 
     # -- the matched rows ------------------------------------------------
 
@@ -1678,6 +1738,7 @@ class _MutateTranslator:
                 "different feature. Match the rows by their properties instead"
             )
         self.rel = match.rels[0] if match.rels else None
+        self._nodes = match.nodes
         for index, pat in enumerate(match.nodes):
             key = ("node", index)
             self.filters[key] = self._node_filters(pat)
@@ -1692,7 +1753,12 @@ class _MutateTranslator:
         if var is None:
             return
         if var in self.positions:
-            raise CypherError(f"variable {var!r} is already bound")
+            raise CypherError(
+                f"variable {var!r} is used twice in this pattern, which asks for a walk "
+                f"that returns to the same row -- the endpoint filters here are "
+                f"independent, so there is no way to say 'the same node'. Match the "
+                f"self-loop by its properties instead"
+            )
         self.positions[var] = key
 
     def _node_filters(self, pat: _NodePat) -> list:
@@ -1701,25 +1767,35 @@ class _MutateTranslator:
         translation the read path makes, since these select rows for the
         same reason."""
         filters = []
-        if pat.labels and self.o.node_label_key is not None:
-            if len(pat.labels) > 1:
+        if pat.labels:
+            if self.o.node_label_key is None:
+                self.discarded.append(
+                    (f"({pat.var or ''}:{':'.join(pat.labels)})", "node_label_key=None",
+                     f"MATCH ({pat.var or 'a'} {{type: {pat.labels[0]!r}}})"))
+            elif len(pat.labels) > 1:
                 raise CypherError(
                     f"node {pat.var or '(anonymous)'} has multiple labels "
                     f"({':'.join(pat.labels)}) -- they would map onto the single property "
                     f"{self.o.node_label_key!r}, and a property has one value"
                 )
-            filters.append({self.o.node_label_key: pat.labels[0]})
+            else:
+                filters.append({self.o.node_label_key: pat.labels[0]})
         if pat.props:
             filters.append(dict(pat.props))
         return filters
 
     def _rel_filters(self, pat: _RelPat) -> list:
         filters = []
-        if pat.types and self.o.edge_type_key is not None:
-            # Several types are an OR over one property, which is what a
-            # list value means to filters.resolve().
-            value = pat.types[0] if len(pat.types) == 1 else list(pat.types)
-            filters.append({self.o.edge_type_key: value})
+        if pat.types:
+            if self.o.edge_type_key is None:
+                self.discarded.append(
+                    (f"[:{'|'.join(pat.types)}]", "edge_type_key=None",
+                     f"MATCH ()-[{pat.var or 'r'} {{kind: {pat.types[0]!r}}}]->()"))
+            else:
+                # Several types are an OR over one property, which is what
+                # a list value means to filters.resolve().
+                value = pat.types[0] if len(pat.types) == 1 else list(pat.types)
+                filters.append({self.o.edge_type_key: value})
         if pat.props:
             filters.append(dict(pat.props))
         return filters
@@ -1783,8 +1859,21 @@ class _MutateTranslator:
 
     def _changes(self, mutations: list, var: str) -> tuple:
         """The (set, remove, replace) one query's SET and REMOVE clauses
-        add up to, refusing the orders whose Cypher meaning this cannot
-        reproduce in a single UPDATE."""
+        add up to.
+
+        Applied IN ORDER, last writer wins per property, because that is
+        what Cypher does: `SET a.x = 1 REMOVE a.x` leaves x gone and
+        `REMOVE a.x SET a.x = 1` leaves it set. Collecting the two
+        independently made both mean the same thing, and produced a plan
+        that could not execute -- the executor refuses to set and remove
+        one key at once -- so `cypher_to_mutations()` was handing back
+        plans that raise.
+
+        `SET a.x = null` REMOVES the property here, as it does in
+        Cypher. Merging a JSON null instead would leave a key that
+        Cypher considers absent and `properties ?& array[...]` (what
+        Required compiles to) considers present -- the same intent
+        walking straight past a declared constraint."""
         properties: dict = {}
         removals: list = []
         replace = False
@@ -1798,17 +1887,76 @@ class _MutateTranslator:
                         f"to keep inside the map, or drop it"
                     )
                 replace = replace or entry["replace"]
-                properties.update(entry["set"])
+                for key, value in entry["set"].items():
+                    if value is None:
+                        # A replacing map simply does not carry the key;
+                        # there is nothing left to remove it from.
+                        properties.pop(key, None)
+                        if not replace and key not in removals:
+                            removals.append(key)
+                    else:
+                        properties[key] = value
+                        if key in removals:
+                            removals.remove(key)
             elif isinstance(clause, _RemoveClause):
                 if replace:
                     raise CypherError(
                         f"REMOVE after `SET {var} = {{...}}` has nothing to remove from -- "
                         f"the map replaced every property. Leave the key out of the map"
                     )
-                removals.extend(clause.removals[var])
+                for key in clause.removals[var]:
+                    properties.pop(key, None)
+                    if key not in removals:
+                        removals.append(key)
         return properties, removals, replace
 
+    def _check_replaceable(self, var: str, properties: dict, replace: bool,
+                           key: Optional[str], what: str, written: Optional[str]) -> None:
+        """`SET x = {...}` may not erase the property a label maps to.
+
+        In Cypher `SET n = {map}` replaces PROPERTIES; labels are not
+        properties and survive it, and a relationship's type cannot be
+        changed at all. hopai stores both AS properties, so the same
+        query would erase the discriminator -- leaving a node no
+        `(a:person)` can match, or an edge no `[:knows]` can find and
+        nothing records the kind of. That is a query Cypher guarantees
+        is non-destructive translating into unrecoverable loss, so it
+        refuses."""
+        if not replace or key is None or key in properties:
+            return
+        value = f"{key}: {written!r}" if written else f"a {key} property"
+        raise CypherError(
+            f"`SET {var} = {{...}}` replaces every property, and {what} is the property "
+            f"{key!r} here -- so this would erase it, which Cypher's SET never does to a "
+            f"label or a relationship type. Put {value} in the map, or write "
+            f"`SET {var} += {{...}}` to merge into what is there"
+        )
+
     # -- emit --------------------------------------------------------------
+
+    def _operation(self, op: str, **arguments) -> dict:
+        """One operation, carrying only what it actually says.
+
+        Defaults are left out so the plan reads like the query it came
+        from, and `all` is added exactly when nothing constrains the
+        rows -- the flag the executor requires before it touches
+        everything. It belongs here rather than in the executor because
+        only the front end knows whether the caller wrote no filter or
+        wrote one that translation threw away: `MATCH (a:person) DELETE
+        a` under node_label_key=None arrives with an empty filter and
+        means the opposite of `MATCH (n) DELETE n`."""
+        kept = {k: v for k, v in arguments.items() if v}
+        if not any(k in kept for k in ("where", "start", "end")):
+            if self.discarded:
+                written, option, rewrite = self.discarded[0]
+                raise CypherError(
+                    f"{written} is the only thing constraining this query, and {option} "
+                    f"discards it -- so the query would change every row instead of the "
+                    f"ones it names. Drop {option}, or write the property the label "
+                    f"stands for: `{rewrite}`"
+                )
+            kept["all"] = True
+        return {"op": op, **kept}
 
     def translate(self, clauses: list) -> list:
         matches = [c for c in clauses if isinstance(c, _MatchClause)]
@@ -1834,16 +1982,22 @@ class _MutateTranslator:
 
     def _node_operation(self, var, deletes, properties, removals, replace) -> dict:
         if self.rel is not None:
+            # The example names what this query was trying to do: a
+            # caller who wrote SET should not be told to write a delete.
+            rewrite = f"DETACH DELETE {var}" if deletes else f"SET {var}.x = ..."
             raise CypherError(
                 f"{var!r} is a node in a pattern that also has a relationship, and hopai "
                 f"cannot change the nodes a relationship pattern matched -- that is a "
                 f"traversal driving a write. Match the node on its own: "
-                f"`MATCH ({var} {{...}}) DETACH DELETE {var}`"
+                f"`MATCH ({var} {{...}}) {rewrite}`"
             )
+        pattern = self._nodes[self.positions[var][1]]
+        self._check_replaceable(var, properties, replace, self.o.node_label_key, "a label",
+                                pattern.labels[0] if pattern.labels else None)
         where = _combine(self.filters[self.positions[var]], f"node {var}")
         if deletes:
-            return _operation("delete_nodes", where=where, detach=deletes[0].detach)
-        return _operation("update_nodes", where=where, set=properties,
+            return self._operation("delete_nodes", where=where, detach=deletes[0].detach)
+        return self._operation("update_nodes", where=where, set=properties,
                           remove=removals, replace=replace)
 
     def _edge_operation(self, var, deletes, properties, removals, replace) -> dict:
@@ -1858,6 +2012,9 @@ class _MutateTranslator:
                 f"how far to walk, and the edges a walk passed through are not what "
                 f"{var!r} names. Match one relationship"
             )
+        self._check_replaceable(var, properties, replace, self.o.edge_type_key,
+                                "a relationship's type",
+                                self.rel.types[0] if self.rel.types else None)
         where = _combine(self.filters[("rel", 0)], f"relationship {var}")
         start = _combine(self.filters[("node", 0)], "node")
         end = _combine(self.filters[("node", 1)], "node")
@@ -1866,24 +2023,11 @@ class _MutateTranslator:
             # first node is the one it ends at.
             start, end = end, start
         if deletes:
-            return _operation("delete_edges", where=where, start=start, end=end)
-        return _operation("update_edges", where=where, start=start, end=end,
+            return self._operation("delete_edges", where=where, start=start, end=end)
+        return self._operation("update_edges", where=where, start=start, end=end,
                           set=properties, remove=removals, replace=replace)
 
 
-def _operation(op: str, **arguments) -> dict:
-    """One operation, carrying only what it actually says.
-
-    Defaults are left out so the plan reads like the query it came from,
-    and `all` is added exactly when nothing constrains the rows -- which
-    is the flag the executor requires before it will touch everything.
-    Computed here rather than in the executor because only the front end
-    knows whether the caller wrote a filter that happened to be empty or
-    wrote no filter at all."""
-    kept = {k: v for k, v in arguments.items() if v}
-    if not any(k in kept for k in ("where", "start", "end")):
-        kept["all"] = True
-    return {"op": op, **kept}
 
 
 def cypher_to_operations(
@@ -1961,14 +2105,34 @@ def _refuse_mixed(clauses: list) -> None:
 
     Cypher runs them in order against one result set. Here they are two
     plans with two executors and two result types, and picking one would
-    silently drop the other half of what the caller wrote."""
-    if (any(isinstance(c, _WriteClause) for c in clauses)
-            and any(isinstance(c, _MutateClause) for c in clauses)):
+    silently drop the other half of what the caller wrote.
+
+    `CREATE ... SET` and `MERGE ... SET` get their own message. Both are
+    ordinary Cypher for "and give it these properties", the writer is
+    nobody's idea of a mutation, and the general message would send the
+    caller to split a query whose halves cannot be split -- the SET has
+    nothing to match on its own."""
+    writes = [c for c in clauses if isinstance(c, _WriteClause)]
+    if not writes or not any(isinstance(c, _MutateClause) for c in clauses):
+        return
+    if all(isinstance(c, (_SetClause, _RemoveClause))
+           for c in clauses if isinstance(c, _MutateClause)):
+        if any(c.kind == "merge" for c in writes):
+            raise CypherError(
+                "a bare SET after MERGE is not supported -- write `ON CREATE SET` for "
+                "the properties a new row gets and `ON MATCH SET` for the ones an "
+                "existing row gets, which is the distinction MERGE exists to make"
+            )
         raise CypherError(
-            "a query that creates or merges and also deletes or updates is not "
-            "supported: the two produce different plans and different results. Run them "
-            "as separate queries, in the order you want them applied"
+            "a bare SET after CREATE is not supported -- put the properties in the "
+            "pattern, `CREATE (a:person {name: 'Alice'})`, which is the same write in "
+            "one statement"
         )
+    raise CypherError(
+        "a query that creates or merges and also deletes or updates is not "
+        "supported: the two produce different plans and different results. Run them "
+        "as separate queries, in the order you want them applied"
+    )
 
 
 # ---------------------------------------------------------------------

@@ -122,9 +122,28 @@ class TestScopedMutations:
         assert not any(n["properties"].get("checked")
                        for n in support.traverse(Start()).nodes)
 
-    def test_an_endpoint_filter_never_resolves_across_graphs(self, two):
-        """The subquery behind start=/end= is scoped like every other
-        read: an unscoped one would let 's1' select support's edges."""
+    def test_deleting_edges_by_property_stops_at_the_graph_boundary(self, two):
+        """Edge statements need their own scope proof: a property-only
+        edge filter carries no ids, so nothing else keeps it inside this
+        graph. Dropping the discriminator from the edge DELETE left
+        every other test in this class passing."""
+        marketing, support = two
+        assert marketing.delete_edges(where={"kind": "knows"}).deleted_edges == 1
+        assert len(support.traverse(Start(), Hop()).edges) == 1
+
+    def test_updating_edges_by_property_stops_at_the_graph_boundary(self, two):
+        marketing, support = two
+        assert marketing.update_edges(where={"kind": "knows"},
+                                      set={"weight": 1}).updated_edges == 1
+        assert all("weight" not in e["properties"]
+                   for e in support.traverse(Start(), Hop()).edges)
+
+    def test_an_endpoint_filter_resolves_inside_this_graph_only(self, two):
+        """A node name that exists only in the other graph matches
+        nothing here. (Node ids are a global primary key, so this cannot
+        catch an unscoped subquery on its own -- the two tests above are
+        what pin the edge statements; this one pins the reading of the
+        endpoint filter itself.)"""
         marketing, support = two
         assert marketing.delete_edges(start={"name": "s1"}).deleted_edges == 0
         assert len(support.traverse(Start(), Hop()).edges) == 1

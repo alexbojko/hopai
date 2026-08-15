@@ -242,10 +242,18 @@ Every call returns a `MutationResult` — `deleted_nodes`,
 `deleted_edges`, `updated_nodes`, `updated_edges`, `elapsed_ms` — four
 counters because one delete touches both tables.
 
+`start`/`end` are filters, not references: any number of nodes may match
+one, and every edge touching any of them goes. That is the opposite of
+`add_edges()`, where `start`/`end` must identify exactly one node and
+ambiguity raises.
+
 **A call with no filter raises rather than matching everything.**
 `where=None` and `where={}` are what an empty variable looks like, and
 the cost of being wrong here is the data. Say it on purpose with
-`all=True`, or call `clear()`.
+`all=True`, or call `clear()`. `all`, `detach` and `replace` must be
+real booleans — `all="false"` raises rather than being read as truthy,
+because JSON booleans arriving as strings is an ordinary tool-call
+failure and this one would empty the graph.
 
 **Deleting a node that still has edges fails**, and the error names
 `detach=True` — the composite foreign key is doing its job, and an edge
@@ -619,9 +627,10 @@ graph.cypher("""
 ```
 
 `graph.cypher()` returns a `Subgraph` for a query that reads, an
-`IngestResult` for one that writes and a `MutationResult` for one that
-deletes or updates; `traverse_cypher`, `write_cypher` and
-`mutate_cypher` are the same thing when you'd rather be explicit.
+`IngestResult` for one that writes, a `MutationResult` for one that
+deletes or updates, and a plain `dict` of numbers for one whose `RETURN`
+aggregates; `traverse_cypher`, `write_cypher`, `mutate_cypher` and
+`aggregate_cypher` are the same thing when you'd rather be explicit.
 `cypher_to_traversal`, `graph.cypher_operations` and
 `cypher_to_mutations` show the translation — a `(Start, [Hop])` pair,
 the ingestion plan, or the mutation plan — without running anything.
@@ -649,6 +658,26 @@ difference is deliberate: before a `CREATE` it names **one** node (an
 edge has to attach to exactly one row, so an ambiguous match is an
 error), before a `DELETE` or a `SET` it names the **set** of rows to
 change, which is what Cypher means by it too.
+
+Three places where Cypher's meaning decides ours, because labels are
+properties here and are not in Neo4j:
+
+- **`SET x = {…}` refuses unless the map carries the label or type
+  property.** Cypher's `SET n = {map}` replaces *properties* — labels
+  survive it, and a relationship's type cannot be changed at all. Here
+  both are ordinary properties, so the same query would leave a node no
+  `(a:person)` can match and an edge no `[:knows]` can find. Put
+  `type: 'person'` in the map, or write `+=`.
+- **`SET a.x = null` removes the property**, as it does in Cypher. A
+  stored JSON null is *absent* to Cypher and *present* to `Required`, so
+  merging one would walk a constraint you declared.
+- **`SET` and `REMOVE` apply in order, last writer wins** —
+  `SET a.x = 1 REMOVE a.x` and `REMOVE a.x SET a.x = 1` differ.
+
+And one refusal that only exists because deleting is not reading: with
+`node_label_key=None`, `MATCH (a:person) DELETE a` has had its only
+constraint translated away. On the read path that widens a result set;
+here it would empty the graph, so it raises instead.
 
 The pattern is one node or one relationship. Changing the rows a
 multi-hop pattern reached (`MATCH (a)-[:knows]->(b) DELETE b`) is a
@@ -718,7 +747,15 @@ translating into something that answers a different question:
   refuses with a message rather than approximating.
 - Deletes and updates select rows by their properties, not by where a
   traversal arrived: `MATCH (a)-[:knows]->(b) DELETE b` refuses rather
-  than guessing which of the two readings you meant.
+  than guessing which of the two readings you meant. There is no way to
+  target a row by its `id` column either — `where=` filters the JSONB
+  properties, so give the rows you care about a property you can name
+  (and a `Unique` on it).
+- `enforce_schema(endpoints=True)` polices endpoint types with a trigger
+  on the *edges* table, so retyping a node with `update_nodes` (or
+  `merge_nodes(replace=True)`, which could always do it) can leave a
+  declared edge connecting types the schema forbids without raising.
+  Re-run `enforce_schema()` after retyping nodes.
 - Synchronous only — every call blocks; no `AsyncSession` support yet.
 - A cycle-protection path array is carried on every recursive row. Cheap
   at moderate depth, measurably not-cheap on single-segment traversals

@@ -53,11 +53,23 @@ read.** When a design question comes up, these decide it, in order:
   variable looks like, and matching everything on it is unrecoverable. `all=True` is the
   opt-in; `all=True` *with* a filter refuses too, since one of them is being ignored.
   (`test_a_delete_with_no_filter_refuses`)
+- **`all` / `detach` / `replace` are checked, not coerced.** `all="false"` is truthy in
+  Python, and JSON booleans arriving as the strings `"true"`/`"false"` is an ordinary
+  tool-call failure — coercing let the string `"false"` mean *every row*.
+- **A constraint the options discard is not "no filter".** `node_label_key=None` throws
+  labels away; on the read path that widens a result set, in front of a `DELETE` it
+  widened it to the whole graph *and* auto-supplied the `all=True` opt-in. An operation
+  left with nothing refuses instead.
 - **Deleting a node that still has edges refuses and the message names `detach=True`.**
   Cascading instead would leave the corruption the composite FK exists to prevent.
 - **A mutating `MATCH` binds a set of rows; an ingesting one binds a single node.** That
   is Cypher's own asymmetry — `SET` applies to every match, an edge attaches to exactly
   one — so neither may be "fixed" into the other.
+- **`SET x = {...}` refuses unless the map carries the label/type property, and
+  `SET x.k = null` means REMOVE.** Cypher's `SET n = {map}` never erases a label and a
+  relationship's type cannot be changed at all; `= null` removes a property, where a
+  stored JSON null is absent to Cypher and *present* to `Required`. Both are the same
+  spelling meaning something else, which is the one thing this library must not do.
 - **Every read and write goes through `Graph._scoped()`.** Forgetting the graph
   discriminator does not error; it silently touches another graph's rows.
 - **Writes are one transaction**, batching included. A half-committed write makes a
@@ -103,6 +115,15 @@ from hopai import Graph, Start, Hop
 g = Graph("postgresql+psycopg2://u:p@localhost/db")   # never connects
 print(g.build_query(Start(where={"type": "person"}), [Hop(hops=(1, 3))])
        .compile(dialect=postgresql.dialect()))
+```
+
+Deletes and updates build the same way — `Mutator`'s `*_statement` methods take no
+connection, which is how the graph discriminator is asserted on with nothing running:
+
+```python
+from hopai.mutate import Mutator
+print(Mutator(g).delete_nodes_statement({"type": "draft"})
+      .compile(dialect=postgresql.dialect()))
 ```
 
 ## Deeper detail

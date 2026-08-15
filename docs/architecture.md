@@ -71,6 +71,12 @@ caller declared" are one implementation, not two that drift.
   (`tests/test_mutate.py::TestStatementShape`).
 - **Both front ends emit the same operation dicts** (`MUTATION_OPS`), run by one
   executor: `spec_to_mutations()` for JSON, `cypher_to_mutations()` for Cypher.
+- **`all=True` is decided by the front end, never by the executor** — only the front end
+  knows whether the caller wrote no filter or wrote one that translation discarded
+  (`node_label_key=None`). `_MutateTranslator._operation` refuses in the second case;
+  the executor only sees a flag that was meant.
+- **The booleans go through `_flag()`**, which rejects anything that is not `True` or
+  `False`. `"false"` is truthy, and these arguments decide how many rows survive.
 
 A mutating `MATCH` binds a *set* of rows; the ingesting one binds a single node. That
 asymmetry is Cypher's own — `MATCH (a:person) SET a.x = 1` updates every person, while an

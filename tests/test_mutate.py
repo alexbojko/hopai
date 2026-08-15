@@ -36,6 +36,25 @@ def norm(statement) -> str:
         dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})).split())
 
 
+def _plain_tables(offline_graph, graph_col):
+    """A Graph over tables named nothing like hopai's own, so a
+    hardcoded "start_id" or "id" shows up immediately."""
+    from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+    from sqlalchemy.dialects.postgresql import JSONB
+
+    from hopai import Graph
+    meta = MetaData()
+    scope = lambda: [] if graph_col is None else [Column(graph_col, Text)]   # noqa: E731
+    nodes = Table("v", meta, Column("node_key", BigInteger, primary_key=True),
+                  *scope(), Column("properties", JSONB))
+    edges = Table("e", meta, Column("edge_key", BigInteger, primary_key=True),
+                  *scope(), Column("src", BigInteger),
+                  Column("dst", BigInteger), Column("properties", JSONB))
+    return Graph(offline_graph.engine, node_table=nodes, edge_table=edges,
+                 node_id_col="node_key", edge_id_col="edge_key",
+                 edge_start_col="src", edge_end_col="dst", graph_col=graph_col)
+
+
 def properties_of(graph, **where) -> list:
     return [n["properties"] for n in graph.traverse(Start(where=where or None)).nodes]
 
@@ -87,8 +106,14 @@ class TestDeleteNodes:
         """Postgres says "still referenced from table edges", which
         leaves the caller to work out both that edges reference nodes
         and what the flag is called."""
-        with pytest.raises(ConstraintViolation, match="detach=True"):
+        with pytest.raises(ConstraintViolation) as exc:
             people.delete_nodes(where={"name": "Bob"})
+        # The fix leads; the driver's text is kept as the tail because it
+        # names the constraint and the row. Both halves are asserted:
+        # blanking the structured fields left the suite green.
+        assert str(exc.value).startswith("cannot delete a node that still has edges")
+        assert "detach=True" in str(exc.value)
+        assert exc.value.constraint and exc.value.detail
         assert "Bob" in names(people)
 
     def test_the_refusal_still_carries_the_driver_error(self, people):
@@ -102,12 +127,31 @@ class TestDeleteNodes:
             people.delete_nodes(where={"name": "Bob"})
         assert isinstance(exc.value.__cause__, IntegrityError)
 
-    def test_a_refused_delete_leaves_the_edges_alone(self, people):
-        """The failing statement is inside the transaction that would
-        have deleted the node, so nothing at all survives it."""
+    def test_a_detached_delete_that_fails_puts_the_edges_back(self, people):
+        """The edge delete and the node delete are one transaction, so a
+        failure after the edges are gone has to bring them back.
+
+        Provoked with a second operation that fails: the previous
+        version of this test called delete_nodes(detach=False), which
+        never runs an edge delete at all and so could not fail however
+        the transaction was scoped."""
         with pytest.raises(ConstraintViolation):
-            people.delete_nodes(where={"type": "person"})
+            people.mutate({"operations": [
+                {"op": "delete_nodes", "where": {"name": "Bob"}, "detach": True},
+                {"op": "delete_nodes", "where": {"name": "Alice"}},   # still has works_at
+            ]})
         assert kinds(people) == ["knows", "knows", "works_at"]
+        assert names(people) == {"Alice", "Bob", "Carol", "Acme"}
+
+    def test_a_self_loop_is_detached_from_both_sides(self, fresh_graph):
+        """detach matches incident edges with OR over both endpoints; a
+        self-loop is the row that a start-only simplification would
+        leave behind to fail the foreign key."""
+        fresh_graph.ingest({"nodes": [{"name": "solo"}],
+                            "edges": [{"start": {"name": "solo"}, "end": {"name": "solo"},
+                                       "kind": "self"}]})
+        assert fresh_graph.delete_nodes(where={"name": "solo"},
+                                        detach=True).to_dict()["deleted_edges"] == 1
 
     def test_detach_deletes_edges_on_both_sides(self, people):
         """Bob is the end of one edge and the start of another; missing
@@ -229,6 +273,19 @@ class TestUpdateNodes:
                                    set={"checked": True}).updated_nodes == 3
         assert all(p["checked"] for p in properties_of(people, type="person"))
 
+    def test_a_filter_matching_nothing_updates_nothing(self, people):
+        assert people.update_nodes(where={"name": "Nobody"}, set={"x": 1}).updated_nodes == 0
+        assert all("x" not in p for p in properties_of(people))
+
+    def test_hostile_property_keys_can_be_removed(self, fresh_graph):
+        """remove= builds the one hand-written SQL fragment in the
+        module (`jsonb - text[]`), so the keys go through bound
+        parameters like everything else."""
+        keys = ["100% \\ weird \" quotes ' -- ;", "日本語", "x'; DROP TABLE nodes; --"]
+        fresh_graph.add_nodes([{"keep": 1, **dict.fromkeys(keys, "v")}])
+        assert fresh_graph.update_nodes(where={"keep": 1}, remove=keys).updated_nodes == 1
+        assert properties_of(fresh_graph) == [{"keep": 1}]
+
     def test_an_update_can_violate_a_declared_constraint(self, fresh_graph):
         """The caller declared PropertyType, and an UPDATE is as capable
         of breaking it as an INSERT -- so it gets the same named
@@ -255,6 +312,15 @@ class TestUpdateEdges:
                     for e in people.traverse(Start(), Hop(via={"kind": "knows"})).edges}
         assert weighted == {9, None}
 
+    def test_an_end_filter_narrows_the_update(self, people):
+        """`end=` was never executed by the suite -- dropping it from
+        update_edges_statement left every test passing, because the only
+        endpoint filter under test was `start=`."""
+        people.update_edges(where={"kind": "knows"}, end={"name": "Carol"}, set={"weight": 9})
+        weights = {e["properties"].get("name", e["properties"].get("weight"))
+                   for e in people.traverse(Start(), Hop(via={"kind": "knows"})).edges}
+        assert weights == {9, None}          # Bob->Carol only; Alice->Bob untouched
+
     def test_an_edge_update_can_violate_a_declared_constraint(self, fresh_graph):
         """The edge path translates its IntegrityError too -- an update
         rejected by a constraint the caller declared should name it, not
@@ -262,7 +328,7 @@ class TestUpdateEdges:
         fresh_graph.define_constraints(edges=[PropertyType("weight", "number")])
         fresh_graph.ingest({"nodes": [{"n": 1}, {"n": 2}],
                             "edges": [{"start": {"n": 1}, "end": {"n": 2}, "kind": "knows"}]})
-        with pytest.raises(ConstraintViolation, match="rejected by constraint"):
+        with pytest.raises(ConstraintViolation, match="edge rejected by constraint"):
             fresh_graph.update_edges(where={"kind": "knows"}, set={"weight": "heavy"})
 
     def test_remove_drops_an_edge_property(self, people):
@@ -314,11 +380,53 @@ class TestRefusals:
 
     def test_replace_with_no_properties_refuses(self, people):
         with pytest.raises(ValueError, match="erase every property"):
-            people.update_nodes(where={"type": "person"}, remove=["age"], replace=True)
+            people.update_nodes(where={"type": "person"}, replace=True)
 
-    def test_replace_and_remove_contradict_each_other(self, people):
+    @pytest.mark.parametrize("arguments", [
+        {"set": {"a": 1}, "remove": ["b"], "replace": True},
+        {"remove": ["age"], "replace": True},
+    ])
+    def test_replace_and_remove_contradict_each_other(self, people, arguments):
+        """Diagnosed as the contradiction it is. Checked before the
+        "nothing to change" case, which used to shadow it and answer
+        `replace=True, remove=[...]` with "...or use remove=[...] to drop
+        specific keys" -- telling the caller to do what they had done."""
         with pytest.raises(ValueError, match="contradicts itself"):
-            people.update_nodes(where={"type": "person"}, set={"a": 1}, remove=["b"], replace=True)
+            people.update_nodes(where={"type": "person"}, **arguments)
+
+    def test_an_explicitly_empty_bag_is_not_the_same_as_no_argument(self, people):
+        """`set={}` with replace means Cypher's `SET a = {}` -- clear
+        every property. `set=None` is the argument not given at all, and
+        erasing on that would be the accident the guards exist for."""
+        assert people.update_nodes(where={"name": "Alice"}, set={},
+                                   replace=True).updated_nodes == 1
+        assert properties_of(people, name="Alice") == []      # no properties left to match on
+        assert len(properties_of(people)) == 4
+        with pytest.raises(ValueError, match="erase every property"):
+            people.update_nodes(where={"type": "person"}, set=None, replace=True)
+
+    @pytest.mark.parametrize("call,arguments", [
+        ("delete_nodes", {"all": "false"}),
+        ("delete_nodes", {"where": {"type": "person"}, "detach": 1}),
+        ("update_nodes", {"where": {"type": "person"}, "set": {"x": 1}, "replace": "false"}),
+    ])
+    def test_a_flag_that_decides_destruction_is_checked_not_coerced(self, people, call,
+                                                                    arguments):
+        """JSON booleans arriving as the strings "true"/"false" is an
+        ordinary tool-call failure, and "false" is truthy in Python -- so
+        coercing let `{"op": "delete_nodes", "all": "false"}` mean "yes,
+        every row" and empty the graph."""
+        with pytest.raises(TypeError, match="takes True or False"):
+            getattr(people, call)(**arguments)
+        assert len(properties_of(people)) == 4
+
+    def test_a_property_value_outside_json_is_refused_before_the_transaction(self, people):
+        """json.dumps emits the non-JSON tokens NaN and Infinity happily,
+        so this used to reach the driver as a DataError -- raised after
+        the transaction opened, and in a document after earlier
+        operations had already run."""
+        with pytest.raises(TypeError, match="values must be JSON"):
+            people.update_nodes(where={"type": "person"}, set={"score": float("nan")})
 
     def test_setting_and_removing_one_property_refuses(self, people):
         with pytest.raises(ValueError, match="both sets and removes"):
@@ -364,8 +472,11 @@ class TestStatementShape:
             mutator.update_edges_statement({"kind": "knows"}, end={"name": "Bob"}, set={"x": 1}),
             mutator.delete_nodes_statement(all=True),
         ]
-        for statement in statements:
-            assert "graph_id = 'marketing'" in norm(statement)
+        # Counted, not merely present: the endpoint subquery carries the
+        # discriminator too, so a substring test stayed green with the
+        # scope dropped from the outer DELETE of detach_statement.
+        for statement, occurrences in zip(statements, (1, 3, 2, 1, 2, 1), strict=True):
+            assert norm(statement).count("graph_id = 'marketing'") == occurrences
 
     def test_an_endpoint_subquery_is_scoped_too(self, offline_graph):
         """Two occurrences: the edges being deleted, and the nodes the
@@ -399,22 +510,22 @@ class TestStatementShape:
         noise a reader has to look twice at."""
         assert "true" not in norm(Mutator(offline_graph).delete_edges_statement(all=True))
 
+    def test_tables_without_a_discriminator_carry_no_scope_at_all(self, offline_graph):
+        """graph_col=None means one graph, so the predicate is the
+        filter alone -- `WHERE true AND ...` is noise, and `and_()` over
+        nothing raises."""
+        graph = _plain_tables(offline_graph, graph_col=None)
+        mutator = Mutator(graph)
+        assert norm(mutator.delete_nodes_statement({"type": "person"})) == (
+            'DELETE FROM v WHERE v.properties @> CAST(\'{"type": "person"}\' AS JSONB)')
+        assert norm(mutator.delete_edges_statement(all=True)) == "DELETE FROM e"
+        with pytest.raises(ValueError, match="in these tables"):
+            mutator.delete_nodes_statement()
+
     def test_custom_column_names_are_honoured(self, offline_graph):
         """Nothing may hardcode "start_id" -- the tables are the
         caller's."""
-        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
-        from sqlalchemy.dialects.postgresql import JSONB
-
-        from hopai import Graph
-        meta = MetaData()
-        nodes = Table("v", meta, Column("node_key", BigInteger, primary_key=True),
-                      Column("g", Text), Column("properties", JSONB))
-        edges = Table("e", meta, Column("edge_key", BigInteger, primary_key=True),
-                      Column("g", Text), Column("src", BigInteger), Column("dst", BigInteger),
-                      Column("properties", JSONB))
-        graph = Graph(offline_graph.engine, node_table=nodes, edge_table=edges,
-                      node_id_col="node_key", edge_id_col="edge_key",
-                      edge_start_col="src", edge_end_col="dst", graph_col="g")
+        graph = _plain_tables(offline_graph, graph_col="g")
         sql = norm(Mutator(graph).delete_edges_statement({"kind": "knows"}, start={"name": "A"}))
         assert "DELETE FROM e" in sql and "e.src IN (SELECT v.node_key" in sql
 
@@ -455,6 +566,44 @@ class TestJsonDocument:
         ]})
         assert names(people) == {"Alice", "Carol", "Acme"}
 
+    def test_endpoint_filters_take_the_json_grammar_too(self, people):
+        """`start`/`end` are parsed like `where`, not passed through:
+        with only `where` parsed, every test still passed, because plain
+        dicts need no parsing and no test used an operator form here."""
+        assert people.mutate({"operations": [
+            {"op": "delete_edges", "start": {"gt": ["age", 70]}},
+        ]}).deleted_edges == 1
+        assert kinds(people) == ["knows", "works_at"]
+
+    def test_an_edge_update_is_counted_in_the_document_total(self, people):
+        """update_edges was never executed through a plan: deleting the
+        line that accumulates its count left the whole suite green."""
+        result = people.mutate({"operations": [
+            {"op": "update_edges", "where": {"kind": "knows"}, "set": {"weight": 2}}]})
+        assert result.updated_edges == 2
+        assert [e["properties"].get("weight")
+                for e in people.traverse(Start(), Hop(via={"kind": "knows"})).edges] == [2, 2]
+
+    def test_all_and_replace_travel_through_a_document(self, people):
+        """Neither flag was exercised by any document, so a per-operation
+        key could be dropped from _OP_KEYS and only the union test
+        noticed -- which it did not, being a union."""
+        result = people.mutate({"operations": [
+            {"op": "update_nodes", "where": {"name": "Alice"},
+             "set": {"type": "person", "name": "Alice"}, "replace": True},
+            {"op": "delete_edges", "all": True},
+        ]})
+        assert (result.updated_nodes, result.deleted_edges) == (1, 3)
+        assert properties_of(people, name="Alice") == [{"type": "person", "name": "Alice"}]
+
+    def test_a_flag_arriving_as_a_string_is_refused(self, people):
+        """The tool-call failure this front end exists to survive: JSON
+        booleans as the strings "true"/"false". "false" is truthy in
+        Python, so this used to mean "yes, every row"."""
+        with pytest.raises(TypeError, match="takes True or False"):
+            people.mutate({"operations": [{"op": "delete_nodes", "all": "false"}]})
+        assert len(properties_of(people)) == 4
+
     def test_the_plan_can_be_read_without_running_it(self, people):
         plan = spec_to_mutations({"operations": [
             {"op": "delete_nodes", "where": {"type": "draft"}, "detach": True}]})
@@ -482,24 +631,55 @@ class TestJsonDocument:
             people._mutator.execute_operations([{"op": "truncate"}])
 
 
+def branches() -> dict:
+    """The schema's per-operation branches, keyed by `op`."""
+    return {b["properties"]["op"]["const"]: b
+            for b in MUTATE_TOOL_SCHEMA["parameters"]["properties"]["operations"]
+            ["items"]["oneOf"]}
+
+
 class TestToolSchema:
     def test_is_json_serializable(self):
         assert json.loads(json.dumps(MUTATE_TOOL_SCHEMA)) == MUTATE_TOOL_SCHEMA
 
     def test_lists_exactly_the_operations_the_parser_accepts(self):
         from hopai.mutate import MUTATION_OPS
-        enum = MUTATE_TOOL_SCHEMA["parameters"]["properties"]["operations"]["items"] \
-            ["properties"]["op"]["enum"]
-        assert set(enum) == MUTATION_OPS
+        assert set(branches()) == MUTATION_OPS
 
-    def test_describes_every_argument_an_operation_takes(self):
-        """A model cannot pass what the schema does not mention, and the
-        parser rejects what it does not list -- so the two have to
-        agree."""
+    def test_each_operation_describes_exactly_its_own_arguments(self):
+        """Asserted per operation, not as a union: a union hides the
+        removal of `all` from delete_nodes behind `all` still being
+        listed on the three others, and a model emitting the documented
+        {"op": "delete_nodes", "all": true} would then be told
+        delete_nodes does not take it."""
         from hopai.mutate import _OP_KEYS
-        described = set(MUTATE_TOOL_SCHEMA["parameters"]["properties"]["operations"]
-                        ["items"]["properties"]) - {"op"}
-        assert described == set().union(*_OP_KEYS.values())
+        for op, branch in branches().items():
+            assert set(branch["properties"]) - {"op"} == set(_OP_KEYS[op])
+            assert branch["additionalProperties"] is False
+
+    def test_every_documented_argument_survives_the_parser(self):
+        """The schema and the parser are two statements of one rule, so
+        anything the schema offers has to parse."""
+        for op, branch in branches().items():
+            values = {"where": {"type": "x"}, "start": {"type": "x"}, "end": {"type": "x"},
+                      "set": {"a": 1}, "remove": ["b"], "replace": False,
+                      "detach": True, "all": False}
+            operation = {"op": op, **{k: values[k] for k in branch["properties"] if k != "op"}}
+            assert spec_to_mutations({"operations": [operation]})[0]["op"] == op
+
+    def test_the_filter_grammar_is_spelled_out_not_referenced(self):
+        """A caller may be handed mutate_graph and nothing else, so
+        "same grammar as traverse_graph" would be a dangling pointer --
+        and a model that cannot express a comparison gets a silent zero
+        and reaches for the one lever left, which is `all`."""
+        for key in ("where", "start", "end"):
+            described = [b["properties"][key]["description"]
+                         for b in branches().values() if key in b["properties"]]
+            assert described and all('{"gt": [key, value]}' in d for d in described)
+
+    def test_the_all_flag_documents_both_halves_of_its_rule(self):
+        described = branches()["delete_nodes"]["properties"]["all"]["description"]
+        assert "neither a filter nor this flag" in described and "with both" in described
 
     def test_a_document_shaped_like_the_schema_runs(self, people):
         assert people.mutate({"operations": [
@@ -551,8 +731,44 @@ class TestCypherTranslation:
         ("MATCH (a:person) SET a.x = 1 REMOVE a.y",
          [{"op": "update_nodes", "where": {"type": "person"}, "set": {"x": 1},
            "remove": ["y"]}]),
+        ("MATCH (a:person) SET a = {type: 'person'}",
+         [{"op": "update_nodes", "where": {"type": "person"}, "set": {"type": "person"},
+           "replace": True}]),
         ("MATCH ()-[r:knows]->() SET r.weight = 2",
          [{"op": "update_edges", "where": {"kind": "knows"}, "set": {"weight": 2}}]),
+        # An endpoint filter is a filter: deriving `all` from `where`
+        # alone turned this into "every edge", which the executor then
+        # refused as "all=True also got a filter".
+        ("MATCH (a {name: 'Alice'})-[r]->() DELETE r",
+         [{"op": "delete_edges", "start": {"name": "Alice"}}]),
+        ("MATCH ()-[r]->(b:company) SET r.x = 1",
+         [{"op": "update_edges", "end": {"type": "company"}, "set": {"x": 1}}]),
+        # replace has to survive anything else touching the variable, or
+        # a query that says "wipe the bag" quietly means "merge into it".
+        ("MATCH (a:person) SET a = {type: 'person', y: 2}, a += {x: 1}",
+         [{"op": "update_nodes", "where": {"type": "person"},
+           "set": {"type": "person", "y": 2, "x": 1}, "replace": True}]),
+        ("MATCH (a:person) SET a = {type: 'person', y: 2} SET a += {x: 1}",
+         [{"op": "update_nodes", "where": {"type": "person"},
+           "set": {"type": "person", "y": 2, "x": 1}, "replace": True}]),
+        ("MATCH ()-[r:knows]->() SET r = {kind: 'knows', since: 2000}",
+         [{"op": "update_edges", "where": {"kind": "knows"},
+           "set": {"kind": "knows", "since": 2000}, "replace": True}]),
+        # `= null` REMOVES a property in Cypher. Merging a JSON null
+        # instead leaves a key Cypher calls absent and Required() calls
+        # present -- the same intent walking past a declared constraint.
+        ("MATCH (a:person) SET a.nickname = null",
+         [{"op": "update_nodes", "where": {"type": "person"}, "remove": ["nickname"]}]),
+        ("MATCH (a:person) SET a += {nickname: null, x: 1}",
+         [{"op": "update_nodes", "where": {"type": "person"}, "set": {"x": 1},
+           "remove": ["nickname"]}]),
+        # Applied in order, last writer wins -- these two differ in
+        # Cypher, and collecting SET and REMOVE independently made them
+        # identical AND unexecutable (the executor refuses both on one key).
+        ("MATCH (a:person) SET a.x = 1 REMOVE a.x",
+         [{"op": "update_nodes", "where": {"type": "person"}, "remove": ["x"]}]),
+        ("MATCH (a:person) REMOVE a.x SET a.x = 1",
+         [{"op": "update_nodes", "where": {"type": "person"}, "set": {"x": 1}}]),
     ])
     def test_translates_to_the_same_operations_the_python_api_runs(self, query, plan):
         assert cypher_to_mutations(query) == plan
@@ -577,11 +793,20 @@ class TestCypherTranslation:
         assert cypher_to_mutations("MATCH ()-[r:knows|likes]->() DELETE r") == [
             {"op": "delete_edges", "where": {"kind": ["knows", "likes"]}}]
 
-    def test_label_and_property_that_collide_are_unsatisfiable(self, ):
-        """The same refusal the read path makes: an AND that nothing can
-        satisfy would delete nothing and report success."""
-        with pytest.raises(CypherError, match="which nothing can match"):
-            cypher_to_mutations("MATCH (a:person {type: 'company'}) DELETE a")
+    @pytest.mark.parametrize("query,subject", [
+        ("MATCH (a:person {type: 'company'}) DELETE a", "node a"),
+        ("MATCH ()-[r:knows {kind: 'likes'}]->() DELETE r", "relationship r"),
+        ("MATCH (a:person {type: 'company'})-[r]->() DELETE r", "node"),
+        ("MATCH ()-[r]->(b:person {type: 'company'}) DELETE r", "node"),
+    ])
+    def test_a_pattern_nothing_can_satisfy_is_refused_by_name(self, query, subject):
+        """The same refusal the read path makes -- an AND nothing can
+        satisfy would delete nothing and report success -- and it says
+        which part of the pattern is unsatisfiable, on every side."""
+        with pytest.raises(CypherError) as exc:
+            cypher_to_mutations(query)
+        assert str(exc.value).startswith(subject)
+        assert "which nothing can match" in str(exc.value)
 
     def test_relationship_properties_join_the_filter(self):
         assert cypher_to_mutations("MATCH ()-[r:knows {since: 2000}]->() DELETE r") == [
@@ -609,13 +834,15 @@ class TestCypherRefusals:
         ("MATCH p = (a)-[r]->(b) DELETE r", "never a path"),
         ("OPTIONAL MATCH (a:person) DELETE a", "no meaning"),
         ("MATCH (a:person) MATCH (b:company) DELETE a", "one MATCH clause"),
-        ("MATCH (a)-[r]->(b)-[q]->(c) DELETE r", "multi-hop"),
+        ("MATCH (a)-[r]->(b)-[q]->(c) DELETE r",
+         "^a delete or an update matches one node or one relationship, not a multi-hop"),
         ("MATCH (a:person) DELETE a RETURN count(a)", "MutationResult, not a number"),
         ("MATCH (a:person) CREATE (b {x: 1}) DELETE a", "separate queries"),
-        ("MATCH (a:person)-[r]->(b) WHERE a.x = 1 OR b.y = 2 DELETE r", "several variables"),
+        ("MATCH (a:person)-[r]->(b) WHERE a.x = 1 OR b.y = 2 DELETE r",
+         r"several variables \(a, b\)"),
         ("MATCH (a:person) WHERE b.x = 1 DELETE a", "unknown variable"),
         ("DELETE a", "no MATCH clause"),
-        ("MATCH (a)-[a:knows]->(b) DELETE a", "already bound"),
+        ("MATCH (a)-[a:knows]->(b) DELETE a", "used twice in this pattern"),
         ("MATCH (a:person:employee) DELETE a", "multiple labels"),
         ("MATCH (a)-[r]->(b) WHERE all(x IN relationships(p) WHERE x.k = 1) DELETE r",
          "put the condition on it directly"),
@@ -626,6 +853,58 @@ class TestCypherRefusals:
     def test_what_does_not_translate_says_why(self, query, message):
         with pytest.raises(CypherError, match=message):
             cypher_to_mutations(query)
+
+    @pytest.mark.parametrize("query,options,message", [
+        ("MATCH (a:person) DETACH DELETE a", {"node_label_key": None},
+         "would change every row instead of the ones it names"),
+        ("MATCH ()-[r:knows]->() DELETE r", {"edge_type_key": None},
+         "edge_type_key=None discards it"),
+    ])
+    def test_a_constraint_the_options_discard_refuses_rather_than_widening(
+            self, query, options, message):
+        """THE dangerous one. `node_label_key=None` is a supported
+        option; on the read path it widens a result set, and here it
+        widened a DELETE to the whole graph -- and then auto-supplied
+        the `all=True` opt-in that exists to stop exactly that."""
+        with pytest.raises(CypherError, match=message):
+            cypher_to_mutations(query, **options)
+
+    @pytest.mark.parametrize("query,keep", [
+        ("MATCH (a:person) SET a = {name: 'Alicia'}", "type: 'person'"),
+        ("MATCH (a:person) SET a = {}", "type: 'person'"),
+        ("MATCH (a {email: 'a@x.com'}) SET a = {name: 'Alicia'}", "a type property"),
+        ("MATCH ()-[r:knows]->() SET r = {since: 2000}", "kind: 'knows'"),
+    ])
+    def test_a_replacing_map_may_not_erase_the_label_or_the_type(self, query, keep):
+        """In Cypher `SET n = {map}` replaces PROPERTIES: labels survive
+        it and a relationship's type cannot be changed at all. Here both
+        are properties, so the same query erased the discriminator --
+        leaving a node no `(a:person)` matches and an edge no
+        `[:knows]` finds. Cypher guarantees this query is
+        non-destructive, so translating it is not an option."""
+        with pytest.raises(CypherError) as exc:
+            cypher_to_mutations(query)
+        assert "replaces every property" in str(exc.value)
+        assert keep in str(exc.value) and "+=" in str(exc.value)
+
+    @pytest.mark.parametrize("query,message", [
+        ("MERGE (a:person {email: 'c@x.com'}) SET a.name = 'Carol'", "ON CREATE SET"),
+        ("CREATE (a:person {email: 'c@x.com'}) SET a.name = 'Carol'",
+         "put the properties in the pattern"),
+    ])
+    def test_a_bare_set_after_a_write_keeps_its_own_message(self, query, message):
+        """Both are ordinary Cypher for "and give it these properties".
+        The general mixing refusal sent the caller to split a query whose
+        halves cannot be split -- the SET has nothing to match on its
+        own."""
+        from hopai import cypher_to_operations
+        with pytest.raises(CypherError, match=message):
+            cypher_to_operations(query)
+
+    def test_a_merge_cannot_remove_a_property(self):
+        from hopai import cypher_to_operations
+        with pytest.raises(CypherError, match="removes a property in Cypher"):
+            cypher_to_operations("MERGE (a {n: 1}) ON MATCH SET a.x = null")
 
     def test_a_read_query_is_refused_by_the_mutation_translator(self):
         with pytest.raises(CypherError, match="deletes and updates nothing"):
@@ -657,6 +936,19 @@ class TestCypherExecution:
         assert people.cypher(
             "MATCH (a {name: 'Alice'})-[r:knows]->() DELETE r").deleted_edges == 1
         assert kinds(people) == ["knows", "works_at"]
+
+    def test_setting_a_relationship_property_runs_end_to_end(self, people):
+        assert people.cypher("MATCH ()-[r:knows]->() SET r.weight = 2").updated_edges == 2
+        assert all(e["properties"]["weight"] == 2
+                   for e in people.traverse(Start(), Hop(via={"kind": "knows"})).edges)
+
+    def test_setting_a_property_to_null_removes_it(self, people):
+        """End to end, because the whole point is the stored row: a JSON
+        null would still satisfy Required('nickname') and would not be
+        found by `WHERE a.nickname IS NULL`."""
+        assert people.cypher("MATCH (a:person) SET a.nickname = null").updated_nodes == 3
+        assert properties_of(people, name="Alice")[0] == {
+            "type": "person", "name": "Alice", "age": 34}
 
     def test_cypher_dispatches_on_what_the_query_does(self, people):
         """Four return types, decided by the query rather than by which

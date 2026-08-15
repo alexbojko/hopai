@@ -67,8 +67,9 @@ READ -- the same traversal in three interchangeable notations:
     ''')
 
 graph.cypher() returns a Subgraph for a query that reads, an
-IngestResult for one that writes, and a MutationResult for one that
-deletes or updates.
+IngestResult for one that writes, a MutationResult for one that deletes
+or updates, and a plain dict of numbers for one whose RETURN aggregates
+-- which one is visible in the query.
 
 A result carries every node and edge on a matching chain:
 

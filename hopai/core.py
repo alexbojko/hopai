@@ -815,6 +815,11 @@ class Graph:
 
             graph.delete_edges(where={"kind": "knows"}, start={"name": "Alice"})
 
+        `start`/`end` are filters, not references: any number of nodes
+        may match one, and every edge touching any of them goes. That is
+        the opposite of add_edges(), where `start`/`end` must identify
+        exactly one node and ambiguity raises.
+
         Returns a MutationResult. Deleting an edge never affects the
         nodes it connected."""
         return self._mutator.delete_edges(where, start=start, end=end, all=all)
@@ -834,8 +839,9 @@ class Graph:
     def update_edges(self, where=None, start=None, end=None, set=None, remove=None,
                      replace: bool = False, all: bool = False):
         """Update every edge matching `where`, with the same set/remove/
-        replace semantics as update_nodes() and the same optional
-        endpoint filters as delete_edges(). Returns a MutationResult."""
+        replace semantics as update_nodes() and the same endpoint
+        filters as delete_edges() -- including that they are filters
+        rather than references. Returns a MutationResult."""
         return self._mutator.update_edges(where, start=start, end=end, set=set,
                                           remove=remove, replace=replace, all=all)
 
@@ -845,7 +851,7 @@ class Graph:
         scoped DELETE, not a TRUNCATE. Returns a MutationResult."""
         return self._mutator.clear()
 
-    def mutate(self, spec: dict):
+    def mutate(self, document: dict):
         """Run a whole `{"operations": [...]}` mutation document, in
         order, in one transaction -- the delete/update counterpart of
         ingest(), and the call an agent makes. See MUTATE_TOOL_SCHEMA.
@@ -857,7 +863,7 @@ class Graph:
             ]})
         """
         from .mutate import spec_to_mutations
-        return self._mutator.execute_operations(spec_to_mutations(spec))
+        return self._mutator.execute_operations(spec_to_mutations(document))
 
     def mutate_cypher(self, query: str, **options):
         """Run a Cypher DELETE / DETACH DELETE / SET / REMOVE. Returns a
