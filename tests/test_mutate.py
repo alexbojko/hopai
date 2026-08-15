@@ -945,6 +945,16 @@ class TestCypherRefusals:
         with pytest.raises(CypherError, match=message):
             cypher_to_mutations(query)
 
+    def test_the_multiple_labels_refusal_quotes_the_labels_it_read(self):
+        """`(person:employee)` is the whole diagnosis -- it says which
+        two labels collided, on a query that may carry several patterns.
+        Matched only as "multiple labels" the quote was free to say
+        anything, including nothing."""
+        with pytest.raises(CypherError) as exc:
+            cypher_to_mutations("MATCH (a:person:employee) DELETE a")
+        assert "node a has multiple labels (person:employee)" in str(exc.value)
+        assert "a property has one value" in str(exc.value)
+
     def test_a_constraint_the_options_discard_names_what_it_discarded(self):
         """The message has to quote the pattern that was thrown away and
         the rewrite -- "something was discarded" leaves the caller to

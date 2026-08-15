@@ -156,7 +156,9 @@ class TestPlanTranslation:
                 schema=schema, edge_type_key="rel", node_label_key=None)
 
     def test_a_read_query_is_refused(self):
-        with pytest.raises(CypherError, match="only reads"):
+        # Anchored: "only reads" sits mid-sentence, so an XX-padded
+        # mutant of the literal matched it unchanged.
+        with pytest.raises(CypherError, match="^this query only reads"):
             ops("MATCH (a) RETURN a")
 
 
@@ -166,8 +168,10 @@ class TestWriteRefusals:
         and creates all of it when it does not match -- duplicating nodes
         that already exist. Reproducing that quietly would be worse than
         refusing."""
-        with pytest.raises(CypherError, match="both endpoints already bound"):
+        with pytest.raises(CypherError) as exc:
             ops("MERGE (a {n: 1})-[:knows]->(b {n: 2})")
+        assert str(exc.value).startswith(
+            "MERGE on a relationship needs both endpoints already bound")
 
     def test_variable_length_cannot_be_written(self):
         with pytest.raises(CypherError) as exc:
