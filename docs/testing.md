@@ -67,5 +67,12 @@ because of bugs, not taste:
   before reaching Postgres — and survivors were reported as `segfault` rather than as
   findings. Linux never hit it. `NullPool` is there for the same class of reason.
 
+- **Write-side mutants can come back `timeout` rather than killed.** mutmut runs mutants
+  concurrently against the one Postgres the suite uses, and `fresh_graph` starts each
+  test with `DROP SCHEMA ... CASCADE` — so two mutant processes can sit waiting on each
+  other's locks and be reported as timeouts. Before treating one as a finding, apply the
+  mutation by hand and run the suite: `hopai.mutate.xǁMutatorǁdelete_edges__mutmut_18`
+  came back `timeout` and fails the suite in nine seconds on its own.
+
 CI scopes mutation to the files a PR changed and caps it with a wall-clock budget; a
 full run over `hopai/` is thousands of mutants.

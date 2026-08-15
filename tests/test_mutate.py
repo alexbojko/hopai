@@ -91,6 +91,17 @@ class TestDeleteNodes:
             people.delete_nodes(where={"name": "Bob"})
         assert "Bob" in names(people)
 
+    def test_the_refusal_still_carries_the_driver_error(self, people):
+        """The rewritten message is the useful half, but the original
+        IntegrityError has to stay reachable -- it names the constraint
+        and the row, which is what anyone debugging a foreign key
+        actually needs."""
+        from sqlalchemy.exc import IntegrityError
+
+        with pytest.raises(ConstraintViolation) as exc:
+            people.delete_nodes(where={"name": "Bob"})
+        assert isinstance(exc.value.__cause__, IntegrityError)
+
     def test_a_refused_delete_leaves_the_edges_alone(self, people):
         """The failing statement is inside the transaction that would
         have deleted the node, so nothing at all survives it."""

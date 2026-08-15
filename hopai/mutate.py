@@ -131,14 +131,16 @@ def _detach_hint(exc: IntegrityError) -> ConstraintViolation:
     the flag is spelled `detach`. Cypher's own error for this is the
     thing to imitate -- it names DETACH DELETE."""
     violation = constraint_violation(exc, "node")
-    hint = ConstraintViolation(
+    # No __cause__ set here: the caller raises this `from exc`, which is
+    # what chains the driver's error onto it. Assigning it as well was
+    # dead code, and mutation testing is what noticed -- nothing could
+    # observe the difference.
+    return ConstraintViolation(
         f"{violation} -- these nodes still have edges, and deleting them would leave "
         f"edges pointing at nothing. Pass detach=True (Cypher: DETACH DELETE) to delete "
         f"those edges with the nodes, or delete the edges first",
         constraint=violation.constraint, detail=violation.detail,
     )
-    hint.__cause__ = exc
-    return hint
 
 
 class Mutator:
