@@ -2129,6 +2129,69 @@ class TestEdgeBeamLive:
                             Hop(via_near=Near("relvec", QUERY, min_similarity=-1.0)))
         assert "101" not in {n["id"] for n in result.nodes}
 
+    def test_beam_scopes_by_graph_where_ids_actually_collide(self, fresh_graph):
+        """The default schema makes node ids globally unique and ties
+        both endpoints to the edge's own graph, so no foreign edge can
+        even join this graph's seeds -- which is why the test above
+        proves nothing about the discriminator. On CALLER-SUPPLIED
+        tables keyed by (id, graph_id) the ids do collide, and an
+        unscoped beam spends its only slot on the foreign edge because
+        that one is more similar. The walk then carries an edge id this
+        graph does not own, the scoped edge-report step drops it, and
+        the traversal returns NOTHING -- silence standing in for the
+        neighbor that was there all along."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        engine = fresh_graph.engine
+        meta = MetaData(schema="hopai_beam_scope")
+        nodes = Table("nodes", meta,
+                      Column("id", BigInteger, primary_key=True),
+                      Column("graph_id", Text, primary_key=True),
+                      Column("properties", JSONB, nullable=False))
+        edges = Table("edges", meta,
+                      Column("id", BigInteger, primary_key=True),
+                      Column("graph_id", Text, primary_key=True),
+                      Column("start_id", BigInteger, nullable=False),
+                      Column("end_id", BigInteger, nullable=False),
+                      Column("properties", JSONB, nullable=False))
+        with engine.begin() as conn:
+            conn.execute(text("DROP SCHEMA IF EXISTS hopai_beam_scope CASCADE"))
+            conn.execute(text("CREATE SCHEMA hopai_beam_scope"))
+        meta.create_all(engine)
+        with engine.begin() as conn:
+            conn.execute(nodes.insert(), [
+                {"id": 1, "graph_id": "g1", "properties": {"seed": True}},
+                {"id": 2, "graph_id": "g1", "properties": {"m": "mine"}},
+                {"id": 3, "graph_id": "g1", "properties": {"m": "ours"}},
+                {"id": 1, "graph_id": "g2", "properties": {"seed": True}},
+                {"id": 3, "graph_id": "g2", "properties": {"m": "theirs"}},
+            ])
+            conn.execute(edges.insert(), [
+                {"id": 1, "graph_id": "g1", "start_id": 1, "end_id": 2,
+                 "properties": {"kind": "mine"}},
+                # A DIFFERENT edge id on purpose: reuse g1's and the
+                # scoped edge-report step resolves the stolen id back to
+                # g1's own edge, hiding the leak behind a right answer.
+                {"id": 99, "graph_id": "g2", "start_id": 1, "end_id": 3,
+                 "properties": {"kind": "theirs"}},
+            ])
+
+        g1 = Graph(engine, graph="g1", node_table=nodes, edge_table=edges)
+        g1.define_vectors(edges=[Vector("relvec", 3)])
+        g1.migrate_vectors()
+        # The foreign edge is the MORE similar one, so an unscoped beam
+        # prefers it over this graph's own.
+        g1.set_vectors(edges=[{"id": 1, "relvec": [0.8, 0.6, 0.0]}])
+        g2 = g1.in_graph("g2")
+        g2.define_vectors(edges=[Vector("relvec", 3)])
+        g2.set_vectors(edges=[{"id": 99, "relvec": [1.0, 0.0, 0.0]}])
+
+        result = g1.traverse(Start(where={"seed": True}),
+                             Hop(via_near=Near("relvec", QUERY), via_keep=1))
+        assert {n["id"] for n in result.nodes} == {"1", "2"}
+        assert [e["properties"]["kind"] for e in result.edges] == ["mine"]
+
 
 # ---------------------------------------------------------------------
 # Re-embedding and the pgvector exit
