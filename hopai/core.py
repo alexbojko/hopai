@@ -67,7 +67,27 @@ def _plain(value):
 @dataclass
 class Subgraph:
     """The result of a traversal: every node and edge that is part of at
-    least one complete, filter-satisfying chain."""
+    least one complete, filter-satisfying chain.
+
+        nodes -> [{"id": "1", "properties": {...}}]
+        edges -> [{"id": "7", "start_id": "1", "end_id": "2",
+                   "properties": {...}}]
+
+    Ids are strings everywhere, matching vector_search() and every
+    *_vectors() call, so an edge found by traversal feeds straight into
+    set_vectors(edges=[...]) -- which used to need a hand-written
+    `SELECT id FROM edges`, since the edge id was the one identity this
+    result dropped. It also tells parallel edges apart: two `friend`
+    edges between one pair with identical properties were otherwise two
+    identical dicts.
+
+    Both lists therefore carry ids that already exist, so writing a
+    result back with add_nodes/add_edges asks for those ids again and
+    the primary key refuses. Drop them to copy a subgraph elsewhere:
+    `add_edges([{k: v for k, v in e.items() if k != "id"} for e in
+    result.edges])`. That has always been true of `nodes`; `edges` now
+    says the same thing rather than being the one shape you could feed
+    back by accident."""
     nodes: list = field(default_factory=list)
     edges: list = field(default_factory=list)
     elapsed_ms: float = 0.0
@@ -1227,12 +1247,14 @@ class Graph:
             edges = []
             if edge_ids:
                 q = select(
+                    cast(edge_id_col, String).label("id"),
                     cast(getattr(et.c, self.edge_start_col), String).label("start_id"),
                     cast(getattr(et.c, self.edge_end_col), String).label("end_id"),
                     et.c.properties,
                 ).where(and_(self._scoped(et), cast(edge_id_col, String).in_(edge_ids)))
                 edges = [
-                    {"start_id": r.start_id, "end_id": r.end_id, "properties": r.properties}
+                    {"id": r.id, "start_id": r.start_id, "end_id": r.end_id,
+                     "properties": r.properties}
                     for r in session.execute(q).all()
                 ]
 

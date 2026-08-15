@@ -616,6 +616,54 @@ class TestSubgraphResult:
         result = graph.traverse(Start(where={"type": "leaf"}))
         json.dumps(result.to_dict())  # must not raise
 
+    def test_both_lists_carry_string_ids(self, fresh_graph):
+        """The result shape itself, which nothing asserted -- the edge
+        id could be dropped, renamed or left an integer and the whole
+        suite stayed green.
+
+        Strings because every other id in this library is one:
+        vector_search(), get_vectors(), stale_vectors() and the JSON
+        results all speak strings, and an int here would be the single
+        shape a caller has to convert."""
+        fresh_graph.ingest({
+            "nodes": [{"id": 1, "n": "a"}, {"id": 2, "n": "b"}],
+            "edges": [{"start_id": 1, "end_id": 2, "kind": "knows"}],
+        })
+        result = fresh_graph.traverse(Start(where={"n": "a"}), Hop(hops=1))
+        assert set(result.nodes[0]) == {"id", "properties"}
+        assert set(result.edges[0]) == {"id", "start_id", "end_id", "properties"}
+        assert all(isinstance(row["id"], str) for row in result.nodes + result.edges)
+
+    def test_an_edge_id_from_a_traversal_feeds_set_vectors(self, fresh_graph):
+        """Why the edge id is there at all. set_vectors(edges=…) and
+        get_vectors(edge_ids=…) take edge ids, and a traversal is where
+        a caller finds edges -- so without this the only route between
+        them was a hand-written `SELECT id FROM edges`."""
+        from hopai import Vector
+        fresh_graph.define_vectors(edges=[Vector("relvec", 3)])
+        fresh_graph.migrate_vectors()
+        fresh_graph.ingest({
+            "nodes": [{"id": 1, "n": "a"}, {"id": 2, "n": "b"}],
+            "edges": [{"start_id": 1, "end_id": 2, "kind": "knows"}],
+        })
+        edge = fresh_graph.traverse(Start(where={"n": "a"}), Hop(hops=1)).edges[0]
+        assert fresh_graph.set_vectors(edges=[{"id": edge["id"], "relvec": [1.0, 0.0, 0.0]}]) == 1
+        stored = fresh_graph.get_vectors(edge_ids=[edge["id"]])["edges"][edge["id"]]
+        assert stored["relvec"] == pytest.approx([1.0, 0.0, 0.0], abs=1e-6)
+
+    def test_parallel_edges_are_told_apart(self, fresh_graph):
+        """Two edges of the same kind between the same pair carrying the
+        same properties used to arrive as two identical dicts -- present
+        in the count, indistinguishable in the data."""
+        fresh_graph.ingest({
+            "nodes": [{"id": 1, "n": "a"}, {"id": 2, "n": "b"}],
+            "edges": [{"start_id": 1, "end_id": 2, "kind": "knows"},
+                      {"start_id": 1, "end_id": 2, "kind": "knows"}],
+        })
+        edges = fresh_graph.traverse(Start(where={"n": "a"}), Hop(hops=1)).edges
+        assert len(edges) == 2
+        assert len({e["id"] for e in edges}) == 2
+
     def test_to_networkx(self, graph):
         nx = pytest.importorskip("networkx")
         result = graph.traverse(

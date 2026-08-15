@@ -161,11 +161,16 @@ One pair of tables holds every graph, discriminated by `graph_id`.
   exists, it is created lazily on first save (never by `create_schema()`), and its one
   row per `graph_id` is the same per-graph discipline as everything above.
 
-## Two gotchas in the results
+## Three gotchas in the results
 
 - **Ids come back as strings.** `build_query` casts them so node and edge ids share one
   union'd column. The hydration queries then cast the indexed BIGINT to text to match;
   removing that cast as an optimization breaks the contract the tests assert on.
+- **Both lists carry the row's real id**, so writing a result straight back with
+  `add_nodes`/`add_edges` asks the primary key for ids that already exist and is
+  refused. Strip `id` to copy a subgraph elsewhere. Edges carry one for the same reason
+  nodes always did: `set_vectors(edges=…)` takes edge ids and a traversal is where a
+  caller finds edges, and it is what tells two parallel edges apart.
 - **Table and column names are configurable.** Query building must go through
   `self.node_id_col` / `self.edge_start_col` / `self.graph_col` and the `nodes_tbl` /
   `edges_tbl` attributes — never a hardcoded `"start_id"`.

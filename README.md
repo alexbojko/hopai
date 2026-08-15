@@ -64,8 +64,9 @@ result = graph.traverse(
         where={"type": "company"}),                        #   landing on a company
 )
 
-result.nodes            # every node on a complete matching chain
-result.edges            # every edge those chains actually traversed
+result.nodes            # [{"id": "1", "properties": {...}}, ...]
+result.edges            # [{"id": "7", "start_id": "1", "end_id": "2",
+                        #   "properties": {...}}, ...]
 result.to_networkx()    # in-memory graph, if you have networkx installed
 ```
 
