@@ -216,6 +216,17 @@ class TestNearValidation:
         with pytest.raises(TypeError, match="non-empty list of numbers"):
             Near("summary", bad)
 
+    @pytest.mark.parametrize("bad,name", [("x", "str"), (42, "int"), ({}, "dict"),
+                                          (None, "NoneType")])
+    def test_the_refusal_names_the_type_actually_passed(self, bad, name):
+        """`got {type(vector).__name__}` is the whole diagnostic -- every
+        case above matches only the shared sentence, so the type name
+        could have been hardcoded to any one of them and stayed green.
+        A caller who passed a dict being told "got NoneType" goes looking
+        for the wrong bug."""
+        with pytest.raises(TypeError, match=rf"got {name}$"):
+            Near("summary", bad)
+
     @pytest.mark.parametrize("bad", [[1.0, float("nan")], [float("inf"), 0.0],
                                      [1.0, "2"], [True, False]])
     def test_non_finite_and_non_numeric_elements_are_refused(self, bad):
@@ -1608,6 +1619,23 @@ class TestEdgeBeamShape:
         # Before the LIMIT, which is what "inside the beam" means: the
         # guard has to shrink the candidate set the top-k picks FROM.
         assert beam.index("local_path") < beam.index("LIMIT")
+
+    def test_edges_without_a_vector_are_filtered_before_the_cosine(self, vg):
+        """The same shape the batch path needed, for the same reason.
+        Dropping these guards changes no ANSWER -- the beam's own
+        `combined IS NOT NULL` removes those edges anyway -- but it
+        changes the COST: the unnest+sum LATERAL then runs, once per
+        anchor row of a recursive walk, over every edge that cannot
+        score. edge_beam()'s docstring promises "one set of guards"
+        shared with the node path; this is what holds it to that."""
+        sql = norm(vg.build_query(Start(), [Hop(via_near=Near("rel", [1.0, 0.0, 0.0]),
+                                                via_keep=2)]))
+        # Once per walk term: the beam is built for the anchor and again
+        # for the recursive reference, and a guard on only one of them
+        # would leave the recursive half -- the expensive half -- naked.
+        assert sql.count("vec_rel IS NOT NULL") == 2
+        anchor = sql[sql.index("via_base_0"):sql.index("UNION ALL")]
+        assert anchor.index("vec_rel IS NOT NULL") < anchor.index("sim_0 IS NOT NULL")
 
     def test_threshold_only_beam_has_no_limit(self, vg):
         sql = norm(vg.build_query(
