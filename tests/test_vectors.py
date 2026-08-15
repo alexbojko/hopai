@@ -864,6 +864,43 @@ class TestVectorMigrationLive:
                 conn.execute(text(
                     f"UPDATE nodes SET vec_docvec = '{bad}' WHERE id = {row_id}"))
 
+    def test_two_graphs_may_give_one_EDGE_field_different_dimensions(self, fresh_graph):
+        """The same rule on the other table, which had no test at all.
+
+        `edges` is not the node path with a different string: it has its
+        own _target_for(), its own id column, and its own pass through
+        migrate_vectors(). Every edge-side defect this feature has had
+        was of exactly this shape -- a node path that worked and an edge
+        twin nobody exercised -- so the per-graph rule is asserted here
+        against the edges table directly rather than assumed by
+        symmetry."""
+        a = _migrated(fresh_graph)                      # edges relvec = 3
+        b = fresh_graph.in_graph("other")
+        b.define_vectors(edges=[Vector("relvec", 2)])
+        b.migrate_vectors()
+
+        for graph, ids in ((a, (1, 2)), (b, (3, 4))):
+            graph.add_nodes([{"id": ids[0], "t": "x"}, {"id": ids[1], "t": "y"}])
+            graph.add_edges([{"start_id": ids[0], "end_id": ids[1], "kind": "k"}])
+        with fresh_graph.engine.connect() as conn:
+            edges = dict(conn.execute(text("SELECT graph_id, id FROM edges")).all())
+
+        assert a.set_vectors(edges=[{"id": edges[a.graph], "relvec": [1.0, 2.0, 3.0]}]) == 1
+        assert b.set_vectors(edges=[{"id": edges[b.graph], "relvec": [1.0, 2.0]}]) == 1
+
+        with fresh_graph.engine.connect() as conn:
+            names = sorted(row[0] for row in conn.execute(text(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid = CAST('edges' AS regclass) AND contype = 'c' "
+                "AND conname LIKE 'ck\\_vec\\_dims\\_%relvec' ESCAPE '\\'")))
+        assert len(names) == 2, f"one constraint is serving both graphs: {names}"
+
+        for edge_id, bad in ((edges[b.graph], "{1,2,3}"), (edges[a.graph], "{1,2}")):
+            with pytest.raises(Exception, match="ck_vec_dims_"), \
+                    fresh_graph.engine.begin() as conn:
+                conn.execute(text(
+                    f"UPDATE edges SET vec_relvec = '{bad}' WHERE id = {edge_id}"))
+
 
 # ---------------------------------------------------------------------
 # Live: writing and reading vectors
