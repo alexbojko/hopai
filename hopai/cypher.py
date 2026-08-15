@@ -1533,6 +1533,7 @@ def cypher_to_operations(
     *,
     node_label_key: Optional[str] = "type",
     edge_type_key: Optional[str] = "kind",
+    schema=None,
 ) -> list:
     """Translate a Cypher CREATE/MERGE into ordered ingestion operations.
 
@@ -1552,7 +1553,11 @@ def cypher_to_operations(
             "produces an IngestResult, not a number. Run the aggregation as its own "
             "MATCH query afterwards"
         )
-    return _WriteTranslator(opts).translate(clauses)
+    operations = _WriteTranslator(opts).translate(clauses)
+    if schema is not None:
+        from .schema import validate_operations
+        validate_operations(schema, operations, node_label_key, edge_type_key)
+    return operations
 
 
 # ---------------------------------------------------------------------
@@ -1565,6 +1570,7 @@ def cypher_to_traversal(
     node_label_key: Optional[str] = "type",
     edge_type_key: Optional[str] = "kind",
     max_var_length: Optional[int] = None,
+    schema=None,
 ) -> tuple:
     """Translate a Cypher MATCH into `(Start, [Hop, ...])` -- the same
     pair `spec_to_traversal()` returns, ready for `Graph.traverse()`.
@@ -1595,7 +1601,11 @@ def cypher_to_traversal(
             "this query aggregates -- run it with graph.aggregate_cypher() (or "
             "graph.cypher(), which picks for you)"
         )
-    return translator.emit()
+    start, hops = translator.emit()
+    if schema is not None:
+        from .schema import validate_traversal
+        validate_traversal(schema, start, hops, node_label_key, edge_type_key)
+    return start, hops
 
 
 def _translate_read(query: str, opts: _Options) -> tuple:
@@ -1622,6 +1632,7 @@ def cypher_to_aggregation(
     node_label_key: Optional[str] = "type",
     edge_type_key: Optional[str] = "kind",
     max_var_length: Optional[int] = None,
+    schema=None,
 ) -> tuple:
     """Translate an aggregating Cypher MATCH into
     `(Start, [Hop, ...], {name: aggregate})` -- the exact arguments of
@@ -1642,7 +1653,24 @@ def cypher_to_aggregation(
         )
     aggregates = translator.emit_aggregates(ret)
     start, hops = translator.emit()
+    if schema is not None:
+        from .schema import validate_traversal
+        validate_traversal(schema, start, hops, node_label_key, edge_type_key)
     return start, hops, aggregates
+
+
+def resolve_strict(graph: Graph, options: dict) -> dict:
+    """strict_schema=True on a graph-level call becomes schema=<the
+    graph's declared schema> on the translator -- refusing, with the fix
+    named, when there is nothing to be strict against."""
+    if options.pop("strict_schema", False):
+        if graph.schema is None:
+            raise CypherError(
+                "strict_schema=True needs a schema and none is defined for this Graph "
+                "-- call define_schema(...) first"
+            )
+        options["schema"] = graph.schema
+    return options
 
 
 def traverse_cypher(graph: Graph, query: str, **options) -> Subgraph:
@@ -1655,7 +1683,7 @@ def traverse_cypher(graph: Graph, query: str, **options) -> Subgraph:
 
     Accepts the same keyword options as cypher_to_traversal().
     """
-    start, hops = cypher_to_traversal(query, **options)
+    start, hops = cypher_to_traversal(query, **resolve_strict(graph, dict(options)))
     return graph.traverse(start, *hops)
 
 
@@ -1672,5 +1700,5 @@ def aggregate_cypher(graph: Graph, query: str, **options) -> dict:
     `fn_property` (`count`, `avg_age`). Accepts the same keyword options
     as cypher_to_traversal().
     """
-    start, hops, aggregates = cypher_to_aggregation(query, **options)
+    start, hops, aggregates = cypher_to_aggregation(query, **resolve_strict(graph, dict(options)))
     return graph.aggregate(start, *hops, aggregates=aggregates)

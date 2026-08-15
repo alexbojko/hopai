@@ -71,6 +71,16 @@ class TestPlanTranslation:
         assert plan[1]["rows"][0]["start_var"] == "b"
         assert plan[1]["rows"][0]["end_var"] == "a"
 
+    def test_backward_arrow_reverses_a_merged_edge_too(self):
+        """MERGE swaps the endpoints in its own branch, so the CREATE
+        pin above never covered it -- and an unreversed MERGE writes the
+        edge pointing the wrong way, which no later read can tell from
+        data that was always like that."""
+        plan = ops("MATCH (a {n: 1}), (b {n: 2}) MERGE (a)<-[:knows]-(b)")
+        assert plan[-1]["op"] == "merge_edges"
+        assert plan[-1]["rows"][0]["start_var"] == "b"
+        assert plan[-1]["rows"][0]["end_var"] == "a"
+
     def test_match_before_create_becomes_a_lookup(self):
         assert ops("MATCH (a {email: 'a'}), (b {email: 'b'}) CREATE (a)-[:knows]->(b)") == [
             {"op": "match", "var": "a", "where": {"email": "a"}},
@@ -98,6 +108,30 @@ class TestPlanTranslation:
         plan = ops("CREATE (a {n: 1}) MERGE (b {n: 2}) CREATE (c {n: 3})")
         assert [step["op"] for step in plan] == ["create_nodes", "merge_nodes", "create_nodes"]
 
+    def test_a_bound_variable_is_reused_not_recreated(self):
+        """Referring to `a` in a later clause means THAT row, so the plan
+        creates it once and wires the edge to the original -- a second
+        create_nodes row for `a` would put a duplicate in the database."""
+        plan = ops("CREATE (a:person {email: 'x'}) "
+                   "CREATE (a)-[:works_at]->(b:company {name: 'acme'})")
+        assert [step["op"] for step in plan] == [
+            "create_nodes", "create_nodes", "create_edges"]
+        assert [step["rows"] for step in plan[:2]] == [
+            [{"type": "person", "email": "x"}], [{"type": "company", "name": "acme"}]]
+        assert plan[2]["rows"] == [{"start_var": "a", "end_var": "b",
+                                    "properties": {"kind": "works_at"}}]
+
+    def test_a_bound_variable_is_remerged_not_merged_twice(self):
+        """The MERGE spelling of the same promise: mentioning a bound
+        `a` again adds no second merge_nodes op, so the upsert runs once
+        per entity, not once per mention."""
+        plan = ops("MERGE (a:person {email: 'x'}) "
+                   "MERGE (b:company {name: 'acme'}) MERGE (a)-[:works_at]->(b)")
+        assert [step["op"] for step in plan] == [
+            "merge_nodes", "merge_nodes", "merge_edges"]
+        assert plan[2]["rows"] == [{"start_var": "a", "end_var": "b",
+                                    "properties": {"kind": "works_at"}}]
+
     def test_multiple_patterns_in_one_create(self):
         plan = ops("CREATE (a {n: 1}), (b {n: 2})")
         assert plan == [{"op": "create_nodes", "rows": [{"n": 1}, {"n": 2}],
@@ -108,6 +142,18 @@ class TestPlanTranslation:
                    node_label_key="label", edge_type_key="rel")
         assert plan[0]["rows"] == [{"label": "Person"}, {"label": "Person"}]
         assert plan[1]["rows"][0]["properties"] == {"rel": "KNOWS"}
+
+    def test_configured_type_key_reaches_schema_validation(self):
+        """The write path forwards edge_type_key to validation as well
+        as to translation: with the kind under 'rel', validation has to
+        read it there or strict mode silently stops checking kinds."""
+        from hopai import EdgeType, GraphSchema, NodeType
+        schema = GraphSchema(node_types=[NodeType("person"), NodeType("company")],
+                             edge_types=[EdgeType("works_at", source="person",
+                                                  target="company")])
+        with pytest.raises(CypherError, match="unknown relationship kind 'worksat'"):
+            ops("MATCH (a {email: 'a'}), (b {name: 'acme'}) CREATE (a)-[:worksat]->(b)",
+                schema=schema, edge_type_key="rel", node_label_key=None)
 
     def test_a_read_query_is_refused(self):
         with pytest.raises(CypherError, match="only reads"):
@@ -124,8 +170,22 @@ class TestWriteRefusals:
             ops("MERGE (a {n: 1})-[:knows]->(b {n: 2})")
 
     def test_variable_length_cannot_be_written(self):
-        with pytest.raises(CypherError, match="variable-length"):
+        with pytest.raises(CypherError) as exc:
             ops("CREATE (a {n: 1})-[:knows*1..3]->(b {n: 2})")
+        # verbatim, per the hop.py rule: an XX-padded mutant keeps every
+        # inner word, so a substring match cannot see it
+        assert str(exc.value) == (
+            "a variable-length relationship cannot be written -- `*` says how far to "
+            "walk, and there is no such thing as creating half an edge"
+        )
+
+    def test_multiple_labels_cannot_be_written(self):
+        """Two labels map onto ONE property, so a write has to refuse
+        rather than pick: `(a:person:admin)` would silently drop one of
+        them into a graph nobody could query back."""
+        with pytest.raises(CypherError) as exc:
+            ops("CREATE (a:person:admin {email: 'x'})")
+        assert "has multiple labels (person:admin)" in str(exc.value)
 
     def test_anonymous_endpoints_are_refused(self):
         with pytest.raises(CypherError, match="has to be named"):
@@ -146,6 +206,10 @@ class TestWriteRefusals:
     def test_redefining_a_bound_variable_is_refused(self):
         with pytest.raises(CypherError, match="already bound"):
             ops("MATCH (a {n: 1}) CREATE (a {n: 2})-[:x]->(b {n: 3})")
+        # the MERGE spelling goes through its own bound check -- a
+        # mutation-run survivor showed only the CREATE path was pinned
+        with pytest.raises(CypherError, match="already bound"):
+            ops("MERGE (a {n: 1}) MERGE (a {n: 2})")
 
     def test_multiple_relationship_types_cannot_be_written(self):
         with pytest.raises(CypherError, match="one type"):
@@ -240,6 +304,14 @@ class TestWriteRefusals:
         assert plan[0]["op"] == "create_nodes"
         assert plan[1]["op"] == "create_edges"
         assert plan[1]["rows"][0]["properties"] == {}
+
+    def test_typeless_backward_arrow_creates_a_reversed_edge_with_no_kind(self):
+        """The backward twin of the test above, and it needs its own:
+        `<--` is a separate return in _parse_rel, so the same
+        props-to-None mutant survived on this arm alone -- and
+        `properties.update(None)` is a TypeError, not a wrong edge."""
+        plan = ops("CREATE (a {x: 1})<--(b {y: 2})")
+        assert plan[1]["rows"][0] == {"start_var": "b", "end_var": "a", "properties": {}}
 
     def test_null_property_values_are_literals(self):
         plan = ops("CREATE (a {gone: NULL, missing: null})")

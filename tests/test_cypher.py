@@ -85,6 +85,15 @@ class TestPatternTranslation:
         assert [h.direction for h in hops] == ["forward", "backward"]
         assert [h.via for h in hops] == [{"kind": "x"}, {"kind": "y"}]
 
+    def test_backward_relationship_is_a_single_hop(self):
+        """A plain `<-[:x]-` is one hop exactly, same as its forward
+        twin -- a mutation-run survivor showed the backward arm's bounds
+        were pinned nowhere, and (1, 2) there would quietly walk one hop
+        further than the query says."""
+        _, hops = tr("MATCH (a:person)<-[:works_at]-(b) RETURN b")
+        assert hops[0].direction == "backward"
+        assert bounds(hops[0]) == (1, 1)
+
     @pytest.mark.parametrize("spec,expected", [
         ("", (1, 1)),
         ("*3", (3, 3)),
@@ -421,8 +430,11 @@ class TestSemanticRefusals:
         """A subgraph and a number are different things, so the wrong
         entry point says so rather than dropping the count on the floor
         -- the mirror of the write-query refusal below."""
-        with pytest.raises(CypherError, match="this query aggregates"):
+        with pytest.raises(CypherError) as exc:
             tr("MATCH (a)-[]->(b) RETURN count(DISTINCT b)")
+        # startswith, not substring: XX-padded string mutants keep the
+        # inner text and survive a `match=`
+        assert str(exc.value).startswith("this query aggregates")
 
     @pytest.mark.parametrize("query", [
         "MATCH (a)-[]->(b) RETURN b ORDER BY b.x",
@@ -853,6 +865,19 @@ class TestSyntaxErrors:
         keep working."""
         assert issubclass(CypherError, ValueError)
 
+    def test_a_list_in_a_property_map_is_refused_by_the_literal_parser(self):
+        """`{tags: [1, 2]}` is not a literal, and the refusal has to come
+        from the literal parser naming the offending token. The
+        negative-number branch guards on BOTH the '-' and the number
+        after it: loosen that conjunction (mutant _parse_literal_7) and
+        a '[' followed by a number is swallowed as if it were a minus
+        sign, turning the map into {tags: -1} plus a confusing error
+        further along. A list of STRINGS cannot catch it -- the second
+        conjunct is what differs."""
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a {tags: [1, 2]}) RETURN a")
+        assert "expected a literal value at position 16, got '['" in str(exc.value)
+
     @pytest.mark.parametrize("query,phrase", [
         # Every token kind carries its source position, and _describe()
         # renders the offender -- the ONLY consumers are these error
@@ -1080,3 +1105,196 @@ class TestOptionForwarding:
         without = offline_graph.cypher_operations("CREATE (a:person {x: 1})",
                                                   node_label_key=None)
         assert without[0]["rows"] == [{"x": 1}]
+
+
+class TestStrictSchema:
+    """Opt-in vocabulary validation against a declared schema: with it,
+    a hallucinated label is an immediate CypherError naming the defined
+    vocabulary instead of a silently empty result. Validation runs over
+    the TRANSLATION OUTPUT, so the front ends stay front ends."""
+
+    @staticmethod
+    def schema():
+        from hopai import EdgeType, GraphSchema, NodeType, Property
+        return GraphSchema(
+            node_types=[NodeType("person", properties=[Property("email", "string"),
+                                                       Property("age", "number")]),
+                        NodeType("company", properties=[Property("name", "string")])],
+            edge_types=[EdgeType("works_at", source="person", target="company",
+                                 properties=[Property("since", "number")])],
+        )
+
+    def test_unknown_label_kind_and_property_are_refused_by_name(self):
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a:persn) RETURN a", schema=self.schema())
+        assert "unknown label 'persn'" in str(exc.value)
+        assert "company, person" in str(exc.value)
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a:person)-[:worksat]->(b:company) RETURN b", schema=self.schema())
+        assert "unknown relationship kind 'worksat'" in str(exc.value)
+        assert "works_at" in str(exc.value)
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a:person) WHERE a.emial = 'x' RETURN a", schema=self.schema())
+        assert "unknown property ['emial'] for person" in str(exc.value)
+        assert "age, email" in str(exc.value)
+
+    def test_valid_queries_translate_identically(self):
+        query = ("MATCH (a:person {email: 'a@x.com'})-[:works_at]->(b:company) "
+                 "WHERE b.name = 'acme' RETURN b")
+        strict = tr(query, schema=self.schema())
+        assert repr(strict) == repr(tr(query))
+
+    def test_label_less_patterns_stay_outside_the_schema(self):
+        """An untyped pattern's properties are legitimately unknown to
+        the schema; refusing them would forbid valid untyped queries --
+        the documented limit."""
+        start, _ = tr("MATCH (a {anything: 1}) RETURN a", schema=self.schema())
+        assert start.where == {"anything": 1}
+
+    def test_write_plans_are_validated_too(self):
+        from hopai import cypher_to_operations
+        with pytest.raises(CypherError) as exc:
+            cypher_to_operations("CREATE (a:persn {email: 'x'})", schema=self.schema())
+        assert "unknown label 'persn'" in str(exc.value)
+        with pytest.raises(CypherError) as exc:
+            cypher_to_operations(
+                "MATCH (a {email: 'a'}), (b {name: 'acme'}) CREATE (a)-[:worksat]->(b)",
+                schema=self.schema())
+        assert "unknown relationship kind 'worksat'" in str(exc.value)
+
+    def test_hop_position_labels_are_checked_too(self):
+        """Validation walks EVERY pattern position: a hallucinated label
+        on the far end of a chain is exactly as wrong as one at the
+        start, and a start-only check would let it match nothing
+        silently -- the failure mode strict mode exists to prevent."""
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a:person)-[:works_at]->(b:companyy) RETURN b",
+               schema=self.schema())
+        assert "unknown label 'companyy'" in str(exc.value)
+
+    def test_merge_plans_are_validated_like_create(self):
+        """MERGE reaches the database through the same vocabulary, node
+        and relationship spellings both -- an upsert against a
+        hallucinated label would silently build a parallel graph."""
+        from hopai import cypher_to_operations
+        with pytest.raises(CypherError) as exc:
+            cypher_to_operations("MERGE (a:persn {email: 'x'})", schema=self.schema())
+        assert "unknown label 'persn'" in str(exc.value)
+        with pytest.raises(CypherError) as exc:
+            cypher_to_operations(
+                "MATCH (a {email: 'a'}), (b {name: 'acme'}) MERGE (a)-[:worksat]->(b)",
+                schema=self.schema())
+        assert "unknown relationship kind 'worksat'" in str(exc.value)
+
+    def test_match_lookups_in_write_plans_are_validated(self):
+        """The match ops a MATCH ... CREATE plan starts with carry label
+        vocabulary of their own; leaving them unchecked would let the
+        lookup half of a write hallucinate freely."""
+        from hopai import cypher_to_operations
+        with pytest.raises(CypherError) as exc:
+            cypher_to_operations(
+                "MATCH (a:persn {email: 'a'}), (b:company {name: 'acme'}) "
+                "CREATE (a)-[:works_at]->(b)",
+                schema=self.schema())
+        assert "unknown label 'persn'" in str(exc.value)
+
+    def test_validators_apply_the_conventional_keys_by_default(self):
+        """validate_traversal/validate_operations default to the same
+        type/kind discriminators the rest of the library speaks, so a
+        caller validating a translation by hand needs no extra
+        arguments. Mutating either default must fail here."""
+        from hopai import cypher_to_operations
+        from hopai.schema import validate_operations, validate_traversal
+        start, hops = tr("MATCH (a:persn) RETURN a")
+        with pytest.raises(CypherError, match="unknown label 'persn'"):
+            validate_traversal(self.schema(), start, hops)
+        start, hops = tr("MATCH (a:person)-[:worksat]->(b:company) RETURN b")
+        with pytest.raises(CypherError, match="unknown relationship kind 'worksat'"):
+            validate_traversal(self.schema(), start, hops)
+        node_plan = cypher_to_operations("CREATE (a:persn {email: 'x'})")
+        with pytest.raises(CypherError, match="unknown label 'persn'"):
+            validate_operations(self.schema(), node_plan)
+        edge_plan = cypher_to_operations(
+            "MATCH (a {email: 'a'}), (b {name: 'acme'}) CREATE (a)-[:worksat]->(b)")
+        with pytest.raises(CypherError, match="unknown relationship kind 'worksat'"):
+            validate_operations(self.schema(), edge_plan)
+
+    def test_edge_rows_without_a_property_bag_pass(self):
+        """A hand-built plan may spell a kindless edge as a row with no
+        properties key at all; validation treats that as an empty bag,
+        never as an error about the row's shape."""
+        from hopai.schema import validate_operations
+        validate_operations(self.schema(), [
+            {"op": "create_edges", "rows": [{"start_id": 1, "end_id": 2}]}])
+
+    def test_several_unknown_properties_and_labels_are_listed_together(self):
+        """The refusal names EVERY unknown property (plural spelling
+        included) and every label whose vocabulary was searched -- an
+        agent fixing one name at a time across round trips is the slow
+        version of this one message."""
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a:person) WHERE a.emial = 'x' AND a.aeg = 2 RETURN a",
+               schema=self.schema())
+        assert "unknown properties ['aeg', 'emial'] for person" in str(exc.value)
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a) WHERE a.type IN ['person', 'company'] AND a.emial = 'x' "
+               "RETURN a", schema=self.schema())
+        assert "unknown property ['emial'] for company/person" in str(exc.value)
+        assert "age, email, name" in str(exc.value)
+
+    def test_custom_discriminator_keys_reach_validation(self):
+        """cypher_to_traversal forwards node_label_key/edge_type_key to
+        the validator: with edge_type_key='rel' the kind lives under
+        'rel', and validation must look there, not at the default."""
+        with pytest.raises(CypherError, match="unknown relationship kind 'worksat'"):
+            tr("MATCH (a:person)-[:worksat]->(b:company) RETURN b",
+               schema=self.schema(), edge_type_key="rel")
+
+    def test_graph_level_strict_flag_reaches_writes_and_aggregates(self):
+        """strict_schema=True is one flag on every Graph-level front
+        door -- cypher_operations and aggregate_cypher resolve it
+        against THIS graph's schema exactly as traverse_cypher does."""
+        from hopai import Graph
+        graph = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline")
+        graph.define_schema(schema=self.schema())
+        with pytest.raises(CypherError, match="unknown label 'persn'"):
+            graph.cypher_operations("CREATE (a:persn {email: 'x'})", strict_schema=True)
+        with pytest.raises(CypherError, match="unknown label 'persn'"):
+            aggregate_cypher(graph, "MATCH (a:persn) RETURN count(a)",
+                             strict_schema=True)
+
+    def test_strict_flag_without_a_schema_names_the_fix(self, offline_graph):
+        with pytest.raises(CypherError) as exc:
+            traverse_cypher(offline_graph, "MATCH (a:person) RETURN a", strict_schema=True)
+        # verbatim: the padded-string mutants keep every inner word, so
+        # a substring match cannot tell them from the real message
+        assert str(exc.value) == (
+            "strict_schema=True needs a schema and none is defined for this Graph "
+            "-- call define_schema(...) first"
+        )
+
+    def test_aggregating_queries_validate_their_whole_chain(self):
+        """The aggregation translator forwards start, hops AND both
+        discriminator keys to validation. Each was droppable on its own:
+        a hop-position label, a relationship kind, and a kind under a
+        configured key all have to refuse here exactly as they do on the
+        traversal path."""
+        with pytest.raises(CypherError, match="unknown label 'companyy'"):
+            cypher_to_aggregation(
+                "MATCH (a:person)-[:works_at]->(b:companyy) RETURN count(DISTINCT b)",
+                schema=self.schema())
+        with pytest.raises(CypherError, match="unknown relationship kind 'worksat'"):
+            cypher_to_aggregation(
+                "MATCH (a:person)-[:worksat]->(b:company) RETURN count(DISTINCT b)",
+                schema=self.schema())
+        with pytest.raises(CypherError, match="unknown relationship kind 'worksat'"):
+            cypher_to_aggregation(
+                "MATCH (a:person)-[:worksat]->(b:company) RETURN count(DISTINCT b)",
+                schema=self.schema(), edge_type_key="rel")
+
+    def test_default_stays_permissive(self):
+        """Without the flag, the exact queries strict mode refuses keep
+        translating -- silently matching nothing, as before. Changing
+        THAT default would break every schema-less caller."""
+        start, _ = tr("MATCH (a:persn) RETURN a")
+        assert start.where == {"type": "persn"}

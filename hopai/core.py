@@ -613,12 +613,15 @@ class Graph:
         it is about to change -- the same contract as constraint_ddl().
         endpoints=True appends the endpoint-trigger DDL."""
         from .schema import (
-            compile_edge_constraints, compile_endpoint_ddl, compile_node_constraints,
+            compile_edge_constraints, compile_edge_uniques, compile_endpoint_ddl,
+            compile_node_constraints, compile_node_uniques,
         )
         schema = self._defined_schema("schema_ddl()")
         node_target, edge_target = self._schema_targets()
         ddl = [statement for _, statement in (compile_node_constraints(schema, node_target)
-                                              + compile_edge_constraints(schema, edge_target))]
+                                              + compile_edge_constraints(schema, edge_target)
+                                              + compile_node_uniques(schema, node_target)
+                                              + compile_edge_uniques(schema, edge_target))]
         if endpoints and schema.edge_types:
             ddl.extend(compile_endpoint_ddl(schema, self))
         return ddl
@@ -650,17 +653,20 @@ class Graph:
         declarations are not its to drop. Returns the names now in
         force, in order."""
         from .schema import (
-            ENDPOINT_TRIGGER_EXISTS, SCHEMA_CHECKS, compile_edge_constraints,
-            compile_endpoint_ddl, compile_node_constraints, endpoint_names,
+            ENDPOINT_TRIGGER_EXISTS, SCHEMA_CHECKS, SCHEMA_UNIQUES, _graph_token,
+            compile_edge_constraints, compile_edge_uniques, compile_endpoint_ddl,
+            compile_node_constraints, compile_node_uniques, endpoint_names,
             schema_constraint_prefixes,
         )
         schema = self._defined_schema("enforce_schema()")
         node_target, edge_target = self._schema_targets()
-        groups = [(node_target, compile_node_constraints(schema, node_target)),
-                  (edge_target, compile_edge_constraints(schema, edge_target))]
+        groups = [(node_target, compile_node_constraints(schema, node_target),
+                   compile_node_uniques(schema, node_target)),
+                  (edge_target, compile_edge_constraints(schema, edge_target),
+                   compile_edge_uniques(schema, edge_target))]
         applied = []
         with self.engine.begin() as connection:
-            for target, pairs in groups:
+            for target, pairs, uniques in groups:
                 existing = {row[0] for row in connection.execute(
                     SCHEMA_CHECKS, {"table": target.qualified}).all()}
                 current = {name for name, _ in pairs}
@@ -672,6 +678,19 @@ class Graph:
                 for name, ddl in pairs:
                     if name not in existing:
                         connection.execute(text(ddl))
+                    applied.append(name)
+
+                # unique=True properties: partial unique indexes, same
+                # reconcile discipline under their own uq_schema_ prefix
+                index_prefix = f"uq_schema_{_graph_token(target.graph)}_"
+                existing_uniques = {row[0] for row in connection.execute(
+                    SCHEMA_UNIQUES, {"table": target.table.name}).all()}
+                wanted_uniques = {name for name, _ in uniques}
+                for stale in sorted(n for n in existing_uniques
+                                    if n.startswith(index_prefix) and n not in wanted_uniques):
+                    connection.execute(text(f'DROP INDEX IF EXISTS "{stale}"'))
+                for name, ddl in uniques:
+                    connection.execute(text(ddl))   # IF NOT EXISTS makes this idempotent
                     applied.append(name)
 
             trigger_name, function_name = endpoint_names(self)
@@ -741,15 +760,16 @@ class Graph:
         `graph.cypher_operations(query)` shows the plan without running
         it. Accepts the same node_label_key / edge_type_key options as
         the read side."""
-        from .cypher import cypher_to_operations
-        return self._ingestor.execute_operations(cypher_to_operations(query, **options))
+        from .cypher import cypher_to_operations, resolve_strict
+        return self._ingestor.execute_operations(
+            cypher_to_operations(query, **resolve_strict(self, dict(options))))
 
     def cypher_operations(self, query: str, **options) -> list:
         """The ingestion plan a Cypher write compiles to, without running
         it -- for review, logging, or showing an agent what it is about
         to change."""
-        from .cypher import cypher_to_operations
-        return cypher_to_operations(query, **options)
+        from .cypher import cypher_to_operations, resolve_strict
+        return cypher_to_operations(query, **resolve_strict(self, dict(options)))
 
     def cypher(self, query: str, **options):
         """Run any supported Cypher: reading, writing, or aggregating.
