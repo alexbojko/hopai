@@ -13,13 +13,15 @@ from __future__ import annotations
 import json
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, func, text
 from sqlalchemy.dialects import postgresql
 
 from hopai import (
     AGGREGATE_TOOL_SCHEMA, Count, Graph, Hop, INGEST_TOOL_SCHEMA, Near, Start,
     TRAVERSE_TOOL_SCHEMA, Vector, parse_near, spec_to_traversal, vector_search_json,
 )
+from hopai import Boost
+from hopai.vectors import parse_boost
 from hopai.constraints import ConstraintViolation
 
 
@@ -1198,3 +1200,414 @@ class TestVectorsAreInvisibleToSchemaInference:
         assert properties == {"title"}
         assert [nt.name for nt in schema.node_types] == ["doc"]
         assert report.node_counts == {"doc": 1}
+
+
+# ---------------------------------------------------------------------
+# Batch search: many queries, one round trip
+# ---------------------------------------------------------------------
+
+class TestSearchManyShape:
+    def test_queries_travel_as_one_values_list(self, vg):
+        """The whole point is one statement: the queries become a
+        VALUES list joined LATERAL-ly to a per-query top-k. Two copies
+        of that list would mean the planner scoring every row against
+        every query -- not slower, wrong."""
+        sql = norm(vg.build_vector_search_many_query(
+            [Near("summary", [1.0, 0.0, 0.0]), Near("summary", [0.0, 1.0, 0.0])], k=3))
+        assert sql.count("AS queries") == 1
+        assert "JOIN LATERAL" in sql and "LIMIT" in sql
+        assert ";" not in sql
+
+    def test_query_vectors_are_bound_not_inlined(self, vg):
+        sql = norm(vg.build_vector_search_many_query([Near("summary", [1.5, 2.5, 3.5])], k=1))
+        assert "1.5" not in sql
+
+    def test_batch_is_graph_scoped(self, vg):
+        sql = norm(vg.build_vector_search_many_query([Near("summary", [1.0, 0.0, 0.0])], k=1),
+                   literal_binds=True)
+        assert "graph_id = 'default'" in sql
+
+    def test_mismatched_query_shapes_are_refused(self, vg):
+        """One statement can only express one shape. Ranking the second
+        query with the first one's weights would answer a question
+        nobody asked."""
+        with pytest.raises(ValueError, match="must share a shape"):
+            vg.build_vector_search_many_query(
+                [Near("summary", [1.0, 0.0, 0.0]),
+                 Near("summary", [0.0, 1.0, 0.0], weight=0.5)], k=2)
+        with pytest.raises(ValueError, match="must share a shape"):
+            vg.build_vector_search_many_query(
+                [Near("summary", [1.0, 0.0, 0.0]), Near("title", [0.0, 1.0, 0.0])], k=2)
+
+    @pytest.mark.parametrize("bad", [[], (), "near", None, 42])
+    def test_queries_must_be_a_non_empty_list(self, vg, bad):
+        with pytest.raises(TypeError, match="must be a non-empty list"):
+            vg.build_vector_search_many_query(bad, k=2)
+
+    def test_multivector_queries_are_allowed_per_entry(self, vg):
+        sql = norm(vg.build_vector_search_many_query(
+            [[Near("summary", [1.0, 0.0, 0.0]), Near("title", [0.0, 1.0, 0.0])],
+             [Near("summary", [0.0, 0.0, 1.0]), Near("title", [1.0, 0.0, 0.0])]], k=2))
+        assert sql.count("unnest") == 2      # one per field, not one per query
+
+
+class TestSearchManyLive:
+    def test_each_query_gets_its_own_ranking(self, fresh_graph):
+        g = _corpus(fresh_graph)
+        batch = g.vector_search_many(
+            [Near("docvec", QUERY), Near("docvec", [0.0, 1.0, 0.0])], k=2,
+            where={"type": "doc"})
+        assert [[h["id"] for h in one] for one in batch] == [["1", "3"], ["4", "2"]]
+
+    def test_batch_equals_running_the_searches_one_by_one(self, fresh_graph):
+        """The contract that makes the optimization safe to take."""
+        g = _corpus(fresh_graph)
+        queries = [QUERY, [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]]
+        one_by_one = [[h["id"] for h in g.vector_search(Near("docvec", q), k=3)]
+                      for q in queries]
+        batched = [[h["id"] for h in one]
+                   for one in g.vector_search_many([Near("docvec", q) for q in queries], k=3)]
+        assert batched == one_by_one
+
+    def test_a_query_matching_nothing_keeps_its_slot(self, fresh_graph):
+        """Index i must always answer query i, or the caller has to
+        guess which of their questions came back empty."""
+        g = _corpus(fresh_graph)
+        batch = g.vector_search_many(
+            [Near("docvec", QUERY, min_similarity=0.99),
+             Near("docvec", [0.0, 0.0, 1.0], min_similarity=0.99)], k=5)
+        assert [len(one) for one in batch] == [2, 0]
+
+    def test_one_round_trip(self, fresh_graph):
+        """Two queries, one statement -- the reason this exists rather
+        than a Python loop."""
+        g = _corpus(fresh_graph)
+        statements = []
+        @event.listens_for(g.engine, "before_cursor_execute")
+        def record(conn, cursor, statement, *args):    # noqa: ARG001
+            statements.append(statement)
+        try:
+            g.vector_search_many([Near("docvec", QUERY), Near("docvec", [0.0, 1.0, 0.0])], k=2)
+        finally:
+            event.remove(g.engine, "before_cursor_execute", record)
+        assert len(statements) == 1
+
+
+# ---------------------------------------------------------------------
+# Hybrid ranking
+# ---------------------------------------------------------------------
+
+class TestBoost:
+    def test_boost_lands_in_the_score_not_the_filter(self, vg):
+        """A boost reorders; it must never change which rows qualify,
+        or a ranking knob becomes a silent filter."""
+        sql = norm(vg.build_vector_search_query(
+            Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.5)), literal_binds=True)
+        assert "boost_0" in sql and "* 0.5" in sql
+        assert "jsonb_typeof" in sql          # non-numeric reads as absent
+        assert "coalesce" in sql              # absent contributes `missing`, never NULL
+
+    def test_callable_boost_is_passed_the_properties_column(self, vg):
+        sql = norm(vg.build_vector_search_query(
+            Near("summary", [1.0, 0.0, 0.0]),
+            boost=Boost(lambda p: func.length(p["title"].astext), 0.1)))
+        assert "length" in sql
+
+    @pytest.mark.parametrize("bad", [0, float("nan"), "1", True, None])
+    def test_boost_weight_must_be_a_non_zero_finite_number(self, bad):
+        with pytest.raises(ValueError, match="finite number|non-zero"):
+            Boost("score", bad)
+
+    @pytest.mark.parametrize("bad", [None, 42, b"x", ""])
+    def test_boost_key_must_be_a_property_or_callable(self, bad):
+        with pytest.raises(TypeError, match="property name or a callable"):
+            Boost(bad)
+
+    def test_boost_without_near_is_refused(self):
+        """Nothing is ranked without near=, so the boost would be a
+        silent no-op -- which reads exactly like a working feature."""
+        with pytest.raises(ValueError, match="near= is what creates one"):
+            Start(boost=Boost("score", 1.0))
+        with pytest.raises(ValueError, match="near= is what creates one"):
+            Hop(boost=Boost("score", 1.0))
+
+    def test_reprs_are_exact(self):
+        assert repr(Boost("score", 0.5)) == "Boost('score', weight=0.5)"
+        assert repr(Boost("score", 1.0, missing=-1.0)) \
+            == "Boost('score', weight=1.0, missing=-1.0)"
+
+    def test_json_form_matches_the_python_form(self, vg):
+        python = vg.build_vector_search_query(
+            Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.5, missing=-1.0))
+        parsed = parse_boost({"property": "score", "weight": 0.5, "missing": -1.0})
+        assert norm(vg.build_vector_search_query(Near("summary", [1.0, 0.0, 0.0]), boost=parsed),
+                    literal_binds=True) == norm(python, literal_binds=True)
+
+    @pytest.mark.parametrize("bad,message", [
+        ({}, 'needs "property"'),
+        ({"property": "s", "w": 1}, "unknown"),
+        ([], "empty list"),
+        ("score", "must be an object"),
+    ])
+    def test_malformed_json_boosts_are_rejected(self, bad, message):
+        with pytest.raises((ValueError, TypeError), match=message):
+            parse_boost(bad)
+
+
+class TestBoostLive:
+    def test_boost_reorders_without_changing_membership(self, fresh_graph):
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "n": "closest", "score": 0.0},
+                     {"id": 2, "n": "runner-up", "score": 0.9},
+                     {"id": 3, "n": "no-score"}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 2, "docvec": [0.8, 0.6, 0.0]},
+                             {"id": 3, "docvec": [0.6, 0.8, 0.0]}])
+        plain = [h["id"] for h in g.vector_search(Near("docvec", QUERY), k=10)]
+        boosted = g.vector_search(Near("docvec", QUERY), boost=Boost("score", 1.0), k=10)
+        assert plain == ["1", "2", "3"]
+        assert [h["id"] for h in boosted] == ["2", "1", "3"]
+        # Same rows, different order -- and the missing property is 0,
+        # not a dropped row.
+        assert {h["id"] for h in boosted} == set(plain)
+        assert boosted[0]["similarity"] == pytest.approx(0.8 + 0.9, abs=1e-6)
+
+    def test_non_numeric_property_contributes_missing_not_an_error(self, fresh_graph):
+        """One row carrying "high" where a number was expected must not
+        abort the statement -- the judgement aggregates.py already makes."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "score": "high"}, {"id": 2, "score": 0.5}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 2, "docvec": [1.0, 0.0, 0.0]}])
+        hits = g.vector_search(Near("docvec", QUERY), boost=Boost("score", 1.0, missing=0.0), k=10)
+        assert [h["id"] for h in hits] == ["2", "1"]
+        assert hits[1]["similarity"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_boost_applies_to_a_ranked_traversal_seed(self, fresh_graph):
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "score": 0.0}, {"id": 2, "score": 5.0}, {"id": 3, "n": "target"}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 2, "docvec": [0.0, 1.0, 0.0]}])
+        g.add_edges([{"start_id": 1, "end_id": 3, "kind": "k"},
+                     {"start_id": 2, "end_id": 3, "kind": "k"}])
+        result = g.traverse(Start(near=Near("docvec", QUERY), k=1,
+                                  boost=Boost("score", 1.0)), Hop(via={"kind": "k"}))
+        # Node 2 loses on similarity and wins on the boost.
+        assert {n["id"] for n in result.nodes} == {"2", "3"}
+
+
+# ---------------------------------------------------------------------
+# Edge similarity inside a hop
+# ---------------------------------------------------------------------
+
+class TestEdgeBeamShape:
+    def test_beam_is_a_lateral_in_both_walk_terms(self, vg):
+        sql = norm(vg.build_query(Start(), [Hop(via_near=Near("rel", [1.0, 0.0, 0.0]),
+                                                via_k=2, hops=(1, 3))]))
+        assert "beam_0" in sql and "beam_rec_0" in sql
+        assert sql.count("JOIN LATERAL") >= 2
+
+    def test_cycle_guard_sits_inside_the_beam(self, vg):
+        """A top-k beam that spent slots on edges leading back into the
+        path would follow fewer than via_k usable edges, and how many
+        fewer is invisible from outside the query."""
+        sql = norm(vg.build_query(Start(), [Hop(via_near=Near("rel", [1.0, 0.0, 0.0]),
+                                                via_k=2, hops=(1, 3))]))
+        beam = sql[sql.index("UNION ALL"):sql.index("AS beam_rec_0")]
+        assert "local_path" in beam, beam
+        # Before the LIMIT, which is what "inside the beam" means: the
+        # guard has to shrink the candidate set the top-k picks FROM.
+        assert beam.index("local_path") < beam.index("LIMIT")
+
+    def test_threshold_only_beam_has_no_limit(self, vg):
+        sql = norm(vg.build_query(
+            Start(), [Hop(via_near=Near("rel", [1.0, 0.0, 0.0], min_similarity=0.5))]),
+            literal_binds=True)
+        assert ">= 0.5" in sql
+        assert "LIMIT" not in sql
+
+    def test_via_near_is_validated_against_EDGE_fields(self, vg):
+        """`summary` is a node field; naming it in via_near is the
+        mistake most worth catching by name."""
+        with pytest.raises(ValueError, match=r"no vector field 'summary'.*edges"):
+            vg.build_query(Start(), [Hop(via_near=Near("summary", [1.0, 0.0, 0.0]), via_k=1)])
+
+    def test_via_k_without_via_near_is_rejected(self):
+        with pytest.raises(ValueError, match="via_k is not the hop count"):
+            Hop(via_k=3)
+
+    def test_via_near_error_names_the_hop(self, vg):
+        with pytest.raises(ValueError, match=r"hop 1 \(ranked\) via_near"):
+            vg.build_query(Start(), [Hop(), Hop(via_near=Near("rel", [1.0, 0.0, 0.0]),
+                                                label="ranked")])
+
+    def test_node_and_edge_ranking_compose_on_one_hop(self, vg):
+        sql = norm(vg.build_query(Start(), [Hop(via_near=Near("rel", [1.0, 0.0, 0.0]), via_k=2,
+                                                near=Near("summary", [1.0, 0.0, 0.0]), k=3)]))
+        assert "beam_0" in sql and "reached_0" in sql and "match_0" in sql
+
+
+class TestEdgeBeamLive:
+    @staticmethod
+    def _edges(g):
+        with g.engine.connect() as conn:
+            return {row[0]: row[1] for row in conn.execute(text(
+                "SELECT properties->>'kind', id FROM edges"))}
+
+    def _fixture(self, fresh_graph):
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "n": "src", "seed": True}, {"id": 2, "n": "near"},
+                     {"id": 3, "n": "far"}])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "aligned"},
+                     {"start_id": 1, "end_id": 3, "kind": "orthogonal"}])
+        ids = self._edges(g)
+        g.set_vectors(edges=[{"id": ids["aligned"], "relvec": [1.0, 0.0, 0.0]},
+                             {"id": ids["orthogonal"], "relvec": [0.0, 1.0, 0.0]}])
+        return g
+
+    def test_via_k_follows_only_the_most_similar_edge(self, fresh_graph):
+        g = self._fixture(fresh_graph)
+        result = g.traverse(Start(where={"seed": True}),
+                            Hop(via_near=Near("relvec", QUERY), via_k=1))
+        assert {n["id"] for n in result.nodes} == {"1", "2"}
+        assert len(result.edges) == 1
+        assert result.edges[0]["properties"]["kind"] == "aligned"
+
+    def test_threshold_filters_which_edges_are_worth_walking(self, fresh_graph):
+        g = self._fixture(fresh_graph)
+        kept = g.traverse(Start(where={"seed": True}),
+                          Hop(via_near=Near("relvec", QUERY, min_similarity=0.5)))
+        assert {n["id"] for n in kept.nodes} == {"1", "2"}
+        both = g.traverse(Start(where={"seed": True}),
+                          Hop(via_near=Near("relvec", QUERY, min_similarity=-1.0)))
+        assert {n["id"] for n in both.nodes} == {"1", "2", "3"}
+
+    def test_beam_is_per_source_node_not_a_global_truncation(self, fresh_graph):
+        """via_k=1 from EACH node, so a second source keeps its own best
+        edge -- a global top-1 would starve it entirely."""
+        g = self._fixture(fresh_graph)
+        g.add_nodes([{"id": 4, "n": "src2", "seed": True}, {"id": 5, "n": "target2"}])
+        g.add_edges([{"start_id": 4, "end_id": 5, "kind": "second"}])
+        ids = self._edges(g)
+        g.set_vectors(edges=[{"id": ids["second"], "relvec": [0.9, 0.1, 0.0]}])
+        result = g.traverse(Start(where={"seed": True}),
+                            Hop(via_near=Near("relvec", QUERY), via_k=1))
+        assert {n["id"] for n in result.nodes} == {"1", "2", "4", "5"}
+        assert len(result.edges) == 2
+
+    def test_edges_without_vectors_are_not_followed(self, fresh_graph):
+        g = self._fixture(fresh_graph)
+        g.add_nodes([{"id": 9, "n": "unreachable"}])
+        g.add_edges([{"start_id": 1, "end_id": 9, "kind": "vectorless"}])
+        result = g.traverse(Start(where={"seed": True}),
+                            Hop(via_near=Near("relvec", QUERY, min_similarity=-1.0)))
+        assert "9" not in {n["id"] for n in result.nodes}
+
+    def test_multi_hop_beam_reports_every_edge_it_walked(self, fresh_graph):
+        """The invariant a restructured walk could break: a hop spanning
+        several edges reports all of them, not one fabricated edge."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": i, "n": str(i), "seed": i == 1} for i in (1, 2, 3)])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "a"},
+                     {"start_id": 2, "end_id": 3, "kind": "b"}])
+        ids = self._edges(g)
+        g.set_vectors(edges=[{"id": ids["a"], "relvec": [1.0, 0.0, 0.0]},
+                             {"id": ids["b"], "relvec": [1.0, 0.0, 0.0]}])
+        result = g.traverse(Start(where={"seed": True}),
+                            Hop(via_near=Near("relvec", QUERY), via_k=2, hops=(2, 2)))
+        assert {n["id"] for n in result.nodes} == {"1", "2", "3"}
+        assert len(result.edges) == 2
+
+    def test_beam_does_not_leak_across_graphs(self, fresh_graph):
+        g = self._fixture(fresh_graph)
+        other = g.in_graph("other")
+        other.define_vectors(edges=[Vector("relvec", 3)])
+        other.add_nodes([{"id": 100, "seed": True}, {"id": 101}])
+        other.add_edges([{"start_id": 100, "end_id": 101, "kind": "elsewhere"}])
+        result = g.traverse(Start(where={"seed": True}),
+                            Hop(via_near=Near("relvec", QUERY, min_similarity=-1.0)))
+        assert "101" not in {n["id"] for n in result.nodes}
+
+
+# ---------------------------------------------------------------------
+# Re-embedding and the pgvector exit
+# ---------------------------------------------------------------------
+
+class TestStaleVectorsLive:
+    def test_reports_missing_and_wrong_dimension_rows(self, fresh_graph):
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1}, {"id": 2}, {"id": 3}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]}])
+        stale = g.stale_vectors(nodes=["docvec"])["nodes"]["docvec"]
+        assert stale == {"missing": ["2", "3"], "wrong_dimensions": []}
+
+        # Redefine wider without re-migrating: node 1's stored vector no
+        # longer fits, which is exactly the window this call closes.
+        g.define_vectors(nodes=[Vector("docvec", 6)])
+        stale = g.stale_vectors(nodes=["docvec"])["nodes"]["docvec"]
+        assert stale == {"missing": ["2", "3"], "wrong_dimensions": ["1"]}
+
+    def test_ids_feed_straight_back_into_set_vectors(self, fresh_graph):
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1}, {"id": 2}])
+        for node_id in g.stale_vectors(nodes=["docvec"])["nodes"]["docvec"]["missing"]:
+            g.set_vectors(nodes=[{"id": node_id, "docvec": [1.0, 0.0, 0.0]}])
+        assert g.stale_vectors(nodes=["docvec"])["nodes"]["docvec"]["missing"] == []
+
+    def test_defaults_to_every_declared_field_and_is_graph_scoped(self, fresh_graph):
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1}])
+        other = g.in_graph("other")
+        other.define_vectors(nodes=[Vector("docvec", 3)])
+        other.add_nodes([{"id": 50}])
+        stale = g.stale_vectors()
+        assert set(stale["nodes"]) == {"docvec", "titlevec"}
+        assert stale["nodes"]["docvec"]["missing"] == ["1"]      # not 50
+
+    def test_limit_caps_each_field(self, fresh_graph):
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": i} for i in range(1, 6)])
+        assert len(g.stale_vectors(nodes=["docvec"], limit=2)["nodes"]["docvec"]["missing"]) == 2
+
+    def test_unknown_field_names_the_defined_ones(self, fresh_graph):
+        g = _migrated(fresh_graph)
+        with pytest.raises(ValueError, match="no vector field 'ghost'"):
+            g.stale_vectors(nodes=["ghost"])
+
+
+class TestPgvectorDdl:
+    def test_emits_extension_conversion_and_index(self, vg):
+        ddl = vg.pgvector_ddl()
+        assert ddl[0] == "CREATE EXTENSION IF NOT EXISTS vector"
+        joined = "\n".join(ddl)
+        assert 'TYPE vector(3) USING "vec_summary"::vector(3)' in joined
+        # The dimension CHECK must go: vector(d) enforces it in the type,
+        # and leaving both would reject nothing while confusing everyone.
+        assert 'DROP CONSTRAINT IF EXISTS "ck_vec_dims_default_nodes_summary"' in joined
+        assert "USING hnsw" in joined and "vector_cosine_ops" in joined
+        assert "vec_rel" in joined          # edges too
+
+    def test_cosine_operator_class_matches_the_metric_this_library_computes(self, vg):
+        """An exported index ranking by L2 would answer a different
+        question than the code it replaces."""
+        assert all("vector_cosine_ops" in s for s in vg.pgvector_ddl() if "CREATE INDEX" in s)
+
+    def test_index_none_emits_conversion_only(self, vg):
+        assert not any("CREATE INDEX" in s for s in vg.pgvector_ddl(index=None))
+
+    @pytest.mark.parametrize("bad", ["hnsw2", "gist", "", 3])
+    def test_unknown_index_method_is_refused(self, vg, bad):
+        with pytest.raises(ValueError, match="index must be None or one of"):
+            vg.pgvector_ddl(index=bad)
+
+    def test_needs_a_declaration(self):
+        with pytest.raises(ValueError, match=r"call define_vectors\(...\) first"):
+            offline().pgvector_ddl()
+
+    def test_generates_without_importing_pgvector(self, vg):
+        """The whole point: hopai never depends on the extension, even
+        to describe the migration off itself."""
+        import sys
+        assert "pgvector" not in sys.modules
+        vg.pgvector_ddl()
+        assert "pgvector" not in sys.modules

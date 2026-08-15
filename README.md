@@ -518,15 +518,59 @@ graph.vector_search(
 ```
 
 And similarity composes with traversal — seed a walk with the most
-similar nodes, or keep only the most similar of what a hop reaches:
+similar nodes, keep only the most similar of what a hop reaches, or
+follow only the most similar **edges** out of each node:
 
 ```python
 graph.traverse(
     Start(near=Near("summary", query_embedding), k=25),   # 25 nearest seeds
     Hop(via={"kind": "cites"}, hops=(1, 3)),
 )
+graph.traverse(                                  # a beam over edges
+    Start(where={"type": "paper"}),
+    Hop(via_near=Near("relation", q), via_k=3),  # 3 most similar edges per node
+)
 graph.aggregate(Start(near=Near("summary", q), k=100),
                 aggregates={"avg_score": Avg("score")})
+```
+
+**Several queries at once.** A question expanded into sub-queries is
+one statement, not one per query:
+
+```python
+graph.vector_search_many([Near("summary", q1), Near("summary", q2)], k=5)
+# -> [[...5 hits for q1...], [...5 hits for q2...]]
+```
+
+This buys **round trips, not arithmetic** — every query still scores
+every candidate, so against a local database it measured 1.08×. The
+saving is `N-1` network round trips, which is the real cost when
+Postgres isn't on localhost.
+
+**Hybrid ranking.** A numeric property can contribute to the score
+alongside similarity — `Boost` reorders results without changing which
+ones qualify:
+
+```python
+graph.vector_search(Near("summary", q), boost=Boost("importance", 0.2), k=10)
+```
+
+Store the property already scaled to roughly `[0, 1]`: a cosine lives in
+`[-1, 1]`, so a raw view count wouldn't boost the ranking, it would
+replace it — and hopai won't guess a normalization on your behalf.
+
+**Re-embedding and the exit door.** `stale_vectors()` lists the rows
+with no vector or a vector the current declaration no longer fits (the
+window a dimension change opens), so a re-embed loop is safe to
+automate. And if the exact scan is outgrown, `pgvector_ddl()` prints
+the migration onto pgvector — generated without importing or requiring
+the extension:
+
+```python
+for node_id in graph.stale_vectors()["nodes"]["summary"]["missing"]:
+    graph.set_vectors(nodes=[{"id": node_id, "summary": embed(text_for(node_id))}])
+
+print("\n".join(graph.pgvector_ddl()))   # one-way; read vectors.py first
 ```
 
 Two honest limits, both documented in depth in `hopai/vectors.py`: the

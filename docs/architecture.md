@@ -70,8 +70,24 @@ set plugs into the walk.
   the `seed` / `match_i` CTE, so everything downstream (edge reconstruction, dead-end
   pruning, aggregation) is unchanged — and a traversal without `near` emits
   byte-identical SQL to the pre-vector code, which a test asserts.
+- `search_many()` puts the queries in a VALUES list and hangs the per-query top-k off it
+  as a LATERAL, so N queries are one round trip. `_similarity()` therefore takes its
+  query vector and norm either as Python constants (single search) or as expressions
+  from that VALUES row. Both the inner cosine and the beam use `correlate`/
+  `correlate_except`: left to infer, SQLAlchemy copies the outer FROM element into the
+  subquery, which cross-joins the VALUES list and makes Postgres reject a recursive
+  reference outright.
+- `Boost` adds property terms to the score. They are coalesced, so they can only
+  reorder — never change which rows qualify, which is what keeps
+  `combined IS NOT NULL` meaning "some similarity had a direction".
+- `Hop(via_near=)` compiles to `edge_beam()`: a LATERAL, per anchor row, yielding the
+  `(edge_id, move_id)` pair the plain join produced — so depth, the local path and edge
+  reconstruction are untouched. The cycle guard goes *inside* the beam, or a top-`via_k`
+  beam would spend slots on edges leading back into the path.
 - Writes go through `set_vectors()` only (UPDATE … FROM VALUES … RETURNING, one
   transaction, missing ids fail the call); ingestion rows never carry vectors.
+  `stale_vectors()` reports what needs re-embedding; `pgvector_ddl()` emits the one-way
+  migration off this engine without importing the extension.
 - The JSON forms exist (`"near"`/`"k"` in specs, `vector_search_json`) but the LLM tool
   schemas deliberately omit them — a model fills a `"vector"` parameter by inventing
   floats. `tests/test_vectors.py::TestToolSchemasStayVectorFree` pins the omission.

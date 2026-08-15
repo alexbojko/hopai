@@ -53,11 +53,15 @@ from .aggregates import parse_aggregate
 from .core import Graph, Subgraph
 from .filters import parse_filter
 from .hop import Hop, Start
-from .vectors import parse_near
+from .vectors import parse_boost, parse_near
 
 
-def _near_of(spec: dict):
-    return parse_near(spec["near"]) if "near" in spec else None
+def _near_of(spec: dict, key: str = "near"):
+    return parse_near(spec[key]) if key in spec else None
+
+
+def _boost_of(spec: dict):
+    return parse_boost(spec["boost"]) if "boost" in spec else None
 
 
 def spec_to_traversal(spec: dict) -> tuple:
@@ -73,6 +77,7 @@ def spec_to_traversal(spec: dict) -> tuple:
         label=start_spec.get("label"),
         near=_near_of(start_spec),
         k=start_spec.get("k"),
+        boost=_boost_of(start_spec),
     )
 
     hops = []
@@ -87,6 +92,9 @@ def spec_to_traversal(spec: dict) -> tuple:
                 label=h.get("label"),
                 near=_near_of(h),
                 k=h.get("k"),
+                via_near=_near_of(h, "via_near"),
+                via_k=h.get("via_k"),
+                boost=_boost_of(h),
             )
         )
     return start, hops
@@ -163,6 +171,7 @@ def vector_search_json(graph: Graph, spec: dict) -> dict:
         target=spec.get("target", "nodes"),
         k=spec.get("k", 10),
         where=parse_filter(spec.get("where")),
+        boost=_boost_of(spec),
     )
     return {"results": results}
 

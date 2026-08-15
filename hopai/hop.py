@@ -44,7 +44,7 @@ def _normalize_hops(hops: HopCount) -> tuple:
     raise TypeError(f"hops must be an int or a (min, max) tuple -- got {hops!r}")
 
 
-def _validate_near_k(owner: str, near, k) -> None:
+def _validate_near_k(owner: str, near, k, near_name: str = "near", k_name: str = "k") -> None:
     # Structural checks only: whether each Near names a real field of
     # the right dimensionality needs the Graph's registry, so that
     # validation lives in core/vectors at build time -- the same split
@@ -52,15 +52,27 @@ def _validate_near_k(owner: str, near, k) -> None:
     if k is not None:
         if near is None:
             raise ValueError(
-                f"{owner}: k={k!r} without near= orders nothing -- k is how many of the "
-                f"most similar to keep, so it needs a Near to rank by. Note k is not the "
-                f"hop count; that is hops="
+                f"{owner}: {k_name}={k!r} without {near_name}= orders nothing -- {k_name} is "
+                f"how many of the most similar to keep, so it needs a Near to rank by. Note "
+                f"{k_name} is not the hop count; that is hops="
             )
         if not isinstance(k, int) or isinstance(k, bool) or k < 1:
-            raise ValueError(f"{owner}: k must be a positive integer, got {k!r}")
+            raise ValueError(f"{owner}: {k_name} must be a positive integer, got {k!r}")
     if isinstance(near, (list, tuple)) and not near:
-        raise ValueError(f"{owner}: near=[] is empty -- pass a Near(...) or a list of them, "
-                         f"or drop the argument")
+        raise ValueError(f"{owner}: {near_name}=[] is empty -- pass a Near(...) or a list of "
+                         f"them, or drop the argument")
+
+
+def _validate_boost(owner: str, near, boost) -> None:
+    """A boost adjusts a ranked score, so there has to be one. Without
+    near= nothing is ranked at all and the boost would silently do
+    nothing -- the kind of no-op that reads as a working feature."""
+    if boost is not None and near is None:
+        raise ValueError(
+            f"{owner}: boost= adjusts a similarity ranking, and near= is what creates one -- "
+            f"without it nothing is ranked and the boost would change nothing. Add near=, or "
+            f"filter on the property with where= instead"
+        )
 
 
 @dataclass
@@ -71,14 +83,19 @@ class Start:
     property filter -- Near(field, vector) specs to rank by, and k for
     how many of the most similar nodes to keep. `where` still applies;
     similarity ranks what survives it. See hopai/vectors.py.
+    boost:  Boost(property, weight) terms added to the ranked score,
+            for hybrid retrieval. A boost reorders; it never changes
+            which nodes qualify.
     """
     where: Optional[Any] = None
     label: Optional[str] = None
     near: Optional[Any] = None
     k: Optional[int] = None
+    boost: Optional[Any] = None
 
     def __post_init__(self):
         _validate_near_k("Start", self.near, self.k)
+        _validate_boost("Start", self.near, self.boost)
 
 
 @dataclass
@@ -104,6 +121,17 @@ class Hop:
                 are reported: a semantic beam. See hopai/vectors.py.
     k:          how many of the most similar reached nodes to keep.
                 NOT the hop count -- that is `hops`.
+    via_near:   rank the EDGES this hop walks, against edge vector
+                fields -- the `via` of similarity. With via_k, each
+                node follows only its via_k most similar edges (a beam
+                per source node, not a global truncation); without it,
+                a Near's min_similarity filters which edges are worth
+                walking at all.
+    via_k:      how many of the most similar edges to follow FROM EACH
+                node reached so far.
+    boost:      Boost(property, weight) terms added to the node
+                ranking `near` creates. Reorders; never changes which
+                nodes qualify.
     """
     where: Optional[Any] = None
     via: Optional[Any] = None
@@ -113,9 +141,15 @@ class Hop:
     label: Optional[str] = None
     near: Optional[Any] = None
     k: Optional[int] = None
+    via_near: Optional[Any] = None
+    via_k: Optional[int] = None
+    boost: Optional[Any] = None
 
     def __post_init__(self):
         self.min_hops, self.max_hops = _normalize_hops(self.hops)
         if self.direction not in ("forward", "backward"):
             raise ValueError(f"direction must be 'forward' or 'backward', got {self.direction!r}")
         _validate_near_k("Hop", self.near, self.k)
+        _validate_near_k("Hop", self.via_near, self.via_k,
+                         near_name="via_near", k_name="via_k")
+        _validate_boost("Hop", self.near, self.boost)
