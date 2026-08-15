@@ -106,6 +106,15 @@ def _object_schema() -> dict:
     return {"type": "object", "properties": {}, "required": []}
 
 
+class _Stub:
+    """Stands in for whatever a stubbed library call returns, for the
+    tests that assert on the ARGUMENTS reaching it. The handlers then
+    serialize the result, so it has to answer to_dict()."""
+
+    def to_dict(self) -> dict:
+        return {}
+
+
 @pytest.fixture()
 def vector_graph() -> Graph:
     g = offline()
@@ -267,6 +276,11 @@ class TestManyGraphs:
     def test_a_named_graph_is_the_one_used(self):
         described = named(self.two())["describe_graph"].call(graph="crm")
         assert described["graph"] == "crm"
+        # ...and the OTHER names ride along, so a model that reached for
+        # describe_graph first still learns what else it may ask about
+        # without a second call. A mutant renaming this key dropped that
+        # in silence -- the tool answered, just about one graph only.
+        assert described["graphs"] == ["docs", "crm"]
 
     def test_an_unserved_name_is_refused_with_the_list(self):
         """Never answered from the default: reporting one graph's rows
@@ -396,7 +410,16 @@ class TestToolSchemas:
         takes is a promise broken at call time, with a TypeError the
         model cannot act on -- and the schemas are hand-written here, so
         nothing else would catch it."""
-        for spec in tools(offline(), allow_mutations=True):
+        graph = offline()
+        graph.define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)])
+        # EVERY configuration, because a tool that is not registered is a
+        # tool this cannot check: run without an embedder and allow_ddl,
+        # search_similar and enforce_schema went unexamined -- and
+        # mutants renaming search_similar's `query`, `k`, `target` and
+        # `where`, and enforce_schema's `dry_run` and `endpoints`, all
+        # survived on exactly that gap. Two vector fields so the
+        # search_field key exists to be checked at all.
+        for spec in tools(graph, embed=embedder(), allow_ddl=True, allow_mutations=True):
             accepted = set(inspect.signature(spec.call).parameters)
             assert set(spec.parameters["properties"]) <= accepted, spec.name
 
@@ -436,6 +459,35 @@ class TestToolSchemas:
         forbidden = {"near", "via_near", "via_keep", "boost", "vector", "embedding"}
         for spec in tools(vector_graph, embed=embedder(), allow_ddl=True, allow_mutations=True):
             assert not parameter_names(spec.parameters) & forbidden, spec.name
+
+    @pytest.mark.parametrize("tool, method, arguments, forwarded", [
+        ("ingest_graph", "ingest",
+         {"nodes": [{"id": 1}], "merge_nodes_on": ["email"], "merge_edges_on": ["ref"]},
+         {"merge_nodes_on": ["email"], "merge_edges_on": ["ref"]}),
+        ("enforce_schema", "enforce_schema",
+         {"dry_run": False, "endpoints": True}, {"endpoints": True}),
+    ])
+    def test_an_optional_argument_reaches_the_call_it_names(self, tool, method, arguments,
+                                                           forwarded, monkeypatch):
+        """An advertised argument that parses and is then dropped on the
+        way to the library fails in silence and in the direction nobody
+        wants: `merge_edges_on` omitted turns an upsert back into an
+        insert, and `endpoints` omitted leaves the endpoint-type trigger
+        off while reporting success. Both mutants -- the argument
+        dropped, and `endpoints=None` -- survived because the only tests
+        that could see them need a database.
+
+        The library call is stubbed rather than run, which is what makes
+        this checkable with nothing running: what is asserted is the
+        handoff, not what happens after it."""
+        seen = {}
+        monkeypatch.setattr(f"hopai.core.Graph.{method}",
+                            lambda self, *a, **kw: seen.update(kw) or _Stub())
+        graph = offline()
+        graph.define_schema(nodes=[NodeType("person")])
+        named(graph, allow_ddl=True)[tool].call(**arguments)
+        for name, value in forwarded.items():
+            assert seen.get(name) == value, name
 
     def test_descriptions_carry_this_graphs_vocabulary(self):
         """Same reason Graph.tool_schemas() exists: a model that has
@@ -617,6 +669,34 @@ class TestToolSchemas:
                 # renaming the `description` KEY drops it in silence.
                 assert prop.get("description", "").strip(), where
 
+    def test_the_keys_this_module_injects_are_well_formed_too(self, vector_graph):
+        """The check above stops at the outermost properties, and the
+        keys this module adds to a COPIED schema are nested one level
+        down: `search`, `keep` and `search_field` live inside `start`.
+        Mutants that gave `keep` a `type` of "STRING" and renamed
+        `search_field`'s `description` KEY survived because of exactly
+        that -- and a model reads a nested parameter as literally as a
+        top-level one.
+
+        Nested rather than deep-walked because the static schemas are
+        not this module's to police: TRAVERSE_TOOL_SCHEMA's own
+        `hops.items.direction` carries an enum and no description, which
+        is json_api.py's call to make."""
+        json_schema_types = {"string", "number", "integer", "boolean",
+                             "object", "array", "null"}
+        graphs = {"docs": vector_graph, "crm": vector_graph.in_graph("crm")}
+        graphs["crm"].define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)])
+        for spec in tools(graphs, embed=embedder()):
+            injected = {"graph": spec.parameters["properties"].get("graph")}
+            start = spec.parameters["properties"].get("start") or {}
+            for key in ("search", "keep", "search_field"):
+                injected[f"start.{key}"] = (start.get("properties") or {}).get(key)
+            for where, schema in injected.items():
+                if schema is None:            # not every tool grows every key
+                    continue
+                assert schema.get("type") in json_schema_types, f"{spec.name}.{where}"
+                assert schema.get("description", "").strip(), f"{spec.name}.{where}"
+
     def test_search_field_is_offered_only_when_the_choice_is_real(self):
         """One declared field needs no argument. Several make the choice
         the caller's, because ranking against the wrong field returns
@@ -662,6 +742,27 @@ class TestVectorsNeverComeFromTheModel:
         spec = named(vector_graph, embed=embedder())["traverse_graph"]
         with pytest.raises(ValueError, match="cannot come from a tool call"):
             spec.call(start={"near": {"field": "summary", "vector": [1, 2, 3]}})
+
+    @pytest.mark.parametrize("tool, arguments", [
+        ("traverse_graph", {}),
+        ("aggregate_graph", {"aggregates": {"n": {"fn": "count"}}}),
+    ])
+    def test_the_embedding_this_server_made_is_allowed_through(self, vector_graph, tool,
+                                                               arguments):
+        """The other side of the invariant, and the half a refusal-only
+        test cannot see. `refuse_vectors()` runs on what the MODEL sent;
+        the call that follows passes allow_vectors=True because by then
+        the `near` is this server's own. A mutant flipping that to False
+        made every search-seeded call refuse its own embedding -- and
+        survived on aggregate_graph, which no test had ever seeded.
+
+        Both tools, because they inject separately. Getting past the
+        gate is the assertion: the offline graph then fails on the
+        connection that is not there, which is proof it got that far."""
+        spec = named(vector_graph, embed=embedder())[tool]
+        with pytest.raises(Exception) as raised:
+            spec.call(start={"search": "graph databases"}, **arguments)
+        assert "cannot come from a tool call" not in str(raised.value)
 
     def test_keep_without_search_is_refused(self):
         spec = named(offline())["traverse_graph"]
@@ -948,6 +1049,17 @@ class TestCommandLine:
         loaded = build_parser().parse_args(["--embed", "json:dumps"]).embed
         assert loaded is json.dumps
 
+    def test_the_module_is_everything_before_the_FIRST_colon(self, capsys):
+        """`partition`, not `rpartition`: a dotted path never contains a
+        colon, so the split is unambiguous only from the left. With
+        rpartition, `a:b:c` asks for a module named `a:b` -- and the
+        error would then name something the operator did not type,
+        which is the one job an error message has here. Both spellings
+        fail on this input; only one of them fails honestly."""
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--embed", "no_such_module_xyz:b:c"])
+        assert "'no_such_module_xyz'" in capsys.readouterr().err
+
     def test_defaults_are_the_cautious_ones(self):
         args = build_parser().parse_args(["--dsn", "postgresql://x/y"])
         assert (args.transport, args.host, args.read_only, args.allow_ddl,
@@ -968,6 +1080,15 @@ class TestCommandLine:
         finding out after a server is built is later than necessary."""
         with pytest.raises(SystemExit):
             build_parser().parse_args(["--dsn", "postgresql://x/y", "--transport", "grpc"])
+
+    @pytest.mark.parametrize("transport", ["stdio", "http"])
+    def test_both_transports_are_accepted_by_the_same_gate(self, transport):
+        """The half a refusal-only test cannot see. `choices` is a
+        literal pair, and mutants that misspelled one of them made that
+        transport unusable while `--transport grpc` went on being
+        rejected -- so the test above passed and the CLI was broken."""
+        assert build_parser().parse_args(
+            ["--dsn", "postgresql://x/y", "--transport", transport]).transport == transport
 
     def test_graph_is_repeatable_and_the_first_is_the_handle_that_opens_the_pool(
             self, monkeypatch):
