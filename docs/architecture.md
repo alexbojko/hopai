@@ -116,6 +116,18 @@ of its own decisions about how: you construct the client, hopai calls one method
   when a value is a string, `Near(text=)` at query build (resolved in `validate_nears()`,
   the first point where the spec and the graph are both in hand), and `embed_stale()`
   for the backfill.
+- **Retries and caching are the caller's**, and that is a decision rather than an
+  omission: every provider client retries with exponential backoff and exposes the
+  knob, so a policy here would multiply with theirs. `EmbeddingError` keeps the
+  provider's exception as `__cause__` so the caller can tell transient from terminal
+  without hopai naming any provider's classes. Provider calls log to the
+  `hopai.embeddings` logger — size at DEBUG, failures at WARNING as well as raised,
+  because `embed_stale()` pages and a caught error means rows left unembedded.
+- **Async has to arrive library-wide or not at all.** An async client used inside this
+  sync module means `asyncio.run()` inside `set_vectors()`, which raises
+  `RuntimeError: asyncio.run() cannot be called from a running event loop` — in exactly
+  the async application that motivated it. The Graph API and the SQLAlchemy engine have
+  to move together.
 - **Embedding always happens outside the transaction**, batched per field.
   `set_vectors()` validates and resolves every row before it takes a connection: an
   HTTP call inside an open transaction holds row locks for a network round trip, and a

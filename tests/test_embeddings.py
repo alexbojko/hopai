@@ -15,6 +15,7 @@ module state is what broke its baseline twice already in this project.
 
 from __future__ import annotations
 
+import logging
 import sys
 
 import pytest
@@ -630,6 +631,43 @@ class TestTheModelReachesTheProvider:
         payload = [[1.0, 2.0]]
         client = _named(module, builder(payload))()
         assert Embedder(client, model="m").embed_documents(["a"]) == payload
+
+
+class TestLogging:
+    """The only network calls hopai makes are the only ones worth a log
+    line, and an embedding failure is worth one even when it is caught:
+    embed_stale() pages, so a caller can handle the error and carry on
+    with rows silently unembedded."""
+
+    def test_every_provider_call_is_logged_with_its_size(self, caplog):
+        embedder = Embedder(lambda texts: [[1.0, 0.0] for _ in texts], batch_size=2)
+        with caplog.at_level(logging.DEBUG, logger="hopai.embeddings"):
+            embedder.embed_documents(["a", "b", "c"])
+        sizes = [r.getMessage() for r in caplog.records]
+        assert sizes == ["Embedder(function).embed_documents: embedding 2 text(s)",
+                         "Embedder(function).embed_documents: embedding 1 text(s)"]
+
+    def test_a_failure_logs_before_it_raises(self, caplog):
+        def dies(texts):
+            raise RuntimeError("provider is down")
+
+        with caplog.at_level(logging.WARNING, logger="hopai.embeddings"), \
+                pytest.raises(EmbeddingError):
+            Embedder(dies).embed_documents(["a"])
+        assert len(caplog.records) == 1
+        record = caplog.records[0]
+        assert record.levelname == "WARNING"
+        # Names the call, how far it got, and the provider's own type --
+        # a log line saying only "it failed" is not worth writing.
+        assert "embed_documents" in record.getMessage()
+        assert "RuntimeError: provider is down" in record.getMessage()
+
+    def test_nothing_is_logged_above_debug_on_the_happy_path(self, caplog):
+        """A library that chatters at INFO makes an application turn its
+        logger off, which is how the WARNING above gets lost too."""
+        with caplog.at_level(logging.INFO, logger="hopai.embeddings"):
+            Embedder(lambda texts: [[1.0, 0.0]]).embed_documents(["a"])
+        assert caplog.records == []
 
 
 class TestErrorsNameTheCall:

@@ -57,14 +57,39 @@ promise the vector write path already made.
 
 WHAT THIS DELIBERATELY DOES NOT DO: chunk long documents (an
 application concern with a dozen strategies -- over-long input is
-refused instead), cache embeddings, or run anything asynchronously
-(hopai is sync end to end, because SQLAlchemy here is).
+refused instead), cache embeddings, or retry -- your client already
+retries with exponential backoff and lets you tune it, and a second
+policy here would multiply with it. EmbeddingError keeps the
+provider's own exception as `__cause__` so you can decide.
+
+NOR DOES IT RUN ANYTHING ASYNCHRONOUSLY, and not merely because hopai
+is sync end to end. Reaching for a provider's async client HERE would
+break in exactly the application that wanted it: set_vectors() is a
+sync function, so awaiting inside it means asyncio.run(), and
+asyncio.run() raises RuntimeError when a loop is already running --
+which is the case in the async app the change was for. Async has to
+arrive at the Graph API and the SQLAlchemy engine together or not at
+all.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any, Optional
+
+#: The only network calls hopai makes, so they are the only ones worth a
+#: log line. Standard library, no handler attached: an application
+#: configures `hopai.embeddings` like any other logger, and one that
+#: configures nothing sees nothing.
+#:
+#: DEBUG carries every provider call with its size, which is what
+#: answers "why is this backfill slow" and "how many calls did that
+#: cost". A failure logs at WARNING as well as raising, deliberately:
+#: embed_stale() walks a field in pages, so a caller may well catch the
+#: error and carry on, and a page that silently embedded nothing is
+#: exactly what you want in the log afterwards.
+logger = logging.getLogger(__name__)
 
 #: Providers whose batch endpoint caps the number of inputs per call.
 #: Chunking is ours to do: a provider that refuses 200 inputs should not
@@ -96,7 +121,24 @@ class EmbeddingError(RuntimeError):
 
     Raised rather than returned so a half-embedded batch can never reach
     the write path: set_vectors() resolves every embed before it opens
-    its transaction, so this always fires with nothing written."""
+    its transaction, so this always fires with nothing written.
+
+    THE PROVIDER'S OWN EXCEPTION IS KEPT as `__cause__`, which is how
+    you decide whether to retry without hopai having to name any
+    provider's exception classes (it imports none, and guessing which
+    of them are transient would be a policy in the wrong place):
+
+        try:
+            graph.embed_stale()
+        except EmbeddingError as failed:
+            if isinstance(failed.__cause__, openai.RateLimitError):
+                ...                       # back off and re-run; it resumes
+
+    Retrying is the caller's, on purpose. Every provider client already
+    retries with exponential backoff and exposes the knob
+    (`openai.OpenAI(max_retries=5)`), so a second policy here would
+    multiply with theirs -- 3 attempts inside 3 turning one rate-limit
+    blip into nine calls and a nine-fold stall."""
 
 
 def _provider(client: Any) -> Optional[str]:
@@ -241,11 +283,14 @@ class Embedder:
             return []
         out = []
         for chunk in _chunks(cleaned, self.batch_size):
+            logger.debug("%s: embedding %d text(s)", owner, len(chunk))
             try:
                 raw = self._call(chunk, query, self.dimensions)
             except EmbeddingError:
                 raise
             except Exception as exc:                      # provider-side failure
+                logger.warning("%s: provider call failed after %d embedded (%s: %s)",
+                               owner, len(out), type(exc).__name__, exc)
                 raise EmbeddingError(
                     f"{owner}: the provider call failed ({type(exc).__name__}: {exc}) -- "
                     f"nothing was written"

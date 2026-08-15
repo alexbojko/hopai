@@ -766,6 +766,27 @@ This is the one place hopai makes a **network call** — always to the
 client you constructed and configured, and always outside the write
 transaction, so a provider failure never leaves a half-written batch.
 
+**Retries stay yours**, because your client already has them:
+`openai.OpenAI(max_retries=5)` and its equivalents retry with
+exponential backoff, and a second policy here would multiply with
+theirs — three attempts inside three turns one rate-limit blip into
+nine calls. When a call does fail, `EmbeddingError` keeps the
+provider's own exception as `__cause__`, so deciding what is transient
+needs no knowledge of hopai:
+
+```python
+try:
+    graph.embed_stale()
+except EmbeddingError as failed:
+    if isinstance(failed.__cause__, openai.RateLimitError):
+        ...          # back off and re-run -- embed_stale() resumes
+```
+
+Every provider call is logged to the `hopai.embeddings` logger: the
+size at `DEBUG`, and a failure at `WARNING` as well as raised, since a
+paged backfill can catch the error and carry on with rows left
+unembedded.
+
 **Re-embedding and the exit door.** `stale_vectors()` lists the rows
 with no vector or a vector the current declaration no longer fits (the
 window a dimension change opens) — the report behind `embed_stale()`,
