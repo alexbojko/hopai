@@ -1915,6 +1915,24 @@ class TestVectorCallerNamesArePinned:
         with pytest.raises(exception, match=r"^vector_search_many\(\): boost="):
             vg.build_vector_search_many_query([Near("summary", [1.0, 0.0, 0.0])], boost=bad)
 
+    def test_search_many_names_itself_on_nears_too(self, vg):
+        """validate_nears() is the THIRD helper the batch path hands its
+        own name to, after _check_k and validate_boosts. Each is a
+        separate argument at a separate call site, so each needs its own
+        assertion -- pinning two of the three left the last free."""
+        with pytest.raises(ValueError, match=r"^vector_search_many\(\): two Near specs"):
+            vg.build_vector_search_many_query(
+                [[Near("summary", [1.0, 0.0, 0.0]), Near("summary", [0.0, 1.0, 0.0])]], k=2)
+
+    def test_the_json_search_spec_names_itself_on_an_unknown_key(self, vg):
+        """`vector search spec` is the only thing telling a caller WHICH
+        JSON shape rejected their key -- traverse_json, aggregate_json
+        and this one all route through _check_keys with nothing but that
+        label to tell them apart."""
+        with pytest.raises(ValueError, match=r"^unknown vector search spec keys \['top_k'\]"):
+            vector_search_json(vg, {"near": {"field": "summary", "vector": [1.0, 0.0, 0.0]},
+                                    "top_k": 5})
+
     @pytest.mark.parametrize("caller,run", [
         ("traverse_json()", lambda g, s: traverse_json(g, s)),
         ("aggregate_json()", lambda g, s: aggregate_json(
