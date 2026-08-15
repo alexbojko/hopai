@@ -280,6 +280,40 @@ class TestNaming:
         with pytest.raises(TypeError, match="expected one of"):
             offline_graph.constraint_ddl(nodes=["Unique('email')"])
 
+    @pytest.mark.parametrize("target", ["nodes", "edges"])
+    def test_a_renamed_graph_column_reaches_both_targets(self, target):
+        """Table and column names are configurable, and every constraint
+        is scoped by the graph column -- so a graph discriminator named
+        anything but `graph_id` has to reach the DDL, or the constraint
+        is scoped by a column that does not exist.
+
+        Parametrized because `_targets()` builds the node and edge sides
+        on two separate lines: dropping graph_col from the EDGES line
+        alone left the whole suite green, which is the same
+        node-works/edge-twin-untested shape as every other edge defect
+        this feature has had."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        from hopai import Graph
+
+        metadata = MetaData()
+        nodes = Table("nodes", metadata,
+                      Column("id", BigInteger, primary_key=True),
+                      Column("tenant", Text),
+                      Column("properties", JSONB))
+        edges = Table("edges", metadata,
+                      Column("id", BigInteger, primary_key=True),
+                      Column("tenant", Text),
+                      Column("start_id", BigInteger),
+                      Column("end_id", BigInteger),
+                      Column("properties", JSONB))
+        graph = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+                      node_table=nodes, edge_table=edges, graph_col="tenant")
+        ddl = graph.constraint_ddl(**{target: [Unique("email")]})[0]
+        assert "tenant" in ddl
+        assert "graph_id" not in ddl
+
 
 class TestViolationErrors:
     def test_message_names_the_constraint_and_the_cause_is_kept(self, fresh_graph):

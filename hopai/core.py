@@ -451,6 +451,11 @@ class Graph:
         ]
         edge_selects = [select(literal("edge").label("kind"), cast(edge_rows.c.eid, String).label("id"))]
 
+        # The `is not None` half never decides anything, and the sentinel
+        # above is therefore unobservable: `optional` is rejected anywhere
+        # but the last hop, and `pairs` has one entry per hop, so
+        # hops[-1].optional being true means the loop already assigned
+        # this. Kept as a statement of that coupling, not as a guard.
         if hops[-1].optional and pre_optional_match is not None:
             node_selects.append(
                 select(literal("node").label("kind"), cast(pre_optional_match.c.node_id, String).label("id"))
