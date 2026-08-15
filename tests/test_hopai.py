@@ -9,6 +9,8 @@ failed without the fix.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from hopai import (
@@ -73,6 +75,39 @@ class TestCoreTraversal:
         assert {n["properties"]["m"] for n in one_hop.nodes} == {"one", "one-end"}
         assert len(one_hop.edges) == 1
 
+    def test_in_graph_carries_every_table_and_column_setting(self):
+        """in_graph() is the documented way to hop between graphs on
+        CUSTOM tables too, so the new handle must inherit every name the
+        caller configured -- a mutation-run survivor showed a dropped
+        edge_end_col would go unnoticed, and a handle silently reading
+        the default column is the _scoped() bug in a different coat."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        from hopai import Graph
+
+        meta = MetaData()
+        nodes = Table("my_nodes", meta,
+                      Column("nid", BigInteger, primary_key=True),
+                      Column("tenant", Text),
+                      Column("properties", JSONB))
+        edges = Table("my_edges", meta,
+                      Column("eid", BigInteger, primary_key=True),
+                      Column("tenant", Text),
+                      Column("src", BigInteger),
+                      Column("dst", BigInteger),
+                      Column("properties", JSONB))
+        base = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+                     node_table=nodes, edge_table=edges, node_id_col="nid",
+                     edge_id_col="eid", edge_start_col="src", edge_end_col="dst",
+                     graph_col="tenant")
+        other = base.in_graph("elsewhere")
+        assert other.graph == "elsewhere"
+        assert (other.nodes_tbl, other.edges_tbl) == (nodes, edges)
+        assert (other.node_id_col, other.edge_id_col) == ("nid", "eid")
+        assert (other.edge_start_col, other.edge_end_col) == ("src", "dst")
+        assert other.graph_col == "tenant"
+
     def test_simple_forward_hop(self, graph):
         result = graph.traverse(
             Start(where={"type": "leaf"}),
@@ -134,8 +169,26 @@ class TestCoreTraversal:
             Start(where={"type": "hub"}),
             Hop(hops=(1, 10), direction="backward"),
         )
-        assert result.elapsed_ms < 5000  # generous ceiling; should be near-instant
+        # Bounded on BOTH sides: a ceiling alone is satisfied by 0.0, so
+        # dropping the measurement entirely (Subgraph's elapsed_ms
+        # default) passed unnoticed. A real round trip cannot take zero.
+        assert 0 < result.elapsed_ms < 5000  # generous ceiling; should be near-instant
         assert len(result.nodes) > 0
+
+    def test_elapsed_ms_is_measured_in_milliseconds(self, graph):
+        """The unit is part of the name, and only an independent clock
+        can check it: every self-consistent assertion passes just as
+        happily when the seconds-to-ms conversion is inverted (mutant
+        traverse_111 divides where it should multiply, reporting a
+        millionth of the truth). The bounds are deliberately loose --
+        elapsed_ms times the queries inside a call that also builds the
+        statement and opens a session, so it is a fraction of the wall
+        time, never more, and never a millionth."""
+        t0 = time.perf_counter()
+        result = graph.traverse(Start(where={"type": "leaf"}), Hop(hops=(1, 3)))
+        wall_ms = (time.perf_counter() - t0) * 1000
+        assert 0 < result.elapsed_ms <= wall_ms
+        assert result.elapsed_ms > wall_ms / 1000
 
 
 # ---------------------------------------------------------------------

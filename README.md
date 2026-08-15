@@ -364,7 +364,21 @@ graph.schema           # canonical dataclasses; None until defined
 graph.schema_json      # JSON Schema vocabulary — paste it into a system prompt
 graph.schema_networkx  # nx.MultiDiGraph meta-graph (pip install hopai[networkx])
 graph.schema_pydantic  # generated pydantic models  (pip install hopai[pydantic])
+graph.schema_mermaid   # Mermaid flowchart — paste into a ```mermaid fence
 ```
+
+`schema_mermaid` needs no dependency at all: GitHub, GitLab and most doc
+tooling render the string as a picture. For the schema above it draws:
+
+```mermaid
+flowchart LR
+    person["person (email*, age)"]
+    company["company (name*)"]
+    person -- works_at --> company
+```
+
+(`*` marks required, `!` marks unique — the same markers
+`tool_summary()` uses, capped with `+N more` on wide types.)
 
 Declaring is in-memory and instant. **Enforcing** is a separate,
 explicit step that compiles the schema to CHECK constraints, so the
@@ -386,6 +400,18 @@ first bad one. Ask first:
 ```python
 report = graph.schema_violations()   # read-only; falsy when clean
 print(report)   # per rule: row counts + sample ids -- the work list
+```
+
+Property schemas go further than presence and type: `values=` (or an
+`Enum` annotation) enforces an allowed set, `unique=True` compiles to a
+*partial* unique index — unique among rows of that type only — nested
+dataclasses become nested object schemas, and `datetime`/`date` map to
+strings with a JSON Schema format. And with a schema defined, the
+Cypher front end can refuse hallucinated vocabulary outright:
+
+```python
+graph.cypher("MATCH (a:persn) RETURN a", strict_schema=True)
+# CypherError: unknown label 'persn' -- the schema declares: company, person
 ```
 
 Enforcement covers property presence and JSON type per node type and
@@ -421,6 +447,33 @@ are counted in the report and left alone. An inferred schema is an
 **observation** — nothing is registered or enforced until you adopt it,
 which is exactly why `infer_schema()` is a method and not a silent
 `.schema` fallback.
+
+Inference is a sequential scan. When the graph is too large for one,
+`infer_schema(sample_percent=5)` reads a `TABLESAMPLE SYSTEM (5)` slice
+instead — counts become estimates, a rare property can be missed, and
+`required` means "on every *sampled* row", so the report leads with
+`sampled 5% of rows — counts are estimates` rather than letting an
+estimate read as truth.
+
+**Sharing the contract.** A schema declared on one handle is invisible
+to every other process on the same database. Persist it, and the
+database becomes the single source of truth:
+
+```python
+graph.save_schema()    # upserts this graph's schema into hopai_schema
+                       # (a small metadata table, created on first save)
+
+# ...meanwhile, in another service:
+graph = Graph(same_dsn)
+graph.load_schema()    # reads it back, validates, ADOPTS it
+graph.enforce_schema() # and the contract enforces from the loaded copy
+```
+
+Unlike an inferred schema, a loaded one is adopted on the spot — it was
+explicitly declared a contract by whoever saved it. The stored document
+is `schema_json` verbatim (readable in `psql`), and loading rebuilds it
+through the same validation `define_schema()` runs, so a corrupted row
+raises loudly instead of half-loading.
 
 ## 🔎 Filters
 

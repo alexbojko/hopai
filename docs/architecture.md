@@ -104,6 +104,11 @@ One pair of tables holds every graph, discriminated by `graph_id`.
   delete and update — including the subquery behind `delete_edges(start=...)`, which
   would otherwise resolve an endpoint against another graph's node.
 - `graph_col=None` disables all of it for callers bringing their own tables.
+- `save_schema()` adds a third table, `hopai_schema(graph_id, document, saved_at)`, and
+  it sits **outside** the two-table invariant on purpose: it is metadata about a graph,
+  not graph data. It is never on the query path, traversal and ingestion do not know it
+  exists, it is created lazily on first save (never by `create_schema()`), and its one
+  row per `graph_id` is the same per-graph discipline as everything above.
 
 ## Two gotchas in the results
 
