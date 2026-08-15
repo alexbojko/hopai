@@ -645,6 +645,24 @@ class TestSchemaViolations:
         assert all(r.rows == 1 and r.table == "nodes" for r in report.rules)
         assert len(report.rules) == 2   # ids 1 and 4 appear nowhere
 
+    def test_edge_rules_are_reported_against_the_edges_table(self, fresh_graph):
+        """Every assertion above is about nodes, so the whole edge half
+        of the report went unread: `_schema_targets()` could label the
+        edge target anything at all and the suite stayed green. The
+        label is not decoration -- `rule.table` is how a caller knows
+        which table holds the rows to go fix, and the two halves of the
+        report are otherwise indistinguishable."""
+        fresh_graph.add_nodes([{"id": 1, "type": "person", "email": "a@x.com"},
+                               {"id": 2, "type": "company", "name": "Acme"}])
+        fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "works_at", "since": 2019},
+                               {"start_id": 1, "end_id": 2, "kind": "works_at"}])  # no `since`
+        primitive_schema(fresh_graph)
+
+        (rule,) = fresh_graph.schema_violations().rules
+        assert rule.constraint == "ck_schema_req_default_works_at"
+        assert rule.table == "edges"
+        assert rule.rows == 1
+
     def test_a_clean_graph_reports_falsy_and_enforcement_succeeds(self, fresh_graph):
         """Falsy-when-clean is the contract that makes
         `if graph.schema_violations():` read correctly -- and clean must
