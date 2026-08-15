@@ -124,6 +124,19 @@ never be mistaken for one of these) and calls what is left over `node_extra_cols
 - **Constraints**: no new vocabulary — `Col("user_id")` (constraints.py) already named a
   real column before this existed (`Col("start_id")`), so `Unique`/`Index`/merge's `on=`
   need nothing extra to reach one.
+- **Column collisions are refused, not guessed.** Naming an extra column in a place that
+  means a JSONB property — `Property('user_id', ...)`/a dataclass field of that name,
+  `Required("user_id")`/`Unique("user_id")` etc. with no `Col(...)`, or a bare
+  `on=["user_id"]` — used to compile silently onto `properties->>'user_id'`, a key
+  ingestion never populates for that name. `constraints._reject_column_collision()`
+  (checked in `_key_expression`, so `Unique`/`Index` **and** `merge_nodes`/`merge_edges`'s
+  `on=` share one guard — both render through `key_sql()`) and
+  `schema.check_no_column_collisions()` (checked by `Graph.define_schema()` **and**
+  `load_schema()`, since a saved schema can be adopted onto a different table) both raise
+  naming the exact collision. Neither guesses a `Col(...)` on the caller's behalf —
+  refusing beats guessing, same as everywhere else in this library — and neither touches
+  `Check(...)`, whose filter tree has no fixed key list to check without re-deriving
+  `schema.py`'s own `_filter_vocabulary` walk.
 - **Deliberately out of scope**: `update_nodes()`/`update_edges()` stay `properties`-only
   (`set=`/`remove=` are a JSONB merge with no equivalent for a plain column) and Cypher
   writes never populate one (a property map literal has nowhere else to go but

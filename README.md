@@ -152,6 +152,29 @@ stay JSONB-only, so change an extra column with `UPDATE` through the
 engine, or `merge_nodes`/`merge_edges`, which does refresh it on
 conflict. See `hopai/models.py`'s "EXTENDING THE MODEL" note.
 
+Naming a property, a constraint key, or a merge `on=` entry the same as
+an extra column — easy to do by accident, since `user_id` is your own
+project's name, not a universal convention like `id` — is refused, not
+guessed:
+
+```python
+graph.define_schema(nodes=[NodeType("task", properties=[Property("user_id", "number")])])
+# ValueError: NodeType('task'): ['user_id'] already name real column(s) on 'nodes' -- ...
+
+graph.define_constraints(nodes=[Required("user_id")])
+# TypeError: 'user_id' is a real column on nodes (...) -- say Col('user_id') if you meant it
+
+graph.merge_nodes([{"user_id": 7, "name": "..."}], on=["user_id"])
+# TypeError: 'user_id' is a real column on nodes -- say Col('user_id')
+```
+
+Every one of these would otherwise compile a rule against
+`properties->>'user_id'`, a JSONB key that name can never reach once
+it is an extra column — a correct row would fail forever, or worse for
+merge: `ON CONFLICT` would never match, so every "merge" silently
+inserts a duplicate instead of updating one. `Col("user_id")` is always
+the fix when the real column genuinely is what you mean.
+
 ## 🧬 Many graphs, one database
 
 ```python

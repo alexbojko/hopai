@@ -71,6 +71,22 @@ through the engine directly, or re-`merge_nodes()`/`merge_edges()` it,
 which DOES refresh an extra column's value on conflict, in step with
 `properties`. See ingest.py's ingestion docstring and core.py's
 `traverse()` for the write and read halves.
+
+THE ONE MISTAKE THIS GUARDS AGAINST BY NAME: declaring a `Property`
+(or dataclass field, or bare-string constraint key, or merge `on=`
+entry) called `user_id` without realizing the table already has a real
+column by that name -- easy to do, since an extra column is a
+project's own addition, not a universal convention like `id`. Every
+entry point that would otherwise silently compile a JSONB rule on a
+key ingestion never populates refuses instead, naming the collision:
+`Graph.define_schema()`/`load_schema()` (schema.py's
+`check_no_column_collisions()`), `Graph.define_constraints()`
+(`Unique`/`Index`/`Required`/`PropertyType`, via
+`constraints._reject_column_collision()`), and `merge_nodes()`/
+`merge_edges()`'s `on=` (the same helper, since `key_sql()` is what
+both an index and a merge conflict target render through). `Col(...)`
+is always the escape hatch when the real column genuinely is what is
+meant.
 """
 
 from __future__ import annotations

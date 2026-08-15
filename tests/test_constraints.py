@@ -124,6 +124,50 @@ class TestUnique:
 
 
 # ---------------------------------------------------------------------
+# A bare string colliding with a real column
+# ---------------------------------------------------------------------
+
+class TestColumnCollision:
+    """A bare string that names a real column can only be a mistake --
+    that column is written and read by name already, never through
+    `properties`. Unique/Index/Required/PropertyType all refuse it
+    rather than silently compiling a rule that can never see the value
+    it is testing for; Col(...) is the documented, still-working escape
+    hatch when the real column genuinely is what's meant."""
+
+    def test_unique_refuses_it(self, fresh_graph):
+        with pytest.raises(TypeError, match="'start_id' is a real column"):
+            fresh_graph.constraint_ddl(edges=[Unique("start_id")])
+
+    def test_index_refuses_it(self, fresh_graph):
+        with pytest.raises(TypeError, match="'end_id' is a real column"):
+            fresh_graph.constraint_ddl(edges=[Index("end_id")])
+
+    def test_required_refuses_it(self, fresh_graph):
+        with pytest.raises(TypeError, match="'id' is a real column"):
+            fresh_graph.constraint_ddl(nodes=[Required("id")])
+
+    def test_property_type_refuses_it(self, fresh_graph):
+        with pytest.raises(TypeError, match="'id' is a real column"):
+            fresh_graph.constraint_ddl(nodes=[PropertyType("id", "number")])
+
+    def test_the_message_names_the_fix(self, fresh_graph):
+        with pytest.raises(TypeError, match=r"Col\('start_id'\)"):
+            fresh_graph.constraint_ddl(edges=[Unique("start_id")])
+
+    def test_col_is_the_working_escape_hatch(self, fresh_graph):
+        """The point of the refusal: the real column stays reachable,
+        it just has to say so -- Unique(Col("start_id"), "kind") is
+        exactly what TestMerge.test_merging_edges already relies on."""
+        ddl = fresh_graph.constraint_ddl(edges=[Unique(Col("start_id"), "kind")])
+        assert ddl
+
+    def test_a_non_colliding_property_is_unaffected(self, fresh_graph):
+        fresh_graph.define_constraints(nodes=[Required("email"), Unique("email")])
+        assert fresh_graph.add_nodes([{"email": "a@x.com"}]) == 1
+
+
+# ---------------------------------------------------------------------
 # Presence and type
 # ---------------------------------------------------------------------
 

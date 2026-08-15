@@ -218,6 +218,67 @@ class TestSchemaDefinition:
             NodeType("person", properties=[Property("email", "string"),
                                            Property("email", "number")])
 
+
+# ---------------------------------------------------------------------
+# A property named the same as a real column
+# ---------------------------------------------------------------------
+
+class TestColumnCollision:
+    """Property('id', ...) would compile a CHECK on properties->>'id',
+    a JSONB key that can never hold what the real `id` column already
+    does -- add_nodes()/merge_nodes() route a flat row's 'id' there
+    directly. define_schema() refuses rather than declaring a rule
+    enforce_schema() could never let a correct row satisfy."""
+
+    def test_node_property_named_id_is_refused(self, offgraph):
+        with pytest.raises(ValueError, match=r"NodeType\('person'\).*\['id'\]"):
+            offgraph.define_schema(
+                nodes=[NodeType("person", properties=[Property("id", "number")])])
+        assert offgraph.schema is None   # the refusal must not half-adopt it
+
+    def test_edge_property_named_start_id_is_refused(self, offgraph):
+        with pytest.raises(ValueError, match=r"EdgeType\('knows'\).*\['start_id'\]"):
+            offgraph.define_schema(
+                nodes=[NodeType("person")],
+                edges=[EdgeType("knows", source="person", target="person",
+                                properties=[Property("start_id", "number")])])
+
+    def test_dataclass_field_colliding_with_an_extra_column_is_refused(self):
+        """The scenario this exists for: a project's OWN dataclass
+        happens to name a field the same as a real column its custom
+        table carries. Unlike 'id', 'user_id' is not a SQL convention
+        anyone would recognize on sight -- an honest accident, which is
+        exactly why it needs a guard rather than relying on the author
+        noticing."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        md = MetaData()
+        nodes = Table("nodes", md, Column("id", BigInteger, primary_key=True),
+                      Column("user_id", BigInteger), Column("properties", JSONB))
+        g = Graph(OFFLINE_DSN, node_table=nodes, graph_col=None)
+
+        @dataclass
+        class Person:
+            email: str
+            user_id: int
+
+        with pytest.raises(ValueError, match=r"\['user_id'\]"):
+            g.define_schema(nodes=[Person])
+
+    def test_a_non_colliding_property_is_unaffected(self, offgraph):
+        schema = offgraph.define_schema(
+            nodes=[NodeType("person", properties=[Property("email", "string")])])
+        assert schema.node_types[0].properties[0].name == "email"
+
+    def test_nested_properties_never_collide(self, offgraph):
+        """A nested key compiles to properties->'address'->>'id', never
+        properties->>'id' -- no ambiguity with the real column no
+        matter what the nested key is named."""
+        schema = offgraph.define_schema(nodes=[NodeType("person", properties=[
+            Property("address", "object", properties=[Property("id", "string")])])])
+        assert schema.node_types[0].properties[0].properties[0].name == "id"
+
     def test_non_property_entries_are_named(self):
         with pytest.raises(TypeError, match="each property must be a Property"):
             NodeType("person", properties=["email"])
@@ -1305,6 +1366,28 @@ class TestSchemaPersistence:
         assert {nt.name for nt in loaded.node_types} == {"person", "company"}
         loaded_elsewhere = Graph(fresh_graph.engine).in_graph("elsewhere").load_schema()
         assert {nt.name for nt in loaded_elsewhere.node_types} == {"robot"}
+
+    def test_load_refuses_a_schema_that_collides_with_this_table(self, fresh_graph):
+        """save_schema()/load_schema() can cross tables -- the schema
+        was a valid contract on the table that declared it, but this
+        SECOND handle's table carries a real user_id column the same
+        schema names as a JSONB property. load_schema() must catch
+        that rather than adopt a contract enforce_schema() could never
+        let a correct row satisfy."""
+        fresh_graph.define_schema(
+            nodes=[NodeType("person", properties=[Property("user_id", "number")])])
+        fresh_graph.save_schema()
+
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+        md = MetaData()
+        nodes = Table("nodes", md, Column("id", BigInteger, primary_key=True),
+                      Column("graph_id", Text), Column("user_id", BigInteger),
+                      Column("properties", JSONB))
+        custom = Graph(fresh_graph.engine, node_table=nodes)
+        with pytest.raises(ValueError, match=r"\['user_id'\]"):
+            custom.load_schema()
+        assert custom.schema is None   # the refusal must not half-adopt it
 
     def test_load_without_save_names_both_fixes(self, fresh_graph):
         """No table yet (nobody ever persisted) and the error must name

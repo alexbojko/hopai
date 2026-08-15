@@ -628,8 +628,16 @@ class Graph:
 
         In memory only: nothing touches the database until
         enforce_schema(). Calling this again replaces the schema.
+
+        Refuses a property (either notation) named the same as a real
+        column on this graph's table -- id/start_id/end_id/graph_id, a
+        vec_* vector field, or an EXTRA COLUMN (models.py's "EXTENDING
+        THE MODEL") -- naming exactly which, since that property could
+        never be written or read the way its declaration implies. See
+        schema.py's check_no_column_collisions().
+
         Returns the normalized GraphSchema."""
-        from .schema import GraphSchema, build_schema
+        from .schema import GraphSchema, build_schema, check_no_column_collisions
         if schema is not None:
             if nodes is not None or edges is not None:
                 raise ValueError(
@@ -641,10 +649,11 @@ class Graph:
                     f"schema= takes a GraphSchema (e.g. from infer_schema()), "
                     f"got {type(schema).__name__}"
                 )
-            self._schema = schema
-            return schema
-        self._schema = build_schema(nodes, edges)
-        return self._schema
+        else:
+            schema = build_schema(nodes, edges)
+        check_no_column_collisions(schema, self.nodes_tbl, self.edges_tbl)
+        self._schema = schema
+        return schema
 
     def infer_schema(self, sample_percent: Optional[float] = None) -> tuple:
         """Derive the schema from the rows this graph already holds:
@@ -900,9 +909,12 @@ class Graph:
         ADOPT it on this handle (a saved schema was explicitly declared
         a contract -- unlike an inferred one, which is an observation)
         and return it. The stored document is data: it is rebuilt
-        through the same validation define_schema() runs, so a corrupted
-        row raises loudly instead of half-loading."""
-        from .schema import schema_from_document
+        through the same validation define_schema() runs -- including
+        the column-collision check -- so a corrupted row, or a schema
+        that collides with THIS handle's table (a save/load pair can
+        cross tables; its extra columns need not match), raises loudly
+        instead of half-loading."""
+        from .schema import check_no_column_collisions, schema_from_document
         row = None
         with self.engine.connect() as connection:
             exists = connection.execute(
@@ -918,8 +930,10 @@ class Graph:
                 f"no saved schema for graph {self.graph!r} -- save_schema() stores "
                 f"the declared schema for other handles to load; on this handle, "
                 f"declare it with define_schema(...)")
-        self._schema = schema_from_document(row[0])
-        return self._schema
+        schema = schema_from_document(row[0])
+        check_no_column_collisions(schema, self.nodes_tbl, self.edges_tbl)
+        self._schema = schema
+        return schema
 
     # -- vectors --------------------------------------------------------
 

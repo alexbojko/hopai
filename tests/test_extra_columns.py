@@ -182,3 +182,38 @@ class TestMerge:
         nodes = extra_graph.traverse(Start()).nodes
         assert len(nodes) == 1
         assert nodes[0]["properties"]["name"] == "second"
+
+
+class TestColumnCollision:
+    """The footgun this feature would otherwise open: a schema/
+    constraint/merge declaration that names 'user_id' meaning a JSONB
+    property, unaware that this table's user_id is real. Each entry
+    point refuses instead of silently compiling a rule -- or a merge
+    conflict target -- that a correct row could never satisfy."""
+
+    def test_define_constraints_refuses_a_bare_required(self, extra_graph):
+        from hopai import Required
+        with pytest.raises(TypeError, match="'user_id' is a real column"):
+            extra_graph.constraint_ddl(nodes=[Required("user_id")])
+
+    def test_define_schema_refuses_a_dataclass_field_named_user_id(self, extra_graph):
+        from dataclasses import dataclass
+
+        @dataclass
+        class Person:
+            email: str
+            user_id: int   # an honest name collision, not a typo of 'id'
+
+        with pytest.raises(ValueError, match=r"\['user_id'\]"):
+            extra_graph.define_schema(nodes=[Person])
+        assert extra_graph.schema is None
+
+    def test_merge_on_refuses_a_bare_user_id(self, extra_graph):
+        """The dangerous sibling of test_merge_on_may_target_the_extra_
+        column_itself: on=["user_id"] (no Col()) used to compile a
+        conflict target on properties->>'user_id' -- a key add_nodes()
+        never writes there -- so ON CONFLICT could never match and
+        merge_nodes() would silently insert a duplicate node every
+        single call instead of ever updating one."""
+        with pytest.raises(TypeError, match="'user_id' is a real column"):
+            extra_graph.merge_nodes([{"user_id": 1, "name": "first"}], on=["user_id"])

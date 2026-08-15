@@ -55,9 +55,15 @@ want once stated:
     the type of a value that is there, not its presence.
 
 A bare string names a JSONB property. A real table column has to say so
-with Col("start_id") -- guessing from whether the name happens to match a
-column would silently change the meaning of a constraint on a property
-called `id`.
+with Col("start_id") -- and since a bare string that happens to match a
+real column name can only ever be a mistake (that column is written and
+read by name already, never through `properties`), it is refused rather
+than silently reinterpreted: `Required("start_id")` raises TypeError
+naming the fix, the same way a typo'd Col(...) raises for a column that
+does not exist. This is checked wherever a bare string could compile to
+`properties->>'...'` -- Unique/Index/Required/PropertyType, and
+merge_nodes()/merge_edges()'s `on=`, since key_sql() is what both the
+index and the ON CONFLICT target are rendered through.
 """
 
 from __future__ import annotations
@@ -253,6 +259,24 @@ def _literal(expression) -> str:
     ))
 
 
+def _reject_column_collision(target: _Target, key: str) -> None:
+    """A bare string that names a real column on this table can only be
+    a mistake: the CHECK/index it would compile tests `properties->>
+    '<key>'`, and that column is written and read by name already --
+    directly by add_nodes()/add_edges(), or as an EXTRA COLUMN
+    (models.py's "EXTENDING THE MODEL") -- never through `properties`.
+    Refusing beats guessing, the same "Refuse, don't approximate" rule
+    every other silently-different-meaning trap in this library follows."""
+    if key in target.table.c:
+        raise TypeError(
+            f"{key!r} is a real column on {target.label} ({sorted(c.name for c in target.table.c)}), "
+            f"not a JSONB property -- a bare string always means a property inside "
+            f"`properties`, so this can only be a mistake. Say Col({key!r}) if you meant "
+            f"the column (accepted by Unique/Index/merge's on=), or use a different "
+            f"property name"
+        )
+
+
 def _key_expression(target: _Target, key: Key):
     if isinstance(key, Col):
         if key.name not in target.table.c:
@@ -263,6 +287,7 @@ def _key_expression(target: _Target, key: Key):
         return sa_column(key.name)
     if not isinstance(key, str):
         raise TypeError(f"a constraint key must be a property name or Col(...), got {key!r}")
+    _reject_column_collision(target, key)
     return target.properties_col[key].astext
 
 
@@ -306,6 +331,8 @@ def compile_constraint(constraint: Any, target: _Target) -> tuple:
         return "index", name, ddl
 
     if isinstance(constraint, Required):
+        for key in constraint.keys:
+            _reject_column_collision(target, key)
         name = constraint.name or target.scope_name(
             _auto_name("ck_required", target, constraint.keys))
         body = _literal(target.scope_check(
@@ -313,12 +340,19 @@ def compile_constraint(constraint: Any, target: _Target) -> tuple:
         return "check", name, _add_check(target, name, body)
 
     if isinstance(constraint, PropertyType):
+        _reject_column_collision(target, constraint.key)
         name = constraint.name or target.scope_name(
             _auto_name(f"ck_{constraint.json_type}", target, [constraint.key]))
         expression = func.jsonb_typeof(target.properties_col[constraint.key]) == constraint.json_type
         return "check", name, _add_check(target, name, _literal(target.scope_check(expression)))
 
     if isinstance(constraint, Check):
+        # No _reject_column_collision here: unlike Required/PropertyType,
+        # a Check's filter is an arbitrary AND/OR/NOT/GT/... tree with a
+        # callable escape hatch (see filters.py), so there is no fixed
+        # set of "the keys" to check without re-deriving schema.py's own
+        # _filter_vocabulary walk -- and that walk already treats a
+        # callable as opaque for the same reason. Left to the author.
         if constraint.name is None:
             raise ValueError(
                 "Check(...) needs an explicit name= -- a filter has no short, stable "

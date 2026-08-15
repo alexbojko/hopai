@@ -613,6 +613,50 @@ def build_schema(nodes, edges) -> GraphSchema:
     return GraphSchema(node_types, edge_types)
 
 
+def check_no_column_collisions(schema: GraphSchema, nodes_tbl, edges_tbl) -> None:
+    """Refuse a declared property whose name is already a real column on
+    THIS Graph's table -- the identity/graph column, a vec_* vector
+    field, or an EXTRA COLUMN (models.py's "EXTENDING THE MODEL").
+    `Property('user_id', 'number')` -- or a dataclass field of the same
+    name, both normalize to the same thing -- on a table that already
+    has a real `user_id` column would compile a CHECK on
+    `properties->>'user_id'`, a JSONB key ingestion can never populate
+    for that name: add_nodes()/merge_nodes() route it to the real
+    column instead, every single time. Left uncaught, every insert of
+    the type fails enforce_schema() forever, for a row that is
+    perfectly correct -- worse than a refusal, because nothing points
+    at why.
+
+    Graph.define_schema() and Graph.load_schema() both call this --
+    every path that adopts a schema, since a schema saved for one table
+    can be load_schema()'d onto a handle over a different one. Not a
+    GraphSchema.__init__ check: which columns collide depends on the
+    TABLE, and a schema is deliberately reusable across tables (that is
+    what save_schema()/load_schema() and infer_schema() are for).
+
+    Nested properties (Property.properties) are not checked: a nested
+    key compiles to `properties->'parent'->>'key'`, which cannot
+    collide with a top-level table column no matter what it is named."""
+    for nt in schema.node_types:
+        collisions = sorted(p.name for p in nt.properties if p.name in nodes_tbl.c)
+        if collisions:
+            raise ValueError(
+                f"NodeType({nt.name!r}): {collisions} already name real column(s) on "
+                f"{nodes_tbl.name!r} -- add_nodes()/merge_nodes() write those by column, "
+                f"never into `properties`, so declaring them as properties too would compile "
+                f"a CHECK that can never see the value it is testing for. Rename the "
+                f"field, or drop it from properties=/the dataclass"
+            )
+    for et in schema.edge_types:
+        collisions = sorted(p.name for p in et.properties if p.name in edges_tbl.c)
+        if collisions:
+            raise ValueError(
+                f"EdgeType({et.kind!r}): {collisions} already name real column(s) on "
+                f"{edges_tbl.name!r} -- same reason as NodeType's version of this error: "
+                f"rename the field, or drop it from properties=/the dataclass"
+            )
+
+
 # ---------------------------------------------------------------------
 # Representations: shared pieces
 # ---------------------------------------------------------------------
