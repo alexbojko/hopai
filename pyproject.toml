@@ -37,6 +37,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/alexbojko/hopai"
+Documentation = "https://alexbojko.github.io/hopai/"
 Repository = "https://github.com/alexbojko/hopai"
 Issues = "https://github.com/alexbojko/hopai/issues"
 Changelog = "https://github.com/alexbojko/hopai/blob/main/CHANGELOG.md"
@@ -54,6 +55,11 @@ dev = ["pytest>=8.0", "pytest-cov>=5.0", "networkx>=3.0", "pydantic>=2.0", "ruff
 # executes them headlessly and `pip install jupyterlab` is the reader's call.
 notebooks = ["nbclient>=0.10", "nbformat>=5.9", "ipykernel>=6.29",
              "networkx>=3.0", "pydantic>=2.0"]
+# Building the documentation site (mkdocs.yml). Separate from `notebooks`
+# because the two do opposite things: `notebooks` EXECUTES them against a
+# database, while the site only renders the outputs already committed --
+# so a docs build needs no PostgreSQL and no Jupyter kernel.
+docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocs-jupyter>=0.25"]
 # Pinned <4 deliberately: the config surface this project relies on
 # (`source_paths`, `also_copy`, `mutate_only_covered_lines`, and the
 # `export-cicd-stats` JSON the PR comment parses) is the documented 3.x
