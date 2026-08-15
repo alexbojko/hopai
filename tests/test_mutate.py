@@ -432,8 +432,13 @@ class TestRefusals:
         ordinary tool-call failure, and "false" is truthy in Python -- so
         coercing let `{"op": "delete_nodes", "all": "false"}` mean "yes,
         every row" and empty the graph."""
-        with pytest.raises(TypeError, match="takes True or False"):
+        argument = next(k for k in ("all", "detach", "replace") if k in arguments)
+        with pytest.raises(TypeError) as exc:
             getattr(people, call)(**arguments)
+        # The message has to name the argument it is talking about: three
+        # of them reach _flag(), and "takes True or False" alone leaves
+        # the caller to work out which one they got wrong.
+        assert str(exc.value).startswith(f"{call}({argument}=...) takes True or False")
         assert len(properties_of(people)) == 4
 
     def test_a_property_value_outside_json_is_refused_before_the_transaction(self, people):
@@ -535,7 +540,7 @@ class TestStatementShape:
         assert norm(mutator.delete_nodes_statement({"type": "person"})) == (
             'DELETE FROM v WHERE v.properties @> CAST(\'{"type": "person"}\' AS JSONB)')
         assert norm(mutator.delete_edges_statement(all=True)) == "DELETE FROM e"
-        with pytest.raises(ValueError, match="in these tables"):
+        with pytest.raises(ValueError, match=r"match every node in these tables\."):
             mutator.delete_nodes_statement()
 
     def test_custom_column_names_are_honoured(self, offline_graph):
@@ -634,7 +639,8 @@ class TestJsonDocument:
         ({"operations": [{"op": "delete_nodes", "set": {"x": 1}}]}, "does not take"),
         ({"operations": [{"op": "update_nodes", "detach": True}]}, "does not take"),
         ({"operations": ["delete_nodes"]}, "must be an object"),
-        ("delete everything", "dict with an 'operations' list"),
+        ("delete everything", r"dict with an 'operations' list, got str"),
+        (42, r"dict with an 'operations' list, got int"),
     ])
     def test_a_document_that_does_not_say_what_it_means_refuses(self, spec, message):
         with pytest.raises((ValueError, TypeError), match=message):
@@ -671,6 +677,10 @@ class TestToolSchema:
         from hopai.mutate import _OP_KEYS
         for op, branch in branches().items():
             assert set(branch["properties"]) - {"op"} == set(_OP_KEYS[op])
+            # The three keywords that make the branch mean anything to a
+            # constrained decoder, none of which any other test reads.
+            assert branch["type"] == "object"
+            assert branch["required"] == ["op"]
             assert branch["additionalProperties"] is False
 
     def test_every_documented_argument_survives_the_parser(self):

@@ -74,5 +74,11 @@ because of bugs, not taste:
   mutation by hand and run the suite: `hopai.mutate.xǁMutatorǁdelete_edges__mutmut_18`
   came back `timeout` and fails the suite in nine seconds on its own.
 
+- **A module-level constant's builder comes back `no tests`.** `MUTATE_TOOL_SCHEMA` is
+  built by `_operation_schema()` at import time, so no *test* executes those lines and
+  `mutate_only_covered_lines` skips them — they are unchecked, not survived, and CI's
+  report may list them either way. The assertions in `TestToolSchema` do cover the
+  result; apply a mutation by hand if you want the proof.
+
 CI scopes mutation to the files a PR changed and caps it with a wall-clock budget; a
 full run over `hopai/` is thousands of mutants.
