@@ -32,11 +32,18 @@ _EXTERNAL = re.compile(r"\w+:|//|#")
 
 
 def site_base(config: pathlib.Path) -> str:
-    """The path `site_url` mounts the site at, e.g. `/hopai/`."""
-    match = re.search(r"^site_url:\s*(\S+)", config.read_text(), flags=re.M)
-    if not match:
-        return "/"
-    return urllib.parse.urlparse(match.group(1).strip("\"'")).path or "/"
+    """The path `site_url` mounts the site at, e.g. `/en/latest/`.
+
+    Read through MkDocs' own loader rather than off the file: `site_url` is an
+    `!ENV` lookup, because Read the Docs serves each version at its own path
+    and stamps the canonical one into the environment. Only MkDocs resolves
+    that the way the build that produced this site did -- a regex over the
+    YAML reads the literal `!ENV`, and every absolute link then fails to
+    resolve against a base of `/`.
+    """
+    from mkdocs.config import load_config
+
+    return urllib.parse.urlparse(load_config(str(config)).get("site_url") or "/").path or "/"
 
 
 def check(site: pathlib.Path, base: str) -> list[str]:

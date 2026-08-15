@@ -37,7 +37,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/alexbojko/hopai"
-Documentation = "https://alexbojko.github.io/hopai/"
+Documentation = "https://hopai.readthedocs.io/"
 Repository = "https://github.com/alexbojko/hopai"
 Issues = "https://github.com/alexbojko/hopai/issues"
 Changelog = "https://github.com/alexbojko/hopai/blob/main/CHANGELOG.md"

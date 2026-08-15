@@ -1,6 +1,6 @@
 name: Release
 
-# Three steps, one workflow, all on a push to main:
+# Two steps, one workflow, both on a push to main:
 #
 #   1. release-please reads the Conventional Commits since the last tag
 #      and keeps ONE open "chore(main): release x.y.z" pull request with
@@ -11,12 +11,13 @@ name: Release
 #      PyPI -- but only on the run where the release was actually
 #      created, which is why the publish job keys off
 #      `release_created` rather than off the tag.
-#   3. And it builds the documentation site and deploys it to GitHub
-#      Pages, off the same signal. Deploying only on release is what makes
-#      the published site mean something: it is the documentation for the
-#      version that is on PyPI, not for whatever landed on main an hour
-#      ago. Every PR still BUILDS the site (the `docs` job in ci.yml), so
-#      a broken site is caught long before it can block a release.
+#
+# The documentation site is NOT built here. Read the Docs builds and hosts
+# it (see .readthedocs.yaml), triggered by the tag this workflow creates
+# rather than by a step in it -- so the published site still describes the
+# released version, and this repository still stores no deploy credential.
+# Every PR builds the site anyway (the `docs` job in ci.yml), which is what
+# catches a broken site before a release can trip over it.
 #
 # Publishing uses PyPI Trusted Publishing (OIDC): no API token is stored
 # anywhere. PyPI is told to trust this repository, this workflow file and
@@ -40,26 +41,13 @@ on:
         type: string
         required: false
         default: ""
-      # Separate from publish_tag on purpose. Re-deploying the site for a
-      # tag is safe and repeatable; re-running the PyPI upload for one is
-      # neither -- that version is already there and the upload fails. One
-      # input for both would make "republish the docs" a broken release run.
-      docs_tag:
-        description: "Existing tag to build and deploy the documentation for (e.g. v0.0.1)."
-        type: string
-        required: false
-        default: ""
 
 permissions:
   contents: read
 
 jobs:
   release-please:
-    # A bare dispatch (no tag named) still runs release-please; a dispatch
-    # that names a tag is asking for that one artifact and nothing else.
-    if: >-
-      github.event_name == 'push' ||
-      (inputs.publish_tag == '' && inputs.docs_tag == '')
+    if: github.event_name == 'push' || inputs.publish_tag == ''
     runs-on: ubuntu-latest
     permissions:
       contents: write        # to create the release commit, tag and Release
@@ -138,64 +126,3 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         # No `with: password:` on purpose -- the OIDC identity above is
         # the credential. Adding a token would take the untrusted path.
-
-  # The documentation site. Deliberately NOT `needs: publish`: the docs
-  # describe the tag, and they are worth having even if a PyPI upload had to
-  # be retried. The two run side by side off the same release signal.
-  #
-  # Requires Pages to be set to "Deploy from GitHub Actions" once, in
-  # Settings -> Pages. Like the PyPI job this stores no credential: the
-  # id-token permission below is what the deployment is authenticated with.
-  docs:
-    needs: release-please
-    # Same shape as `publish` above, and for the same reason: the
-    # release-please job is skipped on the manual path, and a skipped
-    # dependency would otherwise skip this one too.
-    if: >-
-      always() &&
-      (needs.release-please.outputs.release_created == 'true' ||
-       inputs.docs_tag != '')
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    permissions:
-      contents: read
-      pages: write           # to publish the artifact to Pages
-      id-token: write        # required to authenticate the deployment
-    # Two release runs overlapping would race to publish two different
-    # versions of the site. Queue them instead, and never cancel one
-    # half-deployed.
-    concurrency:
-      group: github-pages
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # Build from the tag, not from main -- same reasoning as the
-          # publish job: the site has to describe what was released.
-          ref: ${{ needs.release-please.outputs.tag_name || inputs.docs_tag }}
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - run: pip install -e ".[docs]"
-
-      # --strict here as well as in CI. CI proved the site built on main;
-      # this proves it builds from the tag, which is what gets published.
-      - name: Build the site
-        run: mkdocs build --strict
-
-      - name: Check every internal link resolves
-        run: python scripts/check_docs_links.py
-
-      - uses: actions/configure-pages@v5
-
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-
-      - name: Deploy to GitHub Pages
-        id: deploy
-        uses: actions/deploy-pages@v4
