@@ -123,7 +123,28 @@ is counted as skipped.
 
 Cost: one sequential scan per query -- the GIN index cannot serve an
 all-keys aggregate. Meant for start-up, migration or exploration, not
-per-request.
+per-request. When even one scan is too much,
+infer_schema(sample_percent=5) reads TABLESAMPLE SYSTEM (5) instead:
+every count becomes an estimate, a rare property or edge triple can be
+missed entirely, and `required` means only "present on every SAMPLED
+row" -- so the report carries `sampled` and its summary says estimates.
+The endpoint-triple join samples the edges side only: sampling the node
+side too would count an edge whose node happened to fall outside the
+sample as endpoint-less, manufacturing skipped-edge noise the data does
+not contain.
+
+PERSISTENCE -- a schema declared on one handle is invisible to every
+other process on the same database, so Graph.save_schema() upserts the
+declared contract into a third table, hopai_schema(graph_id, document,
+saved_at), and Graph.load_schema() on any handle reads it back and
+adopts it. The table is metadata, never on the query path, and is
+created lazily by the first save -- callers who never persist never see
+it. The document is the to_json() rendering (lossless);
+schema_from_document() is the inverse, and it routes everything through
+the same constructors define_schema() uses, so a corrupted row raises
+the real validation error instead of half-loading. Loading ADOPTS --
+unlike an inferred schema, a saved one was explicitly declared a
+contract by whoever saved it.
 """
 
 from __future__ import annotations
@@ -350,6 +371,33 @@ class GraphSchema:
             models[kind] = _pydantic_model(kind, properties, pydantic.create_model)
         return models
 
+    def to_mermaid(self) -> str:
+        """The schema as a Mermaid flowchart -- GitHub, GitLab and most
+        doc tooling render it natively, so this string inside a
+        ```mermaid fence turns the schema into a picture in any PR
+        description or README. Node labels carry the same bounded
+        property bag as tool_summary() (* required, ! unique, capped
+        with +N more); one arrow per (kind, source, target) triple, so
+        parallel kinds stay parallel arrows -- the same
+        no-silent-collapse rule to_networkx() documents."""
+        ids: dict = {}
+        for index, nt in enumerate(self.node_types):
+            # _slug can collide ("works-at" and "works_at") or come back
+            # empty; the index suffix keeps every id distinct and the
+            # label keeps the real name
+            base = _slug(nt.name) or "node"
+            ids[nt.name] = base if base not in ids.values() else f"{base}_{index}"
+        lines = ["flowchart LR"]
+        for nt in self.node_types:
+            bag = _property_bag(nt.properties)
+            label = _mermaid_text(f"{nt.name} {bag}" if bag else nt.name)
+            lines.append(f'    {ids[nt.name]}["{label}"]')
+        for et in self.edge_types:
+            kind = (et.kind if re.fullmatch(r"[A-Za-z0-9_]+", et.kind)
+                    else f'"{_mermaid_text(et.kind)}"')
+            lines.append(f"    {ids[et.source]} -- {kind} --> {ids[et.target]}")
+        return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------
 # Class notation -> canonical model
@@ -571,8 +619,10 @@ def build_schema(nodes, edges) -> GraphSchema:
 def _property_json(p: Property) -> dict:
     if p.properties:
         spec = _properties_json(p.properties)   # a nested object schema
-        if len(p.json_type) > 1:
-            spec["type"] = list(p.json_type)
+        # the property's OWN type set, not the "object" _properties_json
+        # assumes -- ("null", "object") must round-trip through
+        # schema_from_document() as itself
+        spec["type"] = p.json_type[0] if len(p.json_type) == 1 else list(p.json_type)
     else:
         spec = {"type": p.json_type[0] if len(p.json_type) == 1 else list(p.json_type)}
     if p.values:
@@ -593,6 +643,13 @@ def _properties_json(properties: tuple) -> dict:
     if required:
         spec["required"] = required
     return spec
+
+
+def _mermaid_text(value: str) -> str:
+    """Text safe inside a Mermaid double-quoted label: the one character
+    that can terminate the label early is '"', and Mermaid's own escape
+    for it is the #quot; entity."""
+    return value.replace('"', "#quot;")
 
 
 _PYTHON_TYPES = {"string": str, "number": float, "boolean": bool, "object": dict,
@@ -968,27 +1025,33 @@ def validate_operations(schema: GraphSchema, operations: list,
 _TOOL_SUMMARY_PROPERTIES = 12
 
 
+def _property_bag(properties: tuple) -> str:
+    """'(email*, sku!, +3 more)' -- the bounded property list
+    tool_summary() and to_mermaid() share, so the prompt form and the
+    picture form can never disagree about markers: * required, ! unique,
+    capped because both outputs are budget someone else is paying for."""
+    shown = [p.name + ("*" if p.required else "") + ("!" if p.unique else "")
+             for p in properties[:_TOOL_SUMMARY_PROPERTIES]]
+    overflow = len(properties) - _TOOL_SUMMARY_PROPERTIES
+    if overflow > 0:
+        shown.append(f"+{overflow} more")
+    return f"({', '.join(shown)})" if shown else ""
+
+
 def tool_summary(schema: GraphSchema) -> str:
     """The declared schema as one compact paragraph for a tool
     description: what an agent can filter on, so it stops guessing
     labels and property names. `*` marks required, endpoint pairs are
     grouped per kind, and long property lists are capped -- bounded on
     purpose, never an unbounded dump."""
-    def bag(properties: tuple) -> str:
-        shown = [p.name + ("*" if p.required else "") + ("!" if p.unique else "")
-                 for p in properties[:_TOOL_SUMMARY_PROPERTIES]]
-        overflow = len(properties) - _TOOL_SUMMARY_PROPERTIES
-        if overflow > 0:
-            shown.append(f"+{overflow} more")
-        return f"({', '.join(shown)})" if shown else ""
-
-    nodes = "; ".join(f"{nt.name}{bag(nt.properties)}" for nt in schema.node_types)
+    nodes = "; ".join(f"{nt.name}{_property_bag(nt.properties)}" for nt in schema.node_types)
     per_kind: dict = {}
     for et in schema.edge_types:
         pairs, _ = per_kind.setdefault(et.kind, ([], et.properties))
         pairs.append(f"{et.source} -> {et.target}")
     edges = "; ".join(
-        f"{kind}: {', '.join(pairs)}" + (f" {bag(properties)}" if properties else "")
+        f"{kind}: {', '.join(pairs)}"
+        + (f" {_property_bag(properties)}" if properties else "")
         for kind, (pairs, properties) in per_kind.items())
     parts = ["This graph's declared schema (properties in parentheses, "
              "* = required, ! = unique)."]
@@ -1126,9 +1189,13 @@ class InferenceReport:
     untyped_edges: int
     skipped_endpoint_edges: int
     conflicts: tuple
+    sampled: Optional[float] = None
 
     def __str__(self) -> str:
-        lines = [
+        lines = []
+        if self.sampled is not None:
+            lines.append(f"sampled {self.sampled}% of rows -- counts are estimates")
+        lines += [
             f"nodes: {sum(self.node_counts.values())} typed across "
             f"{len(self.node_counts)} type(s) {dict(sorted(self.node_counts.items()))}, "
             f"{self.untyped_nodes} untyped (outside the schema)",
@@ -1150,28 +1217,38 @@ def _named(value: Optional[str]) -> bool:
     return value is not None and value != ""
 
 
-def _observed_counts(connection, graph, table, discriminator: str) -> dict:
+def _source(table, sample_percent: Optional[float]):
+    """The table, or a TABLESAMPLE SYSTEM view of it. Sampling trades
+    exactness for speed and the caller opted in -- the report carries
+    the flag so nobody reads estimated counts as truth."""
+    if sample_percent is None:
+        return table
+    from sqlalchemy import tablesample
+    return tablesample(table, sample_percent)
+
+
+def _observed_counts(connection, graph, source, discriminator: str) -> dict:
     from sqlalchemy import func, select
-    name = table.c.properties[discriminator].astext
+    name = source.c.properties[discriminator].astext
     rows = connection.execute(
         select(name.label("name"), func.count().label("rows"))
-        .where(graph._scoped(table)).group_by(name)
+        .where(graph._scoped(source)).group_by(name)
     ).all()
     return {r.name: r.rows for r in rows}
 
 
-def _observed_keys(connection, graph, table, discriminator: str) -> list:
+def _observed_keys(connection, graph, source, discriminator: str) -> list:
     """(type name, key, json type, row count) per distinct combination
     -- one lateral jsonb_each scan, Postgres doing all the work."""
     from sqlalchemy import func, select
-    kv = func.jsonb_each(table.c.properties).table_valued(
+    kv = func.jsonb_each(source.c.properties).table_valued(
         "key", "value", joins_implicitly=True)
-    name = table.c.properties[discriminator].astext
+    name = source.c.properties[discriminator].astext
     json_type = func.jsonb_typeof(kv.c.value)
     return connection.execute(
         select(name.label("name"), kv.c.key.label("key"),
                json_type.label("json_type"), func.count().label("rows"))
-        .where(graph._scoped(table))
+        .where(graph._scoped(source))
         .group_by(name, kv.c.key, json_type)
     ).all()
 
@@ -1201,25 +1278,42 @@ def _derive_properties(counts: dict, key_rows: list, discriminator: str,
     return properties
 
 
-def infer_schema(graph) -> tuple:
+def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
     """Derive (GraphSchema, InferenceReport) from the rows this graph
     already holds. Read-only, never registers itself as the handle's
     schema -- see the module docstring for why observation and contract
-    stay separate. Every query is scoped to this graph."""
+    stay separate. Every query is scoped to this graph.
+
+    sample_percent reads TABLESAMPLE SYSTEM (p) instead of every row:
+    counts become estimates, a rare property or edge triple can be
+    missed entirely, and `required` is tentative -- a key present on
+    every SAMPLED row may be missing elsewhere -- so the report carries
+    `sampled` and says estimates. The endpoint-triple join samples the
+    edges side only: sampling the node side too would count edges whose
+    node fell outside the sample as endpoint-less, manufacturing
+    skipped-edge noise the data does not contain."""
     from sqlalchemy import and_, func, select
 
+    if sample_percent is not None and not 0 < sample_percent <= 100:
+        raise ValueError(
+            f"sample_percent must satisfy 0 < sample_percent <= 100, "
+            f"got {sample_percent!r}")
+
     nt, et = graph.nodes_tbl, graph.edges_tbl
+    node_source = _source(nt, sample_percent)
+    edge_source = _source(et, sample_percent)
     conflicts: list = []
     with graph.engine.connect() as connection:
-        node_counts = _observed_counts(connection, graph, nt, "type")
-        edge_counts = _observed_counts(connection, graph, et, "kind")
+        node_counts = _observed_counts(connection, graph, node_source, "type")
+        edge_counts = _observed_counts(connection, graph, edge_source, "kind")
         node_props = _derive_properties(node_counts, _observed_keys(
-            connection, graph, nt, "type"), "type", "nodes", conflicts)
+            connection, graph, node_source, "type"), "type", "nodes", conflicts)
         edge_props = _derive_properties(edge_counts, _observed_keys(
-            connection, graph, et, "kind"), "kind", "edges", conflicts)
+            connection, graph, edge_source, "kind"), "kind", "edges", conflicts)
 
+        edges = edge_source
         source, target = nt.alias("src"), nt.alias("dst")
-        kind = et.c.properties["kind"].astext
+        kind = edges.c.properties["kind"].astext
         node_id = graph.node_id_col
         triples = connection.execute(
             select(kind.label("kind"),
@@ -1227,9 +1321,9 @@ def infer_schema(graph) -> tuple:
                    target.c.properties["type"].astext.label("target"),
                    func.count().label("rows"))
             .select_from(
-                et.join(source, getattr(et.c, graph.edge_start_col) == getattr(source.c, node_id))
-                  .join(target, getattr(et.c, graph.edge_end_col) == getattr(target.c, node_id)))
-            .where(and_(graph._scoped(et), graph._scoped(source), graph._scoped(target)))
+                edges.join(source, getattr(edges.c, graph.edge_start_col) == getattr(source.c, node_id))
+                     .join(target, getattr(edges.c, graph.edge_end_col) == getattr(target.c, node_id)))
+            .where(and_(graph._scoped(edges), graph._scoped(source), graph._scoped(target)))
             .group_by(kind, source.c.properties["type"].astext,
                       target.c.properties["type"].astext)
         ).all()
@@ -1254,5 +1348,75 @@ def infer_schema(graph) -> tuple:
         untyped_edges=sum(v for k, v in edge_counts.items() if not _named(k)),
         skipped_endpoint_edges=skipped,
         conflicts=tuple(conflicts),
+        sampled=sample_percent,
     )
     return GraphSchema(node_types, edge_types), report
+
+
+# ---------------------------------------------------------------------
+# Persistence: the to_json() document, parsed back
+# ---------------------------------------------------------------------
+
+def _properties_from_json(spec, owner: str) -> list:
+    """[Property] from a _properties_json() rendering. Structural
+    checks raise naming the path; everything else is left to the
+    Property constructor, so a corrupted document fails with the same
+    complaint hand-written bad input would."""
+    if not isinstance(spec, dict) or not isinstance(spec.get("properties", {}), dict):
+        raise ValueError(
+            f"{owner}: expected a JSON Schema object spec with a 'properties' "
+            f"mapping, got {spec!r}")
+    required = spec.get("required", [])
+    if not isinstance(required, (list, tuple)):
+        # 'in' on a string would do substring matching -- a corrupted
+        # "required": "email" must not quietly mark nothing (or the
+        # wrong thing) required
+        raise ValueError(f"{owner}: 'required' must be a list of property names, "
+                         f"got {required!r}")
+    properties = []
+    for name, p in spec.get("properties", {}).items():
+        if not isinstance(p, dict) or "type" not in p:
+            raise ValueError(
+                f"{owner} property {name!r}: expected a spec object with a 'type', "
+                f"got {p!r}")
+        properties.append(Property(
+            name, p["type"],
+            required=name in required,
+            unique=bool(p.get("unique", False)),
+            values=tuple(p.get("enum", ())),
+            format=p.get("format"),
+            properties=(_properties_from_json(p, owner=f"{owner} property {name!r}")
+                        if "properties" in p else ()),
+        ))
+    return properties
+
+
+def schema_from_document(document) -> GraphSchema:
+    """The exact inverse of GraphSchema.to_json() -- how load_schema()
+    turns a stored hopai_schema row back into the canonical dataclasses.
+
+    The stored document is data, not trusted state: every piece routes
+    through the same Property/NodeType/EdgeType/GraphSchema constructors
+    define_schema() uses, so a hand-corrupted row raises the real
+    validation error and never half-loads."""
+    if (not isinstance(document, dict)
+            or not isinstance(document.get("nodes"), dict)
+            or not isinstance(document.get("edges"), list)):
+        raise ValueError(
+            "not a hopai schema document: expected {'nodes': {...}, 'edges': [...]} "
+            "as written by save_schema()")
+    node_types = [
+        NodeType(name, properties=_properties_from_json(spec, owner=f"node type {name!r}"))
+        for name, spec in document["nodes"].items()
+    ]
+    edge_types = []
+    for entry in document["edges"]:
+        if not isinstance(entry, dict):
+            raise ValueError(f"schema document edge entries must be objects, got {entry!r}")
+        edge_types.append(EdgeType(
+            entry.get("kind"), source=entry.get("source"), target=entry.get("target"),
+            properties=_properties_from_json(
+                entry.get("properties", {"type": "object", "properties": {}}),
+                owner=f"edge kind {entry.get('kind')!r}"),
+        ))
+    return GraphSchema(node_types, edge_types)

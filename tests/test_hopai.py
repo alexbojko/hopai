@@ -9,6 +9,8 @@ failed without the fix.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from hopai import (
@@ -172,6 +174,21 @@ class TestCoreTraversal:
         # default) passed unnoticed. A real round trip cannot take zero.
         assert 0 < result.elapsed_ms < 5000  # generous ceiling; should be near-instant
         assert len(result.nodes) > 0
+
+    def test_elapsed_ms_is_measured_in_milliseconds(self, graph):
+        """The unit is part of the name, and only an independent clock
+        can check it: every self-consistent assertion passes just as
+        happily when the seconds-to-ms conversion is inverted (mutant
+        traverse_111 divides where it should multiply, reporting a
+        millionth of the truth). The bounds are deliberately loose --
+        elapsed_ms times the queries inside a call that also builds the
+        statement and opens a session, so it is a fraction of the wall
+        time, never more, and never a millionth."""
+        t0 = time.perf_counter()
+        result = graph.traverse(Start(where={"type": "leaf"}), Hop(hops=(1, 3)))
+        wall_ms = (time.perf_counter() - t0) * 1000
+        assert 0 < result.elapsed_ms <= wall_ms
+        assert result.elapsed_ms > wall_ms / 1000
 
 
 # ---------------------------------------------------------------------
