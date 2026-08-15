@@ -508,24 +508,31 @@ def parse_boost(spec: Any):
 
 def parse_near(spec: Any):
     """The JSON form of Near, mirroring parse_filter()/parse_aggregate():
-    an object {"field": ..., "vector": [...]} plus the optional keys
-    weight / min_similarity / missing, or a list of such objects."""
+    an object {"field": ..., "text": "..."} -- or "vector": [...] if you
+    hold the floats -- plus the optional keys weight / min_similarity /
+    missing, or a list of such objects."""
     if isinstance(spec, list):
         if not spec:
-            raise ValueError('"near" is an empty list -- give at least one {"field", "vector"}')
+            raise ValueError('"near" is an empty list -- give at least one {"field", "text"}')
         return [parse_near(one) for one in spec]
     if not isinstance(spec, dict):
         raise TypeError(f'"near" must be an object or a list of objects -- '
                         f'got {type(spec).__name__}')
-    unknown = set(spec) - {"field", "vector", "weight", "min_similarity", "missing"}
+    unknown = set(spec) - {"field", "vector", "text", "weight", "min_similarity", "missing"}
     if unknown:
         raise ValueError(f'unknown "near" keys {sorted(unknown)} -- a near spec has "field", '
-                         f'"vector" and optionally weight, min_similarity, missing')
-    missing_keys = {"field", "vector"} - set(spec)
-    if missing_keys:
-        raise ValueError(f'a near spec needs {sorted(missing_keys)} -- '
-                         f'e.g. {{"field": "summary", "vector": [...]}}')
-    return Near(spec["field"], spec["vector"], weight=spec.get("weight", 1.0),
+                         f'"text" or "vector", and optionally weight, min_similarity, missing')
+    if "field" not in spec:
+        raise ValueError('a near spec needs "field" -- '
+                         'e.g. {"field": "summary", "text": "how do nodes agree?"}')
+    if ("vector" in spec) == ("text" in spec):
+        raise ValueError(
+            f'a near spec needs "text" to embed OR "vector" if you already have the floats, '
+            f'not {"both" if "text" in spec else "neither"} -- '
+            f'e.g. {{"field": {spec["field"]!r}, "text": "how do nodes agree?"}}'
+        )
+    return Near(spec["field"], spec.get("vector"), text=spec.get("text"),
+                weight=spec.get("weight", 1.0),
                 min_similarity=spec.get("min_similarity"), missing=spec.get("missing", "exclude"))
 
 

@@ -23,7 +23,8 @@ from sqlalchemy.schema import CreateTable
 from hopai import (
     AGGREGATE_TOOL_SCHEMA, Count, Graph, Hop, INGEST_TOOL_SCHEMA, Near, Start, aggregate_json,
     traverse_json,
-    TRAVERSE_TOOL_SCHEMA, Vector, parse_near, spec_to_traversal, vector_search_json,
+    TRAVERSE_TOOL_SCHEMA, VECTOR_SEARCH_TOOL_SCHEMA, Vector, parse_near,
+    spec_to_traversal, vector_search_json,
 )
 from hopai import Boost, Embedder
 from hopai.vectors import (
@@ -702,8 +703,10 @@ class TestNearJsonPythonEquivalence:
             == norm(python, literal_binds=True)
 
     @pytest.mark.parametrize("bad,message", [
-        ({"field": "s"}, r"needs \['vector'\]"),
-        ({"vector": [1.0]}, r"needs \['field'\]"),
+        ({"field": "s"}, r'needs "text" to embed OR "vector".*not neither'),
+        ({"field": "s", "text": "a", "vector": [1.0]},
+         r'needs "text" to embed OR "vector".*not both'),
+        ({"vector": [1.0]}, r'a near spec needs "field"'),
         ({"field": "s", "vector": [1.0], "top_k": 3}, "unknown"),
         # Anchored: an unanchored "empty list" kept matching after a
         # mutant mangled the message's edges.
@@ -721,6 +724,32 @@ class TestNearJsonPythonEquivalence:
         with pytest.raises(ValueError, match='"near" key'):
             vector_search_json(vg, {"k": 5})
 
+    def test_the_text_form_carries_every_optional_key_across(self, vg):
+        """The JSON half of the same resolution the Python half does --
+        and the keys travel through parse_near, Near, and _with_vector
+        before reaching SQL, so any of the three could drop one."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder()),
+                                 Vector("title", 3, embed=counting_embedder())])
+        start, hops = spec_to_traversal({
+            "start": {"near": [{"field": "summary", "text": "apple", "weight": 0.25,
+                                "min_similarity": 0.75, "missing": "zero"},
+                               {"field": "title", "text": "banana"}],
+                      "keep": 4},
+        })
+        sql = norm(vg.build_query(start, hops), literal_binds=True)
+        assert "0.25" in sql and "0.75" in sql and "coalesce" in sql.lower()
+        assert "97" in sql and "98" in sql       # both texts reached the embedder
+
+    def test_a_json_text_query_and_the_python_one_compile_alike(self, vg):
+        """The JSON front end holds no query logic -- text= is parsed
+        into exactly the Near the Python caller would have written."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder())])
+        start, hops = spec_to_traversal(
+            {"start": {"near": {"field": "summary", "text": "apple"}, "keep": 4}})
+        python = vg.build_query(Start(near=Near("summary", text="apple"), keep=4), [])
+        assert norm(vg.build_query(start, hops), literal_binds=True) \
+            == norm(python, literal_binds=True)
+
 
 class TestToolSchemasStayVectorFree:
     @staticmethod
@@ -732,8 +761,14 @@ class TestToolSchemasStayVectorFree:
                 for name, child in (node.get("properties") or {}).items():
                     found.add(name)
                     walk(child)
-                for key in ("items", "additionalProperties"):
+                # $defs and the combinators too: a near spec lives in
+                # $defs and is reached by $ref, so a walker that stopped
+                # at properties/items would have seen neither `text` nor
+                # a `vector` someone put back beside it.
+                for key in ("items", "additionalProperties", "anyOf", "oneOf", "allOf"):
                     walk(node.get(key))
+                for child in (node.get("$defs") or {}).values():
+                    walk(child)
             elif isinstance(node, list):
                 for child in node:
                     walk(child)
@@ -742,26 +777,37 @@ class TestToolSchemasStayVectorFree:
         return found
 
     @pytest.mark.parametrize("schema", [TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
-                                        INGEST_TOOL_SCHEMA])
+                                        VECTOR_SEARCH_TOOL_SCHEMA, INGEST_TOOL_SCHEMA])
     def test_no_schema_advertises_a_vector_parameter(self, schema):
-        """DELIBERATE asymmetry with the parsers, pinned: a tool-calling
-        model asked to fill a "vector" invents plausible floats, and an
-        invented embedding finds confidently wrong neighbors. If this
-        fails, someone widened a schema -- vectors.py explains why not.
+        """The DELIBERATE asymmetry with the parsers, pinned, and now
+        down to exactly one key: a tool-calling model asked to fill a
+        "vector" invents plausible floats, and an invented embedding
+        finds confidently wrong neighbors. `text` is the way in -- the
+        field embeds it with the application's own client -- so it is
+        advertised and this must not creep back to cover it.
 
         Asserted on PARAMETER NAMES, not by grepping the serialized
-        schema: the descriptions must stay free to say the tool cannot
-        search by meaning, which is what stops a model guessing
-        property values for a semantic question."""
-        assert not self._parameter_names(schema) & {
-            "near", "keep", "via_near", "via_keep", "boost", "vector", "embedding"}
+        schema: the descriptions must stay free to talk about vectors
+        and embeddings in prose."""
+        assert not self._parameter_names(schema) & {"vector", "embedding"}
+
+    @pytest.mark.parametrize("schema", [TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
+                                        VECTOR_SEARCH_TOOL_SCHEMA])
+    def test_the_text_half_is_advertised(self, schema):
+        """The other side of the same rule. A schema that omitted `text`
+        along with `vector` would leave a model no way to search by
+        meaning at all -- which is what it did before, and why it was
+        told to say it could not."""
+        names = self._parameter_names(schema)
+        assert "text" in names and "near" in names
 
     def test_per_graph_tool_schemas_stay_vector_free_too(self):
         """tool_schemas() summarizes THIS graph's declared schema into
         each description, so it is the second place a vector field
         could reach a model -- and it is generated, not hand-written,
-        which is exactly how the omission would be lost. Vector fields
-        are not graph-schema properties and must not appear."""
+        which is exactly how a leak would arrive. Vector FIELD names
+        are not graph-schema properties: a model given "summary" as a
+        property would filter on it and get nothing."""
         from hopai import NodeType, Property
 
         g = offline()
@@ -769,14 +815,17 @@ class TestToolSchemasStayVectorFree:
         g.define_vectors(nodes=[Vector("summary", 1536)], edges=[Vector("rel", 8)])
         dumped = json.dumps(g.tool_schemas())
         assert "title" in dumped                      # declared properties DO appear
-        for leaked in ("summary", "vec_summary", "rel", "vector", "embedding", "near"):
+        for leaked in ("summary", "vec_summary", "embedding"):
             assert leaked not in dumped, leaked
 
-    def test_descriptions_tell_the_model_what_it_cannot_do(self):
-        """A model holding only the schema sees no hint that meaning-based
-        search exists, so it guesses property values and gets zero rows."""
+    def test_descriptions_point_the_model_at_the_right_tool(self):
+        """A model holding only the schema has to be told which half of
+        the surface answers which question -- it used to be told that
+        searching by meaning was impossible, which is no longer true."""
         for schema in (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA):
             assert "EXACT property matches" in schema["description"]
+            assert "near" in schema["description"]
+        assert "not an exact property match" in VECTOR_SEARCH_TOOL_SCHEMA["description"]
 
 
 class TestJsonFrontEndRefusesInventedVectors:
@@ -794,8 +843,42 @@ class TestJsonFrontEndRefusesInventedVectors:
         spec = {"start": {"where": {"type": "doc"}},
                 "hops": [{"via_near": {"field": "rel", "vector": [1.0, 0.0, 0.0]},
                           "via_keep": 1}]}
-        with pytest.raises(ValueError, match=r"\['via_keep', 'via_near'\]"):
+        with pytest.raises(ValueError, match="via_near=.*cannot come from a tool call"):
             traverse_json(vg, spec)
+
+    def test_a_vector_inside_a_list_of_near_specs_is_found(self, vg):
+        """near= takes a list, and checking only the object form would
+        leave the list the way through."""
+        spec = {"start": {"near": [{"field": "title", "text": "a"},
+                                   {"field": "summary", "vector": [1.0, 0.0, 0.0]}],
+                          "keep": 2}}
+        with pytest.raises(ValueError, match="cannot come from a tool call"):
+            traverse_json(vg, spec)
+
+    def test_text_is_not_refused(self, fresh_graph):
+        """The whole point of the narrowing: a model CAN say what it is
+        looking for, because the field embeds it with the application's
+        own client. Refusing this left semantic search unreachable from
+        a tool call at all."""
+        g = _corpus(fresh_graph)
+        g.define_vectors(nodes=[Vector("docvec", 3, embed=lambda t: [QUERY for _ in t])])
+        result = traverse_json(g, {
+            "start": {"where": {"type": "doc"},
+                      "near": {"field": "docvec", "text": "graph databases"}, "keep": 2},
+        })
+        assert {n["id"] for n in result["nodes"]} == {"1", "3"}
+
+    def test_keep_and_boost_alone_are_not_refused(self, vg):
+        """They hold an integer and a property name -- nothing a model
+        could invent an embedding into. Refusing them was collateral
+        damage from the coarser rule, and it took `keep` with it, so a
+        text query had no way to say how many to keep."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=lambda t: [[1.0, 0.0, 0.0]])])
+        spec = {"start": {"near": {"field": "summary", "text": "a"}, "keep": 2,
+                          "boost": {"property": "rank", "weight": 0.5}}}
+        spec_to_traversal(spec)                        # parses
+        from hopai.json_api import _refuse_vectors
+        _refuse_vectors(spec, "traverse_json()")       # and is not refused
 
     def test_application_code_opts_in(self, fresh_graph):
         """A caller holding a REAL embedding says so, and it runs."""
@@ -1280,7 +1363,7 @@ class TestVectorSearchLive:
         result = vector_search_json(g, {
             "near": {"field": "docvec", "vector": QUERY, "min_similarity": 0.7},
             "k": 2, "where": {"type": "doc"},
-        })
+        }, allow_vectors=True)
         assert json.loads(json.dumps(result)) == result
         assert [h["id"] for h in result["results"]] == ["1", "3"]
 
@@ -1291,10 +1374,31 @@ class TestVectorSearchLive:
         "K" survived exactly that way."""
         g = _corpus(fresh_graph)
         spec = {"near": {"field": "docvec", "vector": QUERY}, "where": {"type": "doc"}}
-        assert len(vector_search_json(g, {**spec, "k": 1})["results"]) == 1
-        assert len(vector_search_json(g, {**spec, "k": 3})["results"]) == 3
+        run = lambda s: vector_search_json(g, s, allow_vectors=True)  # noqa: E731
+        assert len(run({**spec, "k": 1})["results"]) == 1
+        assert len(run({**spec, "k": 3})["results"]) == 3
         # ...and the documented default when the key is absent.
-        assert len(vector_search_json(g, spec)["results"]) == 5
+        assert len(run(spec)["results"]) == 5
+
+    def test_a_model_can_search_by_meaning_with_no_floats_at_all(self, fresh_graph):
+        """VECTOR_SEARCH_TOOL_SCHEMA's whole promise, end to end: the
+        spec a tool-calling model can actually produce -- a field name
+        and words -- runs and ranks. Nothing here opts into vectors."""
+        g = _corpus(fresh_graph)
+        g.define_vectors(nodes=[Vector("docvec", 3, embed=lambda t: [QUERY for _ in t])])
+        result = vector_search_json(g, {
+            "near": {"field": "docvec", "text": "how do nodes agree?"},
+            "k": 2, "where": {"type": "doc"},
+        })
+        assert json.loads(json.dumps(result)) == result
+        assert [h["id"] for h in result["results"]] == ["1", "3"]
+
+    def test_a_field_that_cannot_embed_says_so_through_json_too(self, fresh_graph):
+        """A model that sends text to a field with no embedder gets the
+        declaration to change, not an empty result set."""
+        g = _corpus(fresh_graph)
+        with pytest.raises(ValueError, match="declares no embedder"):
+            vector_search_json(g, {"near": {"field": "docvec", "text": "anything"}})
 
 
 # ---------------------------------------------------------------------
@@ -2340,7 +2444,7 @@ class TestVectorCallerNamesArePinned:
     PINNED = {
         "vector_search()", "vector_search_many()",
         "get_vectors()", "set_vectors()", "stale_vectors()", "embed_stale()",
-        "traverse_json()", "aggregate_json()",
+        "traverse_json()", "aggregate_json()", "vector_search_json()",
         "traversal spec", '"start"', '"hops" entry', "vector search spec",
     }
 
@@ -2407,10 +2511,13 @@ class TestVectorCallerNamesArePinned:
         ("traverse_json()", lambda g, s: traverse_json(g, s)),
         ("aggregate_json()", lambda g, s: aggregate_json(
             g, {**s, "aggregates": {"n": {"fn": "count"}}})),
+        ("vector_search_json()",
+         lambda g, s: vector_search_json(g, {"near": s["start"]["near"]})),
     ])
     def test_json_refusals_name_the_call(self, vg, caller, run):
         spec = {"start": {"near": {"field": "summary", "vector": [1.0, 0.0, 0.0]}, "keep": 1}}
-        with pytest.raises(ValueError, match=rf"^{re.escape(caller)}: \['keep', 'near'\]"):
+        with pytest.raises(ValueError,
+                           match=rf"^{re.escape(caller)}: near=.*cannot come from a tool call"):
             run(vg, spec)
 
     @pytest.mark.parametrize("caller,run", [
