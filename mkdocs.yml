@@ -1,0 +1,99 @@
+site_name: hopai
+site_description: >-
+  A knowledge graph in the PostgreSQL you already run: multi-hop traversal,
+  ingestion and real constraints, with Python, JSON and Cypher interfaces --
+  no graph database required.
+# Read the Docs serves every version at its own path -- /en/stable/,
+# /en/latest/, /en/v0.0.1/ -- so a hard-coded site_url would be correct for
+# exactly one of them and wrong for the rest. RTD stamps the per-version
+# canonical URL into the environment; the default is what a local
+# `mkdocs serve` and the CI build (which publishes nothing) use.
+site_url: !ENV [READTHEDOCS_CANONICAL_URL, "https://hopai.readthedocs.io/en/latest/"]
+repo_url: https://github.com/alexbojko/hopai
+repo_name: alexbojko/hopai
+copyright: MIT-licensed
+
+# The site has NO sources of its own. docs/index.md and docs/notebooks are
+# symlinks to README.md and notebooks/, so there is exactly one copy of every
+# page and no generated markdown to keep in step -- editing the README or a
+# notebook IS editing the site. Nothing here may become a second place to
+# write documentation.
+docs_dir: docs
+
+# A notebook added to notebooks/ arrives in the site automatically (docs/ is a
+# symlink) but NOT in the nav, which has to name it. MkDocs logs that at INFO,
+# so `--strict` stayed green while 09_vector_search was built, reachable only
+# by URL, and invisible in the navigation. Promoting it to a warning makes
+# `--strict` fail instead: adding a notebook now has to say where it goes.
+validation:
+  nav:
+    omitted_files: warn
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: {icon: material/weather-night, name: Switch to dark mode}
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: {icon: material/weather-sunny, name: Switch to light mode}
+
+# Not a plugin and not a dependency -- a plain module MkDocs imports. See the
+# docstring for the one thing it fixes.
+hooks:
+  - scripts/mkdocs_hooks.py
+
+plugins:
+  - search
+  - mkdocs-jupyter:
+      # The committed outputs are the documentation -- CI executes the
+      # notebooks against a real PostgreSQL on every PR (see the `notebooks`
+      # job), so the site renders what that run produced. Turning this on
+      # would mean the docs build needed a database, and would publish
+      # outputs that no assertion had ever checked.
+      execute: false
+      # A "download this notebook" link on every notebook page: the whole
+      # point of documentation that runs is that a reader can run it.
+      include_source: true
+      ignore: ["notebooks/demo_graph.py"]
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - toc:
+      permalink: true
+      # GitHub-compatible anchors, so that ONE README serves both renderers.
+      # The headings carry emoji, and the two slugifiers disagree about them:
+      # GitHub strips the emoji and keeps the separator (`#-graph-schema`),
+      # Python-Markdown's default drops both (`#graph-schema`). Without this
+      # every in-page link in the README is dead on one of the two sites.
+      slugify: !!python/object/apply:pymdownx.slugs.slugify {kwds: {case: lower}}
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+
+nav:
+  - Overview: index.md
+  - Notebooks:
+      - All nine: notebooks/README.md
+      - 01 · Quick start: notebooks/01_quickstart.ipynb
+      - 02 · Traversal: notebooks/02_traversal.ipynb
+      - 03 · Aggregation: notebooks/03_aggregation.ipynb
+      - 04 · JSON and Cypher: notebooks/04_json_and_cypher.ipynb
+      - 05 · Constraints: notebooks/05_constraints.ipynb
+      - 06 · Graph schema: notebooks/06_graph_schema.ipynb
+      - 07 · Many graphs: notebooks/07_many_graphs.ipynb
+      - 08 · Under the hood: notebooks/08_under_the_hood.ipynb
+      - 09 · Vector search: notebooks/09_vector_search.ipynb
+  - Internals:
+      - Architecture: architecture.md
+      - Testing: testing.md
+      - Releasing: releasing.md

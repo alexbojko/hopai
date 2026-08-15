@@ -12,6 +12,13 @@ name: Release
 #      created, which is why the publish job keys off
 #      `release_created` rather than off the tag.
 #
+# The documentation site is NOT built here. Read the Docs builds and hosts
+# it (see .readthedocs.yaml), triggered by the tag this workflow creates
+# rather than by a step in it -- so the published site still describes the
+# released version, and this repository still stores no deploy credential.
+# Every PR builds the site anyway (the `docs` job in ci.yml), which is what
+# catches a broken site before a release can trip over it.
+#
 # Publishing uses PyPI Trusted Publishing (OIDC): no API token is stored
 # anywhere. PyPI is told to trust this repository, this workflow file and
 # the `pypi` environment, and the runner exchanges a short-lived identity

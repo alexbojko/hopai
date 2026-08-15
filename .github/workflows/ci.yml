@@ -97,6 +97,32 @@ jobs:
       # outputs. Regenerating those is a deliberate local step.
       - run: python scripts/run_notebooks.py
 
+  # The documentation site (mkdocs.yml), built but never published here --
+  # Read the Docs publishes it, from the release tag (see .readthedocs.yaml).
+  # Building on every PR is what keeps a broken nav entry or a dead link from
+  # surfacing at release time, when the tag is already cut and the fix costs a
+  # new version. This job runs the same two steps the Read the Docs build
+  # does, so the two cannot disagree about whether the site is publishable.
+  #
+  # No PostgreSQL: the site renders the outputs the `notebooks` job above
+  # produced, and never executes anything itself.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[docs]"
+      - run: mkdocs build --strict
+      # --strict only sees links in markdown pages. mkdocs-jupyter hands
+      # MkDocs finished HTML, so the links written inside the notebooks are
+      # invisible to it -- and those are the ones that move when a notebook
+      # is published one directory deeper. See scripts/mkdocs_hooks.py.
+      - run: python scripts/check_docs_links.py
+
   # Coverage gates the PR; mutation testing rides along in the same job so
   # both land in ONE sticky comment. Two jobs would mean two comments, or
   # an artifact hand-off just to merge two numbers.

@@ -98,6 +98,22 @@ read.** When a design question comes up, these decide it, in order:
   (`python scripts/run_notebooks.py`). A change to a public API means re-running
   them with `--save` and reading the output diff — a stale notebook is a broken
   build, not a cosmetic lag.
+- **The documentation site has no sources of its own.** `mkdocs.yml` publishes
+  `README.md` and `notebooks/` through symlinks in `docs/`, so editing either one
+  *is* editing the site — there is never a second copy to keep in step, and adding
+  one is the defect. CI builds it with `--strict` on every PR; **Read the Docs**
+  publishes it at <https://hopai.readthedocs.io/> (`.readthedocs.yaml`), built
+  **from the release tag** — so the published site describes the version that is
+  on PyPI rather than whatever landed on `main`. Nothing in this repository
+  pushes the site, so there is no deploy credential; the release-only rule lives
+  in an RTD Automation Rule matching tags, not in a workflow.
+  Links written *inside* notebooks are invisible to `--strict` (mkdocs-jupyter
+  hands MkDocs finished HTML), so `scripts/mkdocs_hooks.py` rewrites them and
+  `scripts/check_docs_links.py` fails the build if one stops resolving.
+  **A new notebook must be added to `mkdocs.yml`'s `nav`.** It reaches the site
+  on its own through the symlink, but an unlisted page is built and then left out
+  of the navigation — reachable only by URL. MkDocs calls that INFO, so
+  `validation.nav.omitted_files: warn` promotes it to a `--strict` failure.
 - Comments explain *why*, citing the bug or trade-off. Match that for non-obvious code;
   skip it for mechanical changes.
 - New tests join an existing `TestX` class and say what would break without the fix.
@@ -109,6 +125,8 @@ pip install -e ".[dev]"
 docker compose up -d      # Postgres matching the default DSN
 pytest tests/ -v
 ruff check .
+
+pip install -e ".[docs]" && mkdocs serve    # the documentation site on :8000
 ```
 
 Query building never connects, so the emitted SQL can be inspected with no database —

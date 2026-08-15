@@ -1,0 +1,31 @@
+# Read the Docs builds and hosts the documentation site at
+# https://hopai.readthedocs.io/ -- see mkdocs.yml for what the site IS.
+#
+# `build.commands` rather than the one-line `mkdocs:` shortcut on purpose: it
+# runs the SAME two steps CI runs on every PR. `--strict` catches what MkDocs
+# can see, and scripts/check_docs_links.py catches what it cannot (links
+# written inside notebooks, which mkdocs-jupyter hands over as finished HTML).
+# With the shortcut, a build that publishes a dead link would still be green
+# here and only fail on the pull request.
+#
+# Publishing is release-driven and lives in the Read the Docs admin, not here:
+# an Automation Rule matching new TAGS with the "Activate version" action is
+# what builds a release, and PEP 440 tags move `stable` along with it. Branch
+# builds stay deactivated so the published default keeps describing the
+# version that is on PyPI.
+#
+# Nothing in this repository pushes the site anywhere, so there is no deploy
+# credential to store -- Read the Docs pulls through its own GitHub connection.
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.12"
+  commands:
+    # The docs extra only; the notebooks are rendered from their committed
+    # outputs, so this build needs no PostgreSQL and no Jupyter kernel.
+    - pip install -e ".[docs]"
+    # $READTHEDOCS_OUTPUT/html is the only directory Read the Docs publishes.
+    - mkdocs build --strict --site-dir "$READTHEDOCS_OUTPUT/html"
+    - python scripts/check_docs_links.py --site "$READTHEDOCS_OUTPUT/html"
