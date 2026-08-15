@@ -2,8 +2,9 @@
 hopai.json_api
 
 A JSON-in / JSON-out interface, for callers that can't or shouldn't write
-Python: an LLM tool call, a future HTTP endpoint or MCP server, a config
-file. Everything here is a thin translation layer over Graph.traverse()
+Python: an LLM tool call, an HTTP endpoint, a config file. It is what
+hopai/mcp.py serves over MCP, and what an agent framework wires up
+directly. Everything here is a thin translation layer over Graph.traverse()
 and hopai.filters.parse_filter() -- there is no separate logic to
 trust here, just a different way to describe the same traversal.
 
@@ -133,7 +134,7 @@ def spec_to_traversal(spec: dict) -> tuple:
     return start, hops
 
 
-def _refuse_vectors(spec: dict, caller: str) -> None:
+def refuse_vectors(spec: dict, caller: str) -> None:
     """The one place the "vectors never travel through the LLM"
     invariant is ENFORCED rather than advertised.
 
@@ -143,7 +144,14 @@ def _refuse_vectors(spec: dict, caller: str) -> None:
     agent integration actually calls. A model that emits a `near` gets
     a plausible subgraph built from invented floats and no complaint --
     a confidently wrong answer, which rule 4 says is the worst thing
-    this library can produce. Callers holding REAL vectors say so."""
+    this library can produce. Callers holding REAL vectors say so.
+
+    Public, and named without the underscore, because it is not only
+    this module's business: hopai/mcp.py embeds the model's TEXT into
+    a real vector itself and then passes allow_vectors=True, so it has
+    to make this exact refusal first -- against the same key set, with
+    the same message. A second copy of the rule is a second place for
+    it to rot."""
     for scope in (spec.get("start") or {}, *(spec.get("hops") or [])):
         if not isinstance(scope, dict):
             continue
@@ -174,7 +182,7 @@ def traverse_json(graph: Graph, spec: dict, allow_vectors: bool = False) -> dict
     Application code holding real vectors opts in explicitly.
     """
     if not allow_vectors:
-        _refuse_vectors(spec, "traverse_json()")
+        refuse_vectors(spec, "traverse_json()")
     start, hops = spec_to_traversal(spec)
     subgraph: Subgraph = graph.traverse(start, *hops)
     return subgraph.to_dict()
@@ -212,7 +220,7 @@ def aggregate_json(graph: Graph, spec: dict, allow_vectors: bool = False) -> dic
     traverse_json() gives.
     """
     if not allow_vectors:
-        _refuse_vectors(spec, "aggregate_json()")
+        refuse_vectors(spec, "aggregate_json()")
     start, hops, aggregates = spec_to_aggregation(spec)
     return graph.aggregate(start, *hops, aggregates=aggregates)
 
