@@ -201,6 +201,17 @@ jobs:
             echo "::notice::mutmut stopped early (budget or non-zero exit); reporting partial results"
           mutmut export-cicd-stats || true
           mutmut results > survivors.txt 2>&1 || true
+          # The mutation OF each survivor, for the report's table --
+          # otherwise triaging the comment starts by running this same
+          # command forty times by hand. Driven by --list-survivors so
+          # "which mutants matter" stays one rule in pr_report.py rather
+          # than a second one in shell; `mutmut results` also lists
+          # thousands of unchecked mutants nobody wants a diff for.
+          : > diffs.txt
+          python scripts/pr_report.py --mutmut-results survivors.txt --list-survivors \
+            | while IFS= read -r mutant; do
+                [ -n "$mutant" ] && mutmut show "$mutant" >> diffs.txt 2>/dev/null || true
+              done
 
       - name: Render report
         id: report
@@ -223,6 +234,7 @@ jobs:
             --threshold "${COVERAGE_THRESHOLD}" \
             --mutmut-stats mutants/mutmut-cicd-stats.json \
             --mutmut-results survivors.txt \
+            --mutmut-diffs diffs.txt \
             --mutation-note "${MUTATION_NOTE}" \
             ${MUTATION_ATTEMPTED:+--mutation-attempted} \
             --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
