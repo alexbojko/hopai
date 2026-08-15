@@ -77,20 +77,24 @@ set plugs into the walk.
   `correlate_except`: left to infer, SQLAlchemy copies the outer FROM element into the
   subquery, which cross-joins the VALUES list and makes Postgres reject a recursive
   reference outright.
-- `Boost` adds property terms to the score. They are coalesced, so they can only
-  reorder — never change which rows qualify, which is what keeps
-  `combined IS NOT NULL` meaning "some similarity had a direction".
+- `Boost` adds property terms to the score. They are coalesced, which is what keeps
+  `combined IS NOT NULL` meaning "some similarity had a direction" — but a boost is not
+  consequence-free: it reorders, and with a `keep`/`k` limit reordering decides
+  membership, so a boosted `similarity` is the combined score and can exceed 1.
 - `Hop(via_near=)` compiles to `edge_beam()`: a LATERAL, per anchor row, yielding the
   `(edge_id, move_id)` pair the plain join produced — so depth, the local path and edge
-  reconstruction are untouched. The cycle guard goes *inside* the beam, or a top-`via_k`
+  reconstruction are untouched. The cycle guard goes *inside* the beam, or a top-`via_keep`
   beam would spend slots on edges leading back into the path.
 - Writes go through `set_vectors()` only (UPDATE … FROM VALUES … RETURNING, one
   transaction, missing ids fail the call); ingestion rows never carry vectors.
-  `stale_vectors()` reports what needs re-embedding; `pgvector_ddl()` emits the one-way
+  `stale_vectors()` reports what needs re-embedding; `pgvector_exit_ddl()` emits the one-way
   migration off this engine without importing the extension.
-- The JSON forms exist (`"near"`/`"k"` in specs, `vector_search_json`) but the LLM tool
-  schemas deliberately omit them — a model fills a `"vector"` parameter by inventing
-  floats. `tests/test_vectors.py::TestToolSchemasStayVectorFree` pins the omission.
+- The JSON forms exist (`"near"`/`"keep"`/`"via_near"`/`"via_keep"`/`"boost"` in specs,
+  `vector_search_json`) but the LLM tool schemas deliberately omit them, and
+  `traverse_json`/`aggregate_json` **refuse** them without `allow_vectors=True` — a model
+  fills a `"vector"` parameter by inventing floats, so the invariant is enforced rather
+  than advertised. `tests/test_vectors.py::TestToolSchemasStayVectorFree` pins both the
+  omission and the per-graph `tool_schemas()` staying vector-free.
 
 ## The write path
 

@@ -88,7 +88,7 @@ def main() -> None:
     batched = timed(lambda: graph.vector_search_many(batch_queries, k=10), repeats=3)
     filtered = timed(lambda: graph.vector_search(Near("emb", query), k=10,
                                                  where={"type": "person"}))
-    seeded = timed(lambda: graph.traverse(Start(near=Near("emb", query), k=25),
+    seeded = timed(lambda: graph.traverse(Start(near=Near("emb", query), keep=25),
                                           Hop(optional=True)))
     results["search_unfiltered_ms"] = round(unfiltered * 1000, 1)
     results["search_filtered_25pct_ms"] = round(filtered * 1000, 1)

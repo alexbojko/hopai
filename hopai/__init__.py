@@ -81,7 +81,7 @@ or seed a traversal from similarity:
     graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
     graph.vector_search(Near("summary", query_embedding), k=10,
                         where={"type": "person"})
-    graph.traverse(Start(near=Near("summary", query_embedding), k=25),
+    graph.traverse(Start(near=Near("summary", query_embedding), keep=25),
                    Hop(via={"kind": "cites"}))
 
 Several Near specs combine into one weighted score (multivector

@@ -593,7 +593,7 @@ traversal cannot be seeded from a list of ids.
 **Re-embedding and the exit door.** `stale_vectors()` lists the rows
 with no vector or a vector the current declaration no longer fits (the
 window a dimension change opens), so a re-embed loop is safe to
-automate. And if the exact scan is outgrown, `pgvector_ddl()` prints
+automate. And if the exact scan is outgrown, `pgvector_exit_ddl()` prints
 the migration onto pgvector — generated without importing or requiring
 the extension:
 

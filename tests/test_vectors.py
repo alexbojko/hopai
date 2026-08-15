@@ -11,6 +11,7 @@ and run on the write schema, since migration is DDL.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from sqlalchemy import event, func, text
@@ -1699,3 +1700,143 @@ class TestPgvectorDdl:
         assert "pgvector" not in sys.modules
         vg.pgvector_exit_ddl()
         assert "pgvector" not in sys.modules
+
+
+# ---------------------------------------------------------------------
+# Contracts the mutation run showed nothing was holding
+# ---------------------------------------------------------------------
+
+class TestJsonVectorKeysReachTheSpec:
+    """Every documented JSON key must land on the right Start/Hop field
+    with the right default. Nothing asserted this, so a mutant could
+    drop `boost`, misspell `via_near`, or look up `VIA_KEEP` and the
+    whole suite stayed green -- the spec grammar and the parser would
+    have drifted in silence, which the CLAUDE.md convention forbids."""
+
+    def test_every_start_key_lands(self):
+        start, _ = spec_to_traversal({"start": {
+            "where": {"type": "doc"}, "label": "s",
+            "near": {"field": "summary", "vector": [1.0, 0.0, 0.0]},
+            "keep": 7, "boost": {"property": "score", "weight": 0.25},
+        }})
+        assert start.where == {"type": "doc"} and start.label == "s"
+        assert repr(start.near) == "Near('summary', 3 dims)"
+        assert start.keep == 7
+        assert repr(start.boost) == "Boost('score', weight=0.25)"
+
+    def test_every_hop_key_lands(self):
+        _, hops = spec_to_traversal({"start": {"where": {"a": 1}}, "hops": [{
+            "where": {"b": 2}, "via": {"kind": "k"}, "hops": [1, 3],
+            "direction": "backward", "optional": True, "label": "h",
+            "near": {"field": "summary", "vector": [1.0, 0.0, 0.0]}, "keep": 4,
+            "via_near": {"field": "rel", "vector": [0.0, 1.0, 0.0]}, "via_keep": 2,
+            "boost": {"property": "score", "weight": 0.5},
+        }]})
+        hop = hops[0]
+        assert (hop.min_hops, hop.max_hops) == (1, 3)
+        assert hop.direction == "backward" and hop.optional is True and hop.label == "h"
+        assert repr(hop.near) == "Near('summary', 3 dims)" and hop.keep == 4
+        assert repr(hop.via_near) == "Near('rel', 3 dims)" and hop.via_keep == 2
+        assert repr(hop.boost) == "Boost('score', weight=0.5)"
+
+    def test_absent_vector_keys_stay_absent(self):
+        start, hops = spec_to_traversal({"start": {"where": {"a": 1}}, "hops": [{}]})
+        assert (start.near, start.keep, start.boost) == (None, None, None)
+        assert (hops[0].near, hops[0].keep, hops[0].via_near, hops[0].via_keep,
+                hops[0].boost) == (None, None, None, None, None)
+
+    @pytest.mark.parametrize("spec,message", [
+        ({"start": {"where": {"a": 1}}, "top_k": 3}, r"unknown traversal spec keys \['top_k'\]"),
+        ({"start": {"where": {"a": 1}, "limit": 2}}, r'unknown "start" keys \[\'limit\'\]'),
+        ({"start": {"wehre": {"a": 1}}}, r'unknown "start" keys \[\'wehre\'\]'),
+        ({"start": {"where": {"a": 1}}, "hops": [{"filter": {}}]},
+         r'unknown "hops" entry keys \[\'filter\'\]'),
+    ])
+    def test_unknown_keys_are_refused_by_name(self, spec, message):
+        """top_k/limit/filter are the names a model reaches for, and
+        each was silently ignored -- answering a different question."""
+        with pytest.raises(ValueError, match=message):
+            spec_to_traversal(spec)
+
+
+class TestParseBoostContract:
+    @pytest.mark.parametrize("spec,expected", [
+        ({"property": "s"}, "Boost('s', weight=1.0)"),
+        ({"property": "s", "weight": 0.25}, "Boost('s', weight=0.25)"),
+        ({"property": "s", "default": -1.0}, "Boost('s', weight=1.0, default=-1.0)"),
+        ({"property": "s", "weight": 2.0, "default": 0.5},
+         "Boost('s', weight=2.0, default=0.5)"),
+    ])
+    def test_defaults_and_keys(self, spec, expected):
+        """weight defaults to 1.0 and default to 0.0; both were unpinned,
+        so a mutant could ship weight=2.0 for every JSON boost."""
+        assert repr(parse_boost(spec)) == expected
+
+    def test_list_form_and_its_empty_refusal(self):
+        parsed = parse_boost([{"property": "a"}, {"property": "b", "weight": 2.0}])
+        assert [repr(one) for one in parsed] == ["Boost('a', weight=1.0)",
+                                                 "Boost('b', weight=2.0)"]
+        with pytest.raises(ValueError, match=r'^"boost" is an empty list'):
+            parse_boost([])
+
+    def test_messages_are_exact(self):
+        """Anchored and full: XX-padding mutants hid inside looser
+        matches, and these messages are the whole interface for a
+        caller assembling JSON by hand."""
+        with pytest.raises(ValueError, match=r'^a boost spec needs "property"'):
+            parse_boost({})
+        with pytest.raises(TypeError,
+                           match=r'^"boost" must be an object or a list of objects -- got int'):
+            parse_boost(42)
+
+    def test_callable_boost_repr_names_itself(self):
+        assert repr(Boost(lambda p: p, 1.0)) == "Boost(<callable>, weight=1.0)"
+
+
+class TestVectorCallerNamesArePinned:
+    """Every refusal leads with the CALL, so a traceback says which one
+    to fix. Each name below was mutable with the suite still green."""
+
+    def test_search_names_itself(self, vg):
+        with pytest.raises(ValueError, match=r"^vector_search\(\): boost="):
+            vg.build_vector_search_query(Near("summary", [1.0, 0.0, 0.0]), boost=[])
+
+    def test_search_many_names_itself(self, vg):
+        with pytest.raises(TypeError, match=r"^vector_search_many\(\): queries must be"):
+            vg.build_vector_search_many_query([])
+
+    @pytest.mark.parametrize("caller,run", [
+        ("traverse_json()", lambda g, s: traverse_json(g, s)),
+        ("aggregate_json()", lambda g, s: aggregate_json(
+            g, {**s, "aggregates": {"n": {"fn": "count"}}})),
+    ])
+    def test_json_refusals_name_the_call(self, vg, caller, run):
+        spec = {"start": {"near": {"field": "summary", "vector": [1.0, 0.0, 0.0]}, "keep": 1}}
+        with pytest.raises(ValueError, match=rf"^{re.escape(caller)}: \['keep', 'near'\]"):
+            run(vg, spec)
+
+
+class TestBuilderDelegation:
+    """The Graph methods are thin wrappers, and nothing exercised their
+    keywords -- every argument but `queries` could be dropped or
+    replaced with None and the suite stayed green."""
+
+    def test_search_many_builder_forwards_every_argument(self, vg):
+        sql = norm(vg.build_vector_search_many_query(
+            [[Near("rel", [1.0, 0.0, 0.0])]], target="edges", k=3,
+            where={"kind": "cites"}, boost=Boost("weight", 0.5)), literal_binds=True)
+        assert "FROM edges" in sql            # target=
+        assert "LIMIT 3" in sql               # k=
+        assert '{"kind": "cites"}' in sql     # where=
+        assert "* 0.5" in sql                 # boost=
+
+    def test_search_builder_forwards_every_argument(self, vg):
+        sql = norm(vg.build_vector_search_query(
+            Near("rel", [1.0, 0.0, 0.0]), target="edges", k=3,
+            where={"kind": "cites"}, boost=Boost("weight", 0.5)), literal_binds=True)
+        assert "FROM edges" in sql and "LIMIT 3" in sql
+        assert '{"kind": "cites"}' in sql and "* 0.5" in sql
+
+    def test_pgvector_index_default_is_hnsw(self, vg):
+        """The default is the whole choice this function makes."""
+        assert any("USING hnsw" in s for s in vg.pgvector_exit_ddl())

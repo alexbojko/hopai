@@ -16,7 +16,7 @@ run -- no pgvector, no extension, no approximate index.
     # -> [{"id": "1", "similarity": 0.93, "properties": {...}}, ...]
 
     graph.traverse(                  # similarity as a traversal seed
-        Start(near=Near("summary", query_embedding), k=25),
+        Start(near=Near("summary", query_embedding), keep=25),
         Hop(via={"kind": "cites"}, hops=(1, 3)),
     )
 
@@ -114,12 +114,12 @@ exceed 1. The library will NOT normalize a property for you, because
 a raw view count would not boost a cosine ranking, it would replace
 it. See Boost.
 
-EDGE SIMILARITY is the `via` of ranking: Hop(via_near=..., via_k=N)
-follows the N most similar EDGES out of each node reached so far -- a
-beam per source node, not a global truncation, because "the k most
-similar edges" only means something relative to where you are
-standing. Without via_k, a Near's min_similarity decides which edges
-are worth walking at all.
+EDGE SIMILARITY is the `via` of ranking: Hop(via_near=...,
+via_keep=N) follows the N most similar EDGES out of each node reached
+so far -- a beam per source node, not a global truncation, because
+"the N most similar edges" only means something relative to where you
+are standing. Without via_keep, a Near's min_similarity decides which
+edges are worth walking at all.
 
 VECTORS NEVER TRAVEL THROUGH THE LLM. There is deliberately no `near`
 in TRAVERSE_TOOL_SCHEMA and no vector-search tool schema: a
@@ -1080,7 +1080,7 @@ def pgvector_exit_ddl(graph, index: Optional[str] = "hnsw") -> list:
     as SQL you can read before running -- generated without importing,
     requiring, or checking for the extension.
 
-        for statement in graph.pgvector_ddl():
+        for statement in graph.pgvector_exit_ddl():
             print(statement)
 
     Emitted per declared field: convert the `real[]` column to
