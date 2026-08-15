@@ -766,13 +766,30 @@ This is the one place hopai makes a **network call** — always to the
 client you constructed and configured, and always outside the write
 transaction, so a provider failure never leaves a half-written batch.
 
-**Retries stay yours**, because your client already has them:
-`openai.OpenAI(max_retries=5)` and its equivalents retry with
-exponential backoff, and a second policy here would multiply with
-theirs — three attempts inside three turns one rate-limit blip into
-nine calls. When a call does fail, `EmbeddingError` keeps the
-provider's own exception as `__cause__`, so deciding what is transient
-needs no knowledge of hopai:
+**Transient failures are retried, terminal ones are not**, and the
+difference is the point. A 429 or a 503 is the provider saying "later"
+and is retried with exponential backoff plus full jitter; a 401 or a
+400 fails identically forever, so retrying it only burns your rate
+limit to reach the same error more slowly. Which is which is decided by
+the HTTP status the exception carries, or its class name when it has
+none — hopai imports no provider package, so it cannot name
+`RateLimitError`, but it can read a `429`. A `Retry-After` header wins
+over the computed backoff, being the only number involved that isn't a
+guess.
+
+```python
+Embedder(openai.OpenAI(), model="text-embedding-3-small",
+         retries=2, backoff=0.5)      # the defaults: 3 attempts, 0.5s doubling
+```
+
+Your client almost certainly retries too, and **the two policies
+multiply** — three attempts inside three is nine calls. Pick a side:
+`Embedder(retries=0)` leaves it to the client, `openai.OpenAI(max_retries=0)`
+leaves it to hopai.
+
+When the retries are spent, `EmbeddingError` still carries the
+provider's own exception as `__cause__`, for classifying more precisely
+than the heuristic can:
 
 ```python
 try:
@@ -783,9 +800,8 @@ except EmbeddingError as failed:
 ```
 
 Every provider call is logged to the `hopai.embeddings` logger: the
-size at `DEBUG`, and a failure at `WARNING` as well as raised, since a
-paged backfill can catch the error and carry on with rows left
-unembedded.
+size at `DEBUG`, each retry and every final failure at `WARNING` — a
+retry that succeeded is not an error and does not claim to be.
 
 **Re-embedding and the exit door.** `stale_vectors()` lists the rows
 with no vector or a vector the current declaration no longer fits (the

@@ -17,8 +17,11 @@ read.** When a design question comes up, these decide it, in order:
    `embeddings.py` is the one place hopai makes a **network call**, and it holds the
    line rather than breaking it: no provider package is imported, the client is the
    caller's to construct and configure, and the extras (`hopai[openai]` and friends)
-   name what you were installing anyway. A retry policy, a cache or a rate limiter
-   here would be the wrong feature — your client already has yours.
+   name what you were installing anyway. It retries transient failures because a
+   network call that gives up on one 429 is not finished work — but the policy is
+   `retries=`/`backoff=` on the Embedder, defaults documented against the client's
+   own, since the two multiply. A cache belongs to the application; a rate limiter
+   belongs to the client.
 2. **An LLM must get it right with no custom instructions.** Prefer a protocol a model
    has already seen ten thousand times — Cypher, JSON node/edge lists, JSON Schema tool
    definitions, SQLAlchemy idioms — over anything invented here, even when the invention

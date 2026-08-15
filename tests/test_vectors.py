@@ -1704,7 +1704,12 @@ class TestSearchManyShape:
         """One statement can only express one shape. Ranking the second
         query with the first one's weights would answer a question
         nobody asked."""
-        with pytest.raises(ValueError, match="must share a shape"):
+        # Anchored on the whole opening clause: "must share a shape"
+        # alone survives the message losing the emphasis that explains
+        # WHY -- one statement, not one per query.
+        with pytest.raises(ValueError,
+                           match=r"^vector_search_many\(\) ranks every query with ONE "
+                                 r"statement, so the queries must share a shape"):
             vg.build_vector_search_many_query(
                 [Near("summary", [1.0, 0.0, 0.0]),
                  Near("summary", [0.0, 1.0, 0.0], weight=0.5)], k=2)

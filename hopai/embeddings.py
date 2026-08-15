@@ -55,12 +55,27 @@ the provider's cap, and only then is the transaction opened. A failed
 batch means nothing was written, which is the same all-or-nothing
 promise the vector write path already made.
 
+TRANSIENT FAILURES ARE RETRIED, terminal ones are not, and the
+difference is the whole point. A 429 or a 503 is the provider saying
+"later" and is retried with exponential backoff plus full jitter; a
+401 or a 400 will fail identically forever, so retrying it only burns
+the caller's rate limit to reach the same error more slowly. The
+classification is duck-typed -- an HTTP status where the exception
+carries one, the class name where it does not -- because naming
+`openai.RateLimitError` would need the import this module refuses.
+`Retry-After` wins over the computed backoff when the provider sent
+one; it is the only number here that is not a guess.
+
+Your client probably retries too, and the two policies MULTIPLY:
+`Embedder(retries=0)` leaves it entirely to the client, and
+`openai.OpenAI(max_retries=0)` leaves it entirely to hopai. Pick one
+side rather than paying 3x3.
+
 WHAT THIS DELIBERATELY DOES NOT DO: chunk long documents (an
 application concern with a dozen strategies -- over-long input is
-refused instead), cache embeddings, or retry -- your client already
-retries with exponential backoff and lets you tune it, and a second
-policy here would multiply with it. EmbeddingError keeps the
-provider's own exception as `__cause__` so you can decide.
+refused instead) or cache embeddings. EmbeddingError still keeps the
+provider's own exception as `__cause__`, so a caller who wants to
+classify differently than the heuristic above can.
 
 NOR DOES IT RUN ANYTHING ASYNCHRONOUSLY, and not merely because hopai
 is sync end to end. Reaching for a provider's async client HERE would
@@ -76,6 +91,8 @@ from __future__ import annotations
 
 import logging
 import math
+import random
+import time
 from typing import Any, Optional
 
 #: The only network calls hopai makes, so they are the only ones worth a
@@ -107,6 +124,17 @@ _BATCH_CAPS = {
 #: round trip for ordinary use.
 _DEFAULT_BATCH = 96
 
+#: Retry defaults. Three attempts total, doubling from half a second and
+#: capped, which covers the blip a provider recovers from within a few
+#: seconds without turning an outage into a long hang. `Retry-After`
+#: beyond this cap is refused rather than slept through -- a provider
+#: asking for ten minutes is telling you to come back later, not to
+#: hold a backfill open.
+_DEFAULT_RETRIES = 2
+_DEFAULT_BACKOFF = 0.5
+_MAX_BACKOFF = 30.0
+_MAX_RETRY_AFTER = 120.0
+
 #: The two sides of the document/query asymmetry, per provider family.
 #: Each entry is (documents, queries) for that provider's own spelling.
 _INPUT_TYPES = {
@@ -116,6 +144,73 @@ _INPUT_TYPES = {
 }
 
 
+#: HTTP statuses worth trying again. 429 and the 5xx family are the
+#: provider saying "later"; 408/409 are the request never landing.
+#: Everything else -- 400, 401, 403, 404, 422 -- is a request that will
+#: fail identically forever, and retrying it burns the caller's rate
+#: limit to arrive at the same error more slowly.
+_RETRY_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+
+#: Exception class names that mean the same thing, for clients that
+#: raise without a status. Matched as substrings of the CLASS NAME,
+#: which is the only provider vocabulary available here -- importing
+#: openai to name RateLimitError is the one thing this module cannot do,
+#: and every provider spells these the same way anyway.
+_RETRY_NAMES = ("ratelimit", "timeout", "connection", "unavailable",
+                "overloaded", "internalserver", "serviceunavailable", "apierror")
+
+#: Never retried however the class is spelled: these are the caller's
+#: configuration being wrong, and no amount of waiting fixes them.
+_TERMINAL_NAMES = ("authentication", "permission", "notfound", "badrequest",
+                   "invalidrequest", "unprocessable")
+
+
+def _status_of(exc: BaseException) -> Optional[int]:
+    """The HTTP status a provider exception carries, if any.
+
+    Duck-typed across the two shapes in the wild: `exc.status_code`
+    (openai, anthropic) and `exc.response.status_code` (requests-based
+    clients)."""
+    for holder, attribute in ((exc, "status_code"), (getattr(exc, "response", None),
+                                                     "status_code")):
+        value = getattr(holder, attribute, None)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _retryable(exc: BaseException) -> bool:
+    """Whether trying the same call again could plausibly succeed.
+
+    Status first, because it is unambiguous; the class name only when
+    there is none. A blanket retry would be worse than none: it turns a
+    bad API key into five slow failures instead of one fast one, which
+    is the opposite of handling an API exception correctly."""
+    status = _status_of(exc)
+    if status is not None:
+        return status in _RETRY_STATUS
+    name = type(exc).__name__.lower()
+    if any(word in name for word in _TERMINAL_NAMES):
+        return False
+    return any(word in name for word in _RETRY_NAMES)
+
+
+def _retry_after(exc: BaseException) -> Optional[float]:
+    """The provider's own `Retry-After`, in seconds, when it sent one.
+
+    Honoured over our own backoff because it is the only number here
+    that is not a guess -- a 429 with Retry-After: 30 means backing off
+    0.5s just spends another request to be told 30 again."""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        return None
+    try:
+        value = float(headers.get("Retry-After") or headers.get("retry-after"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return value if 0 <= value <= _MAX_RETRY_AFTER else None
+
+
 class EmbeddingError(RuntimeError):
     """A provider call failed, or answered with something unusable.
 
@@ -123,22 +218,18 @@ class EmbeddingError(RuntimeError):
     the write path: set_vectors() resolves every embed before it opens
     its transaction, so this always fires with nothing written.
 
-    THE PROVIDER'S OWN EXCEPTION IS KEPT as `__cause__`, which is how
-    you decide whether to retry without hopai having to name any
-    provider's exception classes (it imports none, and guessing which
-    of them are transient would be a policy in the wrong place):
+    Raised only after the retries are spent, or immediately when the
+    failure is terminal -- so seeing one means waiting will not help.
+
+    THE PROVIDER'S OWN EXCEPTION IS KEPT as `__cause__`, for a caller
+    who wants to classify it more precisely than `_retryable()` can
+    without importing anything:
 
         try:
             graph.embed_stale()
         except EmbeddingError as failed:
             if isinstance(failed.__cause__, openai.RateLimitError):
-                ...                       # back off and re-run; it resumes
-
-    Retrying is the caller's, on purpose. Every provider client already
-    retries with exponential backoff and exposes the knob
-    (`openai.OpenAI(max_retries=5)`), so a second policy here would
-    multiply with theirs -- 3 attempts inside 3 turning one rate-limit
-    blip into nine calls and a nine-fold stall."""
+                ...                       # back off and re-run; it resumes"""
 
 
 def _provider(client: Any) -> Optional[str]:
@@ -236,7 +327,8 @@ class Embedder:
     the model said."""
 
     def __init__(self, client: Any, model: Optional[str] = None,
-                 batch_size: Optional[int] = None, dimensions: Optional[int] = None):
+                 batch_size: Optional[int] = None, dimensions: Optional[int] = None,
+                 retries: int = _DEFAULT_RETRIES, backoff: float = _DEFAULT_BACKOFF):
         self.client = client
         self.model = model
         self.provider = _provider(client)
@@ -246,6 +338,16 @@ class Embedder:
                 or batch_size < 1):
             raise ValueError(
                 f"Embedder: batch_size must be a positive integer, got {batch_size!r}")
+        if not isinstance(retries, int) or isinstance(retries, bool) or retries < 0:
+            raise ValueError(
+                f"Embedder: retries must be a non-negative integer (0 disables retrying), "
+                f"got {retries!r}")
+        if not isinstance(backoff, (int, float)) or isinstance(backoff, bool) \
+                or not math.isfinite(backoff) or backoff <= 0:
+            raise ValueError(
+                f"Embedder: backoff must be a positive number of seconds, got {backoff!r}")
+        self.retries = retries
+        self.backoff = float(backoff)
         # `provider or ""` keeps .get() off a None key; as in _provider(),
         # the literal is unobservable -- no placeholder is a _BATCH_CAPS
         # key, so an unknown client takes _DEFAULT_BATCH either way.
@@ -273,6 +375,41 @@ class Embedder:
         provider round trip rather than N."""
         return self._run(texts, query=True)
 
+    def _attempt(self, chunk: list, query: bool, owner: str, done: int):
+        """One provider call, retried while the failure looks transient.
+
+        Full jitter (`random.uniform(0, window)`) rather than the exact
+        doubling: a backfill that fans out over several fields fails at
+        the same instant and would otherwise retry in lockstep, hitting
+        a rate-limited provider with the same synchronised burst that
+        caused the 429.
+
+        `Retry-After` wins over the computed window when the provider
+        sent one -- it is the only number here that is not a guess."""
+        for attempt in range(self.retries + 1):
+            try:
+                return self._call(chunk, query, self.dimensions)
+            except EmbeddingError:
+                raise
+            except Exception as exc:                      # provider-side failure
+                last = attempt == self.retries
+                if last or not _retryable(exc):
+                    logger.warning(
+                        "%s: provider call failed after %d embedded, %d attempt(s) (%s: %s)",
+                        owner, done, attempt + 1, type(exc).__name__, exc)
+                    raise EmbeddingError(
+                        f"{owner}: the provider call failed after {attempt + 1} attempt(s) "
+                        f"({type(exc).__name__}: {exc}) -- nothing was written"
+                    ) from exc
+                window = min(self.backoff * (2 ** attempt), _MAX_BACKOFF)
+                delay = _retry_after(exc)
+                if delay is None:
+                    delay = random.uniform(0, window)
+                logger.warning("%s: %s: %s -- retrying in %.2fs (attempt %d of %d)",
+                               owner, type(exc).__name__, exc, delay,
+                               attempt + 2, self.retries + 1)
+                time.sleep(delay)
+
     def _run(self, texts, query: bool) -> list:
         # `query` is read only as `A if query else B` -- here and in every
         # binding _bind() returns -- so any falsy value is the document
@@ -284,17 +421,7 @@ class Embedder:
         out = []
         for chunk in _chunks(cleaned, self.batch_size):
             logger.debug("%s: embedding %d text(s)", owner, len(chunk))
-            try:
-                raw = self._call(chunk, query, self.dimensions)
-            except EmbeddingError:
-                raise
-            except Exception as exc:                      # provider-side failure
-                logger.warning("%s: provider call failed after %d embedded (%s: %s)",
-                               owner, len(out), type(exc).__name__, exc)
-                raise EmbeddingError(
-                    f"{owner}: the provider call failed ({type(exc).__name__}: {exc}) -- "
-                    f"nothing was written"
-                ) from exc
+            raw = self._attempt(chunk, query, owner, len(out))
             out.extend(_as_vectors(raw, len(chunk), owner))
         if self.dimensions is not None:
             for index, vector in enumerate(out):

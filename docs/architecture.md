@@ -116,13 +116,20 @@ of its own decisions about how: you construct the client, hopai calls one method
   when a value is a string, `Near(text=)` at query build (resolved in `validate_nears()`,
   the first point where the spec and the graph are both in hand), and `embed_stale()`
   for the backfill.
-- **Retries and caching are the caller's**, and that is a decision rather than an
-  omission: every provider client retries with exponential backoff and exposes the
-  knob, so a policy here would multiply with theirs. `EmbeddingError` keeps the
-  provider's exception as `__cause__` so the caller can tell transient from terminal
-  without hopai naming any provider's classes. Provider calls log to the
-  `hopai.embeddings` logger — size at DEBUG, failures at WARNING as well as raised,
-  because `embed_stale()` pages and a caught error means rows left unembedded.
+- **Transient failures are retried; terminal ones are refused immediately.** A 429 or
+  5xx is the provider saying "later"; a 401 or 400 fails identically forever, so
+  retrying it only spends the caller's rate limit to reach the same error more slowly.
+  `_retryable()` decides on the HTTP status the exception carries, falling back to its
+  class NAME — the only provider vocabulary available to a module that imports no
+  provider. Backoff is exponential with **full jitter**, because a backfill fanning out
+  over several fields fails at one instant and would otherwise retry in lockstep,
+  rebuilding the burst that caused the 429. A `Retry-After` header wins over the
+  computed window, capped, since it is the only number involved that is not a guess.
+  `retries=0` disables it: the client almost certainly retries too and the two policies
+  multiply. Provider calls log to the `hopai.embeddings` logger — size at DEBUG, each
+  retry and each final failure at WARNING; a retry that succeeded is not an error.
+  `EmbeddingError` still carries the provider's exception as `__cause__` for a caller
+  who wants to classify more precisely.
 - **Async has to arrive library-wide or not at all.** An async client used inside this
   sync module means `asyncio.run()` inside `set_vectors()`, which raises
   `RuntimeError: asyncio.run() cannot be called from a running event loop` — in exactly

@@ -20,6 +20,7 @@ import sys
 
 import pytest
 
+import hopai.embeddings as embeddings_module
 from hopai.embeddings import Embedder, EmbeddingError
 
 
@@ -633,6 +634,223 @@ class TestTheModelReachesTheProvider:
         assert Embedder(client, model="m").embed_documents(["a"]) == payload
 
 
+@pytest.fixture()
+def slept(monkeypatch) -> list:
+    """Every backoff, without spending it. A retry test that really
+    sleeps is a slow test that gets deleted."""
+    waits = []
+    monkeypatch.setattr(embeddings_module.time, "sleep", waits.append)
+    return waits
+
+
+def _raises(exc, times: int, then=None):
+    """A client that fails `times` times and then succeeds."""
+    state = {"calls": 0}
+
+    def call(texts):
+        state["calls"] += 1
+        if state["calls"] <= times:
+            raise exc
+        return then if then is not None else [[1.0, 0.0] for _ in texts]
+    call.state = state
+    return call
+
+
+class TestRetry:
+    def test_a_transient_failure_is_retried_and_succeeds(self, slept):
+        client = _raises(TimeoutError("upstream"), times=2)
+        assert Embedder(client).embed_documents(["a"]) == [[1.0, 0.0]]
+        assert client.state["calls"] == 3          # two failures, then the answer
+        assert len(slept) == 2
+
+    def test_a_terminal_failure_is_not_retried(self, slept):
+        """The half that makes this correct rather than blanket: a bad
+        key fails identically forever, so retrying it spends the
+        caller's rate limit to arrive at the same error more slowly."""
+        class AuthenticationError(Exception):
+            pass
+
+        client = _raises(AuthenticationError("bad key"), times=99)
+        with pytest.raises(EmbeddingError, match="after 1 attempt"):
+            Embedder(client).embed_documents(["a"])
+        assert client.state["calls"] == 1
+        assert slept == []
+
+    @pytest.mark.parametrize("status,retried", [
+        (429, True), (500, True), (503, True), (408, True),
+        (400, False), (401, False), (403, False), (404, False), (422, False),
+    ])
+    def test_the_status_decides_when_there_is_one(self, slept, status, retried):
+        """Status beats class name because it is unambiguous -- a
+        provider that calls everything APIError still says 429."""
+        class APIError(Exception):
+            def __init__(self, code):
+                super().__init__(f"http {code}")
+                self.status_code = code
+
+        client = _raises(APIError(status), times=1)
+        run = lambda: Embedder(client, retries=1).embed_documents(["a"])  # noqa: E731
+        if retried:
+            assert run() == [[1.0, 0.0]]
+        else:
+            with pytest.raises(EmbeddingError):
+                run()
+        assert client.state["calls"] == (2 if retried else 1)
+
+    def test_a_status_on_the_response_is_found_too(self, slept):
+        """requests-based clients hang it off .response instead."""
+        class Failure(Exception):
+            response = type("R", (), {"status_code": 503})()
+
+        client = _raises(Failure("later"), times=1)
+        assert Embedder(client, retries=1).embed_documents(["a"]) == [[1.0, 0.0]]
+        assert client.state["calls"] == 2
+
+    def test_backoff_grows_and_stays_inside_its_window(self, slept):
+        """Full jitter: each wait is somewhere in [0, 2^n * backoff),
+        so the WINDOW doubles even though the samples are random. Two
+        backfills failing at the same instant must not retry in
+        lockstep and rebuild the burst that caused the 429."""
+        client = _raises(TimeoutError("upstream"), times=3)
+        Embedder(client, retries=3, backoff=1.0).embed_documents(["a"])
+        assert len(slept) == 3
+        for index, wait in enumerate(slept):
+            assert 0 <= wait <= 1.0 * (2 ** index)
+
+    def test_backoff_is_capped(self, slept):
+        client = _raises(TimeoutError("upstream"), times=4)
+        Embedder(client, retries=4, backoff=100.0).embed_documents(["a"])
+        assert all(wait <= 30.0 for wait in slept), slept
+
+    def test_retry_after_wins_over_the_computed_backoff(self, slept):
+        """The provider's own number is the only one here that is not a
+        guess: backing off 0.5s against `Retry-After: 7` just spends
+        another request to be told 7 again."""
+        class RateLimit(Exception):
+            response = type("R", (), {"headers": {"Retry-After": "7"}, "status_code": 429})()
+
+        client = _raises(RateLimit("slow down"), times=1)
+        Embedder(client, retries=1, backoff=0.5).embed_documents(["a"])
+        assert slept == [7.0]
+
+    def test_retry_after_is_read_case_insensitively(self, slept):
+        """HTTP header names are case-insensitive and several clients
+        hand back a plain dict, where they are not. Reading only the
+        capitalised spelling silently discards the provider's own number
+        and falls back to a guess."""
+        class RateLimit(Exception):
+            response = type("R", (), {"headers": {"retry-after": "5"}, "status_code": 429})()
+
+        client = _raises(RateLimit("slow down"), times=1)
+        Embedder(client, retries=1, backoff=0.5).embed_documents(["a"])
+        assert slept == [5.0]
+
+    @pytest.mark.parametrize("value,expected", [("0", 0.0), ("2.5", 2.5)])
+    def test_a_zero_retry_after_is_honoured_not_discarded(self, slept, value, expected):
+        """`Retry-After: 0` is a legal answer meaning "immediately". A
+        lower bound above zero would throw it away and sleep a random
+        window instead -- slower than the provider asked for."""
+        class RateLimit(Exception):
+            response = type("R", (), {"headers": {"Retry-After": value}, "status_code": 429})()
+
+        client = _raises(RateLimit("now"), times=1)
+        Embedder(client, retries=1, backoff=9.0).embed_documents(["a"])
+        assert slept == [expected]
+
+    @pytest.mark.parametrize("value,honoured", [("120", True), ("121", False)])
+    def test_the_retry_after_cap_is_inclusive(self, slept, value, honoured):
+        """120s is the documented ceiling, so a provider asking for
+        exactly that is still obeyed -- an exclusive bound would throw
+        away the one number here that is not a guess."""
+        class RateLimit(Exception):
+            response = type("R", (), {"headers": {"Retry-After": value},
+                                      "status_code": 429})()
+
+        client = _raises(RateLimit("later"), times=1)
+        Embedder(client, retries=1, backoff=1.0).embed_documents(["a"])
+        if honoured:
+            assert slept == [120.0]
+        else:
+            assert slept[0] <= 1.0          # ours, not the provider's 121
+
+    def test_a_negative_retry_after_falls_back_to_our_own_window(self, slept):
+        class RateLimit(Exception):
+            response = type("R", (), {"headers": {"Retry-After": "-5"}, "status_code": 429})()
+
+        client = _raises(RateLimit("nonsense"), times=1)
+        Embedder(client, retries=1, backoff=1.0).embed_documents(["a"])
+        assert slept and 0 <= slept[0] <= 1.0
+
+    def test_an_absurd_retry_after_is_not_slept_through(self, slept):
+        """A provider asking for ten minutes is saying come back later,
+        not hold a backfill open for ten minutes."""
+        class RateLimit(Exception):
+            response = type("R", (), {"headers": {"Retry-After": "600"}, "status_code": 429})()
+
+        client = _raises(RateLimit("much later"), times=1)
+        Embedder(client, retries=1, backoff=1.0).embed_documents(["a"])
+        assert slept and slept[0] <= 1.0        # our own window, not 600
+
+    def test_retries_are_exhausted_and_the_count_is_reported(self, slept):
+        client = _raises(TimeoutError("upstream"), times=99)
+        with pytest.raises(EmbeddingError, match=r"after 3 attempt\(s\)"):
+            Embedder(client, retries=2).embed_documents(["a"])
+        assert client.state["calls"] == 3
+
+    def test_retries_zero_disables_it_entirely(self, slept):
+        """The knob that stops hopai's policy multiplying with the
+        client's own -- 3 attempts inside 3 is nine calls."""
+        client = _raises(TimeoutError("upstream"), times=99)
+        with pytest.raises(EmbeddingError, match="after 1 attempt"):
+            Embedder(client, retries=0).embed_documents(["a"])
+        assert client.state["calls"] == 1
+        assert slept == []
+
+    def test_every_retry_is_logged_with_its_wait(self, slept, caplog):
+        client = _raises(TimeoutError("upstream"), times=1)
+        with caplog.at_level(logging.WARNING, logger="hopai.embeddings"):
+            Embedder(client, retries=1).embed_documents(["a"])
+        assert len(caplog.records) == 1
+        message = caplog.records[0].getMessage()
+        # Anchored on the owner: a message mangled at its edges still
+        # contains every substring below.
+        assert message.startswith("Embedder(function).embed_documents: ")
+        assert "retrying in" in message
+        assert "attempt 2 of 2" in message
+        # Names WHAT failed, not just that something did: a retry line
+        # without the exception type says nothing worth logging.
+        assert "TimeoutError: upstream" in message
+
+    def test_a_recovered_call_logs_no_failure(self, slept, caplog):
+        """A retry that worked is not an error -- reporting one would
+        train the reader to ignore the level that means 'rows were left
+        unembedded'."""
+        client = _raises(TimeoutError("upstream"), times=1)
+        with caplog.at_level(logging.WARNING, logger="hopai.embeddings"):
+            Embedder(client, retries=1).embed_documents(["a"])
+        assert not any("failed after" in r.getMessage() for r in caplog.records)
+
+    def test_our_own_refusals_are_never_retried(self, slept):
+        """EmbeddingError from _as_vectors means the provider answered
+        with something unusable, which asking again cannot fix."""
+        client = _raises(TimeoutError("x"), times=0, then=[[1.0], [2.0]])
+        with pytest.raises(EmbeddingError, match="asked for 1 embedding"):
+            Embedder(client, retries=3).embed_documents(["a"])
+        assert slept == []
+
+    @pytest.mark.parametrize("bad", [-1, 1.5, "2", True])
+    def test_a_meaningless_retry_count_is_refused(self, bad):
+        with pytest.raises(ValueError, match="retries must be a non-negative integer"):
+            Embedder(lambda texts: [[1.0]], retries=bad)
+
+    @pytest.mark.parametrize("bad", [0, -1, float("inf"), "1", True])
+    def test_a_meaningless_backoff_is_refused(self, bad):
+        """backoff=0 would busy-loop against a rate limiter, which is
+        the one thing a retry must never do."""
+        with pytest.raises(ValueError, match="backoff must be a positive number"):
+            Embedder(lambda texts: [[1.0]], backoff=bad)
+
+
 class TestLogging:
     """The only network calls hopai makes are the only ones worth a log
     line, and an embedding failure is worth one even when it is caught:
@@ -690,8 +908,11 @@ class TestErrorsNameTheCall:
         def boom(texts):
             raise TimeoutError("upstream")
 
-        with pytest.raises(EmbeddingError, match=r"failed \(TimeoutError: upstream\)"):
-            Embedder(boom).embed_documents(["a"])
+        # retries=0 keeps this about the message rather than the backoff;
+        # the attempt count is asserted in TestRetry.
+        with pytest.raises(EmbeddingError,
+                           match=r"failed after 1 attempt\(s\) \(TimeoutError: upstream\)"):
+            Embedder(boom, retries=0).embed_documents(["a"])
 
     def test_an_unrecognized_client_names_its_own_type(self):
         with pytest.raises(TypeError, match=r"^Embedder: dict is not an embedding"):

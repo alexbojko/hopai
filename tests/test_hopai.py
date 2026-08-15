@@ -190,6 +190,18 @@ class TestCoreTraversal:
         assert 0 < result.elapsed_ms <= wall_ms
         assert result.elapsed_ms > wall_ms / 1000
 
+    def test_the_seconds_to_milliseconds_factor_is_exact(self, graph, monkeypatch):
+        """The bounds above are loose enough that the CONSTANT can drift
+        -- 1000 to 1001 is a tenth of a percent, invisible against a
+        real clock (mutant traverse_124). Driving perf_counter with
+        known values is the only way to assert the factor itself."""
+        import hopai.core as core_module
+
+        ticks = iter([10.0, 10.25])            # exactly 250ms of query time
+        monkeypatch.setattr(core_module.time, "perf_counter", lambda: next(ticks))
+        result = graph.traverse(Start(where={"type": "leaf"}))
+        assert result.elapsed_ms == pytest.approx(250.0)
+
 
 # ---------------------------------------------------------------------
 # Direction
