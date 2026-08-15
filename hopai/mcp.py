@@ -243,6 +243,18 @@ def _seed(graph: Graph, embed: Optional[Callable], start: Any, caller: str) -> d
     return start
 
 
+def _seeds_from_text(graph: Graph, embed: Optional[Callable]) -> bool:
+    """Whether `start.search` can work at all.
+
+    An embedder is not enough: a seed ranks NODE vectors, so a graph
+    that declares only edge vector fields can offer `search_similar`
+    over its edges and still have nothing to seed a traversal from.
+    Advertising the key anyway would put a parameter in front of a
+    model that fails on every use -- found by a surviving mutant, which
+    is what mutation triage is for."""
+    return embed is not None and bool(_vector_fields(graph, "nodes"))
+
+
 def _search_keys(graph: Graph) -> dict:
     """The `search` half of a start object's schema, offered only when
     this server can actually embed text."""
@@ -355,7 +367,7 @@ def _describe_tool(graph: Graph, read_only: bool, allow_ddl: bool,
 
 
 def _traverse_tool(graph: Graph, schema: dict, embed: Optional[Callable]) -> ToolSpec:
-    if embed is not None:
+    if _seeds_from_text(graph, embed):
         schema = _with_search(schema, graph, _NO_MEANING)
 
     def traverse_graph(start: dict, hops: Optional[list] = None) -> dict:
@@ -370,7 +382,7 @@ def _traverse_tool(graph: Graph, schema: dict, embed: Optional[Callable]) -> Too
 
 
 def _aggregate_tool(graph: Graph, schema: dict, embed: Optional[Callable]) -> ToolSpec:
-    if embed is not None:
+    if _seeds_from_text(graph, embed):
         schema = _with_search(schema, graph, _NO_MEANING_AGGREGATE)
 
     def aggregate_graph(start: dict, aggregates: dict, hops: Optional[list] = None) -> dict:

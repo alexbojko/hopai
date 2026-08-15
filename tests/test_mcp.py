@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 
 import pytest
 
@@ -33,6 +34,29 @@ except ImportError:                     # pragma: no cover - depends on the envi
 
 needs_sdk = pytest.mark.skipif(_sdk is None,
                                reason="the MCP SDK is not installed -- pip install hopai[mcp]")
+
+# CONSTRUCTING an SDK server does not survive mutmut, and one failing test
+# there costs the whole mutation run. mutmut executes the suite IN ITS OWN
+# PROCESS, from a `mutants/` copy, with PY_IGNORE_IMPORTMISMATCH=1 -- so a
+# module can end up loaded twice under two identities. The MCP 2.x server
+# constructor derives an AES-GCM key on the way up, and `cryptography`'s
+# Rust binding then rejects its own `SHA256()` with "Expected instance of
+# hashes.HashAlgorithm". Nothing in hopai is involved: the same tests pass
+# under pytest run inside `mutants/` directly.
+#
+# It matters because mutmut's stats pass runs with -x: that one error
+# aborts the run before a single mutant is checked, and the PR report
+# reads `0/N killed, no survivors` -- which looks like a clean sweep and
+# is the opposite (CLAUDE.md's triage rule calls this out by name). The
+# rest of this file still runs under mutmut and is what kills mutants in
+# hopai/mcp.py; the handful of lines only these tests reach are reported
+# as `no_tests` rather than as killed, which is the honest answer.
+#
+# MUTANT_UNDER_TEST is mutmut's own marker, set for every phase it runs.
+survives_mutmut = pytest.mark.skipif(
+    "MUTANT_UNDER_TEST" in os.environ,
+    reason="building an SDK server dies inside cryptography under mutmut's in-process "
+           "runner; see the comment in tests/test_mcp.py")
 
 
 def offline() -> Graph:
@@ -238,6 +262,41 @@ class TestToolSchemas:
         assert "required" not in start
         assert start["anyOf"] == [{"required": ["where"]}, {"required": ["search"]}]
 
+    def test_edge_only_vectors_offer_search_but_not_a_seed(self):
+        """A seed ranks NODE vectors. A graph with only edge vector
+        fields can still be searched, but advertising `start.search`
+        there would put a parameter in front of a model that fails on
+        every use. (Found by a surviving mutant.)"""
+        g = offline()
+        g.define_vectors(edges=[Vector("rel", 3)])
+        specs = named(g, embed=embedder())
+        assert "search_similar" in specs
+        start = specs["traverse_graph"].parameters["properties"]["start"]
+        assert "search" not in start["properties"]
+        assert "cannot find nodes by meaning" in specs["traverse_graph"].description
+
+    def test_aggregation_can_be_seeded_by_meaning_too(self):
+        """"How many papers cite anything about retrieval" is the same
+        question as the traversal, counted. Wiring the seed into only
+        one of the two tools is a silent half-feature."""
+        g = offline()
+        g.define_vectors(nodes=[Vector("summary", 3)])
+        spec = named(g, embed=embedder())["aggregate_graph"]
+        assert "search" in spec.parameters["properties"]["start"]["properties"]
+        assert "start.search" in spec.description
+
+    def test_every_built_schema_is_a_well_formed_object_schema(self):
+        """The tools this module writes itself build their schemas
+        rather than copying hopai's. A malformed one is not rejected by
+        anything -- the SDK ships whatever it is given, and the model
+        gets a schema it cannot satisfy."""
+        for spec in tools(offline(), allow_ddl=False):
+            assert spec.parameters["type"] == "object", spec.name
+            assert isinstance(spec.parameters["properties"], dict), spec.name
+            assert isinstance(spec.parameters.get("required", []), list), spec.name
+            for name, prop in spec.parameters["properties"].items():
+                assert prop.get("type") or prop.get("anyOf"), f"{spec.name}.{name}"
+
     def test_search_field_is_offered_only_when_the_choice_is_real(self):
         """One declared field needs no argument. Several make the choice
         the caller's, because ranking against the wrong field returns
@@ -366,8 +425,25 @@ class TestCypherTool:
         with pytest.raises(CypherError, match="no delete API"):
             named(offline())["cypher"].call(query="MATCH (a) DETACH DELETE a")
 
+    def test_strict_schema_reaches_the_query(self):
+        """The flag is forwarded, not just accepted. Without this a
+        server started with --strict-schema would quietly answer a
+        query naming a label the schema has never heard of, with the
+        empty result that spelling mistake deserves and no hint that
+        it was one. Refused at translation, so no database is needed.
+        (Found by a surviving mutant.)"""
+        g = offline()
+        g.define_schema(nodes=[NodeType("person")])
+        with pytest.raises(CypherError, match="unknown label 'persn'"):
+            named(g, strict_schema=True)["cypher"].call(
+                query="MATCH (a:persn) RETURN count(a)")
+
     def test_the_description_says_which_half_is_available(self):
-        assert "READ-ONLY" in named(offline(), read_only=True)["cypher"].description
+        """Both halves: what a read may do is as load-bearing as what a
+        write may do, and it is the half a read-only server has left."""
+        read_only = named(offline(), read_only=True)["cypher"].description
+        assert "READ-ONLY" in read_only
+        assert "MATCH with one linear chain of hops" in read_only
         assert "CREATE and MERGE write" in named(offline())["cypher"].description
 
 
@@ -447,18 +523,28 @@ class TestCommandLine:
         assert (args.transport, args.host, args.read_only, args.allow_ddl) == (
             "stdio", "127.0.0.1", False, False)
 
-    def test_main_declares_the_vector_fields_and_serves(self, monkeypatch):
+    def test_main_declares_the_vector_fields_and_forwards_every_option(self, monkeypatch):
         """Everything main() does between parsing and serving, with the
-        serving stubbed: the vector fields have to reach the Graph, or
-        the search tools it just enabled have nothing to rank."""
+        serving stubbed. Every flag is asserted, not a sample: an option
+        that parses and is then dropped on the way to serve() fails
+        silently and in the direction nobody wants -- `--host` binding
+        somewhere else, `--allow-ddl` off (or on) without anyone saying
+        so. And the vector fields have to reach the Graph, or the search
+        tools they enable have nothing to rank."""
         served = {}
         monkeypatch.setattr("hopai.mcp.serve",
                             lambda graph, **options: served.update(graph=graph, **options))
         assert main(["--dsn", "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
                      "--no-load-schema", "--vector", "nodes:summary:1536",
-                     "--transport", "http", "--port", "9999", "--read-only"]) == 0
+                     "--vector", "edges:rel:8", "--transport", "http", "--host", "0.0.0.0",
+                     "--port", "9999", "--path", "/graph", "--name", "kg",
+                     "--allow-ddl", "--embed", "json:dumps"]) == 0
         assert served["graph"].vectors["nodes"]["summary"].dimensions == 1536
-        assert (served["transport"], served["port"], served["read_only"]) == ("http", 9999, True)
+        assert served["graph"].vectors["edges"]["rel"].dimensions == 8
+        assert served["transport"] == "http"
+        assert (served["host"], served["port"], served["path"]) == ("0.0.0.0", 9999, "/graph")
+        assert (served["name"], served["read_only"], served["allow_ddl"]) == ("kg", False, True)
+        assert (served["embed"], served["strict_schema"]) == (json.dumps, False)
 
     def test_an_unreachable_saved_schema_is_reported_not_fatal(self, monkeypatch, capsys):
         """A graph that never called save_schema() is the normal case,
@@ -495,6 +581,7 @@ def advertised(tool) -> dict:
 
 
 @needs_sdk
+@survives_mutmut
 class TestServerRegistration:
     def test_every_tool_reaches_the_client_with_hopais_schema(self, vector_graph):
         """The end of the chain the rest of this file tests in pieces:
