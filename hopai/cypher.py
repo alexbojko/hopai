@@ -2074,6 +2074,7 @@ def cypher_to_mutations(
     *,
     node_label_key: Optional[str] = "type",
     edge_type_key: Optional[str] = "kind",
+    schema=None,
 ) -> list:
     """Translate a Cypher DELETE / DETACH DELETE / SET / REMOVE into the
     mutation operations `Graph.mutate()` runs.
@@ -2086,6 +2087,10 @@ def cypher_to_mutations(
         cypher_to_mutations("MATCH (a:person) WHERE a.age > 65 SET a.retired = true")
         # [{'op': 'update_nodes', 'where': AND({'type': 'person'}, GT('age', 65)),
         #   'set': {'retired': True}}]
+
+    `schema=` refuses a query naming a label, kind or property the
+    schema does not declare -- `graph.mutate_cypher(query,
+    strict_schema=True)` is the same thing spelled from a Graph.
 
     Raises CypherError for a query that does not change anything."""
     opts = _Options(node_label_key=node_label_key, edge_type_key=edge_type_key)
@@ -2102,7 +2107,11 @@ def cypher_to_mutations(
             "mutation produces a MutationResult, not a number. Run the aggregation as "
             "its own MATCH query, before or after"
         )
-    return _MutateTranslator(opts).translate(clauses)
+    operations = _MutateTranslator(opts).translate(clauses)
+    if schema is not None:
+        from .schema import validate_mutations
+        validate_mutations(schema, operations, node_label_key, edge_type_key)
+    return operations
 
 
 def _refuse_mixed(clauses: list) -> None:

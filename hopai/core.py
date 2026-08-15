@@ -969,9 +969,14 @@ class Graph:
         The whole query is one transaction and compiles down to the same
         delete_nodes/update_nodes/... the Python API calls --
         `hopai.cypher_to_mutations(query)` shows the plan without running
-        it."""
-        from .cypher import cypher_to_mutations
-        return self._mutator.execute_operations(cypher_to_mutations(query, **options))
+        it. Accepts the same node_label_key / edge_type_key /
+        strict_schema options as the read and write sides -- and a
+        hallucinated label is worth refusing here most of all, since a
+        delete that matched nothing reports the same success as one that
+        had nothing to match."""
+        from .cypher import cypher_to_mutations, resolve_strict
+        return self._mutator.execute_operations(
+            cypher_to_mutations(query, **resolve_strict(self, dict(options))))
 
     # -- execution ------------------------------------------------------
 

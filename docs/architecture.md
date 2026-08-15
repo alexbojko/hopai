@@ -75,6 +75,9 @@ caller declared" are one implementation, not two that drift.
   knows whether the caller wrote no filter or wrote one that translation discarded
   (`node_label_key=None`). `_MutateTranslator._operation` refuses in the second case;
   the executor only sees a flag that was meant.
+- **`strict_schema` applies to mutations too**, via `schema.validate_mutations()` —
+  the delete/update twin of `validate_operations()`, checking the filter's vocabulary
+  and the properties an update writes against the type its filter names.
 - **The booleans go through `_flag()`**, which rejects anything that is not `True` or
   `False`. `"false"` is truthy, and these arguments decide how many rows survive.
 

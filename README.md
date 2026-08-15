@@ -732,6 +732,12 @@ And one refusal that only exists because deleting is not reading: with
 constraint translated away. On the read path that widens a result set;
 here it would empty the graph, so it raises instead.
 
+`strict_schema=True` reaches mutations as well, and is worth more here
+than on the read side — a hallucinated label there returns an empty
+subgraph, which at least looks like a result, while a delete that
+matched nothing reports exactly what a correct delete of an
+already-clean graph reports.
+
 The pattern is one node or one relationship. Changing the rows a
 multi-hop pattern reached (`MATCH (a)-[:knows]->(b) DELETE b`) is a
 traversal driving a write, and refuses — match the rows by their

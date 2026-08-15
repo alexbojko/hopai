@@ -1015,6 +1015,48 @@ def validate_operations(schema: GraphSchema, operations: list,
             _check_vocabulary(dict(op["where"]), node_types, node_label_key, "label")
 
 
+def validate_mutations(schema: GraphSchema, operations: list,
+                       node_label_key: Optional[str] = "type",
+                       edge_type_key: Optional[str] = "kind") -> None:
+    """The delete/update twin.
+
+    A hallucinated label costs more here than on the read path. There it
+    returns an empty subgraph, which at least looks like a result; a
+    delete that matched nothing reports success, and "0 rows" is exactly
+    what a correct delete of an already-clean graph reports too. The
+    properties an update WRITES are checked as well, against the type
+    its filter names -- the same rule validate_operations() applies to
+    a created row."""
+    node_types = {nt.name: {p.name for p in nt.properties} for nt in schema.node_types}
+    edge_kinds: dict = {}
+    for et in schema.edge_types:
+        edge_kinds.setdefault(et.kind, set()).update(p.name for p in et.properties)
+
+    for op in operations:
+        edges = op["op"].endswith("_edges")
+        declared = edge_kinds if edges else node_types
+        key = edge_type_key if edges else node_label_key
+        what = "relationship kind" if edges else "label"
+        if key is not None:
+            _check_vocabulary(op.get("where"), declared, key, what)
+            written = {**(op.get("set") or {}), **dict.fromkeys(op.get("remove") or ())}
+            for name in _discriminator_values(op.get("where"), key):
+                _check_vocabulary({key: name, **written}, declared, key, what)
+        if edges and node_label_key is not None:
+            for side in ("start", "end"):
+                _check_vocabulary(op.get(side), node_types, node_label_key, "label")
+
+
+def _discriminator_values(filt, discriminator: str) -> list:
+    """Every value a filter pins the discriminator to -- what a mutation
+    names as the type it is changing, since `set` carries no label of
+    its own."""
+    pairs: list = []
+    _filter_vocabulary(filt, pairs, set())
+    named = [value for key, value in pairs if key == discriminator]
+    return [v for value in named for v in (value if isinstance(value, list) else [value])]
+
+
 # ---------------------------------------------------------------------
 # The schema, summarized for a tool-calling model
 # ---------------------------------------------------------------------

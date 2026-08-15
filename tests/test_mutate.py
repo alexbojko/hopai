@@ -965,6 +965,55 @@ class TestCypherRefusals:
             cypher_to_operations("MERGE (a {n: 1}) ON MATCH SET a = {x: 2}")
 
 
+class TestStrictSchema:
+    """`strict_schema=True` reaches the mutation path too. It matters
+    more here than on the read side: a hallucinated label returns an
+    empty subgraph there, which looks like a result, while a delete that
+    matched nothing reports exactly what a correct delete of an
+    already-clean graph reports."""
+
+    @pytest.fixture()
+    def declared(self, people):
+        from hopai import EdgeType, NodeType, Property
+        people.define_schema(
+            nodes=[NodeType("person", properties=[Property("name", "string"),
+                                                  Property("age", "number"),
+                                                  Property("nickname", "string")]),
+                   NodeType("company", properties=[Property("name", "string")])],
+            edges=[EdgeType("knows", "person", "person",
+                            properties=[Property("weight", "number")])])
+        return people
+
+    @pytest.mark.parametrize("query,message", [
+        ("MATCH (a:persson) DETACH DELETE a", "unknown label 'persson'"),
+        ("MATCH (a:person) SET a.nickmane = 'Al'", r"unknown property \['nickmane'\]"),
+        ("MATCH (a:person) REMOVE a.nickmane", r"unknown property \['nickmane'\]"),
+        ("MATCH ()-[r:knowss]->() DELETE r", "unknown relationship kind 'knowss'"),
+        ("MATCH ()-[r:knows]->(b:persson) DELETE r", "unknown label 'persson'"),
+    ])
+    def test_vocabulary_the_schema_does_not_declare_is_refused(self, declared, query,
+                                                               message):
+        with pytest.raises(CypherError, match=message):
+            declared.mutate_cypher(query, strict_schema=True)
+        assert len(properties_of(declared)) == 4
+
+    def test_a_declared_query_still_runs(self, declared):
+        assert declared.mutate_cypher("MATCH (a:person) SET a.nickname = 'x'",
+                                      strict_schema=True).updated_nodes == 3
+        assert declared.mutate_cypher("MATCH ()-[r:knows]->() SET r.weight = 2",
+                                      strict_schema=True).updated_edges == 2
+
+    def test_strict_without_a_schema_names_the_fix(self, people):
+        with pytest.raises(CypherError, match="define_schema"):
+            people.mutate_cypher("MATCH (a:person) DELETE a", strict_schema=True)
+
+    def test_graph_cypher_passes_the_option_through(self, declared):
+        """The dispatching entry point is the one an agent uses, so the
+        option has to survive the trip to the mutation translator."""
+        with pytest.raises(CypherError, match="unknown label"):
+            declared.cypher("MATCH (a:persson) DETACH DELETE a", strict_schema=True)
+
+
 class TestCypherExecution:
     def test_delete_runs_end_to_end(self, people):
         result = people.cypher("MATCH (a:person {name: 'Bob'}) DETACH DELETE a")
