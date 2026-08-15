@@ -1080,3 +1080,70 @@ class TestOptionForwarding:
         without = offline_graph.cypher_operations("CREATE (a:person {x: 1})",
                                                   node_label_key=None)
         assert without[0]["rows"] == [{"x": 1}]
+
+
+class TestStrictSchema:
+    """Opt-in vocabulary validation against a declared schema: with it,
+    a hallucinated label is an immediate CypherError naming the defined
+    vocabulary instead of a silently empty result. Validation runs over
+    the TRANSLATION OUTPUT, so the front ends stay front ends."""
+
+    @staticmethod
+    def schema():
+        from hopai import EdgeType, GraphSchema, NodeType, Property
+        return GraphSchema(
+            node_types=[NodeType("person", properties=[Property("email", "string"),
+                                                       Property("age", "number")]),
+                        NodeType("company", properties=[Property("name", "string")])],
+            edge_types=[EdgeType("works_at", source="person", target="company",
+                                 properties=[Property("since", "number")])],
+        )
+
+    def test_unknown_label_kind_and_property_are_refused_by_name(self):
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a:persn) RETURN a", schema=self.schema())
+        assert "unknown label 'persn'" in str(exc.value)
+        assert "company, person" in str(exc.value)
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a:person)-[:worksat]->(b:company) RETURN b", schema=self.schema())
+        assert "unknown relationship kind 'worksat'" in str(exc.value)
+        assert "works_at" in str(exc.value)
+        with pytest.raises(CypherError) as exc:
+            tr("MATCH (a:person) WHERE a.emial = 'x' RETURN a", schema=self.schema())
+        assert "unknown property ['emial'] for person" in str(exc.value)
+        assert "age, email" in str(exc.value)
+
+    def test_valid_queries_translate_identically(self):
+        query = ("MATCH (a:person {email: 'a@x.com'})-[:works_at]->(b:company) "
+                 "WHERE b.name = 'acme' RETURN b")
+        strict = tr(query, schema=self.schema())
+        assert repr(strict) == repr(tr(query))
+
+    def test_label_less_patterns_stay_outside_the_schema(self):
+        """An untyped pattern's properties are legitimately unknown to
+        the schema; refusing them would forbid valid untyped queries --
+        the documented limit."""
+        start, _ = tr("MATCH (a {anything: 1}) RETURN a", schema=self.schema())
+        assert start.where == {"anything": 1}
+
+    def test_write_plans_are_validated_too(self):
+        from hopai import cypher_to_operations
+        with pytest.raises(CypherError) as exc:
+            cypher_to_operations("CREATE (a:persn {email: 'x'})", schema=self.schema())
+        assert "unknown label 'persn'" in str(exc.value)
+        with pytest.raises(CypherError) as exc:
+            cypher_to_operations(
+                "MATCH (a {email: 'a'}), (b {name: 'acme'}) CREATE (a)-[:worksat]->(b)",
+                schema=self.schema())
+        assert "unknown relationship kind 'worksat'" in str(exc.value)
+
+    def test_strict_flag_without_a_schema_names_the_fix(self, offline_graph):
+        with pytest.raises(CypherError, match="define_schema"):
+            traverse_cypher(offline_graph, "MATCH (a:person) RETURN a", strict_schema=True)
+
+    def test_default_stays_permissive(self):
+        """Without the flag, the exact queries strict mode refuses keep
+        translating -- silently matching nothing, as before. Changing
+        THAT default would break every schema-less caller."""
+        start, _ = tr("MATCH (a:persn) RETURN a")
+        assert start.where == {"type": "persn"}

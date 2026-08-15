@@ -819,6 +819,21 @@ class TestToolSchema:
             assert tool["name"] == constant["name"]
             assert tool["description"].startswith(constant["description"])
 
+    def test_tool_summary_is_pinned_verbatim(self):
+        """PR #25's CI surfaced this summary's string mutants one id at
+        a time -- fragment-level pins let every unmatched separator and
+        label drift. The hop.py rule applies: the WHOLE rendered summary
+        is asserted. If you reword it, update this test."""
+        graph = self.offgraph()
+        self.declare(graph)
+        assert graph.tool_schemas()[0]["description"].endswith(
+            "This graph's declared schema (properties in parentheses, * = required, "
+            "! = unique). "
+            "Node types: person(email*, age); company(name*). "
+            "Edge kinds (source -> target): works_at: person -> company (since); "
+            "likes: person -> person, person -> company."
+        )
+
     def test_tool_summary_is_bounded(self):
         """Prompt budget is someone else's money: a type with many
         properties lists a capped set plus an explicit overflow marker,

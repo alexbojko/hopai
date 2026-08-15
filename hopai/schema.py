@@ -129,6 +129,8 @@ per-request.
 from __future__ import annotations
 
 import dataclasses
+import datetime as _datetime
+import enum as _enum
 import hashlib
 import re
 import types as _pytypes
@@ -158,12 +160,31 @@ class Property:
 
     json_type is a JSON type name or a set of them ({"number", "null"});
     it is normalized to a sorted tuple so the same shape written in any
-    input form -- or any order -- compares equal."""
+    input form -- or any order -- compares equal.
+
+    values     allowed values (an Enum's members, or spelled directly);
+               enforced as an IN (...) CHECK and rendered as JSON
+               Schema's "enum".
+    format     JSON Schema format annotation ("date-time", "date");
+               validated by the generated pydantic model, NOT by the
+               database -- a format regex CHECK is deliberately absent.
+    unique     no two rows of THIS type share the value: compiles to a
+               partial unique index, the per-type uniqueness Postgres
+               gives away. Never inferred -- observed distinctness is
+               not declared uniqueness.
+    properties a nested object schema, when json_type is "object". The
+               representations recurse; enforcement checks only the
+               top-level jsonb_typeof -- stated here, not silent."""
     name: str
     json_type: tuple
     required: bool = False
+    unique: bool = False
+    values: tuple = ()
+    format: Optional[str] = None
+    properties: tuple = ()
 
-    def __init__(self, name: str, json_type, required: bool = False):
+    def __init__(self, name: str, json_type, required: bool = False, unique: bool = False,
+                 values=(), format: Optional[str] = None, properties=()):
         if not isinstance(name, str) or not name:
             raise TypeError(f"a property name must be a non-empty string, got {name!r}")
         type_names = (json_type,) if isinstance(json_type, str) else tuple(json_type)
@@ -176,6 +197,11 @@ class Property:
         self.name = name
         self.json_type = tuple(sorted(set(type_names)))
         self.required = bool(required)
+        self.unique = bool(unique)
+        self.values = tuple(values)
+        self.format = format
+        self.properties = (_normalize_properties(properties, owner=f"Property({name!r})")
+                           if properties else ())
 
 
 @dataclass
@@ -368,9 +394,13 @@ def _class_fields(cls: type) -> list:
 
 
 def _map_annotation(owner: str, field: str, annotation) -> tuple:
-    """One annotation -> (json_type tuple, is_optional). Refuses anything
-    outside the documented table -- a datetime silently stored as "we'll
-    see" is the approximation this library exists not to make."""
+    """One annotation -> (Property kwargs, is_optional). Refuses anything
+    outside the documented table -- a value silently stored as "we'll
+    see" is the approximation this library exists not to make. Beyond
+    the scalar table: a single-value-type Enum becomes its JSON type
+    plus allowed values, datetime/date become "string" with a JSON
+    Schema format, and a nested dataclass/pydantic model becomes an
+    "object" with a nested property schema."""
     optional = False
     origin = typing.get_origin(annotation)
     if origin is Union or origin is _pytypes.UnionType:
@@ -390,15 +420,37 @@ def _map_annotation(owner: str, field: str, annotation) -> tuple:
                 f"Optional[X] is mapped; spell any other union explicitly as a type set, "
                 f"e.g. Property({field!r}, (\"number\", \"string\"))"
             )
+
+    def spec(base: str, **extra) -> tuple:
+        return {"json_type": (base, "null") if optional else (base,), **extra}, optional
+
+    if isinstance(annotation, type) and issubclass(annotation, _enum.Enum):
+        member_types = {type(member.value) for member in annotation}
+        bases = {_ANNOTATION_TYPES.get(t) for t in member_types}
+        if len(bases) != 1 or None in bases:
+            raise TypeError(
+                f"{owner}.{field}: enum {annotation.__name__} mixes value types -- allowed "
+                f"values need ONE JSON type; spell it explicitly, e.g. "
+                f"Property({field!r}, \"string\", values=(...))"
+            )
+        return spec(bases.pop(), values=tuple(member.value for member in annotation))
+    if isinstance(annotation, type) and issubclass(annotation, _datetime.datetime):
+        return spec("string", format="date-time")
+    if isinstance(annotation, type) and issubclass(annotation, _datetime.date):
+        return spec("string", format="date")
+    if _is_schema_class(annotation):
+        return spec("object", properties=_bag_properties(annotation))
+
     base = _ORIGIN_TYPES.get(origin) if origin is not None else _ANNOTATION_TYPES.get(annotation)
     if base is None:
         raise TypeError(
             f"{owner}.{field}: unsupported annotation {annotation!r}. The mapped annotations "
-            f"are str, int, float, bool, dict, list and Optional[...] of those; anything else "
+            f"are str, int, float, bool, dict, list, Optional[...] of those, single-type "
+            f"Enums, datetime/date, and nested dataclass/pydantic classes; anything else "
             f"must say what it stores, e.g. Property({field!r}, \"string\") in the primitive "
             f"notation -- guessing a storage type silently is refused on purpose"
         )
-    return ((base, "null") if optional else (base,)), optional
+    return spec(base)
 
 
 def _bag_properties(cls: type, skip: tuple = ()) -> list:
@@ -408,8 +460,8 @@ def _bag_properties(cls: type, skip: tuple = ()) -> list:
     for name, annotation, has_default in _class_fields(cls):
         if name in skip:
             continue
-        type_names, optional = _map_annotation(cls.__name__, name, annotation)
-        properties.append(Property(name, type_names, required=not optional and not has_default))
+        kwargs, optional = _map_annotation(cls.__name__, name, annotation)
+        properties.append(Property(name, required=not optional and not has_default, **kwargs))
     return properties
 
 
@@ -516,13 +568,26 @@ def build_schema(nodes, edges) -> GraphSchema:
 # Representations: shared pieces
 # ---------------------------------------------------------------------
 
+def _property_json(p: Property) -> dict:
+    if p.properties:
+        spec = _properties_json(p.properties)   # a nested object schema
+        if len(p.json_type) > 1:
+            spec["type"] = list(p.json_type)
+    else:
+        spec = {"type": p.json_type[0] if len(p.json_type) == 1 else list(p.json_type)}
+    if p.values:
+        spec["enum"] = list(p.values)
+    if p.format:
+        spec["format"] = p.format
+    if p.unique:
+        spec["unique"] = True
+    return spec
+
+
 def _properties_json(properties: tuple) -> dict:
     spec = {
         "type": "object",
-        "properties": {
-            p.name: {"type": p.json_type[0] if len(p.json_type) == 1 else list(p.json_type)}
-            for p in properties
-        },
+        "properties": {p.name: _property_json(p) for p in properties},
     }
     required = [p.name for p in properties if p.required]
     if required:
@@ -537,9 +602,18 @@ _PYTHON_TYPES = {"string": str, "number": float, "boolean": bool, "object": dict
 def _pydantic_model(name: str, properties: tuple, create_model):
     fields = {}
     for p in properties:
-        non_null = [_PYTHON_TYPES[t] for t in p.json_type if t != "null"]
-        annotation = (non_null[0] if len(non_null) == 1
-                      else Union[tuple(non_null)] if non_null else type(None))
+        if p.properties:
+            annotation = _pydantic_model(f"{name}_{p.name}", p.properties, create_model)
+        elif p.values:
+            annotation = typing.Literal[tuple(p.values)]
+        elif p.format == "date-time":
+            annotation = _datetime.datetime
+        elif p.format == "date":
+            annotation = _datetime.date
+        else:
+            non_null = [_PYTHON_TYPES[t] for t in p.json_type if t != "null"]
+            annotation = (non_null[0] if len(non_null) == 1
+                          else Union[tuple(non_null)] if non_null else type(None))
         if "null" in p.json_type:
             annotation = Optional[annotation]
         # Not-required fields default to None WITHOUT widening the
@@ -628,7 +702,50 @@ def _type_rules(target: _Target, discriminator: str, type_name: str,
         # Required in constraints.py.
         expression = typeof == p.json_type[0] if len(p.json_type) == 1 else typeof.in_(p.json_type)
         rules.append((name, or_(guard, expression)))
+        if p.values:
+            # ->> text comparison, so allowed values compare by their
+            # text rendering (a numeric enum of 1 matches '1'). Absent
+            # keys are NULL and pass -- presence stays req_'s job.
+            allowed = [v if isinstance(v, str) else str(v) for v in p.values]
+            name = f"ck_schema_val_{token}_{_slug(type_name)}_{_slug(p.name)}"[:63]
+            rules.append((name, or_(guard, target.properties_col[p.name].astext.in_(allowed))))
     return rules
+
+
+def _type_uniques(target: _Target, discriminator: str, type_name: str,
+                  properties: tuple) -> list:
+    """(name, ddl) per unique property: the PARTIAL unique index --
+    unique among rows of THIS type only, the constraint the README
+    already markets. Compiled through the same Unique() machinery
+    define_constraints() uses, so the index shape and any future merge
+    conflict-target stay in step."""
+    from .constraints import Unique, compile_constraint
+    pairs = []
+    token = _graph_token(target.graph)
+    for p in properties:
+        if not p.unique:
+            continue
+        name = f"uq_schema_{token}_{_slug(type_name)}_{_slug(p.name)}"[:63]
+        _, _, ddl = compile_constraint(
+            Unique(p.name, where={discriminator: type_name}, name=name), target)
+        pairs.append((name, ddl))
+    return pairs
+
+
+def compile_node_uniques(schema: GraphSchema, target: _Target) -> list:
+    return [pair for nt in schema.node_types
+            for pair in _type_uniques(target, "type", nt.name, nt.properties)]
+
+
+def compile_edge_uniques(schema: GraphSchema, target: _Target) -> list:
+    return [pair for kind, properties in _properties_per_kind(schema.edge_types).items()
+            for pair in _type_uniques(target, "kind", kind, properties)]
+
+
+SCHEMA_UNIQUES = text("""
+    SELECT indexname FROM pg_indexes
+    WHERE tablename = :table AND indexname LIKE 'uq\\_schema\\_%' ESCAPE '\\'
+""")
 
 
 def _type_constraints(target: _Target, discriminator: str, type_name: str,
@@ -744,6 +861,104 @@ ENDPOINT_TRIGGER_EXISTS = text("""
 
 
 # ---------------------------------------------------------------------
+# Strict mode: the Cypher front end validated against the schema
+# ---------------------------------------------------------------------
+# With a schema defined, MATCH (a:persn) is a typo or a hallucination --
+# unvalidated it silently matches nothing, the worst outcome for an LLM
+# caller. Validation runs over the TRANSLATION OUTPUT (Start/Hop or
+# operations), never inside the parser: the front ends stay front ends.
+
+def _filter_vocabulary(filt, pairs: list, keys: set) -> None:
+    """Collect (key, value) equality pairs and every referenced property
+    key from a translated filter. The callable escape hatch is opaque on
+    purpose and collects nothing."""
+    from .filters import AND, BETWEEN, GT, GTE, LT, LTE, NOT, OR
+    if filt is None:
+        return
+    if isinstance(filt, dict):
+        for key, value in filt.items():
+            pairs.append((key, value))
+            keys.add(key)
+    elif isinstance(filt, (AND, OR)):
+        for term in filt.filters:
+            _filter_vocabulary(term, pairs, keys)
+    elif isinstance(filt, NOT):
+        _filter_vocabulary(filt.filt, pairs, keys)
+    elif isinstance(filt, (GT, GTE, LT, LTE, BETWEEN)):
+        keys.add(filt.key)
+
+
+def _check_vocabulary(filt, declared: dict, discriminator: str, what: str) -> None:
+    from .cypher import CypherError
+    pairs: list = []
+    keys: set = set()
+    _filter_vocabulary(filt, pairs, keys)
+    named = [value for key, value in pairs if key == discriminator]
+    flat = [v for value in named for v in (value if isinstance(value, list) else [value])]
+    for name in flat:
+        if name not in declared:
+            raise CypherError(
+                f"unknown {what} {name!r} -- the schema declares: "
+                f"{', '.join(sorted(declared))}"
+            )
+    if not flat:
+        # no discriminator, no verdict: an untyped pattern's properties
+        # are legitimately outside the schema (documented limit)
+        return
+    allowed = set().union(*(declared[name] for name in flat)) | {discriminator}
+    unknown = sorted(keys - allowed)
+    if unknown:
+        raise CypherError(
+            f"unknown propert{'ies' if len(unknown) > 1 else 'y'} {unknown} for "
+            f"{'/'.join(sorted(set(flat)))} -- the schema declares: "
+            f"{', '.join(sorted(allowed - {discriminator}))}"
+        )
+
+
+def validate_traversal(schema: GraphSchema, start, hops,
+                       node_label_key: Optional[str] = "type",
+                       edge_type_key: Optional[str] = "kind") -> None:
+    """Refuse a translated traversal whose labels, kinds or properties
+    the schema does not declare -- CypherErrors listing the vocabulary,
+    so a hallucinated label becomes an immediate fix instead of a
+    silently empty result."""
+    node_types = {nt.name: {p.name for p in nt.properties} for nt in schema.node_types}
+    edge_kinds: dict = {}
+    for et in schema.edge_types:
+        edge_kinds.setdefault(et.kind, set()).update(p.name for p in et.properties)
+    if node_label_key is not None:
+        _check_vocabulary(start.where, node_types, node_label_key, "label")
+    for hop in hops:
+        if node_label_key is not None:
+            _check_vocabulary(hop.where, node_types, node_label_key, "label")
+        if edge_type_key is not None:
+            _check_vocabulary(hop.via, edge_kinds, edge_type_key, "relationship kind")
+
+
+def validate_operations(schema: GraphSchema, operations: list,
+                        node_label_key: Optional[str] = "type",
+                        edge_type_key: Optional[str] = "kind") -> None:
+    """The write-side twin: every row a plan would write is a property
+    dict, validated with the same vocabulary rules."""
+    node_types = {nt.name: {p.name for p in nt.properties} for nt in schema.node_types}
+    edge_kinds: dict = {}
+    for et in schema.edge_types:
+        edge_kinds.setdefault(et.kind, set()).update(p.name for p in et.properties)
+    for op in operations:
+        if op["op"] in ("create_nodes", "merge_nodes"):
+            for row in op["rows"]:
+                if node_label_key is not None:
+                    _check_vocabulary(dict(row), node_types, node_label_key, "label")
+        elif op["op"] in ("create_edges", "merge_edges"):
+            for row in op["rows"]:
+                if edge_type_key is not None:
+                    _check_vocabulary(dict(row.get("properties", {})), edge_kinds,
+                                      edge_type_key, "relationship kind")
+        elif op["op"] == "match" and node_label_key is not None:
+            _check_vocabulary(dict(op["where"]), node_types, node_label_key, "label")
+
+
+# ---------------------------------------------------------------------
 # The schema, summarized for a tool-calling model
 # ---------------------------------------------------------------------
 
@@ -760,7 +975,7 @@ def tool_summary(schema: GraphSchema) -> str:
     grouped per kind, and long property lists are capped -- bounded on
     purpose, never an unbounded dump."""
     def bag(properties: tuple) -> str:
-        shown = [p.name + ("*" if p.required else "")
+        shown = [p.name + ("*" if p.required else "") + ("!" if p.unique else "")
                  for p in properties[:_TOOL_SUMMARY_PROPERTIES]]
         overflow = len(properties) - _TOOL_SUMMARY_PROPERTIES
         if overflow > 0:
@@ -775,7 +990,8 @@ def tool_summary(schema: GraphSchema) -> str:
     edges = "; ".join(
         f"{kind}: {', '.join(pairs)}" + (f" {bag(properties)}" if properties else "")
         for kind, (pairs, properties) in per_kind.items())
-    parts = ["This graph's declared schema (properties in parentheses, * = required)."]
+    parts = ["This graph's declared schema (properties in parentheses, "
+             "* = required, ! = unique)."]
     if nodes:
         parts.append(f"Node types: {nodes}.")
     if edges:
@@ -836,6 +1052,14 @@ def find_violations(graph, sample: int = 5) -> SchemaViolations:
          [rule for kind, properties in _properties_per_kind(schema.edge_types).items()
           for rule in _type_rules(edge_target, "kind", kind, properties)]),
     ]
+    unique_groups = [
+        (node_target, graph.nodes_tbl, graph.node_id_col, "type",
+         [(nt.name, p) for nt in schema.node_types for p in nt.properties if p.unique]),
+        (edge_target, graph.edges_tbl, graph.edge_id_col, "kind",
+         [(kind, p) for kind, properties in _properties_per_kind(schema.edge_types).items()
+          for p in properties if p.unique]),
+    ]
+
     violated = []
     with graph.engine.connect() as connection:
         for target, table, id_col_name, rules in groups:
@@ -849,6 +1073,29 @@ def find_violations(graph, sample: int = 5) -> SchemaViolations:
                 ids = tuple(row[0] for row in connection.execute(
                     select(id_col).select_from(table).where(failing)
                     .order_by(id_col).limit(sample)).all())
+                violated.append(RuleViolations(name, target.label, rows, ids))
+
+        for target, table, id_col_name, discriminator, unique_rules in unique_groups:
+            id_col = getattr(table.c, id_col_name)
+            for type_name, p in unique_rules:
+                # a unique rule's violations are every row in a duplicate
+                # group -- the ADD INDEX failure names one pair, this
+                # names them all
+                name = (f"uq_schema_{_graph_token(target.graph)}_"
+                        f"{_slug(type_name)}_{_slug(p.name)}")[:63]
+                value = table.c.properties[p.name].astext
+                scoped = [graph._scoped(table),
+                          table.c.properties[discriminator].astext == type_name,
+                          value.isnot(None)]
+                duplicated = (select(value).where(*scoped)
+                              .group_by(value).having(func.count() > 1))
+                failing = select(id_col).where(*scoped, value.in_(duplicated))
+                rows = connection.execute(select(func.count()).select_from(
+                    failing.subquery())).scalar()
+                if not rows:
+                    continue
+                ids = tuple(row[0] for row in connection.execute(
+                    failing.order_by(id_col).limit(sample)).all())
                 violated.append(RuleViolations(name, target.label, rows, ids))
     return SchemaViolations(tuple(violated))
 

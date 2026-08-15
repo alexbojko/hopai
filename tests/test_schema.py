@@ -18,10 +18,11 @@ globals -- classes defined inside a test function would not resolve.
 
 from __future__ import annotations
 
+import enum
 import json
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional, Union
 
 import pydantic
@@ -77,7 +78,31 @@ class BadEndpoints:          # edge class whose endpoints are not classes
 
 @dataclass
 class Event:
-    created_at: datetime     # unmapped annotation
+    created_at: complex      # genuinely unmapped annotation
+
+
+class Status(enum.Enum):
+    OPEN = "open"
+    CLOSED = "closed"
+
+
+class Mixed(enum.Enum):
+    A = "a"
+    B = 2
+
+
+@dataclass
+class Coordinates:
+    lat: float
+    lon: float
+
+
+@dataclass
+class Ticket:
+    status: Status                    # Enum -> string + allowed values
+    opened: datetime                  # -> string + date-time format
+    location: Coordinates             # nested dataclass -> object schema
+    day: date = date(2026, 1, 1)      # -> string + date format
 
 
 @dataclass
@@ -942,3 +967,159 @@ class TestEndpointEnforcement:
         assert any("CREATE CONSTRAINT TRIGGER" in statement for statement in ddl)
         assert any("CREATE OR REPLACE FUNCTION" in statement for statement in ddl)
         assert self.trigger_count(fresh_graph) == 0   # preview executed nothing
+
+
+class TestRicherMappings:
+    def test_class_notation_maps_enum_datetime_and_nested(self, offgraph):
+        """The three former refusals, now mapped: a single-value-type
+        Enum carries its allowed values, datetime/date become string
+        with a JSON Schema format, and a nested dataclass becomes an
+        object with a nested property schema -- each losslessly in the
+        canonical form."""
+        offgraph.define_schema(nodes=[Ticket])
+        (ticket,) = offgraph.schema.node_types
+        by_name = {p.name: p for p in ticket.properties}
+        assert by_name["status"] == Property("status", "string", required=True,
+                                             values=("open", "closed"))
+        assert by_name["opened"] == Property("opened", "string", required=True,
+                                             format="date-time")
+        assert by_name["day"] == Property("day", "string", format="date")
+        location = by_name["location"]
+        assert location.json_type == ("object",)
+        assert location.properties == (Property("lat", "number", required=True),
+                                       Property("lon", "number", required=True))
+
+    def test_primitive_spellings_equal_the_class_output(self, offgraph):
+        """values=/format=/properties= spelled explicitly must normalize
+        identically to the class notation -- the cannot-drift rule,
+        extended to the new fields."""
+        explicit = Graph(OFFLINE_DSN).define_schema(nodes=[NodeType("ticket", properties=[
+            Property("status", "string", required=True, values=("open", "closed")),
+            Property("opened", "string", required=True, format="date-time"),
+            Property("location", "object", required=True, properties=[
+                Property("lat", "number", required=True),
+                Property("lon", "number", required=True)]),
+            Property("day", "string", format="date"),
+        ])])
+        assert offgraph.define_schema(nodes=[Ticket]) == explicit
+
+    def test_mixed_value_type_enum_still_refused(self, offgraph):
+        @dataclass
+        class Bad:
+            state: Mixed
+        Bad.__annotations__["state"] = Mixed   # resolvable without module globals
+        with pytest.raises(TypeError, match="mixes value types"):
+            offgraph.define_schema(nodes=[Bad])
+
+    def test_schema_json_renders_enum_format_unique_and_nesting(self, offgraph):
+        offgraph.define_schema(nodes=[NodeType("ticket", properties=[
+            Property("status", "string", values=("open", "closed")),
+            Property("opened", "string", format="date-time"),
+            Property("code", "string", unique=True),
+            Property("location", "object", properties=[Property("lat", "number",
+                                                                required=True)]),
+        ])])
+        spec = offgraph.schema_json["nodes"]["ticket"]["properties"]
+        json.dumps(spec)
+        assert spec["status"] == {"type": "string", "enum": ["open", "closed"]}
+        assert spec["opened"] == {"type": "string", "format": "date-time"}
+        assert spec["code"] == {"type": "string", "unique": True}
+        assert spec["location"]["type"] == "object"
+        assert spec["location"]["properties"]["lat"] == {"type": "number"}
+        assert spec["location"]["required"] == ["lat"]
+
+    def test_pydantic_models_validate_the_new_shapes(self, offgraph):
+        """Literal rejects a non-member, datetime parses ISO strings,
+        and the nested model validates its own fields -- real validation,
+        not annotation decoration."""
+        offgraph.define_schema(nodes=[Ticket])
+        model = offgraph.schema_pydantic["ticket"]
+        ok = model(status="open", opened="2026-08-15T09:00:00",
+                   location={"lat": 1.5, "lon": 2.5})
+        assert ok.opened.year == 2026 and ok.location.lat == 1.5
+        with pytest.raises(pydantic.ValidationError):
+            model(status="reopened", opened="2026-08-15T09:00:00",
+                  location={"lat": 1.5, "lon": 2.5})
+        with pytest.raises(pydantic.ValidationError):
+            model(status="open", opened="2026-08-15T09:00:00",
+                  location={"lat": "north", "lon": 2.5})
+
+    def test_inference_stays_at_json_type_granularity(self, fresh_graph):
+        """Observation is not declaration: rows that happen to hold enum
+        members or ISO strings infer plain string properties -- no
+        values, no format, no uniqueness."""
+        fresh_graph.add_nodes([{"id": 1, "type": "ticket", "status": "open",
+                                "opened": "2026-08-15T09:00:00"}])
+        inferred, _ = fresh_graph.infer_schema()
+        (ticket,) = inferred.node_types
+        for p in ticket.properties:
+            assert p.values == () and p.format is None and p.unique is False
+
+
+class TestTier2Enforcement:
+    def declare(self, graph) -> None:
+        graph.define_schema(nodes=[
+            NodeType("person", properties=[Property("email", "string", unique=True),
+                                           Property("status", "string",
+                                                    values=("active", "gone"))]),
+            NodeType("robot"),
+        ])
+
+    def test_unique_is_per_type(self, fresh_graph):
+        """unique=True compiles to the PARTIAL index: two people cannot
+        share the email, a robot may reuse it, and rows missing the
+        property repeat freely (SQL NULL semantics, same as Unique)."""
+        self.declare(fresh_graph)
+        applied = fresh_graph.enforce_schema()
+        assert "uq_schema_default_person_email" in applied
+        fresh_graph.add_nodes([{"type": "person", "email": "a@x.com"},
+                               {"type": "robot", "email": "a@x.com"},
+                               {"type": "person"}, {"type": "person"}])
+        with pytest.raises(ConstraintViolation) as exc:
+            fresh_graph.add_nodes([{"type": "person", "email": "a@x.com"}])
+        assert exc.value.constraint == "uq_schema_default_person_email"
+
+    def test_values_are_enforced(self, fresh_graph):
+        self.declare(fresh_graph)
+        fresh_graph.enforce_schema()
+        fresh_graph.add_nodes([{"type": "person", "email": "a@x.com", "status": "active"}])
+        with pytest.raises(ConstraintViolation) as exc:
+            fresh_graph.add_nodes([{"type": "person", "email": "b@x.com",
+                                    "status": "resting"}])
+        assert exc.value.constraint.startswith("ck_schema_val_")
+
+    def test_unique_reconciles_away(self, fresh_graph):
+        """Dropping the flag and re-enforcing must drop the index --
+        a stale unique index would keep refusing writes the schema now
+        allows."""
+        self.declare(fresh_graph)
+        fresh_graph.enforce_schema()
+        fresh_graph.define_schema(nodes=[NodeType("person", properties=[
+            Property("email", "string")]), NodeType("robot")])
+        fresh_graph.enforce_schema()
+        fresh_graph.add_nodes([{"type": "person", "email": "a@x.com"},
+                               {"type": "person", "email": "a@x.com"}])   # now legal
+
+    def test_schema_violations_names_every_duplicate(self, fresh_graph):
+        """The dry-run reports the WHOLE duplicate group under the
+        index's name -- the ADD INDEX failure would name one pair."""
+        fresh_graph.add_nodes([{"id": 1, "type": "person", "email": "a@x.com"},
+                               {"id": 2, "type": "person", "email": "a@x.com"},
+                               {"id": 3, "type": "person", "email": "b@x.com"},
+                               {"id": 4, "type": "robot", "email": "a@x.com"}])
+        self.declare(fresh_graph)
+        (rule,) = fresh_graph.schema_violations().rules
+        assert rule.constraint == "uq_schema_default_person_email"
+        assert rule.rows == 2 and rule.sample_ids == (1, 2)
+
+    def test_nested_schemas_check_the_top_level_type_only(self, fresh_graph):
+        """The documented boundary: a wrong INNER value passes
+        enforcement (representations validate it, CHECKs do not), while
+        a non-object at the top level still fails jsonb_typeof."""
+        fresh_graph.define_schema(nodes=[NodeType("ticket", properties=[
+            Property("location", "object", properties=[Property("lat", "number",
+                                                                required=True)])])])
+        fresh_graph.enforce_schema()
+        fresh_graph.add_nodes([{"type": "ticket", "location": {"lat": "not-a-number"}}])
+        with pytest.raises(ConstraintViolation):
+            fresh_graph.add_nodes([{"type": "ticket", "location": 5}])
