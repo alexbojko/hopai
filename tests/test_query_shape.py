@@ -758,6 +758,79 @@ class TestToolSchema:
         start, hops = spec_to_traversal(spec)
         assert start.where and len(hops) == 1
 
+    @staticmethod
+    def offgraph():
+        from hopai import Graph
+        return Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline")
+
+    @staticmethod
+    def declare(graph):
+        from hopai import EdgeType, NodeType, Property
+        graph.define_schema(
+            nodes=[NodeType("person", properties=[Property("email", "string", required=True),
+                                                  Property("age", "number")]),
+                   NodeType("company", properties=[Property("name", "string", required=True)])],
+            edges=[EdgeType("works_at", source="person", target="company",
+                            properties=[Property("since", "number")]),
+                   EdgeType("likes", source="person", target="person"),
+                   EdgeType("likes", source="person", target="company")],
+        )
+
+    def test_tool_schemas_embed_the_declared_schema(self):
+        """A model reads the description instead of documentation, so
+        with a schema defined every tool must say what exists: type
+        names, required markers, and endpoint pairs grouped per kind --
+        and still be json.dumps-clean."""
+        graph = self.offgraph()
+        self.declare(graph)
+        tools = graph.tool_schemas()
+        assert len(tools) == 3
+        for tool in tools:
+            json.dumps(tool)
+            description = tool["description"]
+            assert "person(email*, age)" in description
+            assert "company(name*)" in description
+            assert "works_at: person -> company (since)" in description
+            assert "likes: person -> person, person -> company" in description
+
+    def test_tool_schemas_without_a_schema_are_the_constants_uncoupled(self):
+        """Schema stays optional: no schema means the static definitions,
+        equal but never SHARED -- an integration mutating its copy must
+        not corrupt the module constants every other caller reads."""
+        from hopai import INGEST_TOOL_SCHEMA
+        tools = self.offgraph().tool_schemas()
+        assert tools == [TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA]
+        tools[0]["description"] = "vandalized"
+        tools[2]["parameters"]["properties"].clear()
+        assert TRAVERSE_TOOL_SCHEMA["description"] != "vandalized"
+        assert INGEST_TOOL_SCHEMA["parameters"]["properties"]
+
+    def test_tool_schemas_change_descriptions_only(self):
+        """The parsers accept exactly what they accepted before, so the
+        parameters sections must be byte-identical to the constants --
+        the schema is presentation here, not grammar."""
+        graph = self.offgraph()
+        self.declare(graph)
+        from hopai import INGEST_TOOL_SCHEMA
+        for tool, constant in zip(graph.tool_schemas(),
+                                  (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
+                                   INGEST_TOOL_SCHEMA), strict=True):
+            assert tool["parameters"] == constant["parameters"]
+            assert tool["name"] == constant["name"]
+            assert tool["description"].startswith(constant["description"])
+
+    def test_tool_summary_is_bounded(self):
+        """Prompt budget is someone else's money: a type with many
+        properties lists a capped set plus an explicit overflow marker,
+        never the whole inventory."""
+        from hopai import NodeType, Property
+        graph = self.offgraph()
+        graph.define_schema(nodes=[NodeType("wide", properties=[
+            Property(f"p{i:02d}", "string") for i in range(15)])])
+        (description,) = {t["description"] for t in graph.tool_schemas() if t["name"] == "traverse_graph"}
+        assert "+3 more" in description
+        assert "p11" in description and "p12" not in description
+
 
 # ---------------------------------------------------------------------
 # Result object
