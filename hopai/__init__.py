@@ -90,9 +90,12 @@ and every deliberate refusal.
 
 FOR TOOL-CALLING MODELS: TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA and
 INGEST_TOOL_SCHEMA are JSON Schemas ready to hand to a function-calling
-definition, covering reading, aggregating and writing respectively.
-(Vector search has no tool schema on purpose -- a model asked for an
-embedding invents one; vectors.py explains.)
+definition, covering reading, aggregating and writing respectively --
+and `graph.tool_schemas()` returns the same three with THIS graph's
+declared schema summarized into each description, so the model knows
+what exists instead of guessing labels. (Vector search has no tool
+schema on purpose, in either form -- a model asked for an embedding
+invents one; vectors.py explains.)
 
 SCHEMA -- declare the shape of the graph (node types, edge kinds, typed
 properties) as plain dataclasses or NodeType/EdgeType primitives, read
@@ -124,7 +127,9 @@ from .json_api import (
     spec_to_traversal, traverse_json, vector_search_json,
 )
 from .models import Edge, Node
-from .schema import EdgeType, GraphSchema, InferenceReport, NodeType, Property, TypeConflict
+from .schema import (
+    EdgeType, GraphSchema, InferenceReport, NodeType, Property, SchemaViolations, TypeConflict,
+)
 from .vectors import Boost, Near, Vector, parse_boost, parse_near
 
 # The trailing annotation is load-bearing: release-please updates this
@@ -145,6 +150,7 @@ __all__ = [
     "aggregate_cypher", "cypher_to_aggregation",
     "Unique", "Required", "Check", "Index", "PropertyType", "Col", "ConstraintViolation",
     "GraphSchema", "NodeType", "EdgeType", "Property", "InferenceReport", "TypeConflict",
+    "SchemaViolations",
     "Vector", "Near", "Boost", "parse_near", "parse_boost", "vector_search_json",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",

@@ -654,6 +654,22 @@ class TestToolSchemasStayVectorFree:
         assert not self._parameter_names(schema) & {
             "near", "keep", "via_near", "via_keep", "boost", "vector", "embedding"}
 
+    def test_per_graph_tool_schemas_stay_vector_free_too(self):
+        """tool_schemas() summarizes THIS graph's declared schema into
+        each description, so it is the second place a vector field
+        could reach a model -- and it is generated, not hand-written,
+        which is exactly how the omission would be lost. Vector fields
+        are not graph-schema properties and must not appear."""
+        from hopai import NodeType, Property
+
+        g = offline()
+        g.define_schema(nodes=[NodeType("doc", properties=[Property("title", "string")])])
+        g.define_vectors(nodes=[Vector("summary", 1536)], edges=[Vector("rel", 8)])
+        dumped = json.dumps(g.tool_schemas())
+        assert "title" in dumped                      # declared properties DO appear
+        for leaked in ("summary", "vec_summary", "rel", "vector", "embedding", "near"):
+            assert leaked not in dumped, leaked
+
     def test_descriptions_tell_the_model_what_it_cannot_do(self):
         """A model holding only the schema sees no hint that meaning-based
         search exists, so it guesses property values and gets zero rows."""

@@ -79,14 +79,16 @@ construction. IS DISTINCT FROM, not <>, because <> is NULL for a missing
 key and a CHECK passes on NULL either way -- DISTINCT just says what is
 meant.
 
-WHAT ENFORCEMENT DOES NOT COVER: endpoint types. "works_at connects only
-person -> company" needs a subquery against nodes, which a CHECK cannot
-contain. Declaring it documents intent and feeds every representation,
-but the database does not police it (a trigger could -- tracked as a
-follow-up, still pure Postgres). Also uncovered: two edge types sharing
-a kind with DIFFERENT property schemas. Enforcement is keyed on the kind
-alone (endpoints being unenforceable, above), so it refuses that shape
-outright rather than enforcing the wrong merge of the two.
+ENDPOINT TYPES are policed only on request: "works_at connects only
+person -> company" needs a look at the endpoint nodes, which a CHECK
+cannot contain -- enforce_schema(endpoints=True) does it with a
+CONSTRAINT TRIGGER (still plain Postgres). It fires per edge write,
+which is why it is an opt-in with the cost stated rather than the
+default; it validates edges as they are written, and retyping a NODE
+under existing edges is not re-checked. Still uncovered: two edge types
+sharing a kind with DIFFERENT property schemas. Property enforcement is
+keyed on the kind alone, so it refuses that shape outright rather than
+enforcing the wrong merge of the two.
 
 The node discriminator is the `type` property and the edge discriminator
 is `kind` -- the convention the Cypher front end already uses for
@@ -601,32 +603,38 @@ def schema_constraint_prefixes(target: _Target) -> tuple:
     return (f"ck_schema_req_{token}_", f"ck_schema_typ_{token}_")
 
 
-def _type_constraints(target: _Target, discriminator: str, type_name: str,
-                      properties: tuple) -> list:
-    """(name, ddl) pairs for one node type or edge kind: one presence
-    CHECK covering every required property, plus one jsonb_typeof CHECK
-    per property. Distinct req_/typ_ name prefixes, so a property
-    named 'required' can never collide with the presence check."""
+def _type_rules(target: _Target, discriminator: str, type_name: str,
+                properties: tuple) -> list:
+    """(name, unscoped boolean expression) pairs for one node type or
+    edge kind: one presence rule covering every required property, plus
+    one jsonb_typeof rule per property. Shared by DDL compilation and
+    schema_violations(), so the dry-run and the CHECK can never disagree
+    about what violates. Distinct req_/typ_ name prefixes, so a property
+    named 'required' can never collide with the presence rule."""
     guard = target.properties_col[discriminator].astext.is_distinct_from(type_name)
     token = _graph_token(target.graph)
-    pairs = []
+    rules = []
     required = tuple(p.name for p in properties if p.required)
     if required:
         name = f"ck_schema_req_{token}_{_slug(type_name)}"[:63]
-        body = _literal(target.scope_check(
-            or_(guard, target.properties_col.has_all(postgresql.array(required)))))
-        pairs.append((name, _add_check(target, name, body)))
+        rules.append((name, or_(guard, target.properties_col.has_all(
+            postgresql.array(required)))))
     for p in properties:
         name = f"ck_schema_typ_{token}_{_slug(type_name)}_{_slug(p.name)}"[:63]
         typeof = func.jsonb_typeof(target.properties_col[p.name])
         # jsonb_typeof of a MISSING key is NULL and a CHECK passes on
         # NULL, so this constrains the type of a value that is there --
-        # presence is the req_ constraint's job, same split as
-        # PropertyType vs Required in constraints.py.
+        # presence is the req_ rule's job, same split as PropertyType vs
+        # Required in constraints.py.
         expression = typeof == p.json_type[0] if len(p.json_type) == 1 else typeof.in_(p.json_type)
-        body = _literal(target.scope_check(or_(guard, expression)))
-        pairs.append((name, _add_check(target, name, body)))
-    return pairs
+        rules.append((name, or_(guard, expression)))
+    return rules
+
+
+def _type_constraints(target: _Target, discriminator: str, type_name: str,
+                      properties: tuple) -> list:
+    return [(name, _add_check(target, name, _literal(target.scope_check(expression))))
+            for name, expression in _type_rules(target, discriminator, type_name, properties)]
 
 
 def compile_node_constraints(schema: GraphSchema, target: _Target) -> list:
@@ -637,6 +645,212 @@ def compile_node_constraints(schema: GraphSchema, target: _Target) -> list:
 def compile_edge_constraints(schema: GraphSchema, target: _Target) -> list:
     return [pair for kind, properties in _properties_per_kind(schema.edge_types).items()
             for pair in _type_constraints(target, "kind", kind, properties)]
+
+
+# ---------------------------------------------------------------------
+# Endpoint-type enforcement: (kind, source, target) as a trigger
+# ---------------------------------------------------------------------
+# A CHECK cannot subquery nodes, so "works_at connects only person ->
+# company" needs a CONSTRAINT TRIGGER -- still plain Postgres, still no
+# extension. It fires per edge row, which is why endpoints=True is an
+# explicit opt-in on enforce_schema() rather than the default.
+
+def _quote(value: str) -> str:
+    """A string literal for DDL. Same rationale as constraints._literal:
+    DDL cannot carry bind parameters, and these values come from schema
+    declarations written by a developer, not from ingested data."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def endpoint_names(graph) -> tuple:
+    """(trigger name, function name) for this graph's endpoint trigger.
+    The function name carries the table too: trigger names are scoped
+    per table, but function names are schema-global, and two custom
+    edge tables must not share one function."""
+    token = _graph_token(graph.graph if graph.graph_col is not None else None)
+    trigger = f"ck_schema_end_{token}"[:63]
+    function = f"ck_schema_endf_{token}_{_slug(graph.edges_tbl.name)}"[:63]
+    return trigger, function
+
+
+def compile_endpoint_ddl(schema: GraphSchema, graph) -> list:
+    """The function + trigger DDL policing declared (kind, source,
+    target) triples on this graph's edges table. Untyped/undeclared
+    kinds pass; a DECLARED kind must connect a declared pair, and an
+    untyped endpoint cannot satisfy any triple -- the error says which.
+
+    Raises with ERRCODE 23514 (check_violation) and the trigger's name
+    as CONSTRAINT, so the driver's diagnostics carry it and the write
+    path's existing translation surfaces a ConstraintViolation naming
+    it, like every other schema rule."""
+    trigger_name, function_name = endpoint_names(graph)
+    et, nt = graph.edges_tbl, graph.nodes_tbl
+    edges_q = f'"{et.schema}"."{et.name}"' if et.schema else f'"{et.name}"'
+    nodes_q = f'"{nt.schema}"."{nt.name}"' if nt.schema else f'"{nt.name}"'
+    function_q = f'"{et.schema}"."{function_name}"' if et.schema else f'"{function_name}"'
+
+    triples = sorted((e.kind, e.source, e.target) for e in schema.edge_types)
+    kinds = sorted({k for k, _, _ in triples})
+    values = ", ".join(f"({_quote(k)}, {_quote(s)}, {_quote(t)})" for k, s, t in triples)
+    declared = "; ".join(f"{k}: {s} -> {t}" for k, s, t in triples)
+
+    graph_guard = ""
+    node_scope = ""
+    if graph.graph_col is not None:
+        graph_guard = (f"  IF NEW.{graph.graph_col} IS DISTINCT FROM "
+                       f"{_quote(graph.graph)} THEN RETURN NEW; END IF;\n")
+        node_scope = f" AND n.{graph.graph_col} = NEW.{graph.graph_col}"
+
+    function_ddl = f"""CREATE OR REPLACE FUNCTION {function_q}() RETURNS trigger AS $ck$
+DECLARE
+  edge_kind text; src_type text; dst_type text;
+BEGIN
+{graph_guard}  edge_kind := NEW.properties->>'kind';
+  IF edge_kind IS NULL OR edge_kind NOT IN ({", ".join(_quote(k) for k in kinds)}) THEN
+    RETURN NEW;  -- undeclared and kindless edges are not policed
+  END IF;
+  SELECT n.properties->>'type' INTO src_type FROM {nodes_q} n
+    WHERE n.{graph.node_id_col} = NEW.{graph.edge_start_col}{node_scope};
+  SELECT n.properties->>'type' INTO dst_type FROM {nodes_q} n
+    WHERE n.{graph.node_id_col} = NEW.{graph.edge_end_col}{node_scope};
+  IF (edge_kind, src_type, dst_type) IN (VALUES {values}) THEN
+    RETURN NEW;
+  END IF;
+  -- the observed types and the declared triples go in DETAIL: the
+  -- driver-error translation keeps diagnostics, not the primary text,
+  -- and the DETAIL is what reaches ConstraintViolation's message
+  RAISE EXCEPTION 'edge violates the declared endpoint types'
+    USING ERRCODE = '23514', CONSTRAINT = {_quote(trigger_name)},
+      DETAIL = format('%s connects %s -> %s, but the schema declares: '
+                      {_quote(declared)},
+                      edge_kind, coalesce(src_type, '(untyped)'),
+                      coalesce(dst_type, '(untyped)'));
+END $ck$ LANGUAGE plpgsql"""
+
+    # No CREATE OR REPLACE for CONSTRAINT triggers, so idempotency is
+    # the DROP/CREATE pair, run in enforce_schema()'s one transaction.
+    return [
+        function_ddl,
+        f'DROP TRIGGER IF EXISTS "{trigger_name}" ON {edges_q}',
+        f'CREATE CONSTRAINT TRIGGER "{trigger_name}" AFTER INSERT OR UPDATE ON {edges_q} '
+        f'FOR EACH ROW EXECUTE FUNCTION {function_q}()',
+    ]
+
+
+ENDPOINT_TRIGGER_EXISTS = text("""
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = :name AND tgrelid = CAST(:table AS regclass)
+""")
+
+
+# ---------------------------------------------------------------------
+# The schema, summarized for a tool-calling model
+# ---------------------------------------------------------------------
+
+#: Properties listed per type in a tool description before "+N more"
+#: takes over. A model needs the vocabulary, not an inventory -- and a
+#: tool description is prompt budget someone else is paying for.
+_TOOL_SUMMARY_PROPERTIES = 12
+
+
+def tool_summary(schema: GraphSchema) -> str:
+    """The declared schema as one compact paragraph for a tool
+    description: what an agent can filter on, so it stops guessing
+    labels and property names. `*` marks required, endpoint pairs are
+    grouped per kind, and long property lists are capped -- bounded on
+    purpose, never an unbounded dump."""
+    def bag(properties: tuple) -> str:
+        shown = [p.name + ("*" if p.required else "")
+                 for p in properties[:_TOOL_SUMMARY_PROPERTIES]]
+        overflow = len(properties) - _TOOL_SUMMARY_PROPERTIES
+        if overflow > 0:
+            shown.append(f"+{overflow} more")
+        return f"({', '.join(shown)})" if shown else ""
+
+    nodes = "; ".join(f"{nt.name}{bag(nt.properties)}" for nt in schema.node_types)
+    per_kind: dict = {}
+    for et in schema.edge_types:
+        pairs, _ = per_kind.setdefault(et.kind, ([], et.properties))
+        pairs.append(f"{et.source} -> {et.target}")
+    edges = "; ".join(
+        f"{kind}: {', '.join(pairs)}" + (f" {bag(properties)}" if properties else "")
+        for kind, (pairs, properties) in per_kind.items())
+    parts = ["This graph's declared schema (properties in parentheses, * = required)."]
+    if nodes:
+        parts.append(f"Node types: {nodes}.")
+    if edges:
+        parts.append(f"Edge kinds (source -> target): {edges}.")
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------
+# Violations: the dry-run before enforcement
+# ---------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RuleViolations:
+    """Rows one schema rule would reject -- named exactly as the CHECK
+    enforce_schema() would create, so the report reads as the work list
+    for the enforcement that failed (or is about to)."""
+    constraint: str
+    table: str
+    rows: int
+    sample_ids: tuple
+
+
+@dataclass
+class SchemaViolations:
+    """What enforce_schema() would reject, found by reading. Falsy when
+    clean, so `if graph.schema_violations():` reads correctly."""
+    rules: tuple
+
+    def __bool__(self) -> bool:
+        return bool(self.rules)
+
+    def __str__(self) -> str:
+        if not self.rules:
+            return "no schema violations -- enforce_schema() would succeed"
+        lines = [f"{sum(r.rows for r in self.rules)} row(s) violate "
+                 f"{len(self.rules)} schema rule(s):"]
+        for r in self.rules:
+            ids = ", ".join(str(i) for i in r.sample_ids)
+            more = "" if r.rows <= len(r.sample_ids) else ", ..."
+            lines.append(f"  {r.constraint} ({r.table}): {r.rows} row(s), e.g. id {ids}{more}")
+        return "\n".join(lines)
+
+
+def find_violations(graph, sample: int = 5) -> SchemaViolations:
+    """Evaluate every rule the schema would enforce, as SELECTs. A row
+    the CHECK would reject is exactly a row where the scoped check body
+    is false -- NOT of it, with SQL's NULL-passes semantics matching the
+    CHECK's for free. Read-only: no DDL, nothing registered."""
+    from sqlalchemy import not_, select
+
+    schema = graph._schema
+    node_target, edge_target = graph._schema_targets()
+    groups = [
+        (node_target, graph.nodes_tbl, graph.node_id_col,
+         [rule for nt in schema.node_types
+          for rule in _type_rules(node_target, "type", nt.name, nt.properties)]),
+        (edge_target, graph.edges_tbl, graph.edge_id_col,
+         [rule for kind, properties in _properties_per_kind(schema.edge_types).items()
+          for rule in _type_rules(edge_target, "kind", kind, properties)]),
+    ]
+    violated = []
+    with graph.engine.connect() as connection:
+        for target, table, id_col_name, rules in groups:
+            id_col = getattr(table.c, id_col_name)
+            for name, expression in rules:
+                failing = not_(target.scope_check(expression))
+                rows = connection.execute(
+                    select(func.count()).select_from(table).where(failing)).scalar()
+                if not rows:
+                    continue
+                ids = tuple(row[0] for row in connection.execute(
+                    select(id_col).select_from(table).where(failing)
+                    .order_by(id_col).limit(sample)).all())
+                violated.append(RuleViolations(name, target.label, rows, ids))
+    return SchemaViolations(tuple(violated))
 
 
 # ---------------------------------------------------------------------

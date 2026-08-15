@@ -152,8 +152,12 @@ class TestWriteRefusals:
             ops("CREATE (a {n: 1})-[:knows|likes]->(b {n: 2})")
 
     def test_merge_needs_properties(self):
-        with pytest.raises(CypherError, match="properties to match on"):
+        """Start-anchored: MERGE is spelled as the keyword the caller
+        must type, and a lowercased mutant (_merge_node__mutmut_9) kept
+        the loosely-matched middle intact."""
+        with pytest.raises(CypherError) as exc:
             ops("MERGE (a)")
+        assert str(exc.value).startswith("MERGE needs properties to match on")
 
     def test_relationship_merge_needs_a_type(self):
         with pytest.raises(CypherError, match="something to match it by"):

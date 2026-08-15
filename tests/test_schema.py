@@ -427,6 +427,7 @@ class TestSchemaRepresentations:
                                ("schema_networkx", lambda: offgraph.schema_networkx),
                                ("schema_pydantic", lambda: offgraph.schema_pydantic),
                                ("schema_ddl", offgraph.schema_ddl),
+                               ("schema_violations", offgraph.schema_violations),
                                ("enforce_schema", offgraph.enforce_schema)):
             with pytest.raises(ValueError, match=r"define_schema") as exc:
                 accessor()
@@ -565,6 +566,10 @@ class TestSchemaEnforcement:
         fresh_graph.define_constraints(nodes=[Required("kept")])
         primitive_schema(fresh_graph)
         first = fresh_graph.enforce_schema()
+        # the return value NAMES the constraints in force, same contract
+        # as define_constraints -- a list of Nones satisfies any test
+        # that only compares two runs of it (enforce_schema__mutmut_36)
+        assert "ck_schema_req_default_person" in first
         assert fresh_graph.enforce_schema() == first
         assert "ck_schema_typ_default_person_age" in schema_checks(fresh_graph)
 
@@ -589,6 +594,86 @@ class TestSchemaEnforcement:
         fresh_graph.enforce_schema()
         other = fresh_graph.in_graph("elsewhere")
         assert other.add_nodes([{"type": "person", "nickname": "lawless"}]) == 1
+
+
+class TestSchemaViolations:
+    def seed_dirty(self, graph) -> None:
+        graph.add_nodes([
+            {"id": 1, "type": "person", "email": "a@x.com", "age": 42},   # conforming
+            {"id": 2, "type": "person", "nickname": "no-email"},          # missing required
+            {"id": 3, "type": "person", "email": "c@x.com", "age": "42"}, # wrong JSON type
+            {"id": 4, "name": "untyped"},                                 # outside the schema
+        ])
+
+    def test_reports_each_violated_rule_under_its_enforcement_name(self, fresh_graph):
+        """The report is the work list for the enforcement that would
+        fail, so each entry must carry the SAME ck_schema_* name the
+        CHECK would get, the right count, and the offending ids --
+        while conforming and untyped rows stay out of it."""
+        self.seed_dirty(fresh_graph)
+        primitive_schema(fresh_graph)
+        report = fresh_graph.schema_violations()
+        assert bool(report)
+        by_name = {r.constraint: r for r in report.rules}
+        assert by_name["ck_schema_req_default_person"].sample_ids == (2,)
+        assert by_name["ck_schema_typ_default_person_age"].sample_ids == (3,)
+        assert all(r.rows == 1 and r.table == "nodes" for r in report.rules)
+        assert len(report.rules) == 2   # ids 1 and 4 appear nowhere
+
+    def test_a_clean_graph_reports_falsy_and_enforcement_succeeds(self, fresh_graph):
+        """Falsy-when-clean is the contract that makes
+        `if graph.schema_violations():` read correctly -- and clean must
+        mean enforce_schema() actually goes through."""
+        fresh_graph.add_nodes([{"id": 1, "type": "person", "email": "a@x.com"}])
+        primitive_schema(fresh_graph)
+        report = fresh_graph.schema_violations()
+        assert not report
+        assert "enforce_schema() would succeed" in str(report)
+        assert fresh_graph.enforce_schema()
+
+    def test_dry_run_and_enforcement_cannot_disagree(self, fresh_graph):
+        """The point of sharing _type_rules: after cleaning exactly the
+        rows the report named, enforcement must succeed -- a dry-run
+        that checks different rules than the DDL enforces would be worse
+        than none."""
+        from sqlalchemy.exc import IntegrityError
+        self.seed_dirty(fresh_graph)
+        primitive_schema(fresh_graph)
+        with pytest.raises(IntegrityError):
+            fresh_graph.enforce_schema()   # dirty: the driver refuses ADD CONSTRAINT
+        for rule in fresh_graph.schema_violations().rules:
+            with fresh_graph.engine.begin() as conn:
+                conn.execute(text(f"DELETE FROM edges WHERE start_id IN "
+                                  f"({','.join(map(str, rule.sample_ids))}) OR end_id IN "
+                                  f"({','.join(map(str, rule.sample_ids))})"))
+                conn.execute(text(f"DELETE FROM nodes WHERE id IN "
+                                  f"({','.join(map(str, rule.sample_ids))})"))
+        assert not fresh_graph.schema_violations()
+        assert fresh_graph.enforce_schema()
+
+    def test_sampling_caps_ids_but_not_the_count(self, fresh_graph):
+        fresh_graph.add_nodes([{"id": i, "type": "person", "nickname": f"n{i}"}
+                               for i in range(1, 8)])
+        primitive_schema(fresh_graph)
+        (rule,) = fresh_graph.schema_violations(sample=3).rules
+        assert rule.rows == 7
+        assert rule.sample_ids == (1, 2, 3)
+        assert ", ..." in str(fresh_graph.schema_violations(sample=3))
+
+    def test_violations_are_read_only_and_per_graph(self, fresh_graph):
+        """No DDL may exist after a dry-run, and another graph's dirt
+        must not appear in this graph's report -- the _scoped invariant,
+        applied to reading violations."""
+        self.seed_dirty(fresh_graph)
+        other = fresh_graph.in_graph("elsewhere")
+        other.add_nodes([{"id": 100, "type": "person", "nickname": "dirty-elsewhere"}])
+        primitive_schema(fresh_graph)
+        report = fresh_graph.schema_violations()
+        assert all(100 not in r.sample_ids for r in report.rules)
+        assert schema_checks(fresh_graph) == set()   # read-only: nothing created
+        primitive_schema(other)
+        (rule,) = other.schema_violations().rules
+        assert rule.sample_ids == (100,)
 
 
 # ---------------------------------------------------------------------
@@ -753,3 +838,107 @@ class TestSchemaInference:
         from sqlalchemy.exc import OperationalError
         with pytest.raises(OperationalError):
             offgraph.infer_schema()
+
+
+class TestEndpointEnforcement:
+    def declare(self, graph) -> None:
+        graph.add_nodes([
+            {"id": 1, "type": "person", "email": "a@x.com"},
+            {"id": 2, "type": "company", "name": "acme"},
+            {"id": 3, "type": "robot"},
+            {"id": 4, "name": "untyped"},
+        ])
+        graph.define_schema(
+            nodes=[NodeType("person"), NodeType("company"), NodeType("robot")],
+            edges=[EdgeType("works_at", source="person", target="company"),
+                   EdgeType("likes", source="person", target="person"),
+                   EdgeType("likes", source="person", target="company")],
+        )
+
+    @staticmethod
+    def trigger_count(graph) -> int:
+        with graph.engine.connect() as conn:
+            return conn.execute(text(
+                "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = 'hopai_write' AND t.tgname LIKE 'ck\\_schema\\_end%'"
+            )).scalar()
+
+    def test_wrong_endpoint_rejected_on_every_write_path(self, fresh_graph):
+        """The whole point of a trigger over a Python check: the SERVER
+        rejects the edge whichever door it came through, and the error
+        names the kind, the observed types, and the declared triples --
+        an error that names the fix."""
+        self.declare(fresh_graph)
+        fresh_graph.enforce_schema(endpoints=True)
+        fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "works_at"}])
+        with pytest.raises(ConstraintViolation) as exc:
+            fresh_graph.add_edges([{"start_id": 3, "end_id": 2, "kind": "works_at"}])
+        assert exc.value.constraint == "ck_schema_end_default"
+        assert "works_at connects robot -> company" in str(exc.value)
+        assert "works_at: person -> company" in str(exc.value)
+        with pytest.raises(ConstraintViolation):
+            fresh_graph.cypher(
+                "MATCH (a {type: 'robot'}), (b {name: 'acme'}) CREATE (a)-[:works_at]->(b)")
+
+    def test_a_kind_with_several_pairs_accepts_each_and_only_each(self, fresh_graph):
+        """Edge identity is the (kind, source, target) triple, and the
+        trigger must honor every declared triple of a kind -- while an
+        UNdeclared pair of a declared kind stays rejected."""
+        self.declare(fresh_graph)
+        fresh_graph.enforce_schema(endpoints=True)
+        fresh_graph.add_edges([{"start_id": 1, "end_id": 1, "kind": "likes"},
+                               {"start_id": 1, "end_id": 2, "kind": "likes"}])
+        with pytest.raises(ConstraintViolation):
+            fresh_graph.add_edges([{"start_id": 3, "end_id": 1, "kind": "likes"}])
+
+    def test_undeclared_and_kindless_pass_untyped_endpoint_fails(self, fresh_graph):
+        """Only declared kinds are policed -- consistent with the
+        per-type CHECKs. But a DECLARED kind into an untyped node cannot
+        satisfy any triple, and the error must say (untyped), not
+        pretend a type."""
+        self.declare(fresh_graph)
+        fresh_graph.enforce_schema(endpoints=True)
+        fresh_graph.add_edges([{"start_id": 3, "end_id": 1, "kind": "undeclared"}])
+        fresh_graph.add_edges([{"start_id": 4, "end_id": 1}])
+        with pytest.raises(ConstraintViolation) as exc:
+            fresh_graph.add_edges([{"start_id": 1, "end_id": 4, "kind": "works_at"}])
+        assert "person -> (untyped)" in str(exc.value)
+
+    def test_idempotent_scoped_and_reconciled_away(self, fresh_graph):
+        """Re-running converges; another graph's edges are never
+        validated; and enforce_schema() WITHOUT the flag removes the
+        trigger and its function -- a stale trigger would keep policing
+        a rule the caller just opted out of."""
+        self.declare(fresh_graph)
+        first = fresh_graph.enforce_schema(endpoints=True)
+        assert fresh_graph.enforce_schema(endpoints=True) == first
+        assert "ck_schema_end_default" in first
+        assert self.trigger_count(fresh_graph) == 1
+
+        other = fresh_graph.in_graph("elsewhere")
+        other.add_nodes([{"id": 100, "type": "robot"}, {"id": 101, "type": "company"}])
+        assert other.add_edges([{"start_id": 100, "end_id": 101, "kind": "works_at"}]) == 1
+
+        fresh_graph.enforce_schema()   # endpoints=False -> converge to unpoliced
+        assert self.trigger_count(fresh_graph) == 0
+        with fresh_graph.engine.connect() as conn:
+            functions = conn.execute(text(
+                "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = 'hopai_write' AND p.proname LIKE 'ck\\_schema\\_endf%'"
+            )).scalar()
+        assert functions == 0
+        assert fresh_graph.add_edges(
+            [{"start_id": 3, "end_id": 2, "kind": "works_at"}]) == 1   # unpoliced again
+
+    def test_default_stays_off_and_ddl_previews_without_executing(self, fresh_graph):
+        """endpoints=True is an opt-in with a per-row write cost, so the
+        default must create NO trigger -- and schema_ddl(endpoints=True)
+        must show the exact SQL while executing none of it."""
+        self.declare(fresh_graph)
+        fresh_graph.enforce_schema()
+        assert self.trigger_count(fresh_graph) == 0
+        ddl = fresh_graph.schema_ddl(endpoints=True)
+        assert any("CREATE CONSTRAINT TRIGGER" in statement for statement in ddl)
+        assert any("CREATE OR REPLACE FUNCTION" in statement for statement in ddl)
+        assert self.trigger_count(fresh_graph) == 0   # preview executed nothing

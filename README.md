@@ -317,10 +317,27 @@ graph.enforce_schema()  # idempotent; re-running after a schema change
 graph.add_nodes([{"type": "person"}])   # ConstraintViolation: email required
 ```
 
+Enforcing on a graph that grew **before** the schema did? `ADD
+CONSTRAINT` validates every existing row and fails opaquely on the
+first bad one. Ask first:
+
+```python
+report = graph.schema_violations()   # read-only; falsy when clean
+print(report)   # per rule: row counts + sample ids -- the work list
+```
+
 Enforcement covers property presence and JSON type per node type and
-edge kind. It does **not** police endpoint types ("`works_at` connects
-only person → company") — that needs a trigger, not a CHECK, and hopai
-says so rather than half-enforcing it.
+edge kind. Endpoint types ("`works_at` connects only person → company")
+need a look at the endpoint *nodes*, which a CHECK can't do — so that
+one is an explicit opt-in backed by a constraint trigger, priced
+per edge write:
+
+```python
+graph.enforce_schema(endpoints=True)
+graph.add_edges([{"start_id": robot, "end_id": acme, "kind": "works_at"}])
+# ConstraintViolation: works_at connects robot -> company,
+#                      but the schema declares: works_at: person -> company
+```
 
 **Grew the graph first, never declared anything?** The schema is
 sitting in the data, and Postgres can compute it:
@@ -625,7 +642,16 @@ Filters accept the same grammar, spelled as JSON operators:
 `{"gte": [...]}`, `{"lt": [...]}`, `{"lte": [...]}`, `{"between": [key, lo, hi]}`.
 
 `hopai.TRAVERSE_TOOL_SCHEMA` is a ready-to-use JSON Schema for wiring
-this into an LLM function-calling definition directly.
+this into an LLM function-calling definition directly — and with a
+[graph schema](#-graph-schema) defined, `graph.tool_schemas()` returns
+all three tool definitions with *your* node types, edge kinds and
+properties summarized into the descriptions, so the model stops
+hallucinating labels:
+
+```python
+tools = graph.tool_schemas()   # traverse / aggregate / ingest,
+                               # each describing what this graph holds
+```
 
 ## 🗣️ Cypher as input syntax
 
