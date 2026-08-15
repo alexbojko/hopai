@@ -314,6 +314,15 @@ graph.enforce_schema()  # idempotent; re-running after a schema change
 graph.add_nodes([{"type": "person"}])   # ConstraintViolation: email required
 ```
 
+Enforcing on a graph that grew **before** the schema did? `ADD
+CONSTRAINT` validates every existing row and fails opaquely on the
+first bad one. Ask first:
+
+```python
+report = graph.schema_violations()   # read-only; falsy when clean
+print(report)   # per rule: row counts + sample ids -- the work list
+```
+
 Enforcement covers property presence and JSON type per node type and
 edge kind. It does **not** police endpoint types ("`works_at` connects
 only person → company") — that needs a trigger, not a CHECK, and hopai

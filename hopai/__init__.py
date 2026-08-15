@@ -104,7 +104,9 @@ from .json_api import (
     spec_to_traversal, traverse_json,
 )
 from .models import Edge, Node
-from .schema import EdgeType, GraphSchema, InferenceReport, NodeType, Property, TypeConflict
+from .schema import (
+    EdgeType, GraphSchema, InferenceReport, NodeType, Property, SchemaViolations, TypeConflict,
+)
 
 # The trailing annotation is load-bearing: release-please updates this
 # file with its GENERIC updater, which rewrites the version only on lines
@@ -124,6 +126,7 @@ __all__ = [
     "aggregate_cypher", "cypher_to_aggregation",
     "Unique", "Required", "Check", "Index", "PropertyType", "Col", "ConstraintViolation",
     "GraphSchema", "NodeType", "EdgeType", "Property", "InferenceReport", "TypeConflict",
+    "SchemaViolations",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",
 ]
