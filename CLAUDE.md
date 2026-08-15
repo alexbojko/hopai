@@ -107,6 +107,10 @@ read.** When a design question comes up, these decide it, in order:
   Links written *inside* notebooks are invisible to `--strict` (mkdocs-jupyter
   hands MkDocs finished HTML), so `scripts/mkdocs_hooks.py` rewrites them and
   `scripts/check_docs_links.py` fails the build if one stops resolving.
+  **A new notebook must be added to `mkdocs.yml`'s `nav`.** It reaches the site
+  on its own through the symlink, but an unlisted page is built and then left out
+  of the navigation — reachable only by URL. MkDocs calls that INFO, so
+  `validation.nav.omitted_files: warn` promotes it to a `--strict` failure.
 - Comments explain *why*, citing the bug or trade-off. Match that for non-obvious code;
   skip it for mechanical changes.
 - New tests join an existing `TestX` class and say what would break without the fix.

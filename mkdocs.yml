@@ -15,6 +15,15 @@ copyright: MIT-licensed
 # write documentation.
 docs_dir: docs
 
+# A notebook added to notebooks/ arrives in the site automatically (docs/ is a
+# symlink) but NOT in the nav, which has to name it. MkDocs logs that at INFO,
+# so `--strict` stayed green while 09_vector_search was built, reachable only
+# by URL, and invisible in the navigation. Promoting it to a warning makes
+# `--strict` fail instead: adding a notebook now has to say where it goes.
+validation:
+  nav:
+    omitted_files: warn
+
 theme:
   name: material
   features:
@@ -69,7 +78,7 @@ markdown_extensions:
 nav:
   - Overview: index.md
   - Notebooks:
-      - All eight: notebooks/README.md
+      - All nine: notebooks/README.md
       - 01 · Quick start: notebooks/01_quickstart.ipynb
       - 02 · Traversal: notebooks/02_traversal.ipynb
       - 03 · Aggregation: notebooks/03_aggregation.ipynb
@@ -78,6 +87,7 @@ nav:
       - 06 · Graph schema: notebooks/06_graph_schema.ipynb
       - 07 · Many graphs: notebooks/07_many_graphs.ipynb
       - 08 · Under the hood: notebooks/08_under_the_hood.ipynb
+      - 09 · Vector search: notebooks/09_vector_search.ipynb
   - Internals:
       - Architecture: architecture.md
       - Testing: testing.md
