@@ -774,10 +774,10 @@ translating into something that answers a different question:
 
 ## 📓 Runnable documentation
 
-Everything above, as eight notebooks you can execute against a throwaway
+Everything above, as nine notebooks you can execute against a throwaway
 database — quick start, traversal semantics, aggregation, the JSON and
-Cypher front ends, constraints, graph schema, multi-graph, and the SQL
-underneath:
+Cypher front ends, constraints, graph schema, multi-graph, the SQL
+underneath, and vector search:
 
 ```bash
 pip install -e ".[dev,notebooks]"

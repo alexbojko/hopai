@@ -276,6 +276,27 @@ class TestNearValidation:
         with pytest.raises(TypeError, match="near= on Start/Hop"):
             vg.build_query(Start(where=Near("summary", [1.0, 0.0, 0.0])), [])
 
+    @pytest.mark.parametrize("where", [
+        {"summary": Near("summary", [1.0, 0.0, 0.0])},
+        {"summary": [Near("summary", [1.0, 0.0, 0.0])]},
+    ])
+    def test_near_as_a_property_value_is_refused_by_name_too(self, vg, where):
+        """The value position is the LIKELIER mistake, because GT/BETWEEN
+        live there: `where={"age": GT(30)}` is what the DSL teaches, so
+        `where={"summary": Near(...)}` is the shape a reader reaches for.
+        Guarded only at the filter position, it reached json.dumps and
+        surfaced as "Object of type Near is not JSON serializable" --
+        naming nothing the caller can act on."""
+        with pytest.raises(TypeError, match="near= on Start/Hop"):
+            vg.build_query(Start(where=where), [])
+
+    def test_the_refusal_names_which_key_held_the_near(self, vg):
+        """One offending key out of five is what the caller needs; the
+        bare sentence sends them re-reading the whole filter."""
+        with pytest.raises(TypeError, match=r"in where=\{'summary': \.\.\.\}"):
+            vg.build_query(Start(where={"type": "doc",
+                                        "summary": Near("summary", [1.0, 0.0, 0.0])}), [])
+
     @pytest.mark.parametrize("factory", [
         lambda: Start(keep=5),
         lambda: Hop(keep=5),

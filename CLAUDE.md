@@ -127,7 +127,7 @@ print(g.build_query(Start(where={"type": "person"}), [Hop(hops=(1, 3))])
 | Read | For |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | The read and write pipelines, multi-graph internals, result gotchas, and which module docstring explains what |
-| [notebooks/README.md](notebooks/README.md) | The eight runnable notebooks, how they are executed in CI, and how to regenerate their outputs |
+| [notebooks/README.md](notebooks/README.md) | The nine runnable notebooks, how they are executed in CI, and how to regenerate their outputs |
 | [docs/testing.md](docs/testing.md) | Fixtures, the database-free suite, coverage gate, mutmut config and its fork-safety quirks |
 | [docs/releasing.md](docs/releasing.md) | release-please, PyPI trusted publishing, and the traps already hit |
 | [README.md](README.md) | The user-facing API |

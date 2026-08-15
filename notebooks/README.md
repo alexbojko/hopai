@@ -1,6 +1,6 @@
 # Runnable documentation
 
-Eight notebooks that go from an empty database to the SQL underneath. They are
+Nine notebooks that go from an empty database to the SQL underneath. They are
 documentation, so they are meant to be read on GitHub with the outputs already
 there — and they run, so nothing in them can quietly stop being true.
 
@@ -14,6 +14,7 @@ there — and they run, so nothing in them can quietly stop being true.
 | [06 · Graph schema](06_graph_schema.ipynb) | Declaring the shape as dataclasses, enforcing it in Postgres, or inferring it from data that came first |
 | [07 · Many graphs](07_many_graphs.ipynb) | Thousands of isolated graphs in one pair of tables, and what keeps them apart |
 | [08 · Under the hood](08_under_the_hood.ipynb) | The emitted SQL read with no database, then `EXPLAIN ANALYZE` with one |
+| [09 · Vector search](09_vector_search.ipynb) | Exact cosine similarity on nodes and edges, multivector and hybrid ranking, similarity as a traversal seed and as an edge beam, and the two refusals |
 
 Read them in order the first time; after that each one stands alone.
 
