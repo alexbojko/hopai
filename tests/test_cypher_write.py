@@ -224,8 +224,13 @@ class TestWriteRefusals:
         assert str(exc.value).startswith("MERGE needs properties to match on")
 
     def test_relationship_merge_needs_a_type(self):
-        with pytest.raises(CypherError, match="something to match it by"):
+        """Anchored for the same reason as the node case above: the
+        lowercased mutant of this message (_merge__mutmut_31) left the
+        middle of it untouched."""
+        with pytest.raises(CypherError) as exc:
             ops("MATCH (a {n: 1}), (b {n: 2}) MERGE (a)-[]->(b)")
+        assert str(exc.value).startswith(
+            "MERGE on a relationship needs something to match it by")
 
     def test_on_set_referring_to_an_unbound_variable(self):
         with pytest.raises(CypherError, match="does not bind"):

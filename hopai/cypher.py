@@ -1788,6 +1788,13 @@ class _MutateTranslator:
         filters = []
         if pat.types:
             if self.o.edge_type_key is None:
+                # `or 'r'` never fires in practice and is kept for the
+                # unnamed case anyway: this entry only reaches a caller
+                # through _edge_operation, whose var IS this rel's, so an
+                # anonymous rel refuses earlier ("traversal driving a
+                # write") and the rewrite is never printed. Mutation
+                # testing flags the fallback for that reason -- it is an
+                # equivalent mutant, not a missing test.
                 self.discarded.append(
                     (f"[:{'|'.join(pat.types)}]", "edge_type_key=None",
                      f"MATCH ()-[{pat.var or 'r'} {{kind: {pat.types[0]!r}}}]->()"))

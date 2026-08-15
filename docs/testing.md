@@ -79,11 +79,17 @@ because of bugs, not taste:
   that kills a mutant leaves the old verdict in `mutmut results` until that function is
   edited. Three verdicts here were stale in exactly that way; applying the mutation by
   hand is what showed it. `rm -rf mutants/` for a clean read.
-- **A module-level constant's builder comes back `no tests`.** `MUTATE_TOOL_SCHEMA` is
-  built by `_operation_schema()` at import time, so no *test* executes those lines and
-  `mutate_only_covered_lines` skips them — they are unchecked, not survived, and CI's
-  report may list them either way. The assertions in `TestToolSchema` do cover the
-  result; apply a mutation by hand if you want the proof.
+- **A module-level constant's builder reports `survived`, always, and cannot be
+  killed.** `MUTATE_TOOL_SCHEMA` is built by calling `_operation_schema()` at import
+  time. In the generated `mutants/hopai/mutate.py` the constant is built around line
+  15090 while `mutants_x__operation_schema__mutmut[...] = ...` is registered near the
+  end of the file — so when the constant is built the mutant table is still empty, the
+  dispatcher falls through to the original body, and the mutation is never in effect.
+  Every mutant of such a function is reported `survived` no matter what the tests
+  assert. Five of them (`x__operation_schema__mutmut_1/5/8/13/17`) were checked by
+  applying each change to `hopai/mutate.py` itself: all five fail `TestToolSchema`
+  immediately. Treat this class as a harness artifact, and verify by hand rather than
+  writing a test that cannot run.
 
 CI scopes mutation to the files a PR changed and caps it with a wall-clock budget; a
 full run over `hopai/` is thousands of mutants.

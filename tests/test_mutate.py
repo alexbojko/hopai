@@ -36,6 +36,19 @@ def norm(statement) -> str:
         dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})).split())
 
 
+class _Clock:
+    """A stand-in for the `time` module, handing out readings in order.
+
+    Only perf_counter() is needed: mutate.py calls it exactly twice per
+    operation, once at each end of the measurement."""
+
+    def __init__(self, *readings):
+        self._readings = iter(readings)
+
+    def perf_counter(self) -> float:
+        return next(self._readings)
+
+
 def _plain_tables(offline_graph, graph_col):
     """A Graph over tables named nothing like hopai's own, so a
     hardcoded "start_id" or "id" shows up immediately."""
@@ -230,6 +243,14 @@ class TestClear:
         people.clear()
         assert people.clear().to_dict()["deleted_nodes"] == 0
 
+    def test_elapsed_ms_is_how_long_the_clear_took(self, people, monkeypatch):
+        """`(end - start)` mutated to `(end + start)` still yields a
+        plausible-looking float, because perf_counter's zero is
+        arbitrary -- so "0 < elapsed < a generous ceiling" cannot tell
+        the two apart. Two known readings can."""
+        monkeypatch.setattr("hopai.mutate.time", _Clock(100.0, 100.5))
+        assert people.clear().elapsed_ms == 500.0
+
 
 # ---------------------------------------------------------------------
 # Updating
@@ -366,6 +387,20 @@ class TestRefusals:
         with pytest.raises(ValueError, match="no filter"):
             people.delete_nodes(where=where)
         assert len(properties_of(people)) == 4
+
+    def test_a_detaching_delete_refuses_before_it_deletes_any_edge(self, people):
+        """delete_nodes(detach=True) is guarded twice -- detach_statement
+        checks first, with its own copy of the noun and the call name,
+        and it is the copy a caller actually sees. Pinning only
+        delete_nodes_statement's left the earlier one free to say
+        anything at all, on the one path that deletes edges."""
+        with pytest.raises(ValueError) as exc:
+            people.delete_nodes(detach=True)
+        assert "delete_nodes() was given no filter" in str(exc.value)
+        assert "would match every node in graph" in str(exc.value)
+        # Nothing ran: the refusal happens while building, before the
+        # transaction that would have taken the edges out first.
+        assert people.traverse(Start(), Hop()).edges != []
 
     def test_the_no_filter_message_names_both_ways_to_mean_it(self, people):
         with pytest.raises(ValueError) as exc:
@@ -885,8 +920,9 @@ class TestCypherRefusals:
         ("MATCH (a:person) DELETE b", "not bound by the MATCH"),
         ("MATCH (a:person), (b:company) DELETE a",
          "^comma-separated patterns before a delete or an update"),
-        ("MATCH p = (a)-[r]->(b) DELETE r", "never a path"),
-        ("OPTIONAL MATCH (a:person) DELETE a", "no meaning"),
+        ("MATCH p = (a)-[r]->(b) DELETE r",
+         "^a path variable has nothing to name here"),
+        ("OPTIONAL MATCH (a:person) DELETE a", "^OPTIONAL MATCH has no meaning"),
         ("MATCH (a:person) MATCH (b:company) DELETE a", "one MATCH clause"),
         ("MATCH (a)-[r]->(b)-[q]->(c) DELETE r",
          "^a delete or an update matches one node or one relationship, not a multi-hop"),

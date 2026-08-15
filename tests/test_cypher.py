@@ -735,7 +735,11 @@ class TestAggregationRefusals:
         """A write produces an IngestResult; quietly dropping the count
         would be worse than either running it or refusing."""
         from hopai import cypher_to_operations
-        with pytest.raises(CypherError, match="after a write"):
+        # Anchored, like the MERGE refusals in test_cypher_write.py: the
+        # loosely-matched middle survives a lowercased first word, and
+        # "return with an aggregate" is not a sentence anyone wrote.
+        with pytest.raises(CypherError,
+                           match="^RETURN with an aggregate after a write"):
             cypher_to_operations("CREATE (a:person {email: 'a@x.com'}) RETURN count(a)")
 
     def test_a_plain_traversal_is_refused_by_the_aggregation_translator(self):
