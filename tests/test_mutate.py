@@ -411,6 +411,16 @@ class TestRefusals:
         with pytest.raises(ValueError, match="no filter"):
             people.update_nodes(set={"checked": True})
 
+    def test_the_unfiltered_update_edges_message_says_edge_not_node(self, people):
+        """Each entry point passes _guard its own noun, and getting it
+        wrong sends the reader to the wrong table -- "every node" in
+        front of an UPDATE of `edges` describes a different, much larger
+        change than the one being refused."""
+        with pytest.raises(ValueError) as exc:
+            people.update_edges(set={"weight": 1})
+        assert "update_edges() was given no filter" in str(exc.value)
+        assert "would match every edge in graph" in str(exc.value)
+
     def test_all_is_the_way_to_mean_every_row(self, people):
         assert people.update_nodes(set={"checked": True}, all=True).updated_nodes == 4
 
@@ -765,6 +775,26 @@ class TestMutationResult:
             "deleted_nodes": 1, "deleted_edges": 2, "updated_nodes": 0,
             "updated_edges": 0, "elapsed_ms": pytest.approx(0, abs=10_000)}
 
+    def test_a_plan_reports_how_long_the_whole_plan_took(self, people, monkeypatch):
+        """execute_operations() times the PLAN, and the difference is
+        visible: each operation it runs also times itself, so a total
+        built by summing them would be 200ms of work where the plan took
+        500ms. The clock hands out six readings because that is what a
+        two-operation plan consumes -- one pair per operation, plus the
+        outer pair.
+
+        Pinned exactly rather than by range: a wrong scale (* 1001) and
+        a wrong sign both land inside any plausible span of
+        milliseconds."""
+        monkeypatch.setattr("hopai.mutate.time",
+                            _Clock(100.0, 100.1, 100.2, 100.3, 100.4, 100.5))
+        result = people.mutate({"operations": [
+            {"op": "update_nodes", "where": {"type": "person"}, "set": {"seen": True}},
+            {"op": "delete_edges", "where": {"kind": "knows"}},
+        ]})
+        assert (result.updated_nodes, result.deleted_edges) == (3, 2)
+        assert result.elapsed_ms == 500.0
+
     def test_repr_says_what_changed(self):
         assert repr(MutationResult(deleted_nodes=2, elapsed_ms=1.234)) == (
             "MutationResult(deleted_nodes=2, deleted_edges=0, updated_nodes=0, "
@@ -954,6 +984,14 @@ class TestCypherRefusals:
             cypher_to_mutations("MATCH (a:person:employee) DELETE a")
         assert "node a has multiple labels (person:employee)" in str(exc.value)
         assert "a property has one value" in str(exc.value)
+
+    def test_the_multiple_labels_refusal_names_an_unnamed_node_too(self):
+        """The pattern that hits this need not be the one being changed,
+        so the node often has no variable to quote -- `(anonymous)` is
+        then the only thing distinguishing it from the others."""
+        with pytest.raises(CypherError) as exc:
+            cypher_to_mutations("MATCH (a)-[r:knows]->(:person:employee) DELETE r")
+        assert "node (anonymous) has multiple labels (person:employee)" in str(exc.value)
 
     def test_a_constraint_the_options_discard_names_what_it_discarded(self):
         """The message has to quote the pattern that was thrown away and
