@@ -131,6 +131,7 @@ from .json_api import (
     AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, aggregate_json, spec_to_aggregation,
     spec_to_traversal, traverse_json, vector_search_json,
 )
+from .embeddings import Embedder, EmbeddingError
 from .models import Edge, Node
 from .schema import (
     EdgeType, GraphSchema, InferenceReport, NodeType, Property, SchemaViolations, TypeConflict,
@@ -157,6 +158,7 @@ __all__ = [
     "GraphSchema", "NodeType", "EdgeType", "Property", "InferenceReport", "TypeConflict",
     "SchemaViolations",
     "Vector", "Near", "Boost", "parse_near", "parse_boost", "vector_search_json",
+    "Embedder", "EmbeddingError",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",
 ]

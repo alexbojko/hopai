@@ -186,9 +186,25 @@ class Vector:
     """One named vector field: `Vector("summary", 1536)`.
 
     Declared per target in define_vectors(nodes=[...], edges=[...]);
-    the migration it implies is applied by migrate_vectors()."""
+    the migration it implies is applied by migrate_vectors().
+
+    embed:   an embedding client -- anything Embedder accepts, or an
+             Embedder itself. Given one, hopai can turn text into
+             vectors for this field: set_vectors() takes strings,
+             Near(field, text=...) resolves against it, and
+             embed_stale() fills the gaps. Without one the field is
+             still perfectly usable; you supply the floats.
+    source:  which PROPERTY holds the text to embed, defaulting to the
+             field's own name. `Vector("title", 768, embed=...)` reads
+             each row's "title" property, which is what the name says
+             and used to be untrue -- the field name and the property
+             were unrelated. Point it elsewhere when they differ:
+             `Vector("summary", 768, source="abstract", embed=...)`.
+    """
     name: str
     dimensions: int
+    embed: Any = None
+    source: Optional[str] = None
 
     def __post_init__(self):
         if not isinstance(self.name, str) or not _NAME.match(self.name):
@@ -207,6 +223,28 @@ class Vector:
                 f"Vector({self.name!r}): dimensions must be a positive integer, "
                 f"got {self.dimensions!r}"
             )
+        if self.source is None:
+            self.source = self.name
+        elif not isinstance(self.source, str) or not self.source:
+            raise ValueError(
+                f"Vector({self.name!r}): source= is the PROPERTY name holding the text to "
+                f"embed, got {self.source!r}"
+            )
+        if self.embed is not None:
+            from .embeddings import as_embedder
+            self.embed = as_embedder(self.embed)
+            # An Embedder built with its own dimensions= and pointed at a
+            # field of another size is a disagreement the caller can only
+            # lose: whichever wins, half their configuration was ignored.
+            # One Embedder with dimensions=None across several fields of
+            # different sizes stays legal -- each field checks its own.
+            if self.embed.dimensions is not None \
+                    and self.embed.dimensions != self.dimensions:
+                raise ValueError(
+                    f"Vector({self.name!r}, {self.dimensions}): its embedder is built with "
+                    f"dimensions={self.embed.dimensions} -- they must agree. Drop one of "
+                    f"the two numbers"
+                )
 
     @property
     def column_name(self) -> str:
@@ -214,7 +252,11 @@ class Vector:
 
 
 class Near:
-    """A similarity spec: one field, one query vector.
+    """A similarity spec: one field, one query -- as a vector, or as
+    text the field's own embedder turns into one.
+
+        Near("summary", [0.1, 0.4, ...])      # you embedded it
+        Near("summary", text="raft consensus")  # the field's embed= did
 
     Where it appears decides what it does -- rank candidates in
     vector_search(), pick the top-k seed set on Start, prune to the
@@ -226,6 +268,12 @@ class Near:
     ranks, so passing one there raises with the rewrite named. It
     looks like GT/BETWEEN, which is exactly why the guard exists.
 
+    text:            embed this with the field's declared embedder,
+                     as a QUERY rather than as a document -- several
+                     providers score the two differently and getting
+                     it wrong quietly costs recall. Resolved when the
+                     query is built, because only then is the graph
+                     (and so the field's embedder) known.
     weight:          this field's coefficient in the combined score
                      (only meaningful when several Near are combined).
     min_similarity:  drop rows whose similarity ON THIS FIELD is below
@@ -239,17 +287,37 @@ class Near:
     #: where=/via= by name without importing this module.
     _is_near = True
 
-    def __init__(self, field: str, vector, weight: float = 1.0,
-                 min_similarity: Optional[float] = None, missing: str = "exclude"):
+    def __init__(self, field: str, vector=None, weight: float = 1.0,
+                 min_similarity: Optional[float] = None, missing: str = "exclude",
+                 text: Optional[str] = None):
         if not isinstance(field, str) or not field:
             raise TypeError(f"Near field must be a vector field name, got {field!r}")
         self.field = field
-        self.vector = _clean_vector(vector, f"Near({field!r})")
-        if _norm(self.vector) == 0.0:
-            raise ValueError(
-                f"Near({field!r}): the query vector is all zeros, which has no direction -- "
-                f"cosine similarity to it is undefined for every row"
+        if (vector is None) == (text is None):
+            raise TypeError(
+                f"Near({field!r}) takes a query vector OR text= to embed, not "
+                f"{'both' if text is not None else 'neither'}"
             )
+        if text is not None:
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(
+                    f"Near({field!r}): text= must be a non-empty string, got {text!r}"
+                )
+            # Deferred on purpose: the embedder belongs to the field,
+            # which belongs to the graph, which a Near does not know.
+            # validate_nears() resolves it and hands back a Near with a
+            # vector -- this one is never mutated, so the same spec can
+            # be reused across graphs.
+            self.text = text
+            self.vector = ()
+        else:
+            self.text = None
+            self.vector = _clean_vector(vector, f"Near({field!r})")
+            if _norm(self.vector) == 0.0:
+                raise ValueError(
+                    f"Near({field!r}): the query vector is all zeros, which has no "
+                    f"direction -- cosine similarity to it is undefined for every row"
+                )
         if not isinstance(weight, (int, float)) or isinstance(weight, bool) \
                 or not math.isfinite(weight) or weight == 0:
             raise ValueError(
@@ -273,7 +341,8 @@ class Near:
         self.missing = missing
 
     def __repr__(self) -> str:
-        parts = [repr(self.field), f"{len(self.vector)} dims"]
+        parts = [repr(self.field),
+                 f"text={self.text!r}" if self.text is not None else f"{len(self.vector)} dims"]
         if self.weight != 1.0:
             parts.append(f"weight={self.weight!r}")
         if self.min_similarity is not None:
@@ -281,6 +350,14 @@ class Near:
         if self.missing != "exclude":
             parts.append(f"missing={self.missing!r}")
         return f"Near({', '.join(parts)})"
+
+    def _with_vector(self, vector) -> Near:
+        """This spec with text= resolved to floats. A new Near rather
+        than a mutation: caching the vector on the original would make
+        one reused spec answer with a stale embedding, and silently
+        share it across graphs whose fields embed differently."""
+        return Near(self.field, vector, weight=self.weight,
+                    min_similarity=self.min_similarity, missing=self.missing)
 
 
 class Boost:
@@ -531,15 +608,58 @@ def _table(graph, target: str):
     return graph.nodes_tbl if target == "nodes" else graph.edges_tbl
 
 
+def _resolve_query_texts(graph, target: str, parsed: list, caller: str) -> list:
+    """Every Near(text=) across a batch of queries, embedded in one
+    call per field. validate_nears() resolves one query's texts on its
+    own; this exists because vector_search_many() has N of them, and N
+    round trips would undo the round trip it saves."""
+    waiting: dict = {}
+    for one in parsed:
+        for near in one:
+            if isinstance(near, Near) and near.text is not None:
+                waiting.setdefault(near.field, []).append(near.text)
+    if not waiting:
+        return parsed
+    ready = {}
+    for name, texts in waiting.items():
+        field = _field(graph, target, name, caller)
+        ready[name] = iter(_embedder(field, target, caller).embed_queries(texts))
+    return [[near._with_vector(next(ready[near.field]))
+             if isinstance(near, Near) and near.text is not None else near
+             for near in one]
+            for one in parsed]
+
+
+def _embedder(field: Vector, target: str, caller: str):
+    """The field's embedder, or a refusal naming the declaration to
+    change. Every text-to-vector path lands here, so "this field takes
+    floats" is said once and in the same words."""
+    if field.embed is None:
+        raise ValueError(
+            f"{caller}: field {field.name!r} on {target} was given text, but declares no "
+            f"embedder -- redeclare it as Vector({field.name!r}, {field.dimensions}, "
+            f"embed=<your embedding client>), or pass a {field.dimensions}-dimensional "
+            f"vector here"
+        )
+    return field.embed
+
+
 def validate_nears(graph, target: str, near, k, caller: str,
                    limit_name: str = "k") -> list:
     """Normalize near= (one Near or a list) into a validated list:
     every entry a Near, every field defined for `target`, every query
     vector of the declared dimensions -- so a typo fails here with the
-    fix named, not at execution as an undefined-column error."""
+    fix named, not at execution as an undefined-column error.
+
+    Any Near carrying text= is resolved here, against the embedder its
+    FIELD declares: this is the first point where the spec and the
+    graph are both in hand. The returned list is a new one, so the
+    caller's specs are left as they were written."""
     nears = list(near) if isinstance(near, (list, tuple)) else [near]
     if not nears:
         raise ValueError(f"{caller}: near=[] is empty -- pass a Near(...) or a list of them")
+    # Shape first, in full, and only then anything that costs a provider
+    # call: a batch that is about to be refused should never be embedded.
     seen = set()
     for one in nears:
         if not isinstance(one, Near):
@@ -560,12 +680,20 @@ def validate_nears(graph, target: str, near, k, caller: str,
                 f"yourself so the blend is visible in your code"
             )
         seen.add(one.field)
+
+    resolved = []
+    for one in nears:
         field = _field(graph, target, one.field, caller)
+        if one.text is not None:
+            one = one._with_vector(
+                _embedder(field, target, caller).embed_query(one.text))
         if len(one.vector) != field.dimensions:
             raise ValueError(
                 f"{caller}: the query vector for {one.field!r} has {len(one.vector)} "
                 f"dimensions, the field is defined with {field.dimensions}"
             )
+        resolved.append(one)
+    nears = resolved
     if len(nears) == 1 and nears[0].missing == "zero":
         # With no other field to carry the row, "zero" is provably a
         # no-op: the guards already require this vector to have a
@@ -917,9 +1045,14 @@ def build_search_many_query(graph, queries, target: str = "nodes", k: Optional[i
     """
     _check_k(k, "vector_search_many()")
     parsed = _as_query_list(queries, "vector_search_many()")
-    shapes = {tuple((n.field, n.weight, n.min_similarity, n.missing)
-                    for n in validate_nears(graph, target, one, k, "vector_search_many()"))
-              for one in parsed}
+    # Every text= across every query, embedded in one call per field --
+    # otherwise batching N searches into one statement would still cost
+    # N provider round trips, which is the cost this call exists to save.
+    parsed = _resolve_query_texts(graph, target, parsed, "vector_search_many()")
+    validated = [validate_nears(graph, target, one, k, "vector_search_many()")
+                 for one in parsed]
+    shapes = {tuple((n.field, n.weight, n.min_similarity, n.missing) for n in one)
+              for one in validated}
     if len(shapes) > 1:
         raise ValueError(
             "vector_search_many() ranks every query with ONE statement, so the queries must share "
@@ -928,7 +1061,7 @@ def build_search_many_query(graph, queries, target: str = "nodes", k: Optional[i
             "queries by shape and call search_many() once per group"
         )
     boosts = validate_boosts(boost, "vector_search_many()")
-    template = parsed[0]
+    template = validated[0]
     table = _table(graph, target)
 
     # One VALUES row per query per field: the vectors travel as bound
@@ -946,7 +1079,7 @@ def build_search_many_query(graph, queries, target: str = "nodes", k: Optional[i
         columns.append(sa_column(f"v{i}", ARRAY(REAL)))
         columns.append(sa_column(f"n{i}", DOUBLE_PRECISION))
     rows = []
-    for index, one in enumerate(parsed):
+    for index, one in enumerate(validated):
         row = [str(index)]
         for near in one:
             row.append(list(near.vector))
@@ -1196,6 +1329,106 @@ def stale_vectors(graph, node_fields=None, edge_fields=None,
     return result
 
 
+def embed_stale(graph, node_fields=None, edge_fields=None, limit=None) -> dict:
+    """Fill in every stale vector from its source property:
+
+        {"nodes": {"summary": {"embedded": ["1", "2"], "skipped": ["7"]}},
+         "edges": {}}
+
+    stale_vectors() says which rows need a vector; this reads each
+    one's `source` property, embeds them per field in one batched call,
+    and writes them. `skipped` is the rows whose source property is
+    absent, null, or blank -- not an error, since a node with no
+    abstract legitimately has no abstract vector, but reported so it
+    is never mistaken for work done.
+
+    Fields with no embed= are not touched by the default sweep and
+    cannot be named: this call is only about the ones that declare how
+    to embed themselves. Naming one that does not raises rather than
+    returning a zero for it.
+
+    `limit` caps how many rows PER FIELD one call takes on, for a
+    backfill too large to do in one go -- re-run until every list is
+    empty."""
+    if graph._vectors is None:
+        raise ValueError("embed_stale() needs vector fields and none are defined -- "
+                         "call define_vectors(...) first")
+    chosen = {}
+    for target_name, names in (("nodes", node_fields), ("edges", edge_fields)):
+        defined = (graph._vectors or {}).get(target_name) or {}
+        if names is None:
+            names = sorted(name for name, field in defined.items() if field.embed is not None)
+        else:
+            for name in names:
+                _embedder(_field(graph, target_name, name, "embed_stale()"),
+                          target_name, "embed_stale()")
+        chosen[target_name] = list(names)
+    if not chosen["nodes"] and not chosen["edges"] and node_fields is None \
+            and edge_fields is None:
+        # Returning {} here would read as "nothing was stale", which is
+        # the opposite of "nothing here can embed itself".
+        raise ValueError(
+            "embed_stale(): no vector field on this graph declares an embedder, so there "
+            "is nothing it can fill in -- redeclare a field as Vector(name, dimensions, "
+            "embed=<your embedding client>), or write vectors with set_vectors()"
+        )
+
+    stale = stale_vectors(graph, node_fields=chosen["nodes"],
+                          edge_fields=chosen["edges"], limit=limit)
+    result: dict = {"nodes": {}, "edges": {}}
+    for target_name, names in chosen.items():
+        for name in names:
+            field = _field(graph, target_name, name, "embed_stale()")
+            ids = stale[target_name][name]["missing"] \
+                + stale[target_name][name]["wrong_dimensions"]
+            texts = _source_texts(graph, target_name, field.source, ids)
+            embedded = [row_id for row_id in ids if texts.get(row_id)]
+            result[target_name][name] = {
+                "embedded": embedded,
+                "skipped": [row_id for row_id in ids if not texts.get(row_id)],
+            }
+            if embedded:
+                # set_vectors() batches the embedding itself and keeps
+                # it outside the transaction, so handing it the text is
+                # both shorter and the one place that ordering lives.
+                set_vectors(graph, **{target_name: [
+                    {"id": row_id, name: texts[row_id]} for row_id in embedded
+                ]})
+    return result
+
+
+def _source_texts(graph, target: str, source: str, ids: list) -> dict:
+    """{id: text} for the rows named, reading the source property.
+
+    STRINGS ONLY, which jsonb_typeof enforces rather than ->> alone:
+    ->> renders every scalar as text, so a numeric property would
+    embed as "5" and a boolean as "true" -- an embedding of the
+    rendering, not of anything the caller wrote. Those rows come back
+    None and land in `skipped`, where they can be seen.
+
+    ->> and not -> for the strings themselves: -> leaves the JSON
+    quotes on, and every embedding would carry them."""
+    if not ids:
+        return {}
+    from .ingest import BATCH_SIZE, _chunks
+    table = _table(graph, target)
+    id_column = getattr(table.c, graph.node_id_col if target == "nodes" else graph.edge_id_col)
+    found = {}
+    with graph.engine.connect() as connection:
+        for chunk in _chunks(list(ids), BATCH_SIZE):
+            query = select(
+                cast(id_column, SAString).label("id"),
+                case((func.jsonb_typeof(table.c.properties[source]) == "string",
+                      table.c.properties[source].astext),
+                     else_=None).label("text"),
+            ).where(graph._scoped(table),
+                    cast(id_column, SAString).in_([str(one) for one in chunk]))
+            for row in connection.execute(query):
+                found[row.id] = row.text if isinstance(row.text, str) and row.text.strip() \
+                    else None
+    return found
+
+
 def vector_ddl(graph) -> list:
     """The exact SQL migrate_vectors() would run, without running it --
     the same contract as constraint_ddl() and schema_ddl(), including
@@ -1350,61 +1583,100 @@ def _coerce_id(value):
 
 def set_vectors(graph, nodes=None, edges=None) -> int:
     """UPDATE existing rows' vector columns. Each row is
-    {"id": ..., <field>: <vector or None>}; every non-id key must be a
-    defined field of the right dimensionality. One transaction for the
-    whole call: an id that matches no row in this graph fails
-    everything by name, so a retry never collides with half a write.
-    Returns the number of rows updated."""
+    {"id": ..., <field>: <vector, text, or None>}; every non-id key
+    must be a defined field of the right dimensionality. One
+    transaction for the whole call: an id that matches no row in this
+    graph fails everything by name, so a retry never collides with
+    half a write. Returns the number of rows updated.
+
+    A string value is embedded with the field's declared embedder --
+    every string in the call, per field, in ONE batched provider call,
+    resolved BEFORE the transaction opens. That ordering is the point:
+    an HTTP call inside an open transaction holds row locks for the
+    length of a network round trip, and a provider failure halfway
+    through would leave the write half-done."""
     from .ingest import BATCH_SIZE, _chunks
+
+    # Validation is pure, so it all happens before a connection is
+    # taken -- including the embedding, which is the slow part.
+    plan = []
+    for target_name, rows in (("nodes", nodes), ("edges", edges)):
+        if not rows:
+            continue
+        fields = _defined(graph, target_name, "set_vectors()")
+        table = _table(graph, target_name)
+        id_name = graph.node_id_col if target_name == "nodes" else graph.edge_id_col
+        id_column = getattr(table.c, id_name)
+
+        groups: dict = {}
+        seen_ids = set()
+        #: {field name: [(cleaned row, text)]} -- filled in below and
+        #: embedded once per field, after every row has been checked.
+        pending: dict = {}
+        for row in rows:
+            if not isinstance(row, dict) or "id" not in row:
+                raise ValueError(
+                    f"each {target_name} row must be a dict with an 'id' plus vector "
+                    f"fields, got {row!r}"
+                )
+            row_id = _coerce_id(row["id"])
+            if row_id in seen_ids:
+                raise ValueError(
+                    f"{target_name} id {row['id']!r} appears twice in one set_vectors() "
+                    f"call -- the second update would race the first; merge the rows"
+                )
+            seen_ids.add(row_id)
+            names = sorted(set(row) - {"id"})
+            if not names:
+                raise ValueError(f"{target_name} row {row['id']!r} names no vector fields")
+            cleaned = {}
+            for name in names:
+                if name not in fields:
+                    raise ValueError(
+                        f"no vector field {name!r} is defined for {target_name} in this "
+                        f"graph -- defined: {sorted(fields)}. define_vectors() declares "
+                        f"a new one"
+                    )
+                where = f"{target_name} {row['id']!r} {name!r}"
+                value = row[name]
+                if isinstance(value, str):
+                    _embedder(fields[name], target_name, "set_vectors()")
+                    if not value.strip():
+                        raise ValueError(
+                            f"{where}: the text to embed is empty -- pass None to clear "
+                            f"this field's vector, or text with something in it"
+                        )
+                    pending.setdefault(name, []).append((cleaned, value))
+                    value = None                      # filled in by the embed pass
+                elif value is not None:
+                    value = list(_clean_vector(value, where))
+                    if len(value) != fields[name].dimensions:
+                        raise ValueError(
+                            f"{target_name} {row['id']!r}: vector for {name!r} has "
+                            f"{len(value)} dimensions, the field is defined with "
+                            f"{fields[name].dimensions}"
+                        )
+                cleaned[name] = value
+            groups.setdefault(tuple(names), []).append((row_id, cleaned))
+
+        # One provider call per field for the whole set_vectors(), not
+        # one per row: 500 rows of text is 500 HTTP round trips done
+        # naively, and the Embedder already chunks to the provider's cap.
+        for name, waiting in pending.items():
+            vectors = fields[name].embed.embed_documents([text for _, text in waiting])
+            for (cleaned, _), vector in zip(waiting, vectors, strict=True):
+                if len(vector) != fields[name].dimensions:
+                    raise ValueError(
+                        f"set_vectors(): the embedder for {target_name} field {name!r} "
+                        f"returned {len(vector)} dimensions, the field is defined with "
+                        f"{fields[name].dimensions} -- nothing was written"
+                    )
+                cleaned[name] = list(vector)
+        plan.append((target_name, table, id_column, groups))
 
     total = 0
     with graph.engine.begin() as connection:
-        for target_name, rows in (("nodes", nodes), ("edges", edges)):
-            if not rows:
-                continue
-            fields = _defined(graph, target_name, "set_vectors()")
-            table = _table(graph, target_name)
-            id_name = graph.node_id_col if target_name == "nodes" else graph.edge_id_col
-            id_column = getattr(table.c, id_name)
-
-            groups: dict = {}
-            seen_ids = set()
-            for row in rows:
-                if not isinstance(row, dict) or "id" not in row:
-                    raise ValueError(
-                        f"each {target_name} row must be a dict with an 'id' plus vector "
-                        f"fields, got {row!r}"
-                    )
-                row_id = _coerce_id(row["id"])
-                if row_id in seen_ids:
-                    raise ValueError(
-                        f"{target_name} id {row['id']!r} appears twice in one set_vectors() "
-                        f"call -- the second update would race the first; merge the rows"
-                    )
-                seen_ids.add(row_id)
-                names = sorted(set(row) - {"id"})
-                if not names:
-                    raise ValueError(f"{target_name} row {row['id']!r} names no vector fields")
-                cleaned = {}
-                for name in names:
-                    if name not in fields:
-                        raise ValueError(
-                            f"no vector field {name!r} is defined for {target_name} in this "
-                            f"graph -- defined: {sorted(fields)}. define_vectors() declares "
-                            f"a new one"
-                        )
-                    value = row[name]
-                    if value is not None:
-                        value = list(_clean_vector(value, f"{target_name} {row['id']!r} {name!r}"))
-                        if len(value) != fields[name].dimensions:
-                            raise ValueError(
-                                f"{target_name} {row['id']!r}: vector for {name!r} has "
-                                f"{len(value)} dimensions, the field is defined with "
-                                f"{fields[name].dimensions}"
-                            )
-                    cleaned[name] = value
-                groups.setdefault(tuple(names), []).append((row_id, cleaned))
-
+        for target_name, table, id_column, groups in plan:
             for names, group in groups.items():
                 for chunk in _chunks(group, BATCH_SIZE):
                     incoming = values(

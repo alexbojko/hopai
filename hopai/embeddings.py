@@ -225,6 +225,12 @@ class Embedder:
         """Embed text being SEARCHED WITH."""
         return self._run([text], query=True)[0]
 
+    def embed_queries(self, texts: list) -> list:
+        """Several queries at once, on the query side of the asymmetry
+        -- what vector_search_many() needs so N searches cost one
+        provider round trip rather than N."""
+        return self._run(texts, query=True)
+
     def _run(self, texts, query: bool) -> list:
         # `query` is read only as `A if query else B` -- here and in every
         # binding _bind() returns -- so any falsy value is the document
@@ -334,15 +340,18 @@ def _bind(client: Any, provider: Optional[str], model: Optional[str]):
         return call
 
     # 4. The duck-typed protocols, in the order they are most common.
+    #    Their query methods take ONE text, so several queries are a
+    #    loop here rather than a truncation: embed_queries() may hand
+    #    down a batch, and `texts[0]` alone would drop the rest.
     if hasattr(client, "embed_documents") and hasattr(client, "embed_query"):
         def call(texts, query, dimensions):        # noqa: ARG001
-            return [client.embed_query(texts[0])] if query \
+            return [client.embed_query(text) for text in texts] if query \
                 else client.embed_documents(list(texts))
         return call
 
     if hasattr(client, "get_text_embedding_batch") and hasattr(client, "get_query_embedding"):
         def call(texts, query, dimensions):        # noqa: ARG001
-            return [client.get_query_embedding(texts[0])] if query \
+            return [client.get_query_embedding(text) for text in texts] if query \
                 else client.get_text_embedding_batch(list(texts))
         return call
 

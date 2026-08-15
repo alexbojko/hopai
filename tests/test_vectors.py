@@ -24,7 +24,7 @@ from hopai import (
     traverse_json,
     TRAVERSE_TOOL_SCHEMA, Vector, parse_near, spec_to_traversal, vector_search_json,
 )
-from hopai import Boost
+from hopai import Boost, Embedder
 from hopai.vectors import parse_boost
 from hopai.constraints import ConstraintViolation
 
@@ -263,13 +263,15 @@ class TestVectorDDL:
 # ---------------------------------------------------------------------
 
 class TestNearValidation:
-    @pytest.mark.parametrize("bad", ["x", 42, [], (), {}, None])
+    # None is absent here on purpose: it now means "no vector was given",
+    # which is either the text= form or the neither-of-them refusal --
+    # see TestNearText.
+    @pytest.mark.parametrize("bad", ["x", 42, [], (), {}])
     def test_vector_must_be_a_non_empty_sequence(self, bad):
         with pytest.raises(TypeError, match="non-empty list of numbers"):
             Near("summary", bad)
 
-    @pytest.mark.parametrize("bad,name", [("x", "str"), (42, "int"), ({}, "dict"),
-                                          (None, "NoneType")])
+    @pytest.mark.parametrize("bad,name", [("x", "str"), (42, "int"), ({}, "dict")])
     def test_the_refusal_names_the_type_actually_passed(self, bad, name):
         """`got {type(vector).__name__}` is the whole diagnostic -- every
         case above matches only the shared sentence, so the type name
@@ -1947,6 +1949,245 @@ class TestStaleVectorsLive:
             g.stale_vectors(node_fields=["ghost"])
 
 
+def _embedding_graph(fresh_graph, log=None, source=None, dimensions=3):
+    """A migrated graph whose `docvec` field knows how to embed itself."""
+    fresh_graph.define_vectors(
+        nodes=[Vector("docvec", dimensions, source=source,
+                      embed=counting_embedder(dimensions, log)),
+               Vector("titlevec", 3)],
+        edges=[Vector("relvec", 3, embed=counting_embedder(3, log))])
+    fresh_graph.migrate_vectors()
+    return fresh_graph
+
+
+class TestSetVectorsFromTextLive:
+    def test_a_string_is_embedded_and_stored(self, fresh_graph):
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}])
+        assert g.set_vectors(nodes=[{"id": 1, "docvec": "apple"}]) == 1
+        # ord('a') == 97: the stored vector is the embedder's answer, so
+        # this covers the whole path rather than "something was written".
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] == [97.0, 0.0, 0.0]
+
+    def test_text_and_vectors_mix_in_one_call(self, fresh_graph):
+        """Nothing forces a caller to pick one form for a whole batch,
+        and a half-migrated codebase will have both."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}, {"id": 2}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": "apple"},
+                             {"id": 2, "docvec": [1.0, 2.0, 3.0]}])
+        stored = g.get_vectors(node_ids=[1, 2])["nodes"]
+        assert stored["1"]["docvec"] == [97.0, 0.0, 0.0]
+        assert stored["2"]["docvec"] == [1.0, 2.0, 3.0]
+
+    def test_edges_take_text_too(self, fresh_graph):
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}, {"id": 2}])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "cites"}])
+        with g.engine.connect() as connection:
+            edge_id = connection.execute(text("SELECT id FROM edges")).scalar()
+        g.set_vectors(edges=[{"id": edge_id, "relvec": "banana"}])
+        assert g.get_vectors(edge_ids=[edge_id])["edges"][str(edge_id)]["relvec"] \
+            == [98.0, 0.0, 0.0]
+
+    def test_every_row_is_embedded_in_one_provider_call(self, fresh_graph):
+        """Per row would be 500 HTTP round trips for 500 rows. The
+        Embedder chunks to the provider's cap on top of this; what
+        matters here is that set_vectors() does not defeat it."""
+        log = []
+        g = _embedding_graph(fresh_graph, log=log)
+        g.add_nodes([{"id": i} for i in range(1, 6)])
+        g.set_vectors(nodes=[{"id": i, "docvec": f"text-{i}"} for i in range(1, 6)])
+        assert log == [[f"text-{i}" for i in range(1, 6)]]
+
+    def test_a_field_with_no_embedder_refuses_text(self, fresh_graph):
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}])
+        with pytest.raises(ValueError, match=r"set_vectors\(\): field 'titlevec' on nodes "
+                                             r"was given text, but declares no embedder"):
+            g.set_vectors(nodes=[{"id": 1, "titlevec": "apple"}])
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\n"])
+    def test_blank_text_is_refused_rather_than_embedded(self, fresh_graph, blank):
+        """Whitespace has no meaning to embed; every provider either
+        errors or returns a vector for nothing. Refusing here names
+        None as the way to actually clear the field."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}])
+        with pytest.raises(ValueError, match="the text to embed is empty"):
+            g.set_vectors(nodes=[{"id": 1, "docvec": blank}])
+
+    def test_none_still_clears_the_vector(self, fresh_graph):
+        """The one thing blank text must not become: a field with an
+        embedder still has to be clearable."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": "apple"}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": None}])
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] is None
+
+    def test_a_provider_failure_writes_nothing(self, fresh_graph):
+        """The reason embedding happens before the transaction opens:
+        a provider that dies halfway must not leave half a batch
+        written, and a retry must not collide with rows that landed."""
+        def dies(texts):
+            raise RuntimeError("provider is down")
+
+        g = _embedding_graph(fresh_graph)
+        g.define_vectors(nodes=[Vector("docvec", 3, embed=dies)])
+        g.add_nodes([{"id": 1}, {"id": 2}])
+        with pytest.raises(Exception, match="provider is down"):
+            g.set_vectors(nodes=[{"id": 1, "docvec": "a"}, {"id": 2, "docvec": "b"}])
+        assert g.get_vectors(node_ids=[1, 2])["nodes"]["1"]["docvec"] is None
+
+    def test_an_embedder_of_the_wrong_width_writes_nothing(self, fresh_graph):
+        g = _embedding_graph(fresh_graph)
+        g.define_vectors(nodes=[Vector("docvec", 3, embed=lambda texts: [[1.0, 2.0]])])
+        g.add_nodes([{"id": 1}])
+        with pytest.raises(ValueError, match="returned 2 dimensions, the field is defined "
+                                             "with 3 -- nothing was written"):
+            g.set_vectors(nodes=[{"id": 1, "docvec": "apple"}])
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] is None
+
+    def test_the_provider_is_called_before_the_transaction_opens(self, fresh_graph):
+        """Stated as an invariant in set_vectors()' docstring and
+        untestable by inspection: an HTTP call inside an open
+        transaction holds row locks for a network round trip."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}])
+        seen_texts, opened = [], []
+
+        def watching(texts):
+            seen_texts.extend(texts)
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        def on_begin(conn):
+            opened.append(len(seen_texts))
+
+        g.define_vectors(nodes=[Vector("docvec", 3, embed=watching)])
+        event.listen(g.engine, "begin", on_begin)
+        try:
+            g.set_vectors(nodes=[{"id": 1, "docvec": "apple"}])
+        finally:
+            event.remove(g.engine, "begin", on_begin)
+        # Every transaction this call opened already had the embedding
+        # in hand; a zero here is a provider call holding row locks.
+        assert opened and all(count == 1 for count in opened)
+
+
+class TestEmbedStaleLive:
+    def test_it_reads_the_property_of_the_fields_own_name(self, fresh_graph):
+        """The naming gap, closed: Vector("docvec") embeds the "docvec"
+        property. Before this the field name named a column and nothing
+        else, and which property fed it was simply unanswerable."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple"}])
+        assert g.embed_stale()["nodes"]["docvec"] == {"embedded": ["1"], "skipped": []}
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] == [97.0, 0.0, 0.0]
+
+    def test_source_points_it_at_another_property(self, fresh_graph):
+        g = _embedding_graph(fresh_graph, source="abstract")
+        g.add_nodes([{"id": 1, "abstract": "banana", "docvec": "apple"}])
+        g.embed_stale()
+        # 'b' for the abstract, not 'a' for the same-named property.
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] == [98.0, 0.0, 0.0]
+
+    def test_rows_with_nothing_to_embed_are_reported_not_raised(self, fresh_graph):
+        """A node with no abstract legitimately has no abstract vector.
+        Silence would leave the caller re-running a backfill that can
+        never finish, and an exception would stop the other 999 rows."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple"}, {"id": 2},
+                     {"id": 3, "docvec": "  "}, {"id": 4, "docvec": 5}])
+        result = g.embed_stale(node_fields=["docvec"])["nodes"]["docvec"]
+        assert result == {"embedded": ["1"], "skipped": ["2", "3", "4"]}
+
+    def test_it_refills_the_graph_after_a_dimension_change(self, fresh_graph):
+        """Changing a model means changing a width, and the whole
+        re-embed used to be the caller's loop to write. The source text
+        is already in the properties, so it is three calls now."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple"}])
+        g.embed_stale()
+        g.define_vectors(nodes=[Vector("docvec", 4, embed=counting_embedder(4))])
+        g.drop_vectors(node_fields=["docvec"])       # refuses to reinterpret
+        g.migrate_vectors()
+        assert g.embed_stale()["nodes"]["docvec"]["embedded"] == ["1"]
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] == [97.0, 0.0, 0.0, 0.0]
+
+    def test_wrong_dimension_rows_are_in_the_work_set(self, fresh_graph):
+        """stale_vectors() reports two categories and this fills in
+        both. Taking only `missing` would leave every row a widened
+        declaration outgrew sitting there, reported forever.
+
+        The state is built with raw SQL because the API refuses to
+        create it: set_vectors() checks the width on the way in."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple"}])
+        g.drop_vectors(node_fields=["docvec"])       # take the CHECK away
+        with g.engine.begin() as connection:
+            connection.execute(text(
+                "UPDATE nodes SET vec_docvec = ARRAY[1.0, 2.0]::real[] WHERE id = 1"))
+        stale = g.stale_vectors(node_fields=["docvec"])["nodes"]["docvec"]
+        assert stale == {"missing": [], "wrong_dimensions": ["1"]}
+        assert g.embed_stale()["nodes"]["docvec"]["embedded"] == ["1"]
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] == [97.0, 0.0, 0.0]
+
+    def test_a_second_run_finds_nothing_left(self, fresh_graph):
+        """The loop has to terminate: a call that re-embeds rows it
+        already filled would never come back empty, and a caller
+        looping until it does would loop forever."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple"}])
+        g.embed_stale()
+        assert g.embed_stale()["nodes"]["docvec"] == {"embedded": [], "skipped": []}
+
+    def test_fields_without_an_embedder_are_left_alone(self, fresh_graph):
+        """titlevec declares no embed=, so this call has nothing to say
+        about it -- and must not report a zero that reads as "done"."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple", "titlevec": "apple"}])
+        assert set(g.embed_stale()["nodes"]) == {"docvec"}
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["titlevec"] is None
+
+    def test_naming_a_field_that_cannot_embed_itself_raises(self, fresh_graph):
+        """Skipped from the default sweep, refused when asked for by
+        name: a caller who typed the field meant something by it."""
+        g = _embedding_graph(fresh_graph)
+        with pytest.raises(ValueError, match=r"embed_stale\(\): field 'titlevec' on nodes "
+                                             r"was given text, but declares no embedder"):
+            g.embed_stale(node_fields=["titlevec"])
+
+    def test_a_graph_where_nothing_can_embed_says_so(self, fresh_graph):
+        """An empty result here would read as "nothing was stale",
+        which is the opposite of what happened."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple"}])
+        with pytest.raises(ValueError, match="no vector field on this graph declares an "
+                                             "embedder"):
+            g.embed_stale()
+
+    def test_limit_caps_the_rows_per_field(self, fresh_graph):
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": i, "docvec": f"text-{i}"} for i in range(1, 6)])
+        assert len(g.embed_stale(limit=2)["nodes"]["docvec"]["embedded"]) == 2
+
+    def test_it_stays_inside_its_own_graph(self, fresh_graph):
+        """Every read and write goes through _scoped(); the property
+        read this call adds is a new place to forget it."""
+        g = _embedding_graph(fresh_graph)
+        other = g.in_graph("other")
+        other.define_vectors(nodes=[Vector("docvec", 3, embed=counting_embedder())])
+        g.add_nodes([{"id": 1, "docvec": "apple"}])
+        other.add_nodes([{"id": 2, "docvec": "banana"}])
+        assert g.embed_stale()["nodes"]["docvec"]["embedded"] == ["1"]
+        assert other.get_vectors(node_ids=[2])["nodes"]["2"]["docvec"] is None
+
+    def test_undeclared_graphs_say_to_declare_first(self, fresh_graph):
+        with pytest.raises(ValueError, match=r"call define_vectors\(...\) first"):
+            fresh_graph.embed_stale()
+
+
 class TestPgvectorDdl:
     def test_emits_extension_conversion_and_index(self, vg):
         ddl = vg.pgvector_exit_ddl()
@@ -2086,7 +2327,7 @@ class TestVectorCallerNamesArePinned:
     #: two mutation rounds later, which is how the last four were found.
     PINNED = {
         "vector_search()", "vector_search_many()",
-        "get_vectors()", "set_vectors()", "stale_vectors()",
+        "get_vectors()", "set_vectors()", "stale_vectors()", "embed_stale()",
         "traverse_json()", "aggregate_json()",
         "traversal spec", '"start"', '"hops" entry', "vector search spec",
     }
@@ -2221,3 +2462,146 @@ class TestBuilderDelegation:
         builders document could be any number at all. It is a promise
         the README and both docstrings make."""
         assert "LIMIT 10" in norm(build(vg), literal_binds=True)
+
+
+# ---------------------------------------------------------------------
+# Text, embedded on the way in and on the way out
+# ---------------------------------------------------------------------
+
+def counting_embedder(dimensions: int = 3, log: list = None):
+    """A fake embedding client that records every batch it is handed.
+
+    A plain callable, so it goes down Embedder's last dispatch branch
+    and exercises no provider-specific code. The vector it returns
+    encodes the text's first character, which is enough to tell two
+    embeddings apart without pretending to be a model."""
+    log = [] if log is None else log
+
+    def embed(texts):
+        log.append(list(texts))
+        return [[float(ord(t[0])), 0.0, 0.0][:dimensions] + [0.0] * (dimensions - 3)
+                for t in texts]
+    embed.log = log
+    return embed
+
+
+class TestVectorSourceAndEmbedder:
+    def test_source_defaults_to_the_fields_own_name(self):
+        """The gap this closes: Vector("title") named a column and read
+        nothing, so "which property does it embed" had no answer at
+        all. It is the property of the same name."""
+        assert Vector("title", 3).source == "title"
+
+    def test_source_can_point_at_another_property(self):
+        assert Vector("summary", 3, source="abstract").source == "abstract"
+
+    @pytest.mark.parametrize("bad", ["", 5, []])
+    def test_source_must_be_a_non_empty_string(self, bad):
+        with pytest.raises(ValueError, match="source= is the PROPERTY name"):
+            Vector("summary", 3, source=bad)
+
+    def test_a_client_is_wrapped_once_into_an_embedder(self):
+        field = Vector("summary", 3, embed=counting_embedder())
+        assert isinstance(field.embed, Embedder)
+        # And an Embedder passed straight in is kept, not re-wrapped --
+        # double wrapping is what Embedder(Embedder(...)) refuses.
+        made = Embedder(counting_embedder())
+        assert Vector("summary", 3, embed=made).embed is made
+
+    def test_an_embedder_sized_for_another_field_is_refused(self):
+        """Two numbers, one of which would have to be ignored. Silently
+        picking either leaves half the caller's configuration inert."""
+        from hopai import Embedder
+        with pytest.raises(ValueError, match="its embedder is built with dimensions=768"):
+            Vector("summary", 3, embed=Embedder(counting_embedder(), dimensions=768))
+
+    def test_one_embedder_serves_fields_of_different_sizes(self):
+        """The flip side: an embedder with no dimensions of its own is
+        the ordinary case, and pinning it to the first field it met
+        would break the second."""
+        shared = Embedder(counting_embedder())
+        assert Vector("a", 3, embed=shared).dimensions == 3
+        assert Vector("b", 8, embed=shared).dimensions == 8
+        assert shared.dimensions is None
+
+
+class TestNearText:
+    def test_text_and_vector_are_alternatives(self):
+        for kwargs, word in (({}, "neither"),
+                             ({"vector": [1.0, 0.0, 0.0], "text": "x"}, "both")):
+            with pytest.raises(TypeError, match=f"vector OR text= to embed, not {word}"):
+                Near("summary", **kwargs)
+
+    @pytest.mark.parametrize("bad", ["", "   ", 5])
+    def test_text_must_say_something(self, bad):
+        with pytest.raises((ValueError, TypeError), match="text="):
+            Near("summary", text=bad)
+
+    def test_repr_shows_the_text_rather_than_a_dimension_count(self):
+        """An unresolved Near has no dimensions yet, and "0 dims" would
+        read as a bug in the vector rather than a spec awaiting one."""
+        assert repr(Near("summary", text="raft")) == "Near('summary', text='raft')"
+
+    def test_text_is_embedded_with_the_fields_own_embedder(self, vg):
+        log = []
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder(log=log))])
+        sql = norm(vg.build_vector_search_query(Near("summary", text="apple"), k=1),
+                   literal_binds=True)
+        assert log == [["apple"]]
+        # ord('a') == 97: the embedder's answer is what reached the SQL,
+        # so this is the whole round trip, not just the call.
+        assert "97" in sql
+
+    def test_a_field_with_no_embedder_says_which_declaration_to_change(self, vg):
+        with pytest.raises(ValueError, match=r"vector_search\(\): field 'summary' on nodes "
+                                             r"was given text, but declares no embedder"):
+            vg.build_vector_search_query(Near("summary", text="apple"), k=1)
+
+    def test_resolving_leaves_the_original_spec_alone(self, vg):
+        """A Near is a value: reusing one across two graphs whose fields
+        embed differently must not hand the second graph the first
+        graph's embedding."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder())])
+        spec = Near("summary", text="apple")
+        vg.build_vector_search_query(spec, k=1)
+        assert spec.text == "apple" and spec.vector == ()
+
+    def test_a_text_query_is_still_checked_against_the_declared_size(self, vg):
+        """An embedder answering with the wrong width is a
+        configuration mistake, not a query that should run and rank
+        nothing."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=lambda texts: [[1.0, 0.0]])])
+        with pytest.raises(ValueError, match="has 2 dimensions, the field is defined with 3"):
+            vg.build_vector_search_query(Near("summary", text="apple"), k=1)
+
+    def test_two_text_specs_on_one_field_raise_before_either_is_embedded(self, vg):
+        """The duplicate-field refusal comes first on purpose: a
+        provider call for a query that is about to be rejected is a
+        round trip and a bill for nothing."""
+        log = []
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder(log=log))])
+        with pytest.raises(ValueError, match="two Near specs both rank field 'summary'"):
+            vg.build_vector_search_query(
+                Near("summary", text="a"), Near("summary", text="b"), k=1)
+        assert log == []
+
+    def test_many_queries_cost_one_provider_call_per_field(self, vg):
+        """vector_search_many() exists to turn N round trips into one.
+        Resolving each query's text on its own would put all N back,
+        just against a different server."""
+        log = []
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder(log=log))])
+        vg.build_vector_search_many_query(
+            [Near("summary", text="apple"), Near("summary", text="banana"),
+             Near("summary", text="cherry")], k=1)
+        assert log == [["apple", "banana", "cherry"]]
+
+    def test_queries_keep_their_own_text_in_order(self, vg):
+        """One batched answer has to be dealt back to the query it came
+        from -- zipping it wrongly is a silent mis-ranking."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder())])
+        sql = norm(vg.build_vector_search_many_query(
+            [Near("summary", text="apple"), Near("summary", text="banana")], k=1),
+            literal_binds=True)
+        # ord('a')=97 for query 0, ord('b')=98 for query 1.
+        assert re.search(r"'0'.*?97.*?'1'.*?98", sql, re.S)

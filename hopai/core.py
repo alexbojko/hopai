@@ -939,9 +939,16 @@ class Graph:
 
     def set_vectors(self, nodes: Optional[list] = None, edges: Optional[list] = None) -> int:
         """Store vectors on existing rows, one transaction for the
-        whole call. Each row is {"id": ..., <field>: <vector or None>}:
+        whole call. Each row is {"id": ..., <field>: <vector, text or
+        None>}:
 
             graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
+            graph.set_vectors(nodes=[{"id": 1, "summary": "a paper on Raft"}])
+
+        A string is embedded with the field's declared embed= -- every
+        string in the call batched into one provider request per field,
+        before the transaction opens. A field with no embedder refuses
+        text by name rather than guessing.
 
         This is the ONLY write path for vectors -- add_nodes/merge
         rows never carry them (hopai/vectors.py says why). Returns the
@@ -979,9 +986,31 @@ class Graph:
         The second category is the window a dimension change opens --
         migrate_vectors() refuses to reinterpret stored vectors and
         set_vectors() refuses to write the wrong size, so this is what
-        closes it without hand-writing the catalog query."""
+        closes it without hand-writing the catalog query.
+
+        embed_stale() runs that whole loop for fields that declare an
+        embed=; this is the report for the ones you fill in yourself."""
         from .vectors import stale_vectors
         return stale_vectors(self, node_fields, edge_fields, limit)
+
+    def embed_stale(self, node_fields=None, edge_fields=None, limit=None) -> dict:
+        """Fill in every stale vector from its source property, for the
+        fields that declare an embed=. The backfill loop stale_vectors()
+        leaves you to write:
+
+            graph.define_vectors(nodes=[Vector("summary", 1536,
+                                               source="abstract",
+                                               embed=openai.OpenAI())])
+            graph.embed_stale()
+            # -> {"nodes": {"summary": {"embedded": ["1"], "skipped": []}},
+            #     "edges": {}}
+
+        `skipped` is the rows whose source property is absent or blank
+        -- reported rather than raised, since there is nothing to embed,
+        but never silent. `limit` caps the rows taken per field; re-run
+        until every list comes back empty."""
+        from .vectors import embed_stale
+        return embed_stale(self, node_fields, edge_fields, limit)
 
     def pgvector_exit_ddl(self, index: Optional[str] = "hnsw") -> list:
         """The migration off this library's exact search and onto
