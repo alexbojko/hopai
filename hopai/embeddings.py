@@ -386,29 +386,45 @@ class Embedder:
 
         `Retry-After` wins over the computed window when the provider
         sent one -- it is the only number here that is not a guess."""
-        for attempt in range(self.retries + 1):
+        attempts = self.retries + 1
+        failure = None
+        for attempt in range(attempts):
+            if failure is not None:
+                # Back off BEFORE the retry rather than after the
+                # failure, so the loop bound is the ONLY thing deciding
+                # how many calls happen. With an "is this the last one"
+                # test in the body instead, the two express the same
+                # number twice and a wider bound is unreachable --
+                # unobservable to any test, which is how a retry count
+                # drifts from what the caller asked for.
+                window = min(self.backoff * (2 ** (attempt - 1)), _MAX_BACKOFF)
+                delay = _retry_after(failure)
+                if delay is None:
+                    delay = random.uniform(0, window)
+                logger.warning("%s: %s: %s -- retrying in %.2fs (attempt %d of %d)",
+                               owner, type(failure).__name__, failure, delay,
+                               attempt + 1, attempts)
+                time.sleep(delay)
             try:
                 return self._call(chunk, query, self.dimensions)
             except EmbeddingError:
                 raise
             except Exception as exc:                      # provider-side failure
-                last = attempt == self.retries
-                if last or not _retryable(exc):
-                    logger.warning(
-                        "%s: provider call failed after %d embedded, %d attempt(s) (%s: %s)",
-                        owner, done, attempt + 1, type(exc).__name__, exc)
-                    raise EmbeddingError(
-                        f"{owner}: the provider call failed after {attempt + 1} attempt(s) "
-                        f"({type(exc).__name__}: {exc}) -- nothing was written"
-                    ) from exc
-                window = min(self.backoff * (2 ** attempt), _MAX_BACKOFF)
-                delay = _retry_after(exc)
-                if delay is None:
-                    delay = random.uniform(0, window)
-                logger.warning("%s: %s: %s -- retrying in %.2fs (attempt %d of %d)",
-                               owner, type(exc).__name__, exc, delay,
-                               attempt + 2, self.retries + 1)
-                time.sleep(delay)
+                if not _retryable(exc):
+                    self._give_up(owner, done, attempt + 1, exc)
+                failure = exc
+        self._give_up(owner, done, attempts, failure)
+
+    @staticmethod
+    def _give_up(owner: str, done: int, attempts: int, exc: BaseException):
+        """The one place a spent call is reported, so the log line and
+        the exception can never disagree about how far it got."""
+        logger.warning("%s: provider call failed after %d embedded, %d attempt(s) (%s: %s)",
+                       owner, done, attempts, type(exc).__name__, exc)
+        raise EmbeddingError(
+            f"{owner}: the provider call failed after {attempts} attempt(s) "
+            f"({type(exc).__name__}: {exc}) -- nothing was written"
+        ) from exc
 
     def _run(self, texts, query: bool) -> list:
         # `query` is read only as `A if query else B` -- here and in every
