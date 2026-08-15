@@ -183,6 +183,29 @@ class ToolSpec:
     parameters: dict
     call: Callable[..., Any]
 
+    def __post_init__(self):
+        """A tool that cannot describe itself does not get registered.
+
+        The SDK ships whatever it is handed, so an empty description or
+        a `parameters` that is not an object schema reaches the model as
+        a tool it has to guess at -- which is the failure this module
+        hand-writes its schemas to avoid. Checked here rather than in a
+        test because it is a property of the thing, and a mutant that
+        blanked a description got all the way to a registered tool."""
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError(f"a tool needs a name, got {self.name!r}")
+        if not isinstance(self.description, str) or not self.description.strip():
+            raise ValueError(
+                f"tool {self.name!r} has no description -- a model chooses tools by "
+                f"reading them, so an undescribed tool is one it can only guess at")
+        if not isinstance(self.parameters, dict) or self.parameters.get("type") != "object":
+            raise ValueError(
+                f"tool {self.name!r}: `parameters` must be a JSON Schema object "
+                f"(\"type\": \"object\"), got {self.parameters!r}")
+        if not callable(self.call):
+            raise TypeError(f"tool {self.name!r}: `call` must be callable, "
+                            f"got {type(self.call).__name__}")
+
 
 # ---------------------------------------------------------------------
 # Shared pieces
@@ -845,7 +868,16 @@ def _define_schema_tool(served: Served) -> ToolSpec:
             "Declaring does not change or check a single row; enforce_schema does that."
         )),
         parameters=_object({
-            "schema": _object({
+            "schema": {
+                "type": "object",
+                "description": (
+                    "The whole schema as one document: `nodes` keyed by type name, `edges` "
+                    "a list of (kind, source, target) entries. It REPLACES the current "
+                    "declaration, so send everything you want declared -- describe_graph "
+                    "returns the current one in exactly this shape."
+                ),
+                "required": [],
+                "properties": {
                 "nodes": {
                     "type": "object",
                     "description": "Node types keyed by type name.",
@@ -862,7 +894,7 @@ def _define_schema_tool(served: Served) -> ToolSpec:
                         "properties": property_schema,
                     }, ["kind", "source", "target"]),
                 },
-            }),
+            }},
             "save": {
                 "type": "boolean",
                 "description": "Persist the declaration for other processes. Default true.",

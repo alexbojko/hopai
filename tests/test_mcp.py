@@ -17,6 +17,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 
 import pytest
 
@@ -24,8 +25,8 @@ from hopai import (
     AGGREGATE_TOOL_SCHEMA, CypherError, EdgeType, Graph,
     INGEST_TOOL_SCHEMA, Hop, NodeType, Property, Start, TRAVERSE_TOOL_SCHEMA, Unique, Vector,
 )
-from hopai.mcp import DEFAULT_KEEP, SERVER_INSTRUCTIONS, _seed, build_parser, build_server
-from hopai.mcp import main, tools
+from hopai.mcp import DEFAULT_KEEP, SERVER_INSTRUCTIONS, ToolSpec, _seed, build_parser
+from hopai.mcp import build_server, main, tools
 
 try:                                    # the extra is optional, and so is testing against it
     import mcp as _sdk
@@ -98,6 +99,10 @@ def parameter_names(schema: dict) -> set:
 
     walk(schema)
     return found
+
+
+def _object_schema() -> dict:
+    return {"type": "object", "properties": {}, "required": []}
 
 
 @pytest.fixture()
@@ -290,10 +295,19 @@ class TestManyGraphs:
         with pytest.raises(ValueError, match="no vector fields are defined for nodes"):
             specs["search_similar"].call(query="x", graph="crm")
 
-    def test_an_empty_or_malformed_registry_is_refused(self):
-        for bad in ({}, [], "docs", {"docs": "not a graph"}, {"": offline()}):
-            with pytest.raises((TypeError, ValueError)):
-                tools(bad)
+    @pytest.mark.parametrize("bad, message", [
+        ({}, "non-empty {name: Graph} mapping"),
+        ([], "non-empty {name: Graph} mapping"),
+        ("docs", "non-empty {name: Graph} mapping"),
+        ({"docs": "not a graph"}, "graph 'docs' must be a Graph, got str"),
+        ({"": offline()}, "a graph name must be a non-empty string"),
+    ])
+    def test_a_malformed_registry_is_refused_by_name(self, bad, message):
+        """The message, not just the type: an operator wiring up a
+        server reads it once, at start-up, and a mutant that blanked
+        one survived because only the exception class was asserted."""
+        with pytest.raises((TypeError, ValueError), match=re.escape(message)):
+            tools(bad)
 
 
 # ---------------------------------------------------------------------
@@ -435,6 +449,23 @@ class TestToolSchemas:
         assert "search" in spec.parameters["properties"]["start"]["properties"]
         assert "start.search" in spec.description
 
+    @pytest.mark.parametrize("broken, message", [
+        ({"name": ""}, "a tool needs a name"),
+        ({"description": None}, "has no description"),
+        ({"description": "   "}, "has no description"),
+        ({"parameters": {"properties": {}}}, "must be a JSON Schema object"),
+        ({"call": "not callable"}, "must be callable"),
+    ])
+    def test_a_tool_that_cannot_describe_itself_is_not_built(self, broken, message):
+        """Checked on the thing, not in a test, because the SDK ships
+        whatever it is handed: an undescribed tool reaches the model as
+        one it can only guess at. A mutant that blanked list_graphs's
+        description got all the way to a registered tool."""
+        fields = {"name": "t", "description": "d", "parameters": _object_schema(),
+                  "call": lambda: None, **broken}
+        with pytest.raises((ValueError, TypeError), match=re.escape(message)):
+            ToolSpec(**fields)
+
     def test_search_similar_advertises_the_fields_that_exist(self):
         """The enum is what stops a model inventing a field name. It is
         built from the registry, and a mutation that read the registry
@@ -449,19 +480,37 @@ class TestToolSchemas:
 
     @pytest.mark.parametrize("options", [{}, {"allow_ddl": True}, {"read_only": True},
                                          {"embed": embedder()}])
-    def test_every_built_schema_is_a_well_formed_object_schema(self, options, vector_graph):
+    @pytest.mark.parametrize("many", [False, True])
+    def test_every_built_schema_is_a_well_formed_object_schema(self, options, many,
+                                                              vector_graph):
         """The tools this module writes itself build their schemas
         rather than copying hopai's. A malformed one is not rejected by
         anything -- the SDK ships whatever it is given, and the model
-        gets a schema it cannot satisfy. Every configuration, because
-        `search_similar` only exists in one of them -- and that is the
-        tool whose schema a mutation broke."""
+        gets a schema it cannot satisfy.
+
+        Every configuration, because each one builds a parameter the
+        others do not: `search_similar` exists only with an embedder,
+        the `graph` key only with several graphs, and mutants broke
+        both of those -- one writing a `type` of "STRING", one renaming
+        the `description` key so it vanished."""
+        if many:
+            vector_graph = {"docs": vector_graph, "crm": vector_graph.in_graph("crm")}
+        json_schema_types = {"string", "number", "integer", "boolean",
+                             "object", "array", "null"}
         for spec in tools(vector_graph, **options):
             assert spec.parameters["type"] == "object", spec.name
             assert isinstance(spec.parameters["properties"], dict), spec.name
             assert isinstance(spec.parameters.get("required", []), list), spec.name
             for name, prop in spec.parameters["properties"].items():
-                assert prop.get("type") or prop.get("anyOf"), f"{spec.name}.{name}"
+                where = f"{spec.name}.{name}"
+                # A JSON Schema type, not merely a truthy string: "STRING"
+                # is not one, and a mutant that wrote it survived here.
+                assert prop.get("anyOf") or prop.get("type") in json_schema_types, where
+                # And a description, because a parameter without one is a
+                # parameter a model guesses at -- which is the whole
+                # argument for hand-writing these schemas. A mutant
+                # renaming the `description` KEY drops it in silence.
+                assert prop.get("description", "").strip(), where
 
     def test_search_field_is_offered_only_when_the_choice_is_real(self):
         """One declared field needs no argument. Several make the choice
