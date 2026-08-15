@@ -51,6 +51,17 @@ read.** When a design question comes up, these decide it, in order:
   matrix; loosening a refusal into a near-enough mapping is the bug, not the fix.
 - **Every read and write goes through `Graph._scoped()`.** Forgetting the graph
   discriminator does not error; it silently touches another graph's rows.
+- **The dimension CHECK's name is `_graph_token`-based, never `_auto_name()` +
+  `scope_name()`.** Independent 63-char truncation let two graphs share one constraint —
+  silently disabling one graph's enforcement and letting its `drop_vectors()` remove the
+  other's. (`test_field_and_graph_can_never_share_a_constraint_name`)
+- **Similarity is a LATERAL, never a correlated scalar subquery.** The planner pulls a
+  scalar subquery up and re-evaluates it at every site the outer query names it — filter,
+  score, `ORDER BY` — so the `unnest` ran 2–3× per candidate for identical results. It
+  reads tidier as a subquery and costs 2×; `benchmarks/README.md` has the measurement.
+- **A similarity is NULL — "missing" — when the stored vector is NULL, all zeros, or the
+  wrong length.** `unnest(a, b)` pads the shorter side, so a mis-sized vector would
+  otherwise score a confident cosine over the shared prefix.
 - **Vectors live in `vec_*` real columns, never in `properties`, and never pass
   through an LLM tool schema.** JSONB storage would bloat the GIN index and every
   result; a tool-schema `"vector"` parameter invites a model to invent an embedding,
@@ -78,8 +89,11 @@ read.** When a design question comes up, these decide it, in order:
   subset means adding a translation, never loosening a refusal into a near-enough
   mapping. The tool schemas (`TRAVERSE_TOOL_SCHEMA` / `AGGREGATE_TOOL_SCHEMA` /
   `INGEST_TOOL_SCHEMA`) must stay in step with what the parsers accept — with one
-  pinned exception: the vector keys (`near`/`k`) are parsed but deliberately never
-  advertised to a model (see `vectors.py`).
+  pinned exception: the vector keys (`near`/`keep`/`via_near`/`via_keep`/`boost`) are
+  parsed but deliberately never advertised to a model, and `traverse_json`/
+  `aggregate_json` refuse them without `allow_vectors=True` (see `vectors.py`).
+  `cypher.py` has no vector spelling and is not expected to grow one — Cypher has no
+  portable similarity syntax to translate, so there is nothing to refuse by name.
 - Comments explain *why*, citing the bug or trade-off. Match that for non-obvious code;
   skip it for mechanical changes.
 - New tests join an existing `TestX` class and say what would break without the fix.

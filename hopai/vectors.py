@@ -106,10 +106,13 @@ one shape; a mixed batch is refused rather than silently re-ranked.
 
 HYBRID RANKING adds a non-similarity term with Boost(property,
 weight): the score becomes sum(w_i * sim_i) + sum(w_j * boost_j).
-Boosts never NULL, so they reorder without changing which rows
-qualify -- and the library will NOT normalize a property for you,
-because a raw view count would not boost a cosine ranking, it would
-replace it. See Boost.
+A boost cannot push a row past a min_similarity floor (thresholds
+read each field's own similarity, not the combined score) -- but it
+DOES reorder, so with k it changes which rows come back, and the
+`similarity` in each result is then the combined score, which can
+exceed 1. The library will NOT normalize a property for you, because
+a raw view count would not boost a cosine ranking, it would replace
+it. See Boost.
 
 EDGE SIMILARITY is the `via` of ranking: Hop(via_near=..., via_k=N)
 follows the N most similar EDGES out of each node reached so far -- a
@@ -127,6 +130,15 @@ neighbors. Embedding text is the application's job; the JSON forms
 and config callers that hold real vectors. This is the one place a
 parser accepts more than the tool schema advertises, and it is pinned
 by a test.
+
+`migrate_`, not `enforce_`: this is the one declaration in the
+library that changes the TABLES' SHAPE rather than adding a rule to
+them, so it does not belong with enforce_schema()'s vocabulary. And
+define_vectors() is not purely in-memory the way define_schema() is
+-- it attaches the vec_* columns to the shared SQLAlchemy Table
+metadata, so create_schema() on ANY handle for these tables emits
+them from then on. The database is otherwise untouched until
+migrate_vectors().
 
 WRITES: set_vectors() only -- add_nodes/merge rows do not carry
 vectors, because embeddings are computed after the entity exists and a
@@ -210,6 +222,10 @@ class Near:
     belongs to the surrounding call/Start/Hop, never to Near itself:
     one Near per field, one k per ranked set.
 
+    NEVER inside where=/via=: those are boolean filters and a Near
+    ranks, so passing one there raises with the rewrite named. It
+    looks like GT/BETWEEN, which is exactly why the guard exists.
+
     weight:          this field's coefficient in the combined score
                      (only meaningful when several Near are combined).
     min_similarity:  drop rows whose similarity ON THIS FIELD is below
@@ -274,10 +290,16 @@ class Boost:
                             boost=Boost("importance", 0.2), k=10)
 
     The score becomes `sum(weight_i * similarity_i) + sum(weight_j *
-    boost_j)`. A boost reads a NUMERIC property; a row where the
-    property is absent, null, or non-numeric contributes `missing`
-    (0.0 by default) rather than dropping out -- a boost is a nudge,
-    not a filter. Use `where=` to filter.
+    boost_j)`, and that sum is what comes back as `similarity` -- so a
+    boosted result's score is no longer a cosine and can exceed 1. A
+    boost cannot lift a row past a min_similarity floor (those read
+    each field's own similarity), but it reorders, so with `k` it
+    changes which rows you get. A boost reads a NUMERIC property; a row where the
+    property is absent, null, or non-numeric contributes `default`
+    (0.0) rather than dropping out -- a boost is a nudge, not a
+    filter. Use `where=` to filter. (`default`, not `missing`: Near's
+    `missing=` picks a MODE, this picks a VALUE, and one word for two
+    kinds of thing is how you get a caller passing "zero" here.)
 
     THE LIBRARY DOES NOT NORMALIZE FOR YOU, and will not guess: a
     cosine similarity lives in [-1, 1], so a raw property of 1..10000
@@ -294,14 +316,14 @@ class Boost:
         Boost(lambda p: func.ln(1 + cast(p["views"].astext, Float)), 0.1)
     """
 
-    def __init__(self, key, weight: float = 1.0, missing: float = 0.0):
+    def __init__(self, key, weight: float = 1.0, default: float = 0.0):
         if not (isinstance(key, str) and key) and not callable(key):
             raise TypeError(
                 f"Boost takes a property name or a callable receiving the properties "
                 f"column, got {key!r}"
             )
         self.key = key
-        for name, value in (("weight", weight), ("missing", missing)):
+        for name, value in (("weight", weight), ("default", default)):
             if not isinstance(value, (int, float)) or isinstance(value, bool) \
                     or not math.isfinite(value):
                 raise ValueError(f"Boost {name} must be a finite number, got {value!r}")
@@ -310,13 +332,13 @@ class Boost:
                 "Boost weight must be non-zero -- a zero weight contributes nothing; "
                 "drop the Boost instead"
             )
-        self.weight, self.missing = float(weight), float(missing)
+        self.weight, self.default = float(weight), float(default)
 
     def __repr__(self) -> str:
         key = self.key if isinstance(self.key, str) else "<callable>"
         parts = [repr(key) if isinstance(self.key, str) else key, f"weight={self.weight!r}"]
-        if self.missing != 0.0:
-            parts.append(f"missing={self.missing!r}")
+        if self.default != 0.0:
+            parts.append(f"default={self.default!r}")
         return f"Boost({', '.join(parts)})"
 
 
@@ -349,7 +371,7 @@ def _boost_columns(table, boosts: list) -> list:
                 cast(table.c.properties[boost.key].astext, DOUBLE_PRECISION),
             ))
         columns.append(
-            func.coalesce(value, literal(boost.missing, type_=DOUBLE_PRECISION))
+            func.coalesce(value, literal(boost.default, type_=DOUBLE_PRECISION))
             .label(f"boost_{i}")
         )
     return columns
@@ -387,7 +409,7 @@ def _norm(vector: tuple) -> float:
 
 def parse_boost(spec: Any):
     """The JSON form of Boost: {"property": "score", "weight": 0.2}
-    plus the optional "missing", or a list of such objects. No
+    plus the optional "default", or a list of such objects. No
     callable form here -- JSON cannot carry one, and a string that
     became SQL would be an injection, not a feature."""
     if isinstance(spec, list):
@@ -397,14 +419,14 @@ def parse_boost(spec: Any):
     if not isinstance(spec, dict):
         raise TypeError(f'"boost" must be an object or a list of objects -- '
                         f'got {type(spec).__name__}')
-    unknown = set(spec) - {"property", "weight", "missing"}
+    unknown = set(spec) - {"property", "weight", "default"}
     if unknown:
         raise ValueError(f'unknown "boost" keys {sorted(unknown)} -- a boost spec has '
-                         f'"property" and optionally weight, missing')
+                         f'"property" and optionally weight, default')
     if "property" not in spec:
         raise ValueError('a boost spec needs "property" -- e.g. {"property": "score"}')
     return Boost(spec["property"], weight=spec.get("weight", 1.0),
-                 missing=spec.get("missing", 0.0))
+                 default=spec.get("default", 0.0))
 
 
 def parse_near(spec: Any):
@@ -509,7 +531,8 @@ def _table(graph, target: str):
     return graph.nodes_tbl if target == "nodes" else graph.edges_tbl
 
 
-def validate_nears(graph, target: str, near, k, caller: str) -> list:
+def validate_nears(graph, target: str, near, k, caller: str,
+                   limit_name: str = "k") -> list:
     """Normalize near= (one Near or a list) into a validated list:
     every entry a Near, every field defined for `target`, every query
     vector of the declared dimensions -- so a typo fails here with the
@@ -517,22 +540,48 @@ def validate_nears(graph, target: str, near, k, caller: str) -> list:
     nears = list(near) if isinstance(near, (list, tuple)) else [near]
     if not nears:
         raise ValueError(f"{caller}: near=[] is empty -- pass a Near(...) or a list of them")
+    seen = set()
     for one in nears:
         if not isinstance(one, Near):
             raise TypeError(
                 f"{caller}: near= takes Near(field, vector) specs, got {one!r}"
             )
+        if one.field in seen:
+            # Two Nears on ONE field blend into a single score, so a row
+            # similar to neither query can outrank a row identical to
+            # one of them. That is what query expansion looks like when
+            # it is written as one search by mistake, and it comes back
+            # confidently wrong rather than empty.
+            raise ValueError(
+                f"{caller}: two Near specs both rank field {one.field!r}, which blends them "
+                f"into ONE score -- a row similar to neither query can outrank a row "
+                f"identical to one. If these are separate queries, use "
+                f"vector_search_many([...]); if you meant one query, average the vectors "
+                f"yourself so the blend is visible in your code"
+            )
+        seen.add(one.field)
         field = _field(graph, target, one.field, caller)
         if len(one.vector) != field.dimensions:
             raise ValueError(
                 f"{caller}: the query vector for {one.field!r} has {len(one.vector)} "
                 f"dimensions, the field is defined with {field.dimensions}"
             )
+    if len(nears) == 1 and nears[0].missing == "zero":
+        # With no other field to carry the row, "zero" is provably a
+        # no-op: the guards already require this vector to have a
+        # direction, so coalesce(s, 0) only ever sees a non-NULL s.
+        # Same class as boost= without near= -- a knob that reads as a
+        # working feature and changes nothing.
+        raise ValueError(
+            f"{caller}: missing='zero' lets OTHER fields carry a row this field is missing, "
+            f"and there is no other field here -- with one Near it changes nothing. Drop it, "
+            f"or add the Near it is meant to defer to"
+        )
     if k is None and all(one.min_similarity is None for one in nears):
         raise ValueError(
-            f"{caller}: near= without k= and without any min_similarity changes nothing -- "
-            f"ranking with no limit and no bound keeps every row. Pass k=<how many to keep>, "
-            f"or min_similarity on a Near, or drop near="
+            f"{caller}: near= without {limit_name}= and without any min_similarity changes "
+            f"nothing -- ranking with no limit and no bound keeps every row. Pass "
+            f"{limit_name}=<how many to keep>, or min_similarity on a Near, or drop near="
         )
     return nears
 
@@ -666,9 +715,10 @@ def _combined(inner, nears: list, boosts: list = ()):
     """The ranked score: weighted similarities, plus weighted boosts.
 
     Boosts are added AFTER the similarity terms and never NULL (they
-    coalesce to their `missing`), so adding one cannot change which
-    rows qualify -- only their order. That separation is what keeps
-    `combined IS NOT NULL` meaning "some similarity had a direction"."""
+    coalesce to their `default`), which is what keeps
+    `combined IS NOT NULL` meaning "some similarity had a direction".
+    It does NOT mean a boost is free of consequence: it reorders, and
+    with a `k` limit reordering decides membership."""
     total = None
     for i, near in enumerate(nears):
         term = inner.c[f"sim_{i}"] if near.weight == 1.0 else inner.c[f"sim_{i}"] * near.weight
@@ -774,12 +824,11 @@ def edge_beam(graph, edge_alias, join_expr, anchor_expr, move_col, id_col, via,
     return beam.lateral(name)
 
 
-def build_search_query(graph, near, target: str = "nodes", k: int = 10, where: Any = None,
-                       boost=None):
+def build_search_query(graph, near, target: str = "nodes", k: Optional[int] = 10,
+                       where: Any = None, boost=None):
     """The single statement vector_search() runs. Exposed so the SQL
     can be inspected with no database, like build_query()."""
-    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
-        raise ValueError(f"k must be a positive integer, got {k!r}")
+    _check_k(k, "vector_search()")
     nears = validate_nears(graph, target, near, k, "vector_search()")
     boosts = validate_boosts(boost, "vector_search()")
     table = _table(graph, target)
@@ -796,15 +845,15 @@ def build_search_query(graph, near, target: str = "nodes", k: int = 10, where: A
     combined = _combined(inner, nears, boosts)
     similarity = combined.label("similarity")
     columns = _result_columns(inner, target) + [inner.c.properties, similarity]
-    return (
+    query = (
         select(*columns)
         .where(combined.isnot(None), *_thresholds(inner, nears))
         .order_by(similarity.desc(), inner.c._id)
-        .limit(k)
     )
+    return query if k is None else query.limit(k)
 
 
-def search(graph, near, target: str = "nodes", k: int = 10, where: Any = None,
+def search(graph, near, target: str = "nodes", k: Optional[int] = 10, where: Any = None,
            boost=None) -> list:
     query = build_search_query(graph, near, target=target, k=k, where=where, boost=boost)
     with graph.engine.connect() as connection:
@@ -815,6 +864,22 @@ def search(graph, near, target: str = "nodes", k: int = 10, where: Any = None,
 # ---------------------------------------------------------------------
 # Batch: many queries, one round trip
 # ---------------------------------------------------------------------
+
+def _check_k(k, caller: str) -> None:
+    """k=None means "every row that passes the thresholds".
+
+    Start/Hop have always meant that, and vector_search defaulting to
+    10 while refusing None made one spelling of "give me everything
+    above 0.85" silently return the first ten -- the same Near, the
+    same floor, two different answers depending on which call you
+    reached for. validate_nears() then enforces the other half of the
+    rule everywhere: ranking with neither a limit nor a floor keeps
+    every row, so one of them is required."""
+    if k is None:
+        return
+    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        raise ValueError(f"{caller}: k must be a positive integer or None, got {k!r}")
+
 
 def _as_query_list(queries, caller: str) -> list:
     """queries -> [[Near, ...], ...]: one entry per query, each itself
@@ -827,7 +892,7 @@ def _as_query_list(queries, caller: str) -> list:
     return [list(one) if isinstance(one, (list, tuple)) else [one] for one in queries]
 
 
-def build_search_many_query(graph, queries, target: str = "nodes", k: int = 10,
+def build_search_many_query(graph, queries, target: str = "nodes", k: Optional[int] = 10,
                             where: Any = None, boost=None):
     """The single statement search_many() runs: every query ranked in
     one round trip.
@@ -850,20 +915,19 @@ def build_search_many_query(graph, queries, target: str = "nodes", k: int = 10,
     therefore agree on the SHAPE -- same fields in the same order --
     or they would need different SQL, which one statement cannot be.
     """
-    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
-        raise ValueError(f"k must be a positive integer, got {k!r}")
-    parsed = _as_query_list(queries, "search_many()")
+    _check_k(k, "vector_search_many()")
+    parsed = _as_query_list(queries, "vector_search_many()")
     shapes = {tuple((n.field, n.weight, n.min_similarity, n.missing)
-                    for n in validate_nears(graph, target, one, k, "search_many()"))
+                    for n in validate_nears(graph, target, one, k, "vector_search_many()"))
               for one in parsed}
     if len(shapes) > 1:
         raise ValueError(
-            "search_many() ranks every query with ONE statement, so the queries must share "
+            "vector_search_many() ranks every query with ONE statement, so the queries must share "
             "a shape -- the same fields, in the same order, with the same weights, "
             "min_similarity and missing modes. Only the vectors may differ. Group the "
             "queries by shape and call search_many() once per group"
         )
-    boosts = validate_boosts(boost, "search_many()")
+    boosts = validate_boosts(boost, "vector_search_many()")
     template = parsed[0]
     table = _table(graph, target)
 
@@ -901,20 +965,19 @@ def build_search_many_query(graph, queries, target: str = "nodes", k: int = 10,
         select(*_result_columns(inner, target), inner.c.properties, similarity)
         .where(combined.isnot(None), *_thresholds(inner, template))
         .order_by(similarity.desc(), inner.c._id)
-        .limit(k)
-        .lateral("hits")
     )
+    per_query = (per_query if k is None else per_query.limit(k)).lateral("hits")
     return select(queries_values.c.q.label("q"), *per_query.c).select_from(
         queries_values.join(per_query, literal(True))
     )
 
 
-def search_many(graph, queries, target: str = "nodes", k: int = 10, where: Any = None,
-                boost=None) -> list:
+def search_many(graph, queries, target: str = "nodes", k: Optional[int] = 10,
+                where: Any = None, boost=None) -> list:
     """Results per query, in the order the queries were given -- an
     empty list for a query nothing matched, so index i always answers
     query i."""
-    parsed = _as_query_list(queries, "search_many()")
+    parsed = _as_query_list(queries, "vector_search_many()")
     query = build_search_many_query(graph, queries, target=target, k=k, where=where, boost=boost)
     grouped: dict = {str(i): [] for i in range(len(parsed))}
     with graph.engine.connect() as connection:
@@ -1003,14 +1066,16 @@ def _field_ddl(target: _Target, field: Vector) -> list:
     ]
 
 
-#: pgvector's index methods and the operator class each needs for
-#: cosine. Cosine because that is the metric this library computes --
-#: an exported index that ranked by a different one would answer a
-#: different question than the code it replaces.
-PGVECTOR_INDEXES = {"hnsw": "vector_cosine_ops", "ivfflat": "vector_cosine_ops"}
+#: The one pgvector index this emits, and the operator class it needs.
+#: Cosine because that is the metric this library computes -- an
+#: exported index ranking by a different one would answer a different
+#: question than the code it replaces. HNSW only: IVFFlat's recall
+#: depends on a `lists` value chosen from the table's size, and a
+#: number this function cannot know is a number it should not guess.
+PGVECTOR_INDEXES = {"hnsw": "vector_cosine_ops"}
 
 
-def pgvector_ddl(graph, index: Optional[str] = "hnsw") -> list:
+def pgvector_exit_ddl(graph, index: Optional[str] = "hnsw") -> list:
     """The migration OFF this library's exact search and onto pgvector,
     as SQL you can read before running -- generated without importing,
     requiring, or checking for the extension.
@@ -1048,7 +1113,7 @@ def pgvector_ddl(graph, index: Optional[str] = "hnsw") -> list:
             f"index must be None or one of {sorted(PGVECTOR_INDEXES)}, got {index!r}"
         )
     if graph._vectors is None:
-        raise ValueError("pgvector_ddl() needs vector fields and none are defined -- "
+        raise ValueError("pgvector_exit_ddl() needs vector fields and none are defined -- "
                          "call define_vectors(...) first")
     statements = ["CREATE EXTENSION IF NOT EXISTS vector"]
     for target_name in _TARGETS:
@@ -1069,7 +1134,8 @@ def pgvector_ddl(graph, index: Optional[str] = "hnsw") -> list:
     return statements
 
 
-def stale_vectors(graph, nodes=None, edges=None, limit: Optional[int] = None) -> dict:
+def stale_vectors(graph, node_fields=None, edge_fields=None,
+                  limit: Optional[int] = None) -> dict:
     """Which rows need (re-)embedding, per field:
 
         {"nodes": {"summary": {"missing": ["4"], "wrong_dimensions": ["7"]}},
@@ -1086,10 +1152,14 @@ def stale_vectors(graph, nodes=None, edges=None, limit: Optional[int] = None) ->
     Ids come back as strings, like every other result, so they feed
     straight back into set_vectors(). `limit` caps each field's lists
     for a graph too large to enumerate at once; re-run until empty.
-    Names default to every declared field of each target."""
+    `node_fields`/`edge_fields` name FIELDS (not ids, not rows) and
+    default to every declared field of that target."""
+    if graph._vectors is None:
+        raise ValueError("stale_vectors() needs vector fields and none are defined -- "
+                         "call define_vectors(...) first")
     result: dict = {"nodes": {}, "edges": {}}
-    for target_name, names in (("nodes", nodes), ("edges", edges)):
-        if names is None and nodes is None and edges is None:
+    for target_name, names in (("nodes", node_fields), ("edges", edge_fields)):
+        if names is None and node_fields is None and edge_fields is None:
             names = sorted(_defined(graph, target_name, "stale_vectors()")) \
                 if (graph._vectors or {}).get(target_name) else []
         for name in names or ():
@@ -1117,7 +1187,12 @@ def stale_vectors(graph, nodes=None, edges=None, limit: Optional[int] = None) ->
 
 def vector_ddl(graph) -> list:
     """The exact SQL migrate_vectors() would run, without running it --
-    the same contract as constraint_ddl() and schema_ddl()."""
+    the same contract as constraint_ddl() and schema_ddl(), including
+    refusing an undeclared handle rather than returning an empty list
+    that reads as "nothing to migrate"."""
+    if graph._vectors is None:
+        raise ValueError("vector_ddl() needs vector fields and none are defined -- "
+                         "call define_vectors(...) first")
     statements = []
     for target_name in _TARGETS:
         fields = graph._vectors or {}
@@ -1201,16 +1276,30 @@ def migrate_vectors(graph) -> list:
     return ensured
 
 
-def drop_vectors(graph, nodes=None, edges=None) -> list:
+def drop_vectors(graph, node_fields=None, edge_fields=None) -> list:
     """The inverse of migrate_vectors() for THIS graph: drop each
     field's dimension constraint and NULL its values in this graph's
     rows. The column itself stays -- it is shared by every graph in
     the table, so removing it is a deliberate manual ALTER, not a side
-    effect of one graph cleaning up. Missing fields are ignored, like
-    drop_constraints(). Returns the field names processed."""
+    effect of one graph cleaning up. `node_fields`/`edge_fields` name
+    FIELDS. Missing fields are ignored, like drop_constraints().
+
+    This is the ONE call here that works without define_vectors(): it
+    probes the catalog rather than the registry, because a teardown
+    script or a fresh in_graph() handle legitimately has no
+    declaration for a column that exists. It is also destructive, so
+    that combination is deliberate rather than an oversight -- an
+    undeclared handle can still clear this graph's vectors.
+
+    The DECLARATION survives, deliberately: drop_constraints() does not
+    mutate declarations either, and the recipe migrate_vectors() prints
+    for a dimension change ("drop_vectors(...), then migrate and
+    re-embed") only works if the field is still declared when you get
+    to step two. Returns "table.column" per field, the vocabulary
+    migrate_vectors() returns."""
     dropped = []
     with graph.engine.begin() as connection:
-        for target_name, names in (("nodes", nodes), ("edges", edges)):
+        for target_name, names in (("nodes", node_fields), ("edges", edge_fields)):
             table = _table(graph, target_name)
             target = _target_for(graph, target_name)
             for entry in names or ():
@@ -1229,9 +1318,7 @@ def drop_vectors(graph, nodes=None, edges=None) -> list:
                         .where(graph._scoped(table), column.isnot(None))
                         .values({field.column_name: None})
                     )
-                if graph._vectors:
-                    graph._vectors[target_name].pop(field.name, None)
-                dropped.append(field.name)
+                dropped.append(f"{table.name}.{field.column_name}")
     return dropped
 
 
@@ -1341,14 +1428,16 @@ def set_vectors(graph, nodes=None, edges=None) -> int:
     return total
 
 
-def get_vectors(graph, nodes=None, edges=None, fields=None) -> dict:
+def get_vectors(graph, node_ids=None, edge_ids=None, node_fields=None,
+                edge_fields=None) -> dict:
     """Read stored vectors back, since traversal results never carry
     them. Returns {"nodes": {id: {field: [floats] | None}}, "edges":
     {...}} with string ids, matching every other result. Ids that
-    match no row are simply absent. `fields` narrows which fields are
-    read (for both targets); default is all defined."""
+    match no row are simply absent. `node_fields`/`edge_fields` narrow
+    which fields are read for that target; the default is all defined."""
     result: dict = {"nodes": {}, "edges": {}}
-    for target_name, ids in (("nodes", nodes), ("edges", edges)):
+    for target_name, ids, fields in (("nodes", node_ids, node_fields),
+                                     ("edges", edge_ids, edge_fields)):
         if not ids:
             continue
         defined = _defined(graph, target_name, "get_vectors()")

@@ -13,8 +13,10 @@ Usage:
         [--rows 20000] [--dims 384] [--out bench_vector_results.json]
 
 Numbers recorded during development (Postgres 16, one core, in-repo
-container): ~0.25us per vector element -- 20k x 384-dim unfiltered
-~2.1s, the same search filtered to 25% of rows ~0.6s.
+container): ~0.13us per vector element -- 20k x 384-dim unfiltered
+~1.0s, the same search filtered to 25% of rows ~0.25s, and batching
+8 queries ~1.08x against a loop of single searches. Machine profile
+matters: do not compare these across boxes.
 """
 
 from __future__ import annotations
@@ -77,6 +79,13 @@ def main() -> None:
     results = {"rows": args.rows, "dims": args.dims, "load_seconds": round(load_seconds, 2)}
 
     unfiltered = timed(lambda: graph.vector_search(Near("emb", query), k=10))
+    # The batch claim, measured rather than asserted: search_many buys
+    # round trips, not arithmetic, so this ratio is expected to be
+    # near 1.0 on a local database and to grow with latency.
+    batch_queries = [Near("emb", [random.uniform(-1.0, 1.0) for _ in range(args.dims)])
+                     for _ in range(8)]
+    loop = timed(lambda: [graph.vector_search(one, k=10) for one in batch_queries], repeats=3)
+    batched = timed(lambda: graph.vector_search_many(batch_queries, k=10), repeats=3)
     filtered = timed(lambda: graph.vector_search(Near("emb", query), k=10,
                                                  where={"type": "person"}))
     seeded = timed(lambda: graph.traverse(Start(near=Near("emb", query), k=25),
@@ -86,6 +95,9 @@ def main() -> None:
     results["traverse_seeded_ms"] = round(seeded * 1000, 1)
     # The transferable number: per-element cost of the exact scan.
     results["us_per_element"] = round(unfiltered / (args.rows * args.dims) * 1e6, 3)
+    results["batch_8_loop_ms"] = round(loop * 1000, 1)
+    results["batch_8_many_ms"] = round(batched * 1000, 1)
+    results["batch_8_speedup"] = round(loop / batched, 2)
 
     with engine.begin() as conn:
         conn.execute(text(f"DROP SCHEMA {SCHEMA} CASCADE"))

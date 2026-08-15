@@ -125,7 +125,7 @@ from .json_api import (
 )
 from .models import Edge, Node
 from .schema import EdgeType, GraphSchema, InferenceReport, NodeType, Property, TypeConflict
-from .vectors import Boost, Near, Vector, parse_near
+from .vectors import Boost, Near, Vector, parse_boost, parse_near
 
 # The trailing annotation is load-bearing: release-please updates this
 # file with its GENERIC updater, which rewrites the version only on lines
@@ -145,7 +145,7 @@ __all__ = [
     "aggregate_cypher", "cypher_to_aggregation",
     "Unique", "Required", "Check", "Index", "PropertyType", "Col", "ConstraintViolation",
     "GraphSchema", "NodeType", "EdgeType", "Property", "InferenceReport", "TypeConflict",
-    "Vector", "Near", "Boost", "parse_near", "vector_search_json",
+    "Vector", "Near", "Boost", "parse_near", "parse_boost", "vector_search_json",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",
 ]

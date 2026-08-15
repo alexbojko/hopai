@@ -17,7 +17,8 @@ from sqlalchemy import event, func, text
 from sqlalchemy.dialects import postgresql
 
 from hopai import (
-    AGGREGATE_TOOL_SCHEMA, Count, Graph, Hop, INGEST_TOOL_SCHEMA, Near, Start,
+    AGGREGATE_TOOL_SCHEMA, Count, Graph, Hop, INGEST_TOOL_SCHEMA, Near, Start, aggregate_json,
+    traverse_json,
     TRAVERSE_TOOL_SCHEMA, Vector, parse_near, spec_to_traversal, vector_search_json,
 )
 from hopai import Boost
@@ -196,8 +197,12 @@ class TestVectorDDL:
         with pytest.raises(ValueError, match=r"call define_vectors\(...\) first"):
             offline().migrate_vectors()
 
-    def test_no_declaration_means_no_ddl(self):
-        assert offline().vector_ddl() == []
+    def test_no_declaration_raises_like_its_siblings(self):
+        """An empty list from a DDL previewer reads as "nothing to
+        migrate", not "you forgot to declare" -- and schema_ddl(), the
+        contract this cites, raises."""
+        with pytest.raises(ValueError, match=r"call define_vectors\(...\) first"):
+            offline().vector_ddl()
 
 
 # ---------------------------------------------------------------------
@@ -271,20 +276,19 @@ class TestNearValidation:
             vg.build_query(Start(where=Near("summary", [1.0, 0.0, 0.0])), [])
 
     @pytest.mark.parametrize("factory", [
-        lambda: Start(k=5),
-        lambda: Hop(k=5),
+        lambda: Start(keep=5),
+        lambda: Hop(keep=5),
     ])
     def test_k_without_near_is_rejected(self, factory):
-        """k is 'keep the top k by similarity'; without a Near there is
-        nothing to rank by -- and the message must also head off the
-        obvious misreading of k as the hop count."""
-        with pytest.raises(ValueError, match="k is not the hop count"):
+        """`keep` is 'keep the top N by similarity'; without a Near
+        there is nothing to rank by."""
+        with pytest.raises(ValueError, match="without near= orders nothing"):
             factory()
 
     @pytest.mark.parametrize("bad", [0, -1, "5", True, 2.5])
     def test_k_must_be_a_positive_integer(self, bad):
-        with pytest.raises(ValueError, match="k must be a positive integer"):
-            Start(near=Near("summary", [1.0]), k=bad)
+        with pytest.raises(ValueError, match="keep must be a positive integer"):
+            Start(near=Near("summary", [1.0]), keep=bad)
 
     def test_empty_near_list_is_rejected(self):
         with pytest.raises(ValueError, match=r"near=\[\] is empty"):
@@ -313,7 +317,7 @@ class TestNearValidation:
         chain of five hops must say WHICH one named a field that does
         not exist."""
         with pytest.raises(ValueError, match=r"^hop 1 \(ranked\): no vector field 'body'"):
-            vg.build_query(Start(), [Hop(), Hop(near=Near("body", [1.0]), k=2, label="ranked")])
+            vg.build_query(Start(), [Hop(), Hop(near=Near("body", [1.0]), keep=2, label="ranked")])
 
     def test_dimension_mismatch_names_both_sizes(self, vg):
         with pytest.raises(ValueError, match="has 2 dimensions, the field is defined with 3"):
@@ -321,7 +325,7 @@ class TestNearValidation:
 
     def test_non_near_entries_are_rejected(self, vg):
         with pytest.raises(TypeError, match=r"takes Near\(field, vector\) specs"):
-            vg.build_query(Start(near=[{"field": "summary"}], k=3), [])
+            vg.build_query(Start(near=[{"field": "summary"}], keep=3), [])
 
     def test_invalid_target_is_rejected(self, vg):
         with pytest.raises(ValueError, match="target must be one of"):
@@ -329,7 +333,7 @@ class TestNearValidation:
 
     @pytest.mark.parametrize("bad", [0, -1, True, "10"])
     def test_search_k_must_be_a_positive_integer(self, vg, bad):
-        with pytest.raises(ValueError, match="k must be a positive integer"):
+        with pytest.raises(ValueError, match="k must be a positive integer or None"):
             vg.build_vector_search_query(Near("summary", [1.0, 0.0, 0.0]), k=bad)
 
 
@@ -480,7 +484,7 @@ class TestSearchQueryShape:
 
 class TestTraversalNearShape:
     def test_seed_cte_is_ranked_and_limited(self, vg):
-        sql = norm(vg.build_query(Start(near=Near("summary", [1.0, 0.0, 0.0]), k=4),
+        sql = norm(vg.build_query(Start(near=Near("summary", [1.0, 0.0, 0.0]), keep=4),
                                   [Hop(via={"kind": "x"})]))
         assert "seed AS" in sql
         assert "unnest" in sql and "ORDER BY" in sql and "LIMIT" in sql
@@ -492,13 +496,13 @@ class TestTraversalNearShape:
         walk base, recursive term, match join, edge hydration) must
         hold with a ranked seed too -- similarity must not open a
         cross-graph window."""
-        sql = norm(vg.build_query(Start(near=Near("summary", [1.0, 0.0, 0.0]), k=4),
+        sql = norm(vg.build_query(Start(near=Near("summary", [1.0, 0.0, 0.0]), keep=4),
                                   [Hop()]), literal_binds=True)
         assert sql.count("graph_id = 'default'") == 5
 
     @pytest.mark.parametrize("start,hops", [
-        (Start(near=Near("summary", [1.0, 0.0, 0.0]), k=3), [Hop()]),
-        (Start(), [Hop(near=Near("summary", [1.0, 0.0, 0.0]), k=3)]),
+        (Start(near=Near("summary", [1.0, 0.0, 0.0]), keep=3), [Hop()]),
+        (Start(), [Hop(near=Near("summary", [1.0, 0.0, 0.0]), keep=3)]),
     ])
     def test_ranked_ctes_break_ties_on_the_id(self, vg, start, hops):
         """When more nodes tie on similarity than k keeps, WHICH ones
@@ -516,7 +520,7 @@ class TestTraversalNearShape:
         The reached_i subquery dedupes BEFORE the per-row subquery runs,
         or the most-fanned-in node pays its similarity many times."""
         sql = norm(vg.build_query(Start(), [Hop(near=Near("summary", [1.0, 0.0, 0.0]),
-                                               k=2, hops=(1, 3))]))
+                                               keep=2, hops=(1, 3))]))
         assert "reached_0" in sql
         assert "match_0" in sql and "LIMIT" in sql
 
@@ -540,18 +544,18 @@ class TestTraversalNearShape:
         (and what they reach)' -- and the aggregation path shares
         _walk_matches, so it must accept near the same way."""
         sql = norm(vg.build_aggregate_query(
-            Start(near=Near("summary", [1.0, 0.0, 0.0]), k=7), [Hop()], {"n": Count()}))
+            Start(near=Near("summary", [1.0, 0.0, 0.0]), keep=7), [Hop()], {"n": Count()}))
         assert "LIMIT" in sql
         for cte in ("hop_edges", "all_edges", "edge_rows"):
             assert cte not in sql
 
     def test_optional_and_near_compose_on_the_last_hop(self, vg):
         sql = norm(vg.build_query(
-            Start(), [Hop(), Hop(near=Near("summary", [1.0, 0.0, 0.0]), k=3, optional=True)]))
+            Start(), [Hop(), Hop(near=Near("summary", [1.0, 0.0, 0.0]), keep=3, optional=True)]))
         assert "match_0.node_id" in sql
 
     def test_hop_near_error_names_the_hop_like_optional_does(self, vg):
-        with pytest.raises(ValueError, match=r"hop 1 \(ranked\): near= without k="):
+        with pytest.raises(ValueError, match=r"hop 1 \(ranked\): near= without keep="):
             vg.build_query(Start(), [Hop(), Hop(near=Near("summary", [1.0, 0.0, 0.0]),
                                                label="ranked")])
 
@@ -563,11 +567,11 @@ class TestTraversalNearShape:
         behavioral test because exclude mode also filters via NULL
         propagation; the guard has to be pinned in the SQL itself."""
         exclude = norm(vg.build_query(
-            Start(near=Near("summary", [1.0, 0.0, 0.0]), k=3), [Hop()]))
+            Start(near=Near("summary", [1.0, 0.0, 0.0]), keep=3), [Hop()]))
         assert "vec_summary IS NOT NULL" in exclude
         zero = norm(vg.build_query(
             Start(near=[Near("summary", [1.0, 0.0, 0.0], missing="zero"),
-                        Near("title", [0.0, 1.0, 0.0], missing="zero")], k=3), [Hop()]))
+                        Near("title", [0.0, 1.0, 0.0], missing="zero")], keep=3), [Hop()]))
         assert "vec_summary IS NOT NULL OR" in zero
 
 
@@ -581,15 +585,17 @@ class TestNearJsonPythonEquivalence:
 
     def test_same_traversal_sql(self, vg):
         spec_start, spec_hops = spec_to_traversal({
-            "start": {"near": {"field": "summary", "vector": [1.0, 0.0, 0.0]}, "k": 4},
+            "start": {"near": {"field": "summary", "vector": [1.0, 0.0, 0.0]}, "keep": 4},
             "hops": [{"near": [{"field": "summary", "vector": [0.0, 1.0, 0.0],
-                                "weight": 0.5, "min_similarity": 0.2, "missing": "zero"}],
-                      "k": 2}],
+                                "weight": 0.5, "min_similarity": 0.2},
+                               {"field": "title", "vector": [1.0, 0.0, 0.0],
+                                "missing": "zero"}],
+                      "keep": 2}],
         })
         python = vg.build_query(
-            Start(near=Near("summary", [1.0, 0.0, 0.0]), k=4),
-            [Hop(near=Near("summary", [0.0, 1.0, 0.0], weight=0.5, min_similarity=0.2,
-                           missing="zero"), k=2)])
+            Start(near=Near("summary", [1.0, 0.0, 0.0]), keep=4),
+            [Hop(near=[Near("summary", [0.0, 1.0, 0.0], weight=0.5, min_similarity=0.2),
+                       Near("title", [1.0, 0.0, 0.0], missing="zero")], keep=2)])
         assert norm(vg.build_query(spec_start, spec_hops), literal_binds=True) \
             == norm(python, literal_binds=True)
 
@@ -615,16 +621,79 @@ class TestNearJsonPythonEquivalence:
 
 
 class TestToolSchemasStayVectorFree:
-    def test_no_schema_advertises_an_embedding_parameter(self):
+    @staticmethod
+    def _parameter_names(schema: dict) -> set:
+        found = set()
+
+        def walk(node):
+            if isinstance(node, dict):
+                for name, child in (node.get("properties") or {}).items():
+                    found.add(name)
+                    walk(child)
+                for key in ("items", "additionalProperties"):
+                    walk(node.get(key))
+            elif isinstance(node, list):
+                for child in node:
+                    walk(child)
+
+        walk(schema.get("parameters", schema))
+        return found
+
+    @pytest.mark.parametrize("schema", [TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
+                                        INGEST_TOOL_SCHEMA])
+    def test_no_schema_advertises_a_vector_parameter(self, schema):
         """DELIBERATE asymmetry with the parsers, pinned: a tool-calling
         model asked to fill a "vector" invents plausible floats, and an
         invented embedding finds confidently wrong neighbors. If this
-        fails, someone widened a schema -- vectors.py explains why not."""
-        for schema in (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA):
-            dumped = json.dumps(schema)
-            assert '"near"' not in dumped
-            assert "embedding" not in dumped
-            assert "similarity" not in dumped
+        fails, someone widened a schema -- vectors.py explains why not.
+
+        Asserted on PARAMETER NAMES, not by grepping the serialized
+        schema: the descriptions must stay free to say the tool cannot
+        search by meaning, which is what stops a model guessing
+        property values for a semantic question."""
+        assert not self._parameter_names(schema) & {
+            "near", "keep", "via_near", "via_keep", "boost", "vector", "embedding"}
+
+    def test_descriptions_tell_the_model_what_it_cannot_do(self):
+        """A model holding only the schema sees no hint that meaning-based
+        search exists, so it guesses property values and gets zero rows."""
+        for schema in (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA):
+            assert "EXACT property matches" in schema["description"]
+
+
+class TestJsonFrontEndRefusesInventedVectors:
+    def test_traverse_json_refuses_similarity_keys_by_default(self, vg):
+        """The invariant was advertised and unenforced: this is the call
+        an agent integration wires up, and it happily built a subgraph
+        from invented floats."""
+        spec = {"start": {"where": {"type": "doc"},
+                          "near": {"field": "summary", "vector": [0.1, 0.2, 0.9]},
+                          "keep": 2}}
+        with pytest.raises(ValueError, match="cannot come from a tool call"):
+            traverse_json(vg, spec)
+
+    def test_hop_level_keys_are_refused_too(self, vg):
+        spec = {"start": {"where": {"type": "doc"}},
+                "hops": [{"via_near": {"field": "rel", "vector": [1.0, 0.0, 0.0]},
+                          "via_keep": 1}]}
+        with pytest.raises(ValueError, match=r"\['via_keep', 'via_near'\]"):
+            traverse_json(vg, spec)
+
+    def test_application_code_opts_in(self, fresh_graph):
+        """A caller holding a REAL embedding says so, and it runs."""
+        g = _corpus(fresh_graph)
+        result = traverse_json(g, {
+            "start": {"where": {"type": "doc"},
+                      "near": {"field": "docvec", "vector": QUERY}, "keep": 2},
+            "hops": [{"optional": True}],
+        }, allow_vectors=True)
+        assert {n["id"] for n in result["nodes"]} == {"1", "3"}
+
+    def test_aggregate_json_refuses_the_same_keys(self, vg):
+        with pytest.raises(ValueError, match="cannot come from a tool call"):
+            aggregate_json(vg, {"start": {"near": {"field": "summary",
+                                                   "vector": [1.0, 0.0, 0.0]}, "keep": 1},
+                                "aggregates": {"n": {"fn": "count"}}})
 
 
 # ---------------------------------------------------------------------
@@ -753,7 +822,7 @@ class TestSetGetVectorsLive:
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": 1, "type": "doc"}])
         assert g.set_vectors(nodes=[{"id": 1, "docvec": [0.1, 0.2, 0.3]}]) == 1
-        stored = g.get_vectors(nodes=[1])["nodes"]["1"]
+        stored = g.get_vectors(node_ids=[1])["nodes"]["1"]
         assert stored["docvec"] == pytest.approx([0.1, 0.2, 0.3], abs=1e-6)
         assert stored["titlevec"] is None
 
@@ -763,14 +832,14 @@ class TestSetGetVectorsLive:
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": 7, "type": "doc"}])
         assert g.set_vectors(nodes=[{"id": "7", "docvec": [1.0, 0.0, 0.0]}]) == 1
-        assert "7" in g.get_vectors(nodes=["7"])["nodes"]
+        assert "7" in g.get_vectors(node_ids=["7"])["nodes"]
 
     def test_none_clears_a_vector(self, fresh_graph):
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": 1, "type": "doc"}])
         g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]}])
         g.set_vectors(nodes=[{"id": 1, "docvec": None}])
-        assert g.get_vectors(nodes=[1])["nodes"]["1"]["docvec"] is None
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] is None
 
     def test_edge_vectors_roundtrip(self, fresh_graph):
         g = _migrated(fresh_graph)
@@ -779,7 +848,7 @@ class TestSetGetVectorsLive:
         with g.engine.connect() as conn:
             edge_id = conn.execute(text("SELECT id FROM edges")).scalar()
         assert g.set_vectors(edges=[{"id": edge_id, "relvec": [0.5, 0.5, 0.0]}]) == 1
-        stored = g.get_vectors(edges=[edge_id])["edges"][str(edge_id)]
+        stored = g.get_vectors(edge_ids=[edge_id])["edges"][str(edge_id)]
         assert stored["relvec"] == pytest.approx([0.5, 0.5, 0.0], abs=1e-6)
 
     def test_unknown_field_names_the_defined_ones(self, fresh_graph):
@@ -802,7 +871,7 @@ class TestSetGetVectorsLive:
         with pytest.raises(ValueError, match="no node with id 99.*nothing from this call"):
             g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
                                  {"id": 99, "docvec": [0.0, 1.0, 0.0]}])
-        assert g.get_vectors(nodes=[1])["nodes"]["1"]["docvec"] is None
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] is None
 
     def test_rows_in_another_graph_do_not_count_as_existing(self, fresh_graph):
         """set_vectors is scoped like every write -- updating another
@@ -833,15 +902,15 @@ class TestSetGetVectorsLive:
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": 1}])
         g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]}])
-        only = g.get_vectors(nodes=[1], fields=["docvec"])["nodes"]["1"]
+        only = g.get_vectors(node_ids=[1], node_fields=["docvec"])["nodes"]["1"]
         assert set(only) == {"docvec"}
         with pytest.raises(ValueError, match="no vector field 'nope'"):
-            g.get_vectors(nodes=[1], fields=["nope"])
+            g.get_vectors(node_ids=[1], node_fields=["nope"])
 
     def test_absent_ids_are_simply_absent(self, fresh_graph):
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": 1}])
-        assert g.get_vectors(nodes=[1, 42])["nodes"].keys() == {"1"}
+        assert g.get_vectors(node_ids=[1, 42])["nodes"].keys() == {"1"}
 
     def test_non_numeric_string_ids_pass_through_for_custom_tables(self):
         """The str->int coercion serves the default BIGINT ids; a
@@ -1055,7 +1124,7 @@ class TestVectorSearchLive:
 
 class TestTraversalNearLive:
     def test_similar_seeds_walk_and_dead_ends_still_prune(self, fresh_graph):
-        """Start(near=, k=) seeds the walk with the top-k similar --
+        """Start(near=, keep=) seeds the walk with the top-k similar --
         and a similar seed with no matching edges must STILL vanish
         from the result, because reported nodes derive from edges
         found, never from the seed set."""
@@ -1073,7 +1142,7 @@ class TestTraversalNearLive:
         ])
         g.add_edges([{"start_id": 1, "end_id": 4, "kind": "knows"},
                      {"start_id": 3, "end_id": 4, "kind": "knows"}])
-        result = g.traverse(Start(near=Near("docvec", QUERY), k=2),
+        result = g.traverse(Start(near=Near("docvec", QUERY), keep=2),
                             Hop(via={"kind": "knows"}))
         assert {n["id"] for n in result.nodes} == {"1", "4"}
         assert len(result.edges) == 1
@@ -1089,13 +1158,13 @@ class TestTraversalNearLive:
         g.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"},
                      {"start_id": 1, "end_id": 3, "kind": "knows"}])
         result = g.traverse(Start(where={"seed": True}),
-                            Hop(via={"kind": "knows"}, near=Near("docvec", QUERY), k=1))
+                            Hop(via={"kind": "knows"}, near=Near("docvec", QUERY), keep=1))
         assert {n["id"] for n in result.nodes} == {"1", "2"}
         assert len(result.edges) == 1
 
     def test_aggregate_over_the_k_most_similar(self, fresh_graph):
         g = _corpus(fresh_graph)
-        counted = g.aggregate(Start(near=Near("docvec", QUERY), k=3, where={"type": "doc"}),
+        counted = g.aggregate(Start(near=Near("docvec", QUERY), keep=3, where={"type": "doc"}),
                               aggregates={"n": Count()})
         assert counted == {"n": 3}
 
@@ -1107,8 +1176,8 @@ class TestTraversalNearLive:
 class TestDropVectorsLive:
     def test_drop_nulls_this_graph_and_removes_its_constraint(self, fresh_graph):
         g = _corpus(fresh_graph)
-        dropped = g.drop_vectors(nodes=["docvec"])
-        assert dropped == ["docvec"]
+        dropped = g.drop_vectors(node_fields=["docvec"])
+        assert dropped == ["nodes.vec_docvec"]
         with g.engine.connect() as conn:
             remaining = conn.execute(text(
                 "SELECT count(*) FROM nodes WHERE vec_docvec IS NOT NULL")).scalar()
@@ -1117,7 +1186,10 @@ class TestDropVectorsLive:
                 "WHERE conrelid = CAST('nodes' AS regclass) AND contype = 'c'"))}
         assert remaining == 0
         assert "ck_vec_dims_default_nodes_docvec" not in names
-        assert "docvec" not in g.vectors["nodes"]
+        # The DECLARATION survives: drop_constraints() does not mutate
+        # declarations either, and migrate_vectors()'s dimension-change
+        # recipe ("drop, then migrate") only works if it does not.
+        assert "docvec" in g.vectors["nodes"]
 
     def test_drop_leaves_other_graphs_vectors_alone(self, fresh_graph):
         """The column is shared; dropping a field is a per-graph act.
@@ -1129,12 +1201,12 @@ class TestDropVectorsLive:
         other.migrate_vectors()
         other.add_nodes([{"id": 10, "t": "o"}])
         other.set_vectors(nodes=[{"id": 10, "docvec": [1.0, 0.0, 0.0]}])
-        g.drop_vectors(nodes=["docvec"])
-        kept = other.get_vectors(nodes=[10])["nodes"]["10"]["docvec"]
+        g.drop_vectors(node_fields=["docvec"])
+        kept = other.get_vectors(node_ids=[10])["nodes"]["10"]["docvec"]
         assert kept == pytest.approx([1.0, 0.0, 0.0], abs=1e-6)
 
     def test_drop_of_a_never_migrated_field_is_ignored(self, fresh_graph):
-        assert fresh_graph.drop_vectors(nodes=["ghost"]) == ["ghost"]
+        assert fresh_graph.drop_vectors(node_fields=["ghost"]) == ["nodes.vec_ghost"]
 
     def test_drop_of_an_undeclared_field_alongside_declared_ones(self, fresh_graph):
         """Dropping a name this handle never declared is a no-op, and
@@ -1144,7 +1216,7 @@ class TestDropVectorsLive:
         cleanup at all."""
         g = _migrated(fresh_graph)
         assert set(g.vectors["nodes"]) == {"docvec", "titlevec"}
-        assert g.drop_vectors(nodes=["ghost"]) == ["ghost"]
+        assert g.drop_vectors(node_fields=["ghost"]) == ["nodes.vec_ghost"]
         assert set(g.vectors["nodes"]) == {"docvec", "titlevec"}
 
     def test_drop_works_on_a_handle_that_never_declared_the_field(self, fresh_graph):
@@ -1171,7 +1243,7 @@ class TestDropVectorsLive:
                   Column("end_id", BigInteger), Column("properties", JSONB))
         undeclared = Graph(fresh_graph.engine, node_table=n, edge_table=e)
         assert "vec_docvec" not in undeclared.nodes_tbl.c
-        assert undeclared.drop_vectors(nodes=["docvec"]) == ["docvec"]
+        assert undeclared.drop_vectors(node_fields=["docvec"]) == ["nodes.vec_docvec"]
         with fresh_graph.engine.connect() as conn:
             assert conn.execute(text(
                 "SELECT count(*) FROM nodes WHERE vec_docvec IS NOT NULL")).scalar() == 0
@@ -1326,20 +1398,20 @@ class TestBoost:
     def test_boost_without_near_is_refused(self):
         """Nothing is ranked without near=, so the boost would be a
         silent no-op -- which reads exactly like a working feature."""
-        with pytest.raises(ValueError, match="near= is what creates one"):
+        with pytest.raises(ValueError, match="an edge beam"):
             Start(boost=Boost("score", 1.0))
-        with pytest.raises(ValueError, match="near= is what creates one"):
+        with pytest.raises(ValueError, match="an edge beam"):
             Hop(boost=Boost("score", 1.0))
 
     def test_reprs_are_exact(self):
         assert repr(Boost("score", 0.5)) == "Boost('score', weight=0.5)"
-        assert repr(Boost("score", 1.0, missing=-1.0)) \
-            == "Boost('score', weight=1.0, missing=-1.0)"
+        assert repr(Boost("score", 1.0, default=-1.0)) \
+            == "Boost('score', weight=1.0, default=-1.0)"
 
     def test_json_form_matches_the_python_form(self, vg):
         python = vg.build_vector_search_query(
-            Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.5, missing=-1.0))
-        parsed = parse_boost({"property": "score", "weight": 0.5, "missing": -1.0})
+            Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.5, default=-1.0))
+        parsed = parse_boost({"property": "score", "weight": 0.5, "default": -1.0})
         assert norm(vg.build_vector_search_query(Near("summary", [1.0, 0.0, 0.0]), boost=parsed),
                     literal_binds=True) == norm(python, literal_binds=True)
 
@@ -1379,7 +1451,7 @@ class TestBoostLive:
         g.add_nodes([{"id": 1, "score": "high"}, {"id": 2, "score": 0.5}])
         g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
                              {"id": 2, "docvec": [1.0, 0.0, 0.0]}])
-        hits = g.vector_search(Near("docvec", QUERY), boost=Boost("score", 1.0, missing=0.0), k=10)
+        hits = g.vector_search(Near("docvec", QUERY), boost=Boost("score", 1.0, default=0.0), k=10)
         assert [h["id"] for h in hits] == ["2", "1"]
         assert hits[1]["similarity"] == pytest.approx(1.0, abs=1e-6)
 
@@ -1390,7 +1462,7 @@ class TestBoostLive:
                              {"id": 2, "docvec": [0.0, 1.0, 0.0]}])
         g.add_edges([{"start_id": 1, "end_id": 3, "kind": "k"},
                      {"start_id": 2, "end_id": 3, "kind": "k"}])
-        result = g.traverse(Start(near=Near("docvec", QUERY), k=1,
+        result = g.traverse(Start(near=Near("docvec", QUERY), keep=1,
                                   boost=Boost("score", 1.0)), Hop(via={"kind": "k"}))
         # Node 2 loses on similarity and wins on the boost.
         assert {n["id"] for n in result.nodes} == {"2", "3"}
@@ -1403,7 +1475,7 @@ class TestBoostLive:
 class TestEdgeBeamShape:
     def test_beam_is_a_lateral_in_both_walk_terms(self, vg):
         sql = norm(vg.build_query(Start(), [Hop(via_near=Near("rel", [1.0, 0.0, 0.0]),
-                                                via_k=2, hops=(1, 3))]))
+                                                via_keep=2, hops=(1, 3))]))
         assert "beam_0" in sql and "beam_rec_0" in sql
         assert sql.count("JOIN LATERAL") >= 2
 
@@ -1412,7 +1484,7 @@ class TestEdgeBeamShape:
         path would follow fewer than via_k usable edges, and how many
         fewer is invisible from outside the query."""
         sql = norm(vg.build_query(Start(), [Hop(via_near=Near("rel", [1.0, 0.0, 0.0]),
-                                                via_k=2, hops=(1, 3))]))
+                                                via_keep=2, hops=(1, 3))]))
         beam = sql[sql.index("UNION ALL"):sql.index("AS beam_rec_0")]
         assert "local_path" in beam, beam
         # Before the LIMIT, which is what "inside the beam" means: the
@@ -1430,11 +1502,11 @@ class TestEdgeBeamShape:
         """`summary` is a node field; naming it in via_near is the
         mistake most worth catching by name."""
         with pytest.raises(ValueError, match=r"no vector field 'summary'.*edges"):
-            vg.build_query(Start(), [Hop(via_near=Near("summary", [1.0, 0.0, 0.0]), via_k=1)])
+            vg.build_query(Start(), [Hop(via_near=Near("summary", [1.0, 0.0, 0.0]), via_keep=1)])
 
     def test_via_k_without_via_near_is_rejected(self):
-        with pytest.raises(ValueError, match="via_k is not the hop count"):
-            Hop(via_k=3)
+        with pytest.raises(ValueError, match="without via_near= orders nothing"):
+            Hop(via_keep=3)
 
     def test_via_near_error_names_the_hop(self, vg):
         with pytest.raises(ValueError, match=r"hop 1 \(ranked\) via_near"):
@@ -1442,8 +1514,8 @@ class TestEdgeBeamShape:
                                                 label="ranked")])
 
     def test_node_and_edge_ranking_compose_on_one_hop(self, vg):
-        sql = norm(vg.build_query(Start(), [Hop(via_near=Near("rel", [1.0, 0.0, 0.0]), via_k=2,
-                                                near=Near("summary", [1.0, 0.0, 0.0]), k=3)]))
+        sql = norm(vg.build_query(Start(), [Hop(via_near=Near("rel", [1.0, 0.0, 0.0]), via_keep=2,
+                                                near=Near("summary", [1.0, 0.0, 0.0]), keep=3)]))
         assert "beam_0" in sql and "reached_0" in sql and "match_0" in sql
 
 
@@ -1468,7 +1540,7 @@ class TestEdgeBeamLive:
     def test_via_k_follows_only_the_most_similar_edge(self, fresh_graph):
         g = self._fixture(fresh_graph)
         result = g.traverse(Start(where={"seed": True}),
-                            Hop(via_near=Near("relvec", QUERY), via_k=1))
+                            Hop(via_near=Near("relvec", QUERY), via_keep=1))
         assert {n["id"] for n in result.nodes} == {"1", "2"}
         assert len(result.edges) == 1
         assert result.edges[0]["properties"]["kind"] == "aligned"
@@ -1491,7 +1563,7 @@ class TestEdgeBeamLive:
         ids = self._edges(g)
         g.set_vectors(edges=[{"id": ids["second"], "relvec": [0.9, 0.1, 0.0]}])
         result = g.traverse(Start(where={"seed": True}),
-                            Hop(via_near=Near("relvec", QUERY), via_k=1))
+                            Hop(via_near=Near("relvec", QUERY), via_keep=1))
         assert {n["id"] for n in result.nodes} == {"1", "2", "4", "5"}
         assert len(result.edges) == 2
 
@@ -1514,7 +1586,7 @@ class TestEdgeBeamLive:
         g.set_vectors(edges=[{"id": ids["a"], "relvec": [1.0, 0.0, 0.0]},
                              {"id": ids["b"], "relvec": [1.0, 0.0, 0.0]}])
         result = g.traverse(Start(where={"seed": True}),
-                            Hop(via_near=Near("relvec", QUERY), via_k=2, hops=(2, 2)))
+                            Hop(via_near=Near("relvec", QUERY), via_keep=2, hops=(2, 2)))
         assert {n["id"] for n in result.nodes} == {"1", "2", "3"}
         assert len(result.edges) == 2
 
@@ -1538,21 +1610,21 @@ class TestStaleVectorsLive:
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": 1}, {"id": 2}, {"id": 3}])
         g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]}])
-        stale = g.stale_vectors(nodes=["docvec"])["nodes"]["docvec"]
+        stale = g.stale_vectors(node_fields=["docvec"])["nodes"]["docvec"]
         assert stale == {"missing": ["2", "3"], "wrong_dimensions": []}
 
         # Redefine wider without re-migrating: node 1's stored vector no
         # longer fits, which is exactly the window this call closes.
         g.define_vectors(nodes=[Vector("docvec", 6)])
-        stale = g.stale_vectors(nodes=["docvec"])["nodes"]["docvec"]
+        stale = g.stale_vectors(node_fields=["docvec"])["nodes"]["docvec"]
         assert stale == {"missing": ["2", "3"], "wrong_dimensions": ["1"]}
 
     def test_ids_feed_straight_back_into_set_vectors(self, fresh_graph):
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": 1}, {"id": 2}])
-        for node_id in g.stale_vectors(nodes=["docvec"])["nodes"]["docvec"]["missing"]:
+        for node_id in g.stale_vectors(node_fields=["docvec"])["nodes"]["docvec"]["missing"]:
             g.set_vectors(nodes=[{"id": node_id, "docvec": [1.0, 0.0, 0.0]}])
-        assert g.stale_vectors(nodes=["docvec"])["nodes"]["docvec"]["missing"] == []
+        assert g.stale_vectors(node_fields=["docvec"])["nodes"]["docvec"]["missing"] == []
 
     def test_defaults_to_every_declared_field_and_is_graph_scoped(self, fresh_graph):
         g = _migrated(fresh_graph)
@@ -1567,17 +1639,17 @@ class TestStaleVectorsLive:
     def test_limit_caps_each_field(self, fresh_graph):
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": i} for i in range(1, 6)])
-        assert len(g.stale_vectors(nodes=["docvec"], limit=2)["nodes"]["docvec"]["missing"]) == 2
+        assert len(g.stale_vectors(node_fields=["docvec"], limit=2)["nodes"]["docvec"]["missing"]) == 2
 
     def test_unknown_field_names_the_defined_ones(self, fresh_graph):
         g = _migrated(fresh_graph)
         with pytest.raises(ValueError, match="no vector field 'ghost'"):
-            g.stale_vectors(nodes=["ghost"])
+            g.stale_vectors(node_fields=["ghost"])
 
 
 class TestPgvectorDdl:
     def test_emits_extension_conversion_and_index(self, vg):
-        ddl = vg.pgvector_ddl()
+        ddl = vg.pgvector_exit_ddl()
         assert ddl[0] == "CREATE EXTENSION IF NOT EXISTS vector"
         joined = "\n".join(ddl)
         assert 'TYPE vector(3) USING "vec_summary"::vector(3)' in joined
@@ -1590,24 +1662,24 @@ class TestPgvectorDdl:
     def test_cosine_operator_class_matches_the_metric_this_library_computes(self, vg):
         """An exported index ranking by L2 would answer a different
         question than the code it replaces."""
-        assert all("vector_cosine_ops" in s for s in vg.pgvector_ddl() if "CREATE INDEX" in s)
+        assert all("vector_cosine_ops" in s for s in vg.pgvector_exit_ddl() if "CREATE INDEX" in s)
 
     def test_index_none_emits_conversion_only(self, vg):
-        assert not any("CREATE INDEX" in s for s in vg.pgvector_ddl(index=None))
+        assert not any("CREATE INDEX" in s for s in vg.pgvector_exit_ddl(index=None))
 
     @pytest.mark.parametrize("bad", ["hnsw2", "gist", "", 3])
     def test_unknown_index_method_is_refused(self, vg, bad):
         with pytest.raises(ValueError, match="index must be None or one of"):
-            vg.pgvector_ddl(index=bad)
+            vg.pgvector_exit_ddl(index=bad)
 
     def test_needs_a_declaration(self):
         with pytest.raises(ValueError, match=r"call define_vectors\(...\) first"):
-            offline().pgvector_ddl()
+            offline().pgvector_exit_ddl()
 
     def test_generates_without_importing_pgvector(self, vg):
         """The whole point: hopai never depends on the extension, even
         to describe the migration off itself."""
         import sys
         assert "pgvector" not in sys.modules
-        vg.pgvector_ddl()
+        vg.pgvector_exit_ddl()
         assert "pgvector" not in sys.modules

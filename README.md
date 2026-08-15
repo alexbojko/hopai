@@ -491,7 +491,8 @@ nothing extra:
 ```python
 from hopai import Vector, Near
 
-graph.define_vectors(nodes=[Vector("summary", 1536), Vector("title", 384)])
+graph.define_vectors(nodes=[Vector("summary", 1536), Vector("title", 384)],
+                     edges=[Vector("relation", 384)])
 graph.migrate_vectors()      # ALTER TABLE, idempotent; vector_ddl() previews it
 
 graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
@@ -506,8 +507,8 @@ column, dimension-checked by the server **per graph**, so two graphs
 sharing the tables can give the same field different dimensionality.
 
 Several fields can rank one query together (multivector search), each
-with a weight, an optional per-field floor, and a say over rows missing
-its vector:
+with a weight, an optional `min_similarity` floor, and a say over rows
+missing its vector:
 
 ```python
 graph.vector_search(
@@ -523,14 +524,18 @@ follow only the most similar **edges** out of each node:
 
 ```python
 graph.traverse(
-    Start(near=Near("summary", query_embedding), k=25),   # 25 nearest seeds
+    Start(near=Near("summary", query_embedding), keep=25),  # 25 nearest seeds
     Hop(via={"kind": "cites"}, hops=(1, 3)),
 )
-graph.traverse(                                  # a beam over edges
+graph.traverse(                                     # keep the nearest reached
     Start(where={"type": "paper"}),
-    Hop(via_near=Near("relation", q), via_k=3),  # 3 most similar edges per node
+    Hop(via={"kind": "cites"}, near=Near("summary", q), keep=10),
 )
-graph.aggregate(Start(near=Near("summary", q), k=100),
+graph.traverse(                                     # a beam over edges
+    Start(where={"type": "paper"}),
+    Hop(via_near=Near("relation", q), via_keep=3),  # 3 nearest edges per node
+)
+graph.aggregate(Start(near=Near("summary", q), keep=100),
                 aggregates={"avg_score": Avg("score")})
 ```
 
@@ -548,8 +553,10 @@ saving is `N-1` network round trips, which is the real cost when
 Postgres isn't on localhost.
 
 **Hybrid ranking.** A numeric property can contribute to the score
-alongside similarity — `Boost` reorders results without changing which
-ones qualify:
+alongside similarity. A boost cannot push a row past a
+`min_similarity` floor — but it does reorder, so with `k` it changes
+which rows come back, and each result's `similarity` is then the
+combined score, no longer a cosine in `[-1, 1]`:
 
 ```python
 graph.vector_search(Near("summary", q), boost=Boost("importance", 0.2), k=10)
@@ -558,6 +565,13 @@ graph.vector_search(Near("summary", q), boost=Boost("importance", 0.2), k=10)
 Store the property already scaled to roughly `[0, 1]`: a cosine lives in
 `[-1, 1]`, so a raw view count wouldn't boost the ranking, it would
 replace it — and hopai won't guess a normalization on your behalf.
+
+Two things worth knowing about the traversal forms. A traversal returns
+a **subgraph, not a ranking** — the scores and their order don't survive
+into the result, so use `vector_search()` when you need them. And with
+no hops, `Start(near=…, keep=N)` selects exactly what `vector_search()
+` would, minus the score: `near=` on `Start` earns its place because a
+traversal cannot be seeded from a list of ids.
 
 **Re-embedding and the exit door.** `stale_vectors()` lists the rows
 with no vector or a vector the current declaration no longer fits (the
@@ -570,7 +584,7 @@ the extension:
 for node_id in graph.stale_vectors()["nodes"]["summary"]["missing"]:
     graph.set_vectors(nodes=[{"id": node_id, "summary": embed(text_for(node_id))}])
 
-print("\n".join(graph.pgvector_ddl()))   # one-way; read vectors.py first
+print("\n".join(graph.pgvector_exit_ddl()))   # one-way; read vectors.py first
 ```
 
 Two honest limits, both documented in depth in `hopai/vectors.py`: the
