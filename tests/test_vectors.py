@@ -1337,6 +1337,18 @@ class TestSearchManyShape:
                    literal_binds=True)
         assert "graph_id = 'default'" in sql
 
+    def test_rows_without_a_vector_are_filtered_before_the_cosine(self, vg):
+        """The single-query path has this guard pinned; the batch path
+        did not, and dropping it changes no ANSWER -- the outer
+        `similarity IS NOT NULL` removes those rows anyway. It changes
+        the COST: without it the unnest+sum LATERAL runs once per query
+        for every row that cannot score. A behaviour test structurally
+        cannot see that, which is why this is a shape test."""
+        sql = norm(vg.build_vector_search_many_query([Near("summary", [1.0, 0.0, 0.0])], k=1))
+        pre_filter, _, post_filter = sql.partition(") AS anon_1")
+        assert "vec_summary IS NOT NULL" in pre_filter
+        assert "similarity IS NOT NULL" in post_filter or "sim_0 IS NOT NULL" in post_filter
+
     def test_mismatched_query_shapes_are_refused(self, vg):
         """One statement can only express one shape. Ranking the second
         query with the first one's weights would answer a question
@@ -1427,6 +1439,22 @@ class TestBoost:
     def test_boost_weight_must_be_a_non_zero_finite_number(self, bad):
         with pytest.raises(ValueError, match="finite number|non-zero"):
             Boost("score", bad)
+
+    def test_the_finite_number_message_names_which_argument(self):
+        """`weight` and `default` share one validation loop, so the only
+        thing separating "you passed a bad weight" from "you passed a
+        bad default" is the label -- which was mutable with the suite
+        green. It matters here more than usual: `default` is the
+        argument that got renamed from `missing`, so a caller reading
+        this message is often checking exactly that."""
+        with pytest.raises(ValueError, match=r"^Boost weight must be a finite number"):
+            Boost("score", float("inf"))
+        with pytest.raises(ValueError, match=r"^Boost default must be a finite number"):
+            Boost("score", 1.0, default=float("nan"))
+
+    def test_the_zero_weight_message_names_the_type(self):
+        with pytest.raises(ValueError, match=r"^Boost weight must be non-zero"):
+            Boost("score", 0)
 
     @pytest.mark.parametrize("bad", [None, 42, b"x", ""])
     def test_boost_key_must_be_a_property_or_callable(self, bad):
@@ -1836,6 +1864,32 @@ class TestVectorCallerNamesArePinned:
         with pytest.raises(ValueError, match=rf"^{re.escape(caller)}: \['keep', 'near'\]"):
             run(vg, spec)
 
+    @pytest.mark.parametrize("caller,run", [
+        ("vector_ddl()", lambda g: g.vector_ddl()),
+        ("pgvector_exit_ddl()", lambda g: g.pgvector_exit_ddl()),
+        ("migrate_vectors()", lambda g: g.migrate_vectors()),
+        ("stale_vectors()", lambda g: g.stale_vectors()),
+    ])
+    def test_undeclared_handle_refusals_name_the_call(self, caller, run):
+        """Four calls share one sentence about calling define_vectors()
+        first, and only the caller half tells you which of them you
+        reached. Asserting the shared tail leaves every one of these
+        names free to be anything."""
+        with pytest.raises(ValueError, match=rf"^{re.escape(caller)} needs vector fields"):
+            run(offline())
+
+    @pytest.mark.parametrize("caller,run", [
+        ("vector_search()", lambda g: g.build_vector_search_query(
+            Near("summary", [1.0, 0.0, 0.0]), k=0)),
+        ("vector_search_many()", lambda g: g.build_vector_search_many_query(
+            [Near("summary", [1.0, 0.0, 0.0])], k=0)),
+    ])
+    def test_bad_k_names_the_call(self, vg, caller, run):
+        """`k` is spelled the same on both, so "k must be a positive
+        integer" alone does not say which call to go fix."""
+        with pytest.raises(ValueError, match=rf"^{re.escape(caller)}: k must be"):
+            run(vg)
+
 
 class TestBuilderDelegation:
     """The Graph methods are thin wrappers, and nothing exercised their
@@ -1861,3 +1915,13 @@ class TestBuilderDelegation:
     def test_pgvector_index_default_is_hnsw(self, vg):
         """The default is the whole choice this function makes."""
         assert any("USING hnsw" in s for s in vg.pgvector_exit_ddl())
+
+    @pytest.mark.parametrize("build", [
+        lambda g: g.build_vector_search_query(Near("summary", [1.0, 0.0, 0.0])),
+        lambda g: g.build_vector_search_many_query([Near("summary", [1.0, 0.0, 0.0])]),
+    ])
+    def test_the_default_k_is_ten(self, vg, build):
+        """Every test passed `k` explicitly, so the default both
+        builders document could be any number at all. It is a promise
+        the README and both docstrings make."""
+        assert "LIMIT 10" in norm(build(vg), literal_binds=True)
