@@ -1160,3 +1160,257 @@ class TestTier2Enforcement:
         fresh_graph.add_nodes([{"type": "ticket", "location": {"lat": "not-a-number"}}])
         with pytest.raises(ConstraintViolation):
             fresh_graph.add_nodes([{"type": "ticket", "location": 5}])
+
+
+# ---------------------------------------------------------------------
+# Inference sampling -- TABLESAMPLE, against real PostgreSQL
+# ---------------------------------------------------------------------
+
+class TestInferenceSampling:
+    def test_full_sample_equals_the_exact_scan(self, fresh_graph):
+        """TABLESAMPLE SYSTEM (100) reads every page, so sampling at
+        100 must reproduce the exact pipeline's output -- proving the
+        sampled path changes WHERE rows come from, never what is done
+        with them (a phantom skipped-endpoint edge here would mean the
+        node side got sampled too)."""
+        seed_chaotic(fresh_graph)
+        exact_schema, exact = fresh_graph.infer_schema()
+        sampled_schema, sampled = fresh_graph.infer_schema(sample_percent=100)
+        assert as_shape(sampled_schema) == as_shape(exact_schema)
+        assert sampled.node_counts == exact.node_counts
+        assert sampled.edge_counts == exact.edge_counts
+        assert sampled.untyped_nodes == exact.untyped_nodes
+        assert sampled.untyped_edges == exact.untyped_edges
+        assert sampled.skipped_endpoint_edges == exact.skipped_endpoint_edges
+
+    def test_report_says_estimates_only_when_sampling(self, fresh_graph):
+        """The epistemics flag: an exact run must NOT carry it (or every
+        report would cry wolf), a sampled run must lead with it --
+        estimated counts read as truth are how a tentative `required`
+        gets enforced."""
+        seed_chaotic(fresh_graph)
+        _, exact = fresh_graph.infer_schema()
+        assert exact.sampled is None
+        assert "estimates" not in str(exact)
+        _, sampled = fresh_graph.infer_schema(sample_percent=100)
+        assert sampled.sampled == 100
+        assert str(sampled).startswith(
+            "sampled 100% of rows -- counts are estimates\n")
+
+    def test_partial_sample_still_returns_a_valid_schema(self, fresh_graph):
+        """SYSTEM sampling is page-level, so on a tiny table a 5% run
+        may see all rows or none -- the contract is only that the flag
+        propagates and the result is a well-formed (schema, report)
+        pair, whatever the sample contained."""
+        seed_chaotic(fresh_graph)
+        schema, report = fresh_graph.infer_schema(sample_percent=5)
+        assert isinstance(schema, GraphSchema)
+        assert report.sampled == 5
+
+    def test_out_of_range_percent_is_refused_offline(self, offgraph):
+        """Validation names the range and runs BEFORE anything connects
+        -- TABLESAMPLE with a bad percentage would otherwise surface as
+        a server error naming no parameter."""
+        for bad in (0, -5, 100.5):
+            with pytest.raises(ValueError, match=r"0 < sample_percent <= 100"):
+                offgraph.infer_schema(sample_percent=bad)
+
+
+# ---------------------------------------------------------------------
+# Persistence -- save_schema()/load_schema(), against real PostgreSQL
+# ---------------------------------------------------------------------
+
+class TestSchemaPersistence:
+    def test_save_then_load_on_a_second_handle(self, fresh_graph):
+        """The feature's point: a second process loads the contract
+        instead of re-declaring it -- equal schema, ADOPTED on the
+        handle, and enforce_schema() works from the loaded copy."""
+        declared = primitive_schema(fresh_graph)
+        fresh_graph.save_schema()
+        other = Graph(fresh_graph.engine)
+        assert other.schema is None
+        loaded = other.load_schema()
+        assert loaded == declared
+        assert other.schema == declared      # adopted, not just returned
+        other.enforce_schema()
+        with pytest.raises(ConstraintViolation):
+            other.add_nodes([{"id": 1, "type": "person", "nickname": "no-email"}])
+
+    def test_round_trip_is_exact_including_every_flag(self, fresh_graph):
+        """Lossless means every flag: unique, allowed values, formats,
+        nested object schemas and multi-type sets must all survive the
+        database round trip -- a dropped flag would quietly weaken the
+        enforce_schema() another process runs from the loaded copy."""
+        declared = fresh_graph.define_schema(
+            nodes=[NodeType("ticket", properties=[
+                Property("code", "string", required=True, unique=True),
+                Property("status", "string", values=("open", "closed")),
+                Property("opened", "string", format="date-time"),
+                Property("age", ("null", "number")),
+                Property("location", ("null", "object"), properties=[
+                    Property("lat", "number", required=True),
+                    Property("lon", "number", required=True)])])],
+            edges=[EdgeType("blocks", source="ticket", target="ticket",
+                            properties=[Property("hard", "boolean", required=True)])],
+        )
+        fresh_graph.save_schema()
+        assert Graph(fresh_graph.engine).load_schema() == declared
+
+    def test_graphs_persist_independently(self, fresh_graph):
+        """One row per graph_id: graph A's save must never become graph
+        B's contract -- the _scoped() discipline applied to metadata."""
+        primitive_schema(fresh_graph)
+        fresh_graph.save_schema()
+        elsewhere = fresh_graph.in_graph("elsewhere")
+        elsewhere.define_schema(nodes=[NodeType("robot")])
+        elsewhere.save_schema()
+        loaded = Graph(fresh_graph.engine).load_schema()
+        assert {nt.name for nt in loaded.node_types} == {"person", "company"}
+        loaded_elsewhere = Graph(fresh_graph.engine).in_graph("elsewhere").load_schema()
+        assert {nt.name for nt in loaded_elsewhere.node_types} == {"robot"}
+
+    def test_load_without_save_names_both_fixes(self, fresh_graph):
+        """No table yet (nobody ever persisted) and the error must name
+        save_schema() AND define_schema -- the two ways out."""
+        with pytest.raises(ValueError) as exc:
+            fresh_graph.load_schema()
+        assert "no saved schema for graph 'default'" in str(exc.value)
+        assert "save_schema()" in str(exc.value)
+        assert "define_schema(" in str(exc.value)
+        assert fresh_graph.schema is None
+
+    def test_load_missing_row_when_the_table_exists(self, fresh_graph):
+        """Same error when SOME graph saved but this one did not --
+        another graph's contract must never be handed over as a
+        fallback."""
+        primitive_schema(fresh_graph)
+        fresh_graph.save_schema()
+        with pytest.raises(ValueError, match="no saved schema for graph 'elsewhere'"):
+            fresh_graph.in_graph("elsewhere").load_schema()
+
+    def test_resave_replaces_the_row(self, fresh_graph):
+        """Upsert proven: one row per graph after a re-save, carrying
+        the NEW schema and a newer saved_at -- an INSERT-only
+        implementation would either fail or leave a stale contract for
+        load_schema() to pick nondeterministically."""
+        primitive_schema(fresh_graph)
+        fresh_graph.save_schema()
+        with fresh_graph.engine.connect() as conn:
+            first = conn.execute(text('SELECT saved_at FROM "hopai_schema"')).scalar()
+        fresh_graph.define_schema(nodes=[NodeType("only")])
+        fresh_graph.save_schema()
+        loaded = Graph(fresh_graph.engine).load_schema()
+        assert {nt.name for nt in loaded.node_types} == {"only"}
+        with fresh_graph.engine.connect() as conn:
+            rows = conn.execute(text('SELECT saved_at FROM "hopai_schema"')).all()
+        assert len(rows) == 1
+        assert rows[0][0] > first
+
+    def test_corrupted_document_fails_loudly_and_adopts_nothing(self, fresh_graph):
+        """The trust boundary: the stored row is data, so a
+        hand-corrupted document must raise the real validation error and
+        leave the handle schema-less -- a half-loaded schema would
+        enforce a contract nobody wrote."""
+        primitive_schema(fresh_graph)
+        fresh_graph.save_schema()
+        corruptions = [
+            ('\'{"nodes": {"person": {"type": "object", '
+             '"properties": {"email": "corrupted"}}}, "edges": []}\'',
+             r"expected a spec object with a 'type'"),
+            ("'[1, 2]'", "not a hopai schema document"),
+            ('\'{"nodes": {}, "edges": [{"kind": "works_at", '
+             '"source": "ghost", "target": "ghost"}]}\'',
+             "not a defined node type"),
+        ]
+        for document, complaint in corruptions:
+            with fresh_graph.engine.begin() as conn:
+                conn.execute(text(
+                    f'UPDATE "hopai_schema" SET document = CAST({document} AS json)'))
+            other = Graph(fresh_graph.engine)
+            with pytest.raises(ValueError, match=complaint):
+                other.load_schema()
+            assert other.schema is None
+
+    def test_never_persisting_never_creates_the_table(self, fresh_graph):
+        """hopai_schema is metadata for those who opt in: declare,
+        enforce and write all you like -- the table must not exist until
+        the first save_schema()."""
+        primitive_schema(fresh_graph)
+        fresh_graph.enforce_schema()
+        fresh_graph.add_nodes([{"id": 1, "type": "person", "email": "a@x.com"}])
+        with fresh_graph.engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT to_regclass('hopai_schema')")).scalar() is None
+
+    def test_save_without_schema_refuses_offline(self, offgraph):
+        """The accessor contract: no declared schema means the refusal
+        names define_schema -- and it happens before any connection, so
+        the dead DSN proves nothing was touched."""
+        with pytest.raises(ValueError, match=r"save_schema\(\) needs a schema"):
+            offgraph.save_schema()
+
+
+# ---------------------------------------------------------------------
+# Mermaid -- no database, like the other representations
+# ---------------------------------------------------------------------
+
+class TestSchemaMermaid:
+    def test_flowchart_with_property_bags_and_labeled_arrows(self, offgraph):
+        """The canonical shape: one node per type labeled with the
+        bounded property bag (* required, same markers as
+        tool_summary), one arrow per (kind, source, target) triple."""
+        primitive_schema(offgraph)
+        lines = offgraph.schema_mermaid.split("\n")
+        assert lines[0] == "flowchart LR"
+        assert '    person["person (email*, nickname, age)"]' in lines
+        assert '    company["company (name*)"]' in lines
+        assert "    person -- works_at --> company" in lines
+
+    def test_parallel_endpoint_pairs_stay_parallel_arrows(self, offgraph):
+        """One kind across two endpoint pairs is two arrows -- the same
+        no-silent-collapse rule to_networkx() enforces with
+        MultiDiGraph."""
+        offgraph.define_schema(
+            nodes=[NodeType("person"), NodeType("company")],
+            edges=[EdgeType("likes", source="person", target="person"),
+                   EdgeType("likes", source="person", target="company")])
+        diagram = offgraph.schema_mermaid
+        assert "person -- likes --> person" in diagram
+        assert "person -- likes --> company" in diagram
+
+    def test_names_needing_sanitization_keep_identity_in_the_label(self, offgraph):
+        """works-at and works_at slug to the same Mermaid id: the ids
+        must stay distinct (or the diagram merges two types) while each
+        label keeps the real name; a kind with a space needs the quoted
+        edge-label form to stay parseable."""
+        offgraph.define_schema(
+            nodes=[NodeType("works-at"), NodeType("works_at")],
+            edges=[EdgeType("has space", source="works-at", target="works_at")])
+        diagram = offgraph.schema_mermaid
+        assert 'works_at["works-at"]' in diagram
+        assert 'works_at_1["works_at"]' in diagram
+        assert '    works_at -- "has space" --> works_at_1' in diagram
+
+    def test_quotes_in_names_cannot_break_the_label(self, offgraph):
+        """'\"' is the one character that terminates a Mermaid label
+        early; unescaped it would truncate the diagram at the first
+        quoted name."""
+        offgraph.define_schema(nodes=[NodeType('a"b')])
+        diagram = offgraph.schema_mermaid
+        assert '["a#quot;b"]' in diagram
+        assert 'a"b' not in diagram
+
+    def test_wide_types_cap_with_n_more(self, offgraph):
+        """Bounded like tool_summary: a 15-property type shows 12 and
+        says +3 more -- a diagram node the width of the screen is not a
+        picture anymore."""
+        offgraph.define_schema(nodes=[NodeType("wide", properties=[
+            Property(f"p{i:02d}", "string") for i in range(15)])])
+        diagram = offgraph.schema_mermaid
+        assert "+3 more" in diagram
+        assert "p11" in diagram and "p12" not in diagram
+
+    def test_undefined_schema_raises_naming_the_fix(self, offgraph):
+        """The accessor contract shared by every representation."""
+        with pytest.raises(ValueError, match=r"schema_mermaid needs a schema"):
+            _ = offgraph.schema_mermaid

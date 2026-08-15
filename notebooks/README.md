@@ -11,7 +11,7 @@ there — and they run, so nothing in them can quietly stop being true.
 | [03 · Aggregation](03_aggregation.ipynb) | `count`/`sum`/`avg`/`min`/`max` in the database, what they run over, and the empty and non-numeric cases |
 | [04 · JSON and Cypher](04_json_and_cypher.ipynb) | The same question in three notations, the LLM tool schemas, Cypher reads and writes, every refusal with its rewrite, and refusing vocabulary the schema does not declare |
 | [05 · Constraints](05_constraints.ipynb) | Unique, composite, partial, existence, type and CHECK constraints on JSONB properties |
-| [06 · Graph schema](06_graph_schema.ipynb) | Declaring the shape as dataclasses, value sets and formats and per-type uniqueness, enforcing it all in Postgres, or inferring it from data that came first |
+| [06 · Graph schema](06_graph_schema.ipynb) | Declaring the shape as dataclasses, reading it back as JSON Schema or a Mermaid diagram, value sets and formats and per-type uniqueness, enforcing it all in Postgres, inferring it (whole or sampled) from data that came first, and persisting it for other processes to load |
 | [07 · Many graphs](07_many_graphs.ipynb) | Thousands of isolated graphs in one pair of tables, and what keeps them apart |
 | [08 · Under the hood](08_under_the_hood.ipynb) | The emitted SQL read with no database, then `EXPLAIN ANALYZE` with one |
 | [09 · Vector search](09_vector_search.ipynb) | Exact cosine similarity on nodes and edges, multivector and hybrid ranking, similarity as a traversal seed and as an edge beam, and the two refusals |

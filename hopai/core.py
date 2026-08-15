@@ -612,7 +612,7 @@ class Graph:
         self._schema = build_schema(nodes, edges)
         return self._schema
 
-    def infer_schema(self) -> tuple:
+    def infer_schema(self, sample_percent: Optional[float] = None) -> tuple:
         """Derive the schema from the rows this graph already holds:
         node types from `properties->>'type'`, edge kinds from
         `properties->>'kind'` plus observed endpoint pairs, required
@@ -624,9 +624,12 @@ class Graph:
         per-type row counts live there, not in the schema.
 
         Full sequential scans, meant for start-up or migration -- see
-        hopai/schema.py's INFERENCE section for semantics and cost."""
+        hopai/schema.py's INFERENCE section for semantics and cost.
+        On tables too large for that, sample_percent=5 reads a
+        TABLESAMPLE SYSTEM slice instead; counts become estimates and
+        rare properties can be missed, and the report says so."""
         from .schema import infer_schema
-        return infer_schema(self)
+        return infer_schema(self, sample_percent=sample_percent)
 
     @property
     def schema(self):
@@ -652,6 +655,13 @@ class Graph:
         """Generated pydantic models, one per node type and edge kind.
         Needs pydantic v2 -- pip install hopai[pydantic]."""
         return self._defined_schema("schema_pydantic").to_pydantic()
+
+    @property
+    def schema_mermaid(self) -> str:
+        """The schema as a Mermaid flowchart string -- paste it into a
+        ```mermaid fence and any PR description or README renders the
+        picture. No extra dependency, works offline."""
+        return self._defined_schema("schema_mermaid").to_mermaid()
 
     def _defined_schema(self, wanted: str):
         if self._schema is None:
@@ -804,6 +814,70 @@ class Graph:
                     f'DROP TRIGGER IF EXISTS "{trigger_name}" ON {edge_target.qualified}'))
                 connection.execute(text(f'DROP FUNCTION IF EXISTS {function_q}()'))
         return applied
+
+    def _schema_store(self) -> str:
+        """The qualified name of the schema metadata table. It lives in
+        the nodes table's Postgres schema so multi-tenant setups that
+        namespace their graph tables namespace this one the same way."""
+        if self.nodes_tbl.schema:
+            return f'"{self.nodes_tbl.schema}"."hopai_schema"'
+        return '"hopai_schema"'
+
+    def save_schema(self) -> None:
+        """Persist the declared schema so OTHER processes on this
+        database can load_schema() instead of re-declaring -- the
+        database becomes the single source of truth for the contract.
+
+        Upserts this graph's row in hopai_schema(graph_id, document,
+        saved_at), creating that table on first use. It is metadata,
+        never on the query path: traversal and ingestion do not know it
+        exists, and callers who never persist never create it. The
+        document is schema_json verbatim -- human-readable in psql."""
+        import json
+        schema = self._defined_schema("save_schema()")
+        store = self._schema_store()
+        with self.engine.begin() as connection:
+            # json, NOT jsonb: jsonb canonicalizes object key order, which
+            # would hand load_schema() the properties alphabetized instead
+            # of as declared -- breaking exact round-trip equality. This
+            # table is never queried by containment, so jsonb buys nothing.
+            connection.execute(text(
+                f"CREATE TABLE IF NOT EXISTS {store} ("
+                f"graph_id text PRIMARY KEY, "
+                f"document json NOT NULL, "
+                f"saved_at timestamptz NOT NULL DEFAULT now())"))
+            connection.execute(text(
+                f"INSERT INTO {store} (graph_id, document) "
+                f"VALUES (:graph, CAST(:document AS json)) "
+                f"ON CONFLICT (graph_id) DO UPDATE "
+                f"SET document = EXCLUDED.document, saved_at = now()"),
+                {"graph": self.graph, "document": json.dumps(schema.to_json())})
+
+    def load_schema(self):
+        """Read the schema save_schema() stored for this graph,
+        ADOPT it on this handle (a saved schema was explicitly declared
+        a contract -- unlike an inferred one, which is an observation)
+        and return it. The stored document is data: it is rebuilt
+        through the same validation define_schema() runs, so a corrupted
+        row raises loudly instead of half-loading."""
+        from .schema import schema_from_document
+        row = None
+        with self.engine.connect() as connection:
+            exists = connection.execute(
+                text("SELECT to_regclass(:name)"),
+                {"name": self._schema_store()}).scalar()
+            if exists is not None:
+                row = connection.execute(
+                    text(f"SELECT document FROM {self._schema_store()} "
+                         f"WHERE graph_id = :graph"),
+                    {"graph": self.graph}).first()
+        if row is None:
+            raise ValueError(
+                f"no saved schema for graph {self.graph!r} -- save_schema() stores "
+                f"the declared schema for other handles to load; on this handle, "
+                f"declare it with define_schema(...)")
+        self._schema = schema_from_document(row[0])
+        return self._schema
 
     # -- vectors --------------------------------------------------------
 

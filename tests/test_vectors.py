@@ -1295,7 +1295,12 @@ class TestDropVectorsLive:
 # ---------------------------------------------------------------------
 
 class TestVectorsAreInvisibleToSchemaInference:
-    def test_inferred_schema_never_reports_a_vector_field(self, fresh_graph):
+    # sample_percent=None reads every row; a percentage takes a different
+    # path to the same jsonb_each. Inference is the ONE feature that reads
+    # the database to decide what a schema contains, so every path through
+    # it is a place a vec_* column could start appearing.
+    @pytest.mark.parametrize("sample_percent", [None, 100.0])
+    def test_inferred_schema_never_reports_a_vector_field(self, fresh_graph, sample_percent):
         """`vec_*` are real columns, not properties -- so a schema
         inferred from the same rows must describe the properties only.
         The two features landed independently; this pins the seam, since
@@ -1305,7 +1310,7 @@ class TestVectorsAreInvisibleToSchemaInference:
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": 1, "type": "doc", "title": "a"}])
         g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]}])
-        schema, report = g.infer_schema()
+        schema, report = g.infer_schema(sample_percent=sample_percent)
         # `type` names the inferred node type rather than repeating as
         # one of its properties, so `title` is the whole property set --
         # and no vec_* column joins it.
