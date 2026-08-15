@@ -565,6 +565,10 @@ class TestSchemaEnforcement:
         fresh_graph.define_constraints(nodes=[Required("kept")])
         primitive_schema(fresh_graph)
         first = fresh_graph.enforce_schema()
+        # the return value NAMES the constraints in force, same contract
+        # as define_constraints -- a list of Nones satisfies any test
+        # that only compares two runs of it (enforce_schema__mutmut_36)
+        assert "ck_schema_req_default_person" in first
         assert fresh_graph.enforce_schema() == first
         assert "ck_schema_typ_default_person_age" in schema_checks(fresh_graph)
 

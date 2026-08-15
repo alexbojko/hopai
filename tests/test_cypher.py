@@ -194,6 +194,23 @@ class TestPatternTranslation:
         start, _ = tr("MATCH (a {gone: NULL, missing: null})")
         assert start.where == {"gone": None, "missing": None}
 
+    def test_negative_number_literals(self):
+        """`-5` goes through its own minus-then-number branch; nothing
+        observed it, so the branch's peek (mutant _parse_literal_13) was
+        freely mutable."""
+        start, _ = tr("MATCH (a {depth: -5, delta: -1.5})")
+        assert start.where == {"depth": -5, "delta": -1.5}
+
+    def test_string_escapes_produce_the_escaped_value(self):
+        r"""A successfully-parsed escape was never OBSERVED -- the escape
+        branch ran only inside unterminated-string error paths, whose
+        buffer is discarded, so the entire _ESCAPES append cluster
+        (x__tokenize 42-56) was freely mutable. \' must yield a quote,
+        \n a newline, \\ one backslash, and an unknown escape its bare
+        character."""
+        start, _ = tr(r"MATCH (a {s: 'it\'s', t: 'a\nb', u: 'c\\d', v: 'x\qy'})")
+        assert start.where == {"s": "it's", "t": "a\nb", "u": "c\\d", "v": "xqy"}
+
     def test_boolean_literals_in_a_property_map(self):
         """true AND false: only true had coverage, so the FALSE keyword
         comparison was freely mutable."""
@@ -856,6 +873,11 @@ class TestSyntaxErrors:
         # (mutant x__tokenize__mutmut_43)
         ("MATCH (a {s: 'oops", "unterminated string literal at position 13"),
         ("MATCH (a {s: 'ab\\'", "unterminated string literal at position 13"),
+        # a lone backslash as the LAST character: the escape lookahead
+        # must treat it as a plain character and report the unterminated
+        # string -- the loosened-bound mutant (x__tokenize__mutmut_42)
+        # indexed one past the end and died with IndexError instead
+        ("MATCH (a {s: 'ab\\", "unterminated string literal at position 13"),
     ])
     def test_error_positions_and_token_descriptions(self, query, phrase):
         with pytest.raises(CypherError) as exc:
