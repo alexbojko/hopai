@@ -83,7 +83,7 @@ markdown_extensions:
 nav:
   - Overview: index.md
   - Notebooks:
-      - All nine: notebooks/README.md
+      - All ten: notebooks/README.md
       - 01 · Quick start: notebooks/01_quickstart.ipynb
       - 02 · Traversal: notebooks/02_traversal.ipynb
       - 03 · Aggregation: notebooks/03_aggregation.ipynb
@@ -93,6 +93,7 @@ nav:
       - 07 · Many graphs: notebooks/07_many_graphs.ipynb
       - 08 · Under the hood: notebooks/08_under_the_hood.ipynb
       - 09 · Vector search: notebooks/09_vector_search.ipynb
+      - 10 · The MCP server: notebooks/10_mcp_server.ipynb
   - Internals:
       - Architecture: architecture.md
       - Testing: testing.md

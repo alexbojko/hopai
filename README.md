@@ -1060,7 +1060,7 @@ that authenticates.
 
 ## 📓 Runnable documentation
 
-Everything above, as nine notebooks you can execute against a throwaway
+Everything above, as ten notebooks you can execute against a throwaway
 database — quick start, traversal semantics, aggregation, the JSON and
 Cypher front ends, constraints, graph schema, multi-graph, the SQL
 underneath, and vector search:
