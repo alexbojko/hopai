@@ -30,7 +30,6 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "sqlmodel>=0.0.39",
     "sqlalchemy>=2.0",
     "psycopg2-binary>=2.9",
 ]
@@ -60,9 +59,8 @@ networkx = ["networkx>=3.0"]
 # signatures. Both eras are supported and exercised: 2.0 renamed FastMCP
 # to MCPServer, and hopai/mcp.py's _sdk() is the entire difference.
 mcp = ["mcp>=1.10"]
-# sqlmodel already drags pydantic in transitively, so this extra exists
-# to pin the MAJOR version: schema_pydantic generates v2 models, and
-# sqlmodel's own floor still tolerates v1 in some resolutions.
+# schema_pydantic generates v2 models; this extra pins the MAJOR version
+# so v1, tolerated by some resolutions, is never silently what lands.
 pydantic = ["pydantic>=2.0"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "networkx>=3.0", "pydantic>=2.0", "ruff>=0.6",
        # In `dev` so CI actually registers the tools against a real SDK.
