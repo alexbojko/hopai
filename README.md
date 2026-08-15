@@ -12,9 +12,9 @@
 
 </div>
 
-Multi-hop traversal, ingestion, and real constraints — with a Python API,
-a JSON one, and Cypher, so an agent and a developer can both use it
-without being taught anything new.
+Multi-hop traversal, ingestion, updates and real constraints — with a
+Python API, a JSON one, and Cypher, so an agent and a developer can both
+use it without being taught anything new.
 
 ## ✨ Highlights
 
@@ -22,6 +22,9 @@ without being taught anything new.
   extension, no sidecar service, no new operational dependency.
 - 🧭 **Real multi-hop traversal** — bounded and unbounded hops, per-hop
   direction, `OPTIONAL`, rich JSONB filtering, one round trip.
+- ✏️ **Update and delete by filter** — `SET` / `REMOVE` /
+  `DETACH DELETE` semantics through the same filters a traversal uses,
+  with a filterless call refusing rather than emptying the graph.
 - 🧮 **In-database aggregation** — `count` / `sum` / `avg` / `min` /
   `max` over what a traversal matches, computed where the data lives
   instead of hydrating a subgraph to count it.
@@ -208,6 +211,60 @@ graph.ingest({
 Nodes are written before edges, so a single document can create a node
 and an edge that references it. `graph.add_networkx(g)` loads a networkx
 graph — the inverse of `result.to_networkx()`.
+
+## ✏️ Changing and deleting
+
+The other half of a graph an agent maintains rather than only fills.
+`where=` is the same filter language a traversal uses, and it selects a
+**set** of rows — every row it matches is changed, exactly as Cypher's
+`SET` and `DELETE` do.
+
+```python
+# "Everyone over 65 is retired."
+graph.update_nodes(where=GT("age", 65), set={"retired": True})
+
+# `set` merges over what's there; `remove` drops keys; `replace=True`
+# makes `set` the whole property bag.
+graph.update_nodes(where={"email": "a@x.com"}, remove=["nickname"])
+
+# "Alice doesn't know Bob any more." Endpoint filters, so you never have
+# to look an id up first.
+graph.delete_edges(where={"kind": "knows"},
+                   start={"email": "a@x.com"}, end={"email": "b@x.com"})
+
+# "Forget Alice." detach=True deletes her edges with her.
+graph.delete_nodes(where={"email": "a@x.com"}, detach=True)
+
+graph.clear()          # this graph, and no other, in one transaction
+```
+
+Every call returns a `MutationResult` — `deleted_nodes`,
+`deleted_edges`, `updated_nodes`, `updated_edges`, `elapsed_ms` — four
+counters because one delete touches both tables.
+
+**A call with no filter raises rather than matching everything.**
+`where=None` and `where={}` are what an empty variable looks like, and
+the cost of being wrong here is the data. Say it on purpose with
+`all=True`, or call `clear()`.
+
+**Deleting a node that still has edges fails**, and the error names
+`detach=True` — the composite foreign key is doing its job, and an edge
+pointing at a node that no longer exists is exactly the corruption it
+was added to prevent.
+
+The same thing in Cypher, and as one JSON document for a tool-calling
+model (`MUTATE_TOOL_SCHEMA`):
+
+```python
+graph.cypher("MATCH (a:person) WHERE a.age > 65 SET a.retired = true")
+graph.cypher("MATCH (a {email: 'a@x.com'})-[r:knows]->() DELETE r")
+graph.cypher("MATCH (a {email: 'a@x.com'}) DETACH DELETE a")
+
+graph.mutate({"operations": [                    # in order, one transaction
+    {"op": "update_nodes", "where": {"type": "draft"}, "set": {"status": "archived"}},
+    {"op": "delete_nodes", "where": {"type": "spam"}, "detach": True},
+]})
+```
 
 ## 🔐 Constraints
 
@@ -549,11 +606,13 @@ graph.cypher("""
 """)
 ```
 
-`graph.cypher()` returns a `Subgraph` for a query that reads and an
-`IngestResult` for one that writes; `traverse_cypher` and `write_cypher`
-are the same thing when you'd rather be explicit. `cypher_to_traversal`
-and `graph.cypher_operations` show the translation — a `(Start, [Hop])`
-pair, or the ingestion plan — without running anything.
+`graph.cypher()` returns a `Subgraph` for a query that reads, an
+`IngestResult` for one that writes and a `MutationResult` for one that
+deletes or updates; `traverse_cypher`, `write_cypher` and
+`mutate_cypher` are the same thing when you'd rather be explicit.
+`cypher_to_traversal`, `graph.cypher_operations` and
+`cypher_to_mutations` show the translation — a `(Start, [Hop])` pair,
+the ingestion plan, or the mutation plan — without running anything.
 
 Writes compile to the same `add_nodes` / `merge_nodes` / `add_edges` the
 Python API calls, in one transaction, with ids from the insert wiring the
@@ -570,9 +629,23 @@ edges. Three places writes stop short of Cypher:
 - **`MATCH` before a write binds single nodes** by property, one lookup
   each. It doesn't traverse.
 
-`SET` on matched rows, `DELETE` and `DETACH DELETE` are unsupported:
-there's no update-by-query or delete API here yet, in Cypher or in
-Python.
+`SET`, `REMOVE`, `DELETE` and `DETACH DELETE` compile to the same
+`update_nodes` / `delete_edges` / … the Python API calls — all three
+`SET` spellings included: `a.x = 1` and `a += {…}` merge, `a = {…}`
+replaces. What a `MATCH` means shifts with what follows it, and the
+difference is deliberate: before a `CREATE` it names **one** node (an
+edge has to attach to exactly one row, so an ambiguous match is an
+error), before a `DELETE` or a `SET` it names the **set** of rows to
+change, which is what Cypher means by it too.
+
+The pattern is one node or one relationship. Changing the rows a
+multi-hop pattern reached (`MATCH (a)-[:knows]->(b) DELETE b`) is a
+traversal driving a write, and refuses — match the rows by their
+properties instead. A relationship pattern can still filter both ends:
+`MATCH (a {name: 'Alice'})-[r:knows]->(b:person) DELETE r` compiles to
+one statement with an endpoint filter on each side. `DELETE a, r`, a
+query that both creates and deletes, and `SET a = {…}` after another
+assignment to `a` all refuse and say why.
 
 hopai has no label concept, so labels compile to property tests:
 `(a:person)` → `{"type": "person"}`, `[:friend]` → `{"kind": "friend"}`.
@@ -631,6 +704,9 @@ translating into something that answers a different question:
   (`RETURN b.city, count(b)`), no edge-property aggregates, no
   `stddev`/percentiles, no lexicographic `min`/`max` on strings — each
   refuses with a message rather than approximating.
+- Deletes and updates select rows by their properties, not by where a
+  traversal arrived: `MATCH (a)-[:knows]->(b) DELETE b` refuses rather
+  than guessing which of the two readings you meant.
 - Synchronous only — every call blocks; no `AsyncSession` support yet.
 - A cycle-protection path array is carried on every recursive row. Cheap
   at moderate depth, measurably not-cheap on single-segment traversals

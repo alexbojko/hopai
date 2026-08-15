@@ -167,9 +167,12 @@ class TestWriteRefusals:
         with pytest.raises(CypherError, match="does not bind"):
             ops("MERGE (a {n: 1}) ON CREATE SET b.x = 1")
 
-    def test_bare_set_and_delete_stay_unsupported(self):
+    def test_a_mutating_query_is_refused_by_the_write_translator(self):
+        """CREATE/MERGE and DELETE/SET compile to different plans run by
+        different executors, so the ingestion translator hands these
+        over by name instead of returning half of what was asked for."""
         for query in ("MATCH (a {n: 1}) SET a.x = 2", "MATCH (a {n: 1}) DELETE a"):
-            with pytest.raises(CypherError, match="not supported"):
+            with pytest.raises(CypherError, match="graph.mutate_cypher"):
                 ops(query)
 
     # Refusal texts pinned by their actionable phrase -- see the same

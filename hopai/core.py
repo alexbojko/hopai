@@ -728,20 +728,24 @@ class Graph:
         return cypher_to_operations(query, **options)
 
     def cypher(self, query: str, **options):
-        """Run any supported Cypher: reading, writing, or aggregating.
+        """Run any supported Cypher: reading, writing, deleting,
+        updating, or aggregating.
 
         Returns a Subgraph for a query that matches, an IngestResult for
-        one that creates or merges, and a plain dict of numbers for one
-        whose RETURN aggregates. Which one it is is visible in the
-        query, and this is the entry point anyone arriving from a Neo4j
-        driver reaches for first; traverse_cypher(), write_cypher() and
-        aggregate_cypher() are the same thing when you would rather be
-        explicit."""
+        one that creates or merges, a MutationResult for one that
+        deletes or updates, and a plain dict of numbers for one whose
+        RETURN aggregates. Which one it is is visible in the query, and
+        this is the entry point anyone arriving from a Neo4j driver
+        reaches for first; traverse_cypher(), write_cypher(),
+        mutate_cypher() and aggregate_cypher() are the same thing when
+        you would rather be explicit."""
         from .cypher import (
-            _Parser, _ReturnClause, _tokenize, _WriteClause, aggregate_cypher,
-            traverse_cypher,
+            _MutateClause, _Parser, _ReturnClause, _tokenize, _WriteClause,
+            aggregate_cypher, traverse_cypher,
         )
         clauses = _Parser(_tokenize(query)).parse()
+        if any(isinstance(c, _MutateClause) for c in clauses):
+            return self.mutate_cypher(query, **options)
         if any(isinstance(c, _WriteClause) for c in clauses):
             return self.write_cypher(query, **options)
         if any(isinstance(c, _ReturnClause) for c in clauses):
@@ -753,6 +757,89 @@ class Graph:
         attribute dicts become properties -- the inverse of
         Subgraph.to_networkx()."""
         return self._ingestor.add_networkx(nx_graph)
+
+    # -- deleting and updating ------------------------------------------
+
+    @property
+    def _mutator(self):
+        from .mutate import Mutator
+        if not hasattr(self, "_mutator_cache"):
+            self._mutator_cache = Mutator(self)
+        return self._mutator_cache
+
+    def delete_nodes(self, where=None, detach: bool = False, all: bool = False):
+        """Delete every node matching `where` -- the same filter language
+        a traversal uses. Returns a MutationResult.
+
+        A node that still has edges cannot be deleted: pass detach=True
+        to delete its edges with it (Cypher's DETACH DELETE). A call with
+        no filter raises rather than emptying the graph -- say it on
+        purpose with all=True, or call clear()."""
+        return self._mutator.delete_nodes(where, detach=detach, all=all)
+
+    def delete_edges(self, where=None, start=None, end=None, all: bool = False):
+        """Delete every edge matching `where`, optionally restricted to
+        edges whose endpoints match `start`/`end`:
+
+            graph.delete_edges(where={"kind": "knows"}, start={"name": "Alice"})
+
+        Returns a MutationResult. Deleting an edge never affects the
+        nodes it connected."""
+        return self._mutator.delete_edges(where, start=start, end=end, all=all)
+
+    def update_nodes(self, where=None, set=None, remove=None, replace: bool = False,
+                     all: bool = False):
+        """Update every node matching `where`. `set` is merged over the
+        existing properties, leaving anything it does not mention alone;
+        `remove` drops keys; `replace=True` makes `set` the whole
+        property bag. Returns a MutationResult.
+
+            graph.update_nodes(where={"type": "person"}, set={"active": False})
+        """
+        return self._mutator.update_nodes(where, set=set, remove=remove,
+                                          replace=replace, all=all)
+
+    def update_edges(self, where=None, start=None, end=None, set=None, remove=None,
+                     replace: bool = False, all: bool = False):
+        """Update every edge matching `where`, with the same set/remove/
+        replace semantics as update_nodes() and the same optional
+        endpoint filters as delete_edges(). Returns a MutationResult."""
+        return self._mutator.update_edges(where, start=start, end=end, set=set,
+                                          remove=remove, replace=replace, all=all)
+
+    def clear(self):
+        """Delete every node and edge in THIS graph, in one transaction.
+        Other graphs in the same tables keep their rows -- this is a
+        scoped DELETE, not a TRUNCATE. Returns a MutationResult."""
+        return self._mutator.clear()
+
+    def mutate(self, spec: dict):
+        """Run a whole `{"operations": [...]}` mutation document, in
+        order, in one transaction -- the delete/update counterpart of
+        ingest(), and the call an agent makes. See MUTATE_TOOL_SCHEMA.
+
+            graph.mutate({"operations": [
+                {"op": "update_nodes", "where": {"type": "draft"},
+                 "set": {"status": "archived"}},
+                {"op": "delete_edges", "where": {"kind": "draft_of"}},
+            ]})
+        """
+        from .mutate import spec_to_mutations
+        return self._mutator.execute_operations(spec_to_mutations(spec))
+
+    def mutate_cypher(self, query: str, **options):
+        """Run a Cypher DELETE / DETACH DELETE / SET / REMOVE. Returns a
+        MutationResult.
+
+            graph.mutate_cypher("MATCH (a:person {email: 'a@x.com'}) DETACH DELETE a")
+            graph.mutate_cypher("MATCH (a:person) WHERE a.age > 65 SET a.retired = true")
+
+        The whole query is one transaction and compiles down to the same
+        delete_nodes/update_nodes/... the Python API calls --
+        `hopai.cypher_to_mutations(query)` shows the plan without running
+        it."""
+        from .cypher import cypher_to_mutations
+        return self._mutator.execute_operations(cypher_to_mutations(query, **options))
 
     # -- execution ------------------------------------------------------
 

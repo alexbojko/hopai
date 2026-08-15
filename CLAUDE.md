@@ -49,6 +49,15 @@ read.** When a design question comes up, these decide it, in order:
   Cypher would not — and bare `count(b)`/`sum(b.x)` with hops mean per-*path* in Cypher,
   which hopai cannot express. `cypher.py`'s AGGREGATION docstring holds the acceptance
   matrix; loosening a refusal into a near-enough mapping is the bug, not the fix.
+- **A delete or update with no filter refuses.** `where=None`/`{}` is what an empty
+  variable looks like, and matching everything on it is unrecoverable. `all=True` is the
+  opt-in; `all=True` *with* a filter refuses too, since one of them is being ignored.
+  (`test_a_delete_with_no_filter_refuses`)
+- **Deleting a node that still has edges refuses and the message names `detach=True`.**
+  Cascading instead would leave the corruption the composite FK exists to prevent.
+- **A mutating `MATCH` binds a set of rows; an ingesting one binds a single node.** That
+  is Cypher's own asymmetry — `SET` applies to every match, an edge attaches to exactly
+  one — so neither may be "fixed" into the other.
 - **Every read and write goes through `Graph._scoped()`.** Forgetting the graph
   discriminator does not error; it silently touches another graph's rows.
 - **Writes are one transaction**, batching included. A half-committed write makes a
@@ -66,11 +75,12 @@ read.** When a design question comes up, these decide it, in order:
   **equivalent** (record the one-line proof; "probably fine" is not a proof), or
   **out of scope** (say so explicitly). A run reporting `0 checked`, or all `segfault`,
   is a broken harness, not a clean sweep.
-- `json_api.py` and `cypher.py` are front ends that emit `(Start, [Hop])`, an
-  aggregation triple, or ingestion operations, and hold no query logic. Widening a
-  subset means adding a translation, never loosening a refusal into a near-enough
-  mapping. The tool schemas (`TRAVERSE_TOOL_SCHEMA` / `AGGREGATE_TOOL_SCHEMA` /
-  `INGEST_TOOL_SCHEMA`) must stay in step with what the parsers accept.
+- `json_api.py`, `mutate.py`'s spec parser and `cypher.py` are front ends that emit
+  `(Start, [Hop])`, an aggregation triple, or ingestion/mutation operations, and hold no
+  query logic. Widening a subset means adding a translation, never loosening a refusal
+  into a near-enough mapping. The tool schemas (`TRAVERSE_TOOL_SCHEMA` /
+  `AGGREGATE_TOOL_SCHEMA` / `INGEST_TOOL_SCHEMA` / `MUTATE_TOOL_SCHEMA`) must stay in
+  step with what the parsers accept.
 - Comments explain *why*, citing the bug or trade-off. Match that for non-obvious code;
   skip it for mechanical changes.
 - New tests join an existing `TestX` class and say what would break without the fix.
