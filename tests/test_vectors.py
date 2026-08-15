@@ -10,7 +10,9 @@ and run on the write schema, since migration is DDL.
 
 from __future__ import annotations
 
+import ast
 import json
+import pathlib
 import re
 
 import pytest
@@ -25,6 +27,35 @@ from hopai import (
 from hopai import Boost
 from hopai.vectors import parse_boost
 from hopai.constraints import ConstraintViolation
+
+
+#: Helpers that take their CALLER's name as an argument, mapped to the
+#: position that argument sits in. Several refusals are shared by many
+#: entry points, and the label is the only thing telling a caller which
+#: one they reached -- so each call site needs its own assertion, and
+#: four separate mutation rounds each surfaced one more that had none.
+#: Reading the sites out of the source is what stops the fifth.
+_LABEL_ARG = {"_check_k": 1, "validate_nears": 4, "validate_boosts": 1,
+              "_field": 3, "_defined": 2, "_check_keys": 2, "_refuse_vectors": 1}
+
+
+def declared_caller_labels() -> set:
+    """Every literal caller label passed to one of those helpers."""
+    from hopai import json_api, vectors
+
+    found = set()
+    for module in (vectors, json_api):
+        tree = ast.parse(pathlib.Path(module.__file__).read_text())
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+                continue
+            index = _LABEL_ARG.get(node.func.id)
+            if index is None or len(node.args) <= index:
+                continue
+            argument = node.args[index]
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                found.add(argument.value)
+    return found
 
 
 def norm(statement, literal_binds: bool = False) -> str:
@@ -2027,6 +2058,41 @@ class TestParseBoostContract:
 class TestVectorCallerNamesArePinned:
     """Every refusal leads with the CALL, so a traceback says which one
     to fix. Each name below was mutable with the suite still green."""
+
+    #: Every caller label this class asserts on. The test below reads the
+    #: real call sites out of the source and compares, so a NEW entry
+    #: point fails here until someone pins it -- rather than surfacing
+    #: two mutation rounds later, which is how the last four were found.
+    PINNED = {
+        "vector_search()", "vector_search_many()",
+        "get_vectors()", "set_vectors()", "stale_vectors()",
+        "traverse_json()", "aggregate_json()",
+        "traversal spec", '"start"', '"hops" entry', "vector search spec",
+    }
+
+    def test_every_caller_label_in_the_source_is_pinned_here(self):
+        """The durable half of this class.
+
+        Five helpers take a caller label from eleven call sites, and the
+        per-site assertions below can only ever cover the sites that
+        existed when they were written. Comparing against the source
+        makes an unpinned twelfth site a failure, and a removed one a
+        failure too -- so this set cannot rot in either direction."""
+        declared = declared_caller_labels()
+        assert declared - self.PINNED == set(), \
+            f"caller labels with no assertion in this class: {sorted(declared - self.PINNED)}"
+        assert self.PINNED - declared == set(), \
+            f"pinned labels no longer in the source: {sorted(self.PINNED - declared)}"
+
+    def test_get_vectors_names_itself(self):
+        with pytest.raises(ValueError, match=r"^get_vectors\(\) needs vector fields"):
+            offline().get_vectors(node_ids=[1])
+
+    def test_set_vectors_names_itself(self, fresh_graph):
+        """Reached only against a live graph: set_vectors() opens its
+        transaction before it consults the registry."""
+        with pytest.raises(ValueError, match=r"^set_vectors\(\) needs vector fields"):
+            fresh_graph.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 2.0, 3.0]}])
 
     def test_search_names_itself(self, vg):
         with pytest.raises(ValueError, match=r"^vector_search\(\): boost="):

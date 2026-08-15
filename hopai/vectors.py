@@ -933,6 +933,14 @@ def build_search_many_query(graph, queries, target: str = "nodes", k: Optional[i
 
     # One VALUES row per query per field: the vectors travel as bound
     # parameters, like every other caller value in this library.
+    #
+    # `q`'s SAString is documentation, not machinery: measured, the
+    # compiled SQL is byte-identical without it and the bound parameter
+    # types are unchanged, because this column renders as a plain bind
+    # with no cast -- unlike v{i}, which renders ::REAL[]. Kept because
+    # it says what the column holds; recorded here so the next reader
+    # (or the next mutation run, which flags dropping it) does not
+    # re-derive that it is inert.
     columns = [sa_column("q", SAString)]
     for i in range(len(template)):
         columns.append(sa_column(f"v{i}", ARRAY(REAL)))
@@ -1095,18 +1103,21 @@ def pgvector_exit_ddl(graph, index: Optional[str] = "hnsw") -> list:
         declared it differently, this DDL will fail on the second
         graph's rows -- which is the honest outcome, since pgvector
         cannot represent what the CHECK could.
-      - **The search stops being exact.** An HNSW/IVFFlat index is
+      - **The search stops being exact.** The HNSW index this emits is
         approximate: it answers fast and sometimes wrongly, which is
         the trade this library declines to make silently on your
-        behalf. Recall becomes a tuning problem (`ef_search`,
-        `lists`), and `hopai`'s own search no longer runs on these
+        behalf. Recall becomes a tuning problem (`ef_search`), and
+        `hopai`'s own search no longer runs on these
         columns.
       - **hopai does not drive pgvector.** After this, queries are
         yours to write (`ORDER BY vec_x <=> $1`). This function exists
         so outgrowing the library is a documented door rather than a
         rewrite -- not so hopai can pretend to support both.
 
-    `index=None` emits the conversion without an index.
+    `index=None` emits the conversion without an index. HNSW is the
+    only method offered, and deliberately: IVFFlat's recall depends on
+    a `lists` value derived from the table's size, and a number this
+    function cannot know is a number it should not guess.
     """
     if index is not None and index not in PGVECTOR_INDEXES:
         raise ValueError(
