@@ -24,7 +24,15 @@ a property.**
 The nested form is what a traversal returns, so a result can be fed
 straight back into another graph without reshaping. The flat form is what
 a person or a model writes by hand. Identity keys are `id` for nodes and
-`id`, `start_id`, `end_id` for edges.
+`id`, `start_id`, `end_id` for edges -- plus, on a Graph built over a
+custom table, every EXTRA COLUMN that table carries (Graph's
+node_extra_cols/edge_extra_cols, discovered from the table itself; see
+models.py's "EXTENDING THE MODEL"). `add_nodes([{"id": 1, "user_id": 7,
+"type": "person"}])` writes `user_id` to its own real column the same
+way it writes `id`, never into `properties` -- and merge_nodes()/
+merge_edges() refresh an extra column's value on conflict, same as
+`properties`. `update_nodes()`/`update_edges()` (mutate.py) do not:
+`set=`/`remove=` stay `properties`-only.
 
 EDGES BY PROPERTY, not just by id. A model that just wrote some nodes
 does not know their generated ids, and making it ask is how ingestion
@@ -71,13 +79,14 @@ from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.exc import IntegrityError, ProgrammingError
 
 from .constraints import ConstraintViolation
+from .models import EDGE_IDENTITY_KEYS, NODE_IDENTITY_KEYS
 
 #: Rows per statement. Large enough that the round trips disappear, small
 #: enough that one bad batch stays diagnosable and memory stays flat.
 BATCH_SIZE = 1000
 
-_NODE_KEYS = frozenset({"id", "properties"})
-_EDGE_KEYS = frozenset({"id", "start_id", "end_id", "start", "end", "properties"})
+_NODE_KEYS = NODE_IDENTITY_KEYS
+_EDGE_KEYS = EDGE_IDENTITY_KEYS
 
 
 @dataclass
@@ -175,6 +184,12 @@ class Ingestor:
 
     def __init__(self, graph):
         self.g = graph
+        # Extra columns (see Graph.node_extra_cols/edge_extra_cols) are
+        # identity keys too, the same way id/start_id/end_id are: a flat
+        # row addresses one by name and split_row() must pull it out of
+        # `properties` rather than leave it there.
+        self._node_keys = _NODE_KEYS | frozenset(self.g.node_extra_cols)
+        self._edge_keys = _EDGE_KEYS | frozenset(self.g.edge_extra_cols)
 
     # -- helpers --------------------------------------------------------
 
@@ -216,14 +231,18 @@ class Ingestor:
         id_column = self._node_id_col()
         payload, explicit_ids = [], False
         for row in rows:
-            identity, properties = split_row(row, _NODE_KEYS, "node")
+            identity, properties = split_row(row, self._node_keys, "node")
             record = {"properties": properties, **self._graph_stamp()}
             if "id" in identity:
                 record[id_column.name] = identity["id"]
                 explicit_ids = True
+            for column in self.g.node_extra_cols:
+                if column in identity:
+                    record[column] = identity[column]
             payload.append(record)
         if payload:
             _require_uniform(payload, id_column.name, "node")
+            _require_uniform_columns(payload, self.g.node_extra_cols, "node")
         return payload, explicit_ids
 
     def add_nodes(self, rows: list, connection=None, return_ids: bool = False):
@@ -310,7 +329,7 @@ class Ingestor:
         split = []
         references = []
         for row in rows:
-            identity, properties = split_row(row, _EDGE_KEYS, "edge")
+            identity, properties = split_row(row, self._edge_keys, "edge")
             for side in ("start", "end"):
                 if side in row:
                     if isinstance(row[side], dict):
@@ -336,7 +355,12 @@ class Ingestor:
                     )
             if "id" in identity:
                 record[edge_id_col] = identity["id"]
+            for column in self.g.edge_extra_cols:
+                if column in identity:
+                    record[column] = identity[column]
             payload.append(record)
+        if payload:
+            _require_uniform_columns(payload, self.g.edge_extra_cols, "edge")
         return payload
 
     def _resolve_references(self, references: list, connection) -> dict:
@@ -408,6 +432,15 @@ class Ingestor:
         # graph column. Without it Postgres cannot infer the index and
         # every merge fails.
         index_elements = [text(key_sql(target, key)) for key in target.scope_index(tuple(on))]
+        # Extra columns (see Graph.node_extra_cols/edge_extra_cols) have no
+        # merge semantics of their own -- unlike `properties`, a plain
+        # column cannot be `||`-ed -- so a re-import just overwrites one
+        # with the incoming value, the same as it would overwrite `id`
+        # were `id` mergeable at all. Only ones the payload actually
+        # carries (uniform across it, by _require_uniform_columns) are
+        # touched -- referencing an unlisted column in EXCLUDED is invalid
+        # SQL, since EXCLUDED only has the columns this INSERT named.
+        extra_cols = self.g.node_extra_cols if table is self.g.nodes_tbl else self.g.edge_extra_cols
 
         ids: list = []
         for chunk in _chunks(payload):
@@ -420,8 +453,12 @@ class Ingestor:
             else:
                 incoming = statement.excluded.properties
             merged = incoming if replace else table.c.properties.op("||")(incoming)
+            set_ = {"properties": merged, **{
+                column: statement.excluded[column] for column in extra_cols
+                if chunk and column in chunk[0]
+            }}
             statement = statement.on_conflict_do_update(
-                index_elements=index_elements, set_={"properties": merged}
+                index_elements=index_elements, set_=set_
             )
             if returning is not None:
                 # DO UPDATE, unlike DO NOTHING, returns a row whether it
@@ -554,10 +591,29 @@ class Ingestor:
         )
 
     def add_networkx(self, nx_graph) -> IngestResult:
-        nodes = [{"id": n, "properties": dict(data)} for n, data in nx_graph.nodes(data=True)]
-        edges = [{"start_id": u, "end_id": v, "properties": dict(data)}
+        """Load a networkx graph. The inverse of Subgraph.to_networkx(),
+        extra columns included: an attribute matching an extra column's
+        name is written there, not folded into `properties` -- the same
+        split to_networkx() made when it produced that attribute."""
+        nodes = [_networkx_row({"id": n}, data, self.g.node_extra_cols)
+                 for n, data in nx_graph.nodes(data=True)]
+        edges = [_networkx_row({"start_id": u, "end_id": v}, data, self.g.edge_extra_cols)
                  for u, v, data in nx_graph.edges(data=True)]
         return self.ingest({"nodes": nodes, "edges": edges})
+
+
+def _networkx_row(identity: dict, data, extra_cols: tuple) -> dict:
+    """One add_networkx() row: `identity` (id, or start_id/end_id) plus
+    whichever attributes in `data` name an extra column, pulled out flat
+    the way a hand-written row already addresses id/start_id/end_id;
+    everything left over is `properties`."""
+    properties = dict(data)
+    row = dict(identity)
+    for column in extra_cols:
+        if column in properties:
+            row[column] = properties.pop(column)
+    row["properties"] = properties
+    return row
 
 
 def _reference_key(reference: dict) -> tuple:
@@ -591,6 +647,24 @@ def _require_uniform(payload: list, id_name: str, what: str) -> None:
             f"row an id or none of them -- a mixed batch would insert NULL ids for the "
             f"rest instead of generating them. Split it into two calls"
         )
+
+
+def _require_uniform_columns(payload: list, names: tuple, what: str) -> None:
+    """The extra-column twin of _require_uniform, one name at a time: a
+    batch where some rows carry a value for an extra column and others
+    do not would bind NULL for the rest, silently discarding whatever
+    that column's own default (or NOT NULL constraint) would otherwise
+    have decided -- the same executemany trap `id` has, generalized to
+    every column a custom table adds (see models.py)."""
+    for name in names:
+        with_value = sum(1 for record in payload if name in record)
+        if with_value not in (0, len(payload)):
+            raise ValueError(
+                f"{with_value} of {len(payload)} {what}s have {name!r}. Either give every "
+                f"row a value for {name!r} or none of them -- a mixed batch would bind NULL "
+                f"for the rest instead of leaving the column to its default. Split it into "
+                f"two calls"
+            )
 
 
 #: JSON Schema for the document form, to hand to a tool-calling model

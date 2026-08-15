@@ -96,6 +96,39 @@ set plugs into the walk.
   than advertised. `tests/test_vectors.py::TestToolSchemasStayVectorFree` pins both the
   omission and the per-graph `tool_schemas()` staying vector-free.
 
+## Extra columns
+
+A custom `node_table=`/`edge_table=` may carry columns beyond `id`/`start_id`/`end_id`/
+`graph_id`/`properties` — a foreign key to a `users` table is the motivating case.
+`Graph.__init__` diffs the table's columns against the ones it already has a use for
+(`models.NODE_IDENTITY_KEYS`/`EDGE_IDENTITY_KEYS`, plus the configured id/start/end/
+graph columns, plus anything `vec_*` — vector fields keep their own write path and must
+never be mistaken for one of these) and calls what is left over `node_extra_cols` /
+`edge_extra_cols`, computed once and never revisited.
+
+- **Write**: `Ingestor.__init__` widens the identity-key set `split_row()` uses by these
+  names, so a flat row addressing one is pulled into `identity`, not `properties` —
+  `ingest.py:_node_payload`/`_edge_payload` then copy it onto the insert record exactly
+  like `id`. `_require_uniform_columns` is `_require_uniform`'s generalization: a batch
+  where some rows name an extra column and others do not would bind NULL for the rest
+  (the same executemany trap `id` has), so it is refused per-column, not just for `id`.
+  `merge_nodes`/`merge_edges` (`_merge_payload`) also add each extra column the payload
+  actually carries to the `ON CONFLICT DO UPDATE` `set_=` as `EXCLUDED.<col>` — a plain
+  column has no `||` merge the way `properties` does, so a re-import simply overwrites
+  it, in step with `properties`.
+- **Read**: `Graph.traverse()`'s two hydration `SELECT`s (not `build_query()`, which only
+  ever returns tagged `(kind, id)` rows) add the extra columns and fold each into its
+  node/edge dict by name. With no extra columns declared the statement and the dict
+  shape are unchanged from before this existed — the same "byte-identical when unused"
+  contract vectors.py's `near=` keeps.
+- **Constraints**: no new vocabulary — `Col("user_id")` (constraints.py) already named a
+  real column before this existed (`Col("start_id")`), so `Unique`/`Index`/merge's `on=`
+  need nothing extra to reach one.
+- **Deliberately out of scope**: `update_nodes()`/`update_edges()` stay `properties`-only
+  (`set=`/`remove=` are a JSONB merge with no equivalent for a plain column) and Cypher
+  writes never populate one (a property map literal has nowhere else to go but
+  `properties`) — both documented in ingest.py/models.py rather than half-supported.
+
 ## The write path
 
 `Graph` exposes the writes; `ingest.py` and `constraints.py` implement them; `core.py`

@@ -122,6 +122,36 @@ may change without a migration path — `drop_schema()` and
 
 Different table or column names? `Graph(engine, node_table=..., edge_table=..., node_id_col=..., ...)`.
 
+**Extending the model** — a field no JSONB property can give you, like a
+foreign key to a `users` table, is an ordinary `Column()` on your own
+table:
+
+```python
+nodes = Table(
+    "nodes", metadata,
+    Column("id", BigInteger, Identity(always=False), primary_key=True),
+    Column("graph_id", Text, nullable=False, server_default="default"),
+    Column("properties", JSONB, nullable=False, server_default="{}"),
+    Column("user_id", BigInteger, ForeignKey("users.id"), nullable=False),
+)
+graph = Graph(engine, node_table=nodes)
+graph.create_schema()   # emits user_id and its foreign key too
+
+graph.add_nodes([{"id": 1, "user_id": 7, "type": "task"}])   # writes the real column
+graph.traverse(Start()).nodes[0]     # {"id": "1", "properties": {"type": "task"}, "user_id": 7}
+```
+
+Graph() finds every such **extra column** on its own — nothing to
+declare — and it behaves like `id` from then on: written by
+`add_nodes`/`add_edges`/`merge_nodes`/`merge_edges` when a row names it,
+returned by `traverse()`, and `Col("user_id")` names it for
+`Unique`/`Index`/merge's `on=`, the same way `Col("start_id")` already
+does. A real `NOT NULL`/`FOREIGN KEY` validates it, for free; what does
+*not* extend to it is `update_nodes`/`update_edges` — `set=`/`remove=`
+stay JSONB-only, so change an extra column with `UPDATE` through the
+engine, or `merge_nodes`/`merge_edges`, which does refresh it on
+conflict. See `hopai/models.py`'s "EXTENDING THE MODEL" note.
+
 ## 🧬 Many graphs, one database
 
 ```python

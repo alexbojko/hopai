@@ -45,13 +45,26 @@ from sqlalchemy.orm import Session
 
 from .filters import resolve
 from .hop import Hop, Start
-from .models import DEFAULT_GRAPH, Edge, Node
+from .models import DEFAULT_GRAPH, EDGE_IDENTITY_KEYS, NODE_IDENTITY_KEYS, Edge, Node
+from .vectors import VECTOR_COLUMN_PREFIX
 
 
 def _qualify(table) -> str:
     if table.schema:
         return f'"{table.schema}"."{table.name}"'
     return f'"{table.name}"'
+
+
+def _extra_columns(table, reserved: set, graph_col: Optional[str]) -> tuple:
+    """Every column on `table` this library does not already have a use
+    for: not one of the identity/reserved names, and not a `vec_*`
+    similarity field (define_vectors() may attach those to this very
+    Table object, before or after this call -- they keep their own
+    write path, set_vectors(), and must never be treated as a plain
+    extra column). Column order, so output is deterministic."""
+    names = set(reserved) | ({graph_col} if graph_col is not None else set())
+    return tuple(c.name for c in table.columns
+                 if c.name not in names and not c.name.startswith(VECTOR_COLUMN_PREFIX))
 
 
 def _plain(value):
@@ -84,13 +97,20 @@ class Subgraph:
         silently collapses them -- pass multigraph=True if your data can
         have more than one real edge between the same pair of nodes and
         that distinction matters to you.
-        """
+
+        Extra columns (see Graph's node_extra_cols/edge_extra_cols) ride
+        along as node/edge attributes beside the properties, the same
+        flat namespace `id` already occupies as the node key -- so an
+        extra column named the same as a property wins, exactly as `id`
+        already would. add_networkx() is the inverse."""
         import networkx as nx
         g = (nx.MultiDiGraph if multigraph else nx.DiGraph)()
         for n in self.nodes:
-            g.add_node(n["id"], **n["properties"])
+            extra = {k: v for k, v in n.items() if k not in ("id", "properties")}
+            g.add_node(n["id"], **{**n["properties"], **extra})
         for e in self.edges:
-            g.add_edge(e["start_id"], e["end_id"], **e["properties"])
+            extra = {k: v for k, v in e.items() if k not in ("start_id", "end_id", "properties")}
+            g.add_edge(e["start_id"], e["end_id"], **{**e["properties"], **extra})
         return g
 
     def __repr__(self) -> str:
@@ -106,6 +126,14 @@ class Graph:
             Start(where={"type": "person"}),
             Hop(where={"active": True}, via={"kind": "friend"}, hops=(1, 4)),
         )
+
+    A custom `node_table=`/`edge_table=` may carry columns beyond the
+    ones above -- a foreign key to a `users` table, say. Every such
+    column is discovered automatically (`node_extra_cols` /
+    `edge_extra_cols`, computed once here) and from then on behaves
+    like `id` or `start_id`: written by add_nodes()/add_edges()/
+    merge_nodes()/merge_edges() when a row names it, and returned by
+    traverse(). See models.py's "EXTENDING THE MODEL" note.
     """
 
     def __init__(
@@ -143,6 +171,12 @@ class Graph:
                         f"be kept apart in it. Add the column (see create_schema), or pass "
                         f"graph_col=None to run a single unscoped graph against these tables"
                     )
+        self.node_extra_cols = _extra_columns(
+            self.nodes_tbl, NODE_IDENTITY_KEYS | {self.node_id_col}, graph_col)
+        self.edge_extra_cols = _extra_columns(
+            self.edges_tbl,
+            EDGE_IDENTITY_KEYS | {self.edge_id_col, self.edge_start_col, self.edge_end_col},
+            graph_col)
 
     def __repr__(self) -> str:
         return f"Graph({self.engine.url!r}, graph={self.graph!r})"
@@ -1290,12 +1324,26 @@ class Graph:
             node_id_col = getattr(nt.c, self.node_id_col)
             edge_id_col = getattr(et.c, self.edge_id_col)
 
+            # Extra columns (see node_extra_cols/edge_extra_cols) tag along
+            # here, not in build_query() -- that statement only ever
+            # returns tagged (kind, id) rows, and hydration is the one
+            # place a real row is actually read. An empty tuple (the
+            # common case: no custom table, or one with none) expands to
+            # nothing, so the statement stays byte-identical to before
+            # this existed.
+            node_extra = [getattr(nt.c, c) for c in self.node_extra_cols]
+            edge_extra = [getattr(et.c, c) for c in self.edge_extra_cols]
+
             nodes = []
             if node_ids:
-                q = select(cast(node_id_col, String).label("id"), nt.c.properties).where(
+                q = select(cast(node_id_col, String).label("id"), nt.c.properties, *node_extra).where(
                     and_(self._scoped(nt), cast(node_id_col, String).in_(node_ids))
                 )
-                nodes = [{"id": r.id, "properties": r.properties} for r in session.execute(q).all()]
+                nodes = [
+                    {"id": r.id, "properties": r.properties,
+                     **{c: getattr(r, c) for c in self.node_extra_cols}}
+                    for r in session.execute(q).all()
+                ]
 
             edges = []
             if edge_ids:
@@ -1303,9 +1351,11 @@ class Graph:
                     cast(getattr(et.c, self.edge_start_col), String).label("start_id"),
                     cast(getattr(et.c, self.edge_end_col), String).label("end_id"),
                     et.c.properties,
+                    *edge_extra,
                 ).where(and_(self._scoped(et), cast(edge_id_col, String).in_(edge_ids)))
                 edges = [
-                    {"start_id": r.start_id, "end_id": r.end_id, "properties": r.properties}
+                    {"start_id": r.start_id, "end_id": r.end_id, "properties": r.properties,
+                     **{c: getattr(r, c) for c in self.edge_extra_cols}}
                     for r in session.execute(q).all()
                 ]
 
