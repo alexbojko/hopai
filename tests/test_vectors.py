@@ -39,6 +39,27 @@ _LABEL_ARG = {"_check_k": 1, "validate_nears": 4, "validate_boosts": 1,
               "_field": 3, "_defined": 2, "_check_keys": 2, "_refuse_vectors": 1}
 
 
+#: mutmut copies every function once per mutant into the tree it runs
+#: from, so the source this reads THERE also contains the mutated labels
+#: -- "XXvector_search()XX", "VECTOR_SEARCH()". Counting those would fail
+#: this test under every mutant, which fails the BASELINE, which mutmut
+#: reports as "0 checked": a broken harness that reads like a clean
+#: sweep. The `_orig` copy carries the real labels, so skipping the
+#: numbered ones is both correct and sufficient.
+_MUTANT_COPY = re.compile(r"__mutmut_\d+$")
+
+
+def _calls(node):
+    """Every Call below `node`, not descending into mutmut's copies."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and _MUTANT_COPY.search(child.name):
+            continue
+        if isinstance(child, ast.Call):
+            yield child
+        yield from _calls(child)
+
+
 def declared_caller_labels() -> set:
     """Every literal caller label passed to one of those helpers."""
     from hopai import json_api, vectors
@@ -46,8 +67,8 @@ def declared_caller_labels() -> set:
     found = set()
     for module in (vectors, json_api):
         tree = ast.parse(pathlib.Path(module.__file__).read_text())
-        for node in ast.walk(tree):
-            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+        for node in _calls(tree):
+            if not isinstance(node.func, ast.Name):
                 continue
             index = _LABEL_ARG.get(node.func.id)
             if index is None or len(node.args) <= index:
