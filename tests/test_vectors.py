@@ -1435,6 +1435,15 @@ class TestSearchManyLive:
              Near("docvec", [0.0, 0.0, 1.0], min_similarity=0.99)], k=5)
         assert [len(one) for one in batch] == [2, 0]
 
+    def test_hits_carry_their_properties(self, fresh_graph):
+        """Every batch assertion read `id` or `similarity`, so the
+        properties column could be dropped from the per-query select and
+        nothing objected -- every caller would get bare ids back from a
+        search whose single-query twin returns whole rows."""
+        g = _corpus(fresh_graph)
+        (one,) = g.vector_search_many([Near("docvec", QUERY)], k=1)
+        assert one[0]["properties"]["name"] == "exact"
+
     def test_edge_hits_carry_their_endpoints(self, fresh_graph):
         """The single-query path has had this since it was written; the
         batch path was only ever exercised against nodes, so nothing
@@ -1620,6 +1629,21 @@ class TestEdgeBeamShape:
         # guard has to shrink the candidate set the top-k picks FROM.
         assert beam.index("local_path") < beam.index("LIMIT")
 
+    def test_via_still_filters_the_edges_the_beam_ranks(self, vg):
+        """`via=` and `via_near=` compose: rank the most similar edges
+        AMONG the ones via allows. Nothing combined them, so `via` could
+        be dropped on the way into the beam -- at the call site or
+        inside it -- and the walk would follow the nearest edge of ANY
+        kind. That is a silently wrong answer, not an error.
+
+        Counted per walk term, like the null guards: the beam is built
+        for the anchor and again for the recursive reference, and `via`
+        surviving on only one of them is the same bug at half depth."""
+        sql = norm(vg.build_query(Start(), [Hop(via={"kind": "cites"}, hops=(1, 2),
+                                                via_near=Near("rel", [1.0, 0.0, 0.0]),
+                                                via_keep=3)]), literal_binds=True)
+        assert sql.count('{"kind": "cites"}') == 2
+
     def test_edges_without_a_vector_are_filtered_before_the_cosine(self, vg):
         """The same shape the batch path needed, for the same reason.
         Dropping these guards changes no ANSWER -- the beam's own
@@ -1682,6 +1706,23 @@ class TestEdgeBeamLive:
         g.set_vectors(edges=[{"id": ids["aligned"], "relvec": [1.0, 0.0, 0.0]},
                              {"id": ids["orthogonal"], "relvec": [0.0, 1.0, 0.0]}])
         return g
+
+    def test_via_wins_over_similarity(self, fresh_graph):
+        """The beam ranks the edges `via` allows -- it does not rank all
+        of them and hope `via` agrees. Proven by making the DISALLOWED
+        edge the more similar one: if `via` is dropped anywhere on the
+        way into the beam, the walk follows `orthogonal` to node 3 and
+        the result is confidently wrong rather than empty."""
+        g = self._fixture(fresh_graph)
+        ids = self._edges(g)
+        # aligned points AWAY from the query; orthogonal points at it.
+        g.set_vectors(edges=[{"id": ids["aligned"], "relvec": [0.0, 1.0, 0.0]},
+                             {"id": ids["orthogonal"], "relvec": [1.0, 0.0, 0.0]}])
+        result = g.traverse(Start(where={"seed": True}),
+                            Hop(via={"kind": "aligned"},
+                                via_near=Near("relvec", QUERY), via_keep=1))
+        assert {n["id"] for n in result.nodes} == {"1", "2"}      # NOT node 3
+        assert [e["properties"]["kind"] for e in result.edges] == ["aligned"]
 
     def test_via_k_follows_only_the_most_similar_edge(self, fresh_graph):
         g = self._fixture(fresh_graph)
