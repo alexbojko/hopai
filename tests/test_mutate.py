@@ -769,6 +769,19 @@ class TestCypherTranslation:
          [{"op": "update_nodes", "where": {"type": "person"}, "remove": ["x"]}]),
         ("MATCH (a:person) REMOVE a.x SET a.x = 1",
          [{"op": "update_nodes", "where": {"type": "person"}, "set": {"x": 1}}]),
+        # A null inside a REPLACING map is simply a key the map does not
+        # carry -- recording a removal as well would hand the executor a
+        # plan it refuses, since replace and remove contradict.
+        ("MATCH (a:person) SET a = {type: 'person', x: null}",
+         [{"op": "update_nodes", "where": {"type": "person"}, "set": {"type": "person"},
+           "replace": True}]),
+        # REMOVE and the start-side endpoint filter, on the edge path:
+        # both were dropped by a mutant with the suite still green.
+        ("MATCH ()-[r:knows]->() REMOVE r.since",
+         [{"op": "update_edges", "where": {"kind": "knows"}, "remove": ["since"]}]),
+        ("MATCH (a {name: 'Alice'})-[r:knows]->() SET r.weight = 2",
+         [{"op": "update_edges", "where": {"kind": "knows"}, "start": {"name": "Alice"},
+           "set": {"weight": 2}}]),
     ])
     def test_translates_to_the_same_operations_the_python_api_runs(self, query, plan):
         assert cypher_to_mutations(query) == plan
@@ -830,7 +843,8 @@ class TestCypherRefusals:
         ("MATCH (a:person) SET a:Employee", "no labels"),
         ("MATCH (a:person) REMOVE a:Employee", "no labels"),
         ("MATCH (a:person) DELETE b", "not bound by the MATCH"),
-        ("MATCH (a:person), (b:company) DELETE a", "separate queries"),
+        ("MATCH (a:person), (b:company) DELETE a",
+         "^comma-separated patterns before a delete or an update"),
         ("MATCH p = (a)-[r]->(b) DELETE r", "never a path"),
         ("OPTIONAL MATCH (a:person) DELETE a", "no meaning"),
         ("MATCH (a:person) MATCH (b:company) DELETE a", "one MATCH clause"),
@@ -845,7 +859,7 @@ class TestCypherRefusals:
         ("MATCH (a)-[a:knows]->(b) DELETE a", "used twice in this pattern"),
         ("MATCH (a:person:employee) DELETE a", "multiple labels"),
         ("MATCH (a)-[r]->(b) WHERE all(x IN relationships(p) WHERE x.k = 1) DELETE r",
-         "put the condition on it directly"),
+         r"^all\(\.\.\. IN relationships\(p\) \.\.\.\) constrains the edges of a walk"),
         ("MATCH (a:person) SET a.x = 1 SET a = {y: 2}", "would be discarded"),
         ("MATCH (a:person) REMOVE a.x SET a = {y: 2}", "would be discarded"),
         ("MATCH (a:person) SET a 5", "expected a.property = value"),
@@ -853,6 +867,16 @@ class TestCypherRefusals:
     def test_what_does_not_translate_says_why(self, query, message):
         with pytest.raises(CypherError, match=message):
             cypher_to_mutations(query)
+
+    def test_a_constraint_the_options_discard_names_what_it_discarded(self):
+        """The message has to quote the pattern that was thrown away and
+        the rewrite -- "something was discarded" leaves the caller to
+        guess which half of their query stopped counting."""
+        with pytest.raises(CypherError) as exc:
+            cypher_to_mutations("MATCH ()-[r:knows|likes]->() DELETE r",
+                                edge_type_key=None)
+        assert str(exc.value).startswith("[:knows|likes] is the only thing constraining")
+        assert "`MATCH ()-[r {kind: 'knows'}]->()`" in str(exc.value)
 
     @pytest.mark.parametrize("query,options,message", [
         ("MATCH (a:person) DETACH DELETE a", {"node_label_key": None},
@@ -869,13 +893,16 @@ class TestCypherRefusals:
         with pytest.raises(CypherError, match=message):
             cypher_to_mutations(query, **options)
 
-    @pytest.mark.parametrize("query,keep", [
-        ("MATCH (a:person) SET a = {name: 'Alicia'}", "type: 'person'"),
-        ("MATCH (a:person) SET a = {}", "type: 'person'"),
-        ("MATCH (a {email: 'a@x.com'}) SET a = {name: 'Alicia'}", "a type property"),
-        ("MATCH ()-[r:knows]->() SET r = {since: 2000}", "kind: 'knows'"),
+    @pytest.mark.parametrize("query,var,subject,keep", [
+        ("MATCH (a:person) SET a = {name: 'Alicia'}", "a", "a label", "type: 'person'"),
+        ("MATCH (a:person) SET a = {}", "a", "a label", "type: 'person'"),
+        ("MATCH (a {email: 'a@x.com'}) SET a = {name: 'Alicia'}", "a", "a label",
+         "a type property"),
+        ("MATCH ()-[r:knows]->() SET r = {since: 2000}", "r", "a relationship's type",
+         "kind: 'knows'"),
     ])
-    def test_a_replacing_map_may_not_erase_the_label_or_the_type(self, query, keep):
+    def test_a_replacing_map_may_not_erase_the_label_or_the_type(self, query, var,
+                                                                 subject, keep):
         """In Cypher `SET n = {map}` replaces PROPERTIES: labels survive
         it and a relationship's type cannot be changed at all. Here both
         are properties, so the same query erased the discriminator --
@@ -884,8 +911,9 @@ class TestCypherRefusals:
         non-destructive, so translating it is not an option."""
         with pytest.raises(CypherError) as exc:
             cypher_to_mutations(query)
-        assert "replaces every property" in str(exc.value)
-        assert keep in str(exc.value) and "+=" in str(exc.value)
+        assert str(exc.value).startswith(f"`SET {var} = {{...}}` replaces every property")
+        assert f"and {subject} is the property" in str(exc.value)
+        assert keep in str(exc.value) and f"SET {var} += " in str(exc.value)
 
     @pytest.mark.parametrize("query,message", [
         ("MERGE (a:person {email: 'c@x.com'}) SET a.name = 'Carol'", "ON CREATE SET"),
