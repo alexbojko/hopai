@@ -1769,6 +1769,10 @@ class _MutateTranslator:
         filters = []
         if pat.labels:
             if self.o.node_label_key is None:
+                # `or 'a'` is unreachable for the same reason as the one
+                # in _rel_filters below: a discarded node constraint only
+                # reaches a caller through _node_operation, whose var IS
+                # this node's. Equivalent mutant, not a missing test.
                 self.discarded.append(
                     (f"({pat.var or ''}:{':'.join(pat.labels)})", "node_label_key=None",
                      f"MATCH ({pat.var or 'a'} {{type: {pat.labels[0]!r}}})"))

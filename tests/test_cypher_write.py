@@ -161,6 +161,23 @@ class TestPlanTranslation:
         with pytest.raises(CypherError, match="^this query only reads"):
             ops("MATCH (a) RETURN a")
 
+    @pytest.mark.parametrize("query", [
+        "MATCH (a) DELETE a",
+        "MATCH (a) DETACH DELETE a",
+        "MATCH (a) SET a.x = 1",
+        "MATCH (a) REMOVE a.x",
+    ])
+    def test_a_mutating_query_is_refused_by_the_write_translator(self, query):
+        """The third leg of the routing between the front ends. The read
+        translator's copy of this refusal was pinned; this one had no
+        test at all, so nothing said where a caller who reached the
+        INGESTION entry point with a delete should go instead."""
+        with pytest.raises(CypherError,
+                           match="^this query deletes or updates"):
+            ops(query)
+        with pytest.raises(CypherError, match=r"graph\.mutate_cypher\(\)"):
+            ops(query)
+
 
 class TestWriteRefusals:
     def test_full_path_merge_is_refused(self):
