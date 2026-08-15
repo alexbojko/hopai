@@ -98,9 +98,11 @@ jobs:
       - run: python scripts/run_notebooks.py
 
   # The documentation site (mkdocs.yml), built but never published here --
-  # deploying is a release step, in release.yml. Building on every PR is what
-  # keeps a broken nav entry or a dead link from surfacing at release time,
-  # when the tag is already cut and the fix costs a new version.
+  # Read the Docs publishes it, from the release tag (see .readthedocs.yaml).
+  # Building on every PR is what keeps a broken nav entry or a dead link from
+  # surfacing at release time, when the tag is already cut and the fix costs a
+  # new version. This job runs the same two steps the Read the Docs build
+  # does, so the two cannot disagree about whether the site is publishable.
   #
   # No PostgreSQL: the site renders the outputs the `notebooks` job above
   # produced, and never executes anything itself.

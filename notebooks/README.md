@@ -2,7 +2,7 @@
 
 Nine notebooks that go from an empty database to the SQL underneath. They are
 documentation, so they are meant to be read with the outputs already there —
-on GitHub, or on the [documentation site](https://alexbojko.github.io/hopai/),
+on GitHub, or on the [documentation site](https://hopai.readthedocs.io/),
 which renders these same files and is published on every release — and they
 run, so nothing in them can quietly stop being true.
 

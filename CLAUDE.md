@@ -101,9 +101,12 @@ read.** When a design question comes up, these decide it, in order:
 - **The documentation site has no sources of its own.** `mkdocs.yml` publishes
   `README.md` and `notebooks/` through symlinks in `docs/`, so editing either one
   *is* editing the site — there is never a second copy to keep in step, and adding
-  one is the defect. CI builds it with `--strict` on every PR; `release.yml`
-  deploys it to GitHub Pages **only on release, from the tag**, so the published
-  site describes the version that is on PyPI rather than whatever landed on `main`.
+  one is the defect. CI builds it with `--strict` on every PR; **Read the Docs**
+  publishes it at <https://hopai.readthedocs.io/> (`.readthedocs.yaml`), built
+  **from the release tag** — so the published site describes the version that is
+  on PyPI rather than whatever landed on `main`. Nothing in this repository
+  pushes the site, so there is no deploy credential; the release-only rule lives
+  in an RTD Automation Rule matching tags, not in a workflow.
   Links written *inside* notebooks are invisible to `--strict` (mkdocs-jupyter
   hands MkDocs finished HTML), so `scripts/mkdocs_hooks.py` rewrites them and
   `scripts/check_docs_links.py` fails the build if one stops resolving.
