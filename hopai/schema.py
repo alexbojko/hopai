@@ -1244,7 +1244,8 @@ class InferenceReport:
             f"edges: {sum(self.edge_counts.values())} with a kind across "
             f"{len(self.edge_counts)} kind(s) {dict(sorted(self.edge_counts.items()))}, "
             f"{self.untyped_edges} kindless, "
-            f"{self.skipped_endpoint_edges} skipped (endpoint node carries no type)",
+            f"{self.skipped_endpoint_edges} skipped (endpoint node's type is not "
+            f"one of the above)",
         ]
         for c in self.conflicts:
             lines.append(f"conflict: {c.table}/{c.type_name}.{c.key} observed as "
@@ -1372,12 +1373,22 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
 
     node_types = [NodeType(name, properties=props)
                   for name, props in sorted(node_props.items())]
+    # The endpoint join above reads the WHOLE nodes table, while
+    # node_types comes from the sample -- so under sample_percent an edge
+    # can name an endpoint type the node sample never saw. Inference then
+    # built EdgeType(source='person') against an empty node-type list and
+    # GraphSchema rejected the schema its own inference had just
+    # produced, which is a raise from a function whose signature promises
+    # a (schema, report) pair. An unobserved type is not a type this run
+    # can claim, so the edge type goes the same way an untyped endpoint
+    # does -- counted, not silently dropped.
+    observed = {t.name for t in node_types}
     edge_types = []
     skipped = 0
     for row in sorted(triples, key=lambda r: (r.kind or "", r.source or "", r.target or "")):
         if not _named(row.kind):
             continue  # already counted as kindless below
-        if not (_named(row.source) and _named(row.target)):
+        if row.source not in observed or row.target not in observed:
             skipped += row.rows
             continue
         edge_types.append(EdgeType(row.kind, source=row.source, target=row.target,
