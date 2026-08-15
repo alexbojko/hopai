@@ -106,6 +106,9 @@ def _provider(client: Any) -> Optional[str]:
     see the module docstring. `type(client).__module__` is
     'openai.resources...' or 'cohere.client_v2' or similar, so the first
     dotted segment is the distribution."""
+    # The `or ""` only keeps .split() off a None; any placeholder would
+    # do, since no falsy __module__ can produce a root that is a provider
+    # key. Mutating the literal is therefore an equivalent mutant.
     module = type(client).__module__ or ""
     root = module.split(".")[0]
     return root if root in _BATCH_CAPS or root in _INPUT_TYPES else None
@@ -201,6 +204,9 @@ class Embedder:
                 or batch_size < 1):
             raise ValueError(
                 f"Embedder: batch_size must be a positive integer, got {batch_size!r}")
+        # `provider or ""` keeps .get() off a None key; as in _provider(),
+        # the literal is unobservable -- no placeholder is a _BATCH_CAPS
+        # key, so an unknown client takes _DEFAULT_BATCH either way.
         self.batch_size = batch_size or _BATCH_CAPS.get(self.provider or "", _DEFAULT_BATCH)
         self._call = _bind(client, self.provider, model)
 
@@ -220,6 +226,9 @@ class Embedder:
         return self._run([text], query=True)[0]
 
     def _run(self, texts, query: bool) -> list:
+        # `query` is read only as `A if query else B` -- here and in every
+        # binding _bind() returns -- so any falsy value is the document
+        # side. Mutating query=False to another falsy value is equivalent.
         owner = f"{self!r}.{'embed_query' if query else 'embed_documents'}"
         cleaned = _clean_texts(list(texts), owner)
         if not cleaned:

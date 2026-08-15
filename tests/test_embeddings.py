@@ -88,7 +88,11 @@ class TestProtocols:
             Embedder(object())
 
     def test_an_embedder_is_not_a_client(self):
-        with pytest.raises(TypeError, match="pass the provider client"):
+        # Anchored and case-sensitive: the message opens by echoing the
+        # mistake back as code, `Embedder(Embedder(...))`, which is what
+        # makes it recognizable at a glance. A looser match passes on a
+        # message that has lost that opening.
+        with pytest.raises(TypeError, match=r"^Embedder\(Embedder\(\.\.\.\)\) -- "):
             Embedder(Embedder(lambda texts: [[1.0]]))
 
 
@@ -205,7 +209,11 @@ class TestNativeClients:
             def encode(self, texts): return [[1.0, 0.0] for _ in texts]
 
         assert Embedder(SentenceTransformerish()).embed_query("q") == [1.0, 0.0]
-        with pytest.raises(ValueError, match="already IS the model"):
+        # Anchored: the refusal has to open by naming the class it is
+        # talking about, and end by naming the rewrite.
+        with pytest.raises(ValueError,
+                           match=r"^Embedder: a SentenceTransformer already IS the "
+                                 r"model.*SentenceTransformer\(name\) instead$"):
             Embedder(SentenceTransformerish(), model="all-MiniLM-L6-v2")
 
     def test_dimensions_are_passed_where_the_provider_truncates(self, calls):
@@ -248,8 +256,17 @@ class TestRefusals:
         than texts sent would pair embeddings with the wrong ids, and
         every neighbour after that is confidently wrong."""
         embedder = Embedder(lambda texts: [[1.0, 0.0]])
-        with pytest.raises(EmbeddingError, match="asked for 2 embedding.* and got 1"):
+        # The label is the diagnostic half: a miscount raised from inside
+        # the answer coercion says nothing about WHICH call produced it
+        # unless _run hands its owner down.
+        with pytest.raises(
+                EmbeddingError,
+                match=r"^Embedder\(function\)\.embed_documents: asked for 2 "
+                      r"embedding.* and got 1"):
             embedder.embed_documents(["a", "b"])
+        with pytest.raises(EmbeddingError,
+                           match=r"^Embedder\(function\)\.embed_query: asked for 1 "):
+            Embedder(lambda texts: []).embed_query("a")
 
     def test_a_model_disagreeing_with_the_field_is_named(self):
         embedder = Embedder(lambda texts: [[1.0, 2.0, 3.0] for _ in texts], dimensions=2)
@@ -318,6 +335,340 @@ class TestBatching:
 # ---------------------------------------------------------------------
 # The promise the whole module rests on
 # ---------------------------------------------------------------------
+
+class TestAnswerCoercion:
+    """Providers disagree about the container and agree about the
+    contents, so _as_vectors() has to accept several shapes -- and each
+    shape is a branch nothing else exercises."""
+
+    def test_a_numpy_like_container_is_accepted(self):
+        """sentence-transformers returns an ndarray, not a list."""
+        class Array:
+            def tolist(self):
+                return [[1.0, 2.0]]
+
+        assert Embedder(lambda texts: Array()).embed_documents(["a"]) == [[1.0, 2.0]]
+
+    def test_numpy_like_rows_are_accepted(self):
+        class Row:
+            def tolist(self):
+                return [3.0, 4.0]
+
+        assert Embedder(lambda texts: [Row()]).embed_documents(["a"]) == [[3.0, 4.0]]
+
+    def test_a_row_object_carrying_embedding_is_unwrapped(self):
+        """OpenAI answers with objects, not bare lists."""
+        class Row:
+            embedding = [5.0, 6.0]
+
+        assert Embedder(lambda texts: [Row()]).embed_documents(["a"]) == [[5.0, 6.0]]
+
+    def test_ints_become_floats(self):
+        """real[] is float4; handing SQLAlchemy ints would work by luck
+        and read as if the provider returned them."""
+        vectors = Embedder(lambda texts: [[1, 2]]).embed_documents(["a"])
+        assert vectors == [[1.0, 2.0]]
+        assert all(isinstance(v, float) for v in vectors[0])
+
+    def test_a_row_that_is_not_a_sequence_names_its_type(self):
+        with pytest.raises(
+                EmbeddingError,
+                match=r"^Embedder\(function\)\.embed_documents: the provider returned "
+                      r"str where a list of numbers"):
+            Embedder(lambda texts: ["nope"]).embed_documents(["a"])
+
+
+class TestDispatch:
+    """_bind() picks how to call a client ONCE, at construction, so a
+    mistyped client is refused at the line that got it wrong rather than
+    at the first write. The order it tries things in is load-bearing."""
+
+    def test_the_client_is_resolved_at_construction_not_at_first_use(self):
+        with pytest.raises(TypeError):
+            Embedder(object())          # not deferred to embed_documents()
+
+    def test_a_native_client_beats_the_duck_typed_protocols(self, calls):
+        """A real provider client may also happen to expose a method
+        named like a protocol. The module name is the stronger signal --
+        matching the protocol first would send OpenAI traffic through a
+        path that never sets its model."""
+        class Embeddings:
+            def create(self, model, input, **kwargs):
+                calls.append("native")
+                return type("R", (), {"data": [
+                    type("D", (), {"embedding": [1.0]})() for _ in input]})()
+
+        class Hybrid:
+            embeddings = Embeddings()
+
+            def embed_documents(self, texts):
+                calls.append("protocol")
+                return [[9.9]]
+
+            def embed_query(self, text):
+                calls.append("protocol")
+                return [9.9]
+
+        Embedder(_named("openai.resources", Hybrid)(), model="m").embed_documents(["a"])
+        assert calls == ["native"]
+
+    def test_an_unknown_module_falls_through_to_the_protocols(self, calls):
+        """Recognition is by module name, so a LangChain embedder from
+        any distribution still lands on the protocol path."""
+        class Anywhere:
+            def embed_documents(self, texts):
+                calls.append("documents")
+                return [[1.0]]
+
+            def embed_query(self, text):
+                calls.append("query")
+                return [1.0]
+
+        client = _named("some.unrelated.package", Anywhere)()
+        Embedder(client).embed_documents(["a"])
+        assert calls == ["documents"]
+
+    def test_cohere_answers_are_unwrapped_however_they_are_shaped(self):
+        """The v2 client returns .embeddings.float_; older shapes return
+        the list directly. Both are read rather than one being assumed."""
+        def cohere_client(payload):
+            class Cohereish:
+                def embed(self, texts, model, input_type, embedding_types):
+                    return payload
+            return _named("cohere.client_v2", Cohereish)()
+
+        floats = [[1.0, 0.0]]
+        wrapped = type("R", (), {"embeddings": type("E", (), {"float_": floats})()})()
+        # `.float` with no `.float_`. Without this third shape the second
+        # getattr is never the one that answers -- for `bare` it falls
+        # through to its default -- so the attribute name it looks up is
+        # free to be anything at all.
+        legacy = type("R", (), {"embeddings": type("E", (), {"float": floats})()})()
+        bare = type("R", (), {"embeddings": floats})()
+        for payload in (wrapped, legacy, bare):
+            assert Embedder(cohere_client(payload),
+                            model="m").embed_documents(["a"]) == floats
+
+
+class TestEmbedderSurface:
+    def test_repr_names_the_provider_and_model(self):
+        class Embeddings:
+            def create(self, model, input, **kwargs): ...
+
+        class OpenAIish:
+            embeddings = Embeddings()
+
+        assert repr(Embedder(_named("openai.resources", OpenAIish)(), model="m")) \
+            == "Embedder(openai, model='m')"
+        # No provider and no model: the class name is all there is to say.
+        assert repr(Embedder(lambda texts: [[1.0]])) == "Embedder(function)"
+
+    def test_embedding_nothing_calls_nothing(self, calls):
+        """An empty batch must not become a provider call -- every
+        provider bills per request, and several reject an empty input."""
+        embedder = Embedder(lambda texts: calls.append(texts) or [[1.0]])
+        assert embedder.embed_documents([]) == []
+        assert calls == []
+
+    def test_embed_query_returns_one_vector_not_a_list_of_one(self):
+        """The asymmetry in the RETURN shape, which is easy to get wrong
+        because embed_query is implemented on top of the batch path."""
+        assert Embedder(lambda texts: [[1.0, 2.0]]).embed_query("q") == [1.0, 2.0]
+
+    def test_an_embedding_error_is_not_wrapped_twice(self):
+        """A short answer already raises EmbeddingError with a precise
+        message; catching and re-wrapping it as "the provider call
+        failed" would bury the real diagnosis."""
+        with pytest.raises(EmbeddingError, match="asked for 2 embedding"):
+            Embedder(lambda texts: [[1.0]]).embed_documents(["a", "b"])
+
+
+class TestDispatchGuardsNeedBothHalves:
+    """Every provider guard is `module matches AND shape matches`, and
+    each half carries its own weight.
+
+    Drop the module half and any client with an `embeddings` attribute
+    becomes an OpenAI client. Drop the shape half and a package merely
+    named `cohere` does. Both send real traffic down a path that will
+    call methods the client does not have -- and the failure surfaces
+    from inside a provider adapter, naming nothing the caller can act
+    on. The protocols are the same story: half of LangChain's pair is
+    not LangChain."""
+
+    def test_the_shape_alone_is_not_an_openai_client(self):
+        class NotOpenAI:
+            embeddings = object()       # right attribute, wrong provider
+
+        with pytest.raises(TypeError, match="is not an embedding client"):
+            Embedder(_named("some.other.sdk", NotOpenAI)())
+
+    @pytest.mark.parametrize("module,attribute", [
+        ("cohere.client_v2", "embed"),
+        ("voyageai.client", "embed"),
+        ("google.genai", "models"),
+    ])
+    def test_the_module_alone_is_not_that_client(self, module, attribute):
+        class Bare:
+            pass                        # right module, no callable surface
+
+        assert not hasattr(Bare, attribute)
+        with pytest.raises(TypeError, match="is not an embedding client"):
+            Embedder(_named(module, Bare)())
+
+    def test_half_of_the_langchain_pair_is_not_langchain(self):
+        class HalfLangChain:
+            def embed_documents(self, texts):
+                return [[1.0]]
+            # no embed_query: taking this path would crash on the first
+            # search, a long way from the line that built the Embedder.
+
+        with pytest.raises(TypeError, match="is not an embedding client"):
+            Embedder(HalfLangChain())
+
+    def test_half_of_the_llamaindex_pair_is_not_llamaindex(self):
+        class HalfLlamaIndex:
+            def get_query_embedding(self, text):
+                return [1.0]
+
+        with pytest.raises(TypeError, match="is not an embedding client"):
+            Embedder(HalfLlamaIndex())
+
+    def test_tokenize_alone_is_not_a_sentence_transformer(self):
+        """`encode` is common; `tokenize` beside it is what makes it a
+        SentenceTransformer rather than any object with an encode()."""
+        class OnlyTokenize:
+            def tokenize(self, text): ...
+
+        with pytest.raises(TypeError, match="is not an embedding client"):
+            Embedder(OnlyTokenize())
+
+
+class TestTheModelReachesTheProvider:
+    """model= is required, so it must also be USED. Nothing asserted
+    that the name travelled, so every adapter could have sent None and
+    silently embedded with the provider's default -- different
+    neighbours, no error."""
+
+    def test_openai_is_given_its_model(self, calls):
+        class Embeddings:
+            def create(self, model, input, **kwargs):
+                calls.append(model)
+                return type("R", (), {"data": [
+                    type("D", (), {"embedding": [1.0]})() for _ in input]})()
+
+        class OpenAIish:
+            embeddings = Embeddings()
+
+        Embedder(_named("openai.resources", OpenAIish)(),
+                 model="text-embedding-3-small").embed_documents(["a"])
+        assert calls == ["text-embedding-3-small"]
+
+    def test_cohere_is_given_its_model_and_asks_for_floats(self, calls):
+        """embedding_types=["float"] is not decoration: ask for the
+        wrong representation and the vectors come back quantized."""
+        class Cohereish:
+            def embed(self, texts, model, input_type, embedding_types):
+                calls.append((model, embedding_types))
+                return type("R", (), {"embeddings": type("E", (), {
+                    "float_": [[1.0]] * len(texts)})()})()
+
+        Embedder(_named("cohere.client_v2", Cohereish)(),
+                 model="embed-v4.0").embed_documents(["a"])
+        assert calls == [("embed-v4.0", ["float"])]
+
+    def test_voyage_is_given_its_model(self, calls):
+        class Voyageish:
+            def embed(self, texts, model, input_type):
+                calls.append(model)
+                return type("R", (), {"embeddings": [[1.0]] * len(texts)})()
+
+        Embedder(_named("voyageai.client", Voyageish)(),
+                 model="voyage-3").embed_documents(["a"])
+        assert calls == ["voyage-3"]
+
+    def test_google_is_given_its_model(self, calls):
+        class Models:
+            def embed_content(self, model, contents, config):
+                calls.append(model)
+                return type("R", (), {"embeddings": [
+                    type("V", (), {"values": [1.0]})() for _ in contents]})()
+
+        class Googleish:
+            models = Models()
+
+        Embedder(_named("google.genai", Googleish)(),
+                 model="gemini-embedding-001").embed_documents(["a"])
+        assert calls == ["gemini-embedding-001"]
+
+    @pytest.mark.parametrize("module,builder", [
+        ("cohere.client_v2", lambda payload: type(
+            "C", (), {"embed": lambda self, texts, model, input_type,
+                      embedding_types: payload})),
+        ("voyageai.client", lambda payload: type(
+            "V", (), {"embed": lambda self, texts, model, input_type: payload})),
+    ])
+    def test_an_answer_without_the_wrapper_is_still_read(self, module, builder):
+        """`getattr(answer, "embeddings", answer)` -- the fallback is
+        the branch that handles a client returning the list directly,
+        which older and thinner wrappers do."""
+        payload = [[1.0, 2.0]]
+        client = _named(module, builder(payload))()
+        assert Embedder(client, model="m").embed_documents(["a"]) == payload
+
+
+class TestErrorsNameTheCall:
+    """The same rule the vector surface already carries: a refusal leads
+    with the call that produced it. embed_documents and embed_query
+    share every helper below them, so the method name is the only thing
+    telling a caller which side went wrong."""
+
+    def test_a_document_failure_names_embed_documents(self):
+        with pytest.raises(ValueError, match=r"embed_documents: item 0 is empty"):
+            Embedder(lambda texts: [[1.0]]).embed_documents(["  "])
+
+    def test_a_query_failure_names_embed_query(self):
+        with pytest.raises(ValueError, match=r"embed_query: item 0 is empty"):
+            Embedder(lambda texts: [[1.0]]).embed_query("  ")
+
+    def test_a_provider_failure_names_the_real_exception_type(self):
+        """`type(exc).__name__` is the diagnosis -- a TimeoutError and a
+        ValueError from the client mean different next steps."""
+        def boom(texts):
+            raise TimeoutError("upstream")
+
+        with pytest.raises(EmbeddingError, match=r"failed \(TimeoutError: upstream\)"):
+            Embedder(boom).embed_documents(["a"])
+
+    def test_an_unrecognized_client_names_its_own_type(self):
+        with pytest.raises(TypeError, match=r"^Embedder: dict is not an embedding"):
+            Embedder({})
+
+    @pytest.mark.parametrize("module,attribute,expected", [
+        ("openai.resources", "embeddings", "an OpenAI client needs model="),
+        ("cohere.client_v2", "embed", "a Cohere client needs model="),
+        ("voyageai.client", "embed", "a Voyage client needs model="),
+        ("google.genai", "models", "a Google GenAI client needs model="),
+    ])
+    def test_each_missing_model_refusal_names_its_provider(self, module, attribute,
+                                                           expected):
+        """Four providers share one rule; the sentence is what says
+        WHICH client you built wrong."""
+        class Client:
+            pass
+        setattr(Client, attribute, object())
+        with pytest.raises(ValueError, match=rf"^Embedder: {expected}"):
+            Embedder(_named(module, Client)())
+
+
+class TestBatchSizeEdges:
+    def test_one_is_a_legal_batch_size(self):
+        """The boundary: a provider that accepts a single input per call
+        is unusual but real, and `< 1` is what allows it. Off-by-one
+        here would refuse a valid configuration at construction."""
+        embedder = Embedder(lambda texts: [[1.0] for _ in texts], batch_size=1)
+        assert embedder.batch_size == 1
+        assert embedder.embed_documents(["a", "b"]) == [[1.0], [1.0]]
+
 
 class TestNoProviderIsImported:
     def test_no_provider_package_is_ever_imported(self):
