@@ -1190,6 +1190,12 @@ class InferenceReport:
     skipped_endpoint_edges: int
     conflicts: tuple
     sampled: Optional[float] = None
+    #: Edges whose endpoints ARE typed, but whose type the node sample
+    #: never saw. Always 0 for an unsampled run, where node types and
+    #: endpoint types are read from the same full table. Distinct from
+    #: skipped_endpoint_edges, which counts a genuinely untyped endpoint
+    #: -- that is a fact about the data, this is a gap in the sample.
+    unsampled_endpoint_edges: int = 0
 
     def __str__(self) -> str:
         lines = []
@@ -1204,6 +1210,10 @@ class InferenceReport:
             f"{self.untyped_edges} kindless, "
             f"{self.skipped_endpoint_edges} skipped (endpoint node carries no type)",
         ]
+        if self.unsampled_endpoint_edges:
+            lines.append(
+                f"{self.unsampled_endpoint_edges} edge(s) dropped: their endpoint type "
+                f"was not in the sample -- re-run without sample_percent to see them")
         for c in self.conflicts:
             lines.append(f"conflict: {c.table}/{c.type_name}.{c.key} observed as "
                          f"{list(c.json_types)}")
@@ -1291,7 +1301,16 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
     `sampled` and says estimates. The endpoint-triple join samples the
     edges side only: sampling the node side too would count edges whose
     node fell outside the sample as endpoint-less, manufacturing
-    skipped-edge noise the data does not contain."""
+    skipped-edge noise the data does not contain.
+
+    That asymmetry has a consequence worth stating: an endpoint type can
+    be observed without a node of that type being sampled, and an edge
+    type naming a node type the schema does not define is one this
+    library's own GraphSchema refuses. Those edge types are DROPPED and
+    counted as `unsampled_endpoint_edges`, so a sampled inference stays
+    a well-formed pair whatever the sample contained -- and stays
+    adoptable by define_schema(), which is the whole point of returning
+    a schema rather than a pile of observations."""
     from sqlalchemy import and_, func, select
 
     if sample_percent is not None and not 0 < sample_percent <= 100:
@@ -1330,13 +1349,28 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
 
     node_types = [NodeType(name, properties=props)
                   for name, props in sorted(node_props.items())]
+    # Endpoint types come from the FULL node table (see the docstring:
+    # sampling that side would manufacture skipped-edge noise), while
+    # node types come from the sampled one. So a sampled run can observe
+    # an endpoint type it never sampled a node of -- and TABLESAMPLE
+    # SYSTEM is page-level, so on a small table that is common rather
+    # than exotic. Emitting such an edge type built a GraphSchema whose
+    # own constructor rejects it, turning infer_schema() into a raise.
+    # Drop them and say so: an inferred schema describes what the sample
+    # contained, and this keeps its output always adoptable by
+    # define_schema().
+    sampled_types = {nt_.name for nt_ in node_types}
     edge_types = []
     skipped = 0
+    unsampled = 0
     for row in sorted(triples, key=lambda r: (r.kind or "", r.source or "", r.target or "")):
         if not _named(row.kind):
             continue  # already counted as kindless below
         if not (_named(row.source) and _named(row.target)):
             skipped += row.rows
+            continue
+        if not {row.source, row.target} <= sampled_types:
+            unsampled += row.rows
             continue
         edge_types.append(EdgeType(row.kind, source=row.source, target=row.target,
                                    properties=edge_props.get(row.kind, ())))
@@ -1349,6 +1383,7 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
         skipped_endpoint_edges=skipped,
         conflicts=tuple(conflicts),
         sampled=sample_percent,
+        unsampled_endpoint_edges=unsampled,
     )
     return GraphSchema(node_types, edge_types), report
 
