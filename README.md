@@ -833,10 +833,11 @@ hopai-mcp --dsn ... --graph docs --graph crm    # several graphs, one pool
 }
 ```
 
-Nine tools, each one a call this README already documents:
+Each tool is a call this README already documents:
 
 | Tool | Is | Needs |
 | --- | --- | --- |
+| `list_graphs` | the graphs this server serves, and what each declares | >1 graph |
 | `describe_graph` | the declared schema, the vector fields, what this server refuses | |
 | `traverse_graph` | `traverse_json()` | |
 | `aggregate_graph` | `aggregate_json()` | |
@@ -861,13 +862,20 @@ away. Repeat `--graph`, or pass a mapping:
 serve({"docs": graph, "crm": graph.in_graph("crm")})
 ```
 
-Every tool then takes an optional `graph` (an enum of the served names,
-defaulting to the first) and every description names them; with a single
-graph, no tool mentions graphs at all. Each keeps its own schema and
-vector fields, because `in_graph()` deliberately carries neither. What one
-server *cannot* do is give two graphs different permissions —
-`--read-only` is a property of the server, so "read `docs`, write `crm`"
-is two servers, which is the honest boundary anyway.
+Every tool then **requires** a `graph` argument — an enum of the served
+names — and `list_graphs` appears to say what those names are. There is
+no default on purpose: an omitted `graph` has no safe reading, since
+falling back to one graph answers a question about another, and for a
+write it puts the rows there. With a single graph, no tool mentions
+graphs at all.
+
+Each graph keeps its own schema and vector fields, because `in_graph()`
+deliberately carries neither. `list_graphs` reports what the server was
+*configured* to serve, never every `graph_id` in the tables — enumerating
+the database would hand a model one tenant's graph from a server set up
+for another's. And one server *cannot* give two graphs different
+permissions: `--read-only` belongs to the server, so "read `docs`, write
+`crm`" is two servers, which is the honest boundary anyway.
 
 **Search by meaning takes text, never vectors.** A model asked to fill in
 an embedding invents one, and an invented embedding finds confidently

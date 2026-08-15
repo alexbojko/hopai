@@ -180,18 +180,41 @@ class TestManyGraphs:
         for spec in tools(offline(), allow_ddl=True):
             assert "graph" not in spec.parameters["properties"], spec.name
 
-    def test_several_graphs_put_the_choice_on_every_tool(self):
+    def test_several_graphs_require_the_name_on_every_tool(self):
+        """Required, not defaulted: with several graphs an omitted
+        `graph` has no safe reading. Falling back to one of them answers
+        a question about another -- and for a write, puts the rows
+        there. `graph` is exactly the argument a model forgets."""
         specs = tools(self.two(), allow_ddl=True)
         assert specs, "expected the usual inventory"
         for spec in specs:
+            if spec.name == "list_graphs":
+                assert spec.parameters["properties"] == {}, "the way IN cannot need a name"
+                continue
             key = spec.parameters["properties"].get("graph")
             assert key and key["enum"] == ["docs", "crm"], spec.name
-            assert "graph" not in spec.parameters.get("required", []), spec.name
+            assert "graph" in spec.parameters["required"], spec.name
 
-    def test_the_first_graph_is_the_default(self):
-        described = named(self.two())["describe_graph"].call()
-        assert described["graph"] == "docs"
-        assert (described["graphs"], described["default_graph"]) == (["docs", "crm"], "docs")
+    def test_list_graphs_exists_only_when_there_is_a_list(self):
+        assert "list_graphs" not in named(offline())
+        assert "list_graphs" in named(self.two())
+
+    def test_list_graphs_is_the_index_a_required_name_needs(self):
+        """Requiring a name everywhere else creates a chicken and egg:
+        this is the one call that answers "which names are there?" and
+        the only one that cannot itself take a graph."""
+        graphs = self.two()
+        graphs["docs"].define_schema(nodes=[NodeType("paper"), NodeType("author")])
+        graphs["docs"].define_vectors(nodes=[Vector("summary", 3)])
+        listed = named(graphs)["list_graphs"].call()["graphs"]
+        assert [entry["graph"] for entry in listed] == ["docs", "crm"]
+        assert listed[0]["node_types"] == ["author", "paper"]
+        assert listed[0]["vector_fields"] == {"nodes": ["summary"], "edges": []}
+        assert listed[1]["schema_declared"] is False and listed[1]["node_types"] is None
+
+    def test_an_unnamed_call_is_refused_rather_than_guessed(self):
+        with pytest.raises(ValueError, match="every call names one -- pass graph="):
+            named(self.two())["describe_graph"].call()
 
     def test_a_named_graph_is_the_one_used(self):
         described = named(self.two())["describe_graph"].call(graph="crm")
@@ -204,6 +227,11 @@ class TestManyGraphs:
         with pytest.raises(ValueError, match=r"does not serve a graph named 'crn'.*"
                                              r"it serves \['docs', 'crm'\]"):
             named(self.two())["describe_graph"].call(graph="crn")
+
+    def test_one_graph_still_needs_no_name(self):
+        """The single-graph server keeps its surface: nothing to choose,
+        nothing to forget, no argument."""
+        assert named(offline())["describe_graph"].call()["graph"] == "default"
 
     def test_each_graph_keeps_its_own_schema(self):
         """in_graph() carries neither schema nor vector fields on
@@ -304,6 +332,21 @@ class TestToolSchemas:
             needed = {name for name, p in inspect.signature(spec.call).parameters.items()
                       if p.default is inspect.Parameter.empty}
             assert set(spec.parameters.get("required", [])) == needed, spec.name
+
+    def test_a_required_parameter_may_exceed_the_signature_but_never_the_reverse(self):
+        """`graph` is required only when several graphs are served, and
+        one handler serves both configurations -- so its signature
+        cannot say it and Served.pick() enforces it instead. The rule
+        that still has to hold: everything advertised is accepted, and
+        everything the signature demands is advertised."""
+        base = offline()
+        for spec in tools({"docs": base.in_graph("docs"), "crm": base.in_graph("crm")}):
+            accepted = set(inspect.signature(spec.call).parameters)
+            required = set(spec.parameters.get("required", []))
+            needed = {name for name, p in inspect.signature(spec.call).parameters.items()
+                      if p.default is inspect.Parameter.empty}
+            assert required <= accepted, spec.name
+            assert needed <= required, spec.name
 
     def test_no_tool_advertises_a_vector_parameter(self, vector_graph):
         """The invariant tests/test_vectors.py pins for the static tool
@@ -888,11 +931,13 @@ class TestManyGraphsLive:
         graphs = {"docs": fresh_graph, "crm": fresh_graph.in_graph("crm")}
         specs = named(graphs)
 
-        specs["ingest_graph"].call(nodes=[{"id": 1, "type": "paper", "title": "graphs"}])
+        specs["ingest_graph"].call(nodes=[{"id": 1, "type": "paper", "title": "graphs"}],
+                                   graph="docs")
         specs["ingest_graph"].call(nodes=[{"id": 2, "type": "account", "name": "acme"}],
                                    graph="crm")
 
-        in_docs = specs["traverse_graph"].call(start={"where": {"type": "paper"}})
+        in_docs = specs["traverse_graph"].call(start={"where": {"type": "paper"}},
+                                               graph="docs")
         assert [n["id"] for n in in_docs["nodes"]] == ["1"]
         assert specs["traverse_graph"].call(
             start={"where": {"type": "paper"}}, graph="crm")["nodes"] == []
@@ -907,9 +952,9 @@ class TestManyGraphsLive:
         graphs = {"docs": fresh_graph, "crm": fresh_graph.in_graph("crm")}
         specs = named(graphs)
         document = {"nodes": {"paper": {"type": "object", "properties": {}}}, "edges": []}
-        specs["define_schema"].call(schema=document)
+        specs["define_schema"].call(schema=document, graph="docs")
 
-        assert set(specs["describe_graph"].call()["schema"]["nodes"]) == {"paper"}
+        assert set(specs["describe_graph"].call(graph="docs")["schema"]["nodes"]) == {"paper"}
         assert specs["describe_graph"].call(graph="crm")["schema"] is None
         with pytest.raises(ValueError, match="no saved schema for graph 'crm'"):
             fresh_graph.in_graph("crm").load_schema()

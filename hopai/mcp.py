@@ -29,11 +29,20 @@ graphs cost N handles rather than N connection pools. Serving one graph
 per process would have made an operator run N processes to get back
 something hopai gives away.
 
-With several, every tool grows an optional `graph` argument (an enum of
-the served names, defaulting to the first) and every description names
-them; with one, no tool mentions graphs at all. Each graph keeps its
-OWN schema and vector fields -- `in_graph()` carries neither on purpose,
-since a different graph is allowed a different shape.
+With several, every tool REQUIRES a `graph` argument (an enum of the
+served names) and `list_graphs` appears to say what those names are --
+there is no default, because an omitted `graph` has no safe reading:
+falling back to one graph answers a question about another, and for a
+write it puts the rows there. With one graph, no tool mentions graphs
+at all. Each graph keeps its OWN schema and vector fields --
+`in_graph()` carries neither on purpose, since a different graph is
+allowed a different shape.
+
+`list_graphs` lists what this server was CONFIGURED to serve, not every
+graph_id in the tables. Enumerating the database would hand a model
+rows the operator never chose to expose -- one tenant's graph from a
+server set up for another's -- and that is not a discovery convenience,
+it is the boundary.
 
 What one server cannot do is give two graphs DIFFERENT permissions:
 read_only and allow_ddl are properties of the server, not of a graph.
@@ -42,6 +51,7 @@ is the honest boundary -- a per-call argument was never one.
 
 THE TOOLS, and the call each one is:
 
+    list_graphs       the graphs this server serves (only when >1)
     describe_graph    what exists: the declared schema, the vector
                       fields, what this server will and will not do
     traverse_graph    traverse_json()      -- multi-hop, filtered
@@ -221,24 +231,40 @@ class Served:
         return list(self.graphs)
 
     @property
-    def default_name(self) -> str:
+    def first_name(self) -> str:
+        """The first name given. There is no DEFAULT graph when several
+        are served -- `graph` is required on every call then -- so this
+        is only what a single-graph server answers with, plus whose
+        vocabulary the static schemas summarize in that case."""
         return self.names[0]
 
     @property
-    def default(self) -> Graph:
-        return self.graphs[self.default_name]
+    def first(self) -> Graph:
+        return self.graphs[self.first_name]
 
     @property
     def many(self) -> bool:
         return len(self.graphs) > 1
 
     def pick(self, name: Optional[str], caller: str) -> Graph:
-        """The named graph, or the default. A name this server does not
-        serve is refused with the list -- never silently answered from
-        the default, which would report another graph's rows as this
-        one's."""
+        """The named graph. With several served there is no default and
+        an unnamed call is REFUSED, because a default is precisely what
+        writes a model's rows into the graph it did not mean: `graph`
+        is an argument a model can forget, and forgetting it would
+        otherwise be silent and successful. With one served graph there
+        is nothing to name and nothing to forget.
+
+        A name this server does not serve is refused with the list, and
+        never answered from another graph -- reporting one graph's rows
+        as another's is the single bug multi-graph scoping produces."""
         if name is None:
-            return self.default
+            if self.many:
+                raise ValueError(
+                    f"{caller}: this server serves several graphs, so every call names "
+                    f"one -- pass graph=<name>. It serves {self.names}; list_graphs "
+                    f"describes them"
+                )
+            return self.first
         if name not in self.graphs:
             raise ValueError(
                 f"{caller}: this server does not serve a graph named {name!r} -- "
@@ -272,7 +298,7 @@ def _static_schemas(served: Served) -> dict:
     for every other graph -- a summary that is wrong for all but one of
     them is worse than none. _described() names the graphs instead."""
     if not served.many:
-        return {tool["name"]: tool for tool in served.default.tool_schemas()}
+        return {tool["name"]: tool for tool in served.first.tool_schemas()}
 
     import copy
 
@@ -296,8 +322,9 @@ def _graph_key(served: Served) -> dict:
         "graph": {
             "type": "string",
             "enum": served.names,
-            "description": f"Which graph to use. Defaults to {served.default_name!r}. "
-                           f"Graphs are separate: nothing in one is visible from another.",
+            "description": "Which graph this call is about. Required: the graphs are "
+                           "separate, nothing in one is visible from another, and there "
+                           "is no default to fall back on. list_graphs names them.",
         },
     }
 
@@ -310,10 +337,10 @@ def _described(served: Served, description: str) -> str:
     Nothing is appended when several graphs are served: there is no
     single vocabulary, and the default's would read as every graph's.
     _named_graphs() says what IS true of all of them instead."""
-    if served.many or served.default.schema is None:
+    if served.many or served.first.schema is None:
         return description
     from .schema import tool_summary
-    return f"{description} {tool_summary(served.default.schema)}"
+    return f"{description} {tool_summary(served.first.schema)}"
 
 
 def _instructions(served: Served) -> str:
@@ -333,8 +360,8 @@ def _named_graphs(served: Served) -> str:
     describe_graph returns one graph's schema in full."""
     return (f"This server exposes {len(served.names)} separate graphs "
             f"({', '.join(repr(n) for n in served.names)}), each with its own schema and "
-            f"invisible to the others; the default is {served.default_name!r}. Pass `graph` "
-            f"to choose, and call describe_graph for what one contains.")
+            f"invisible to the others. There is no default: every call names its graph. "
+            f"list_graphs lists them, describe_graph says what one contains.")
 
 
 def _vector_fields(graph: Graph, target: str) -> dict:
@@ -483,6 +510,41 @@ def _with_search(schema: dict, served: Served, sentence: str) -> dict:
 # The tools
 # ---------------------------------------------------------------------
 
+def _list_graphs_tool(served: Served) -> ToolSpec:
+    def list_graphs() -> dict:
+        return {
+            "graphs": [
+                {
+                    "graph": name,
+                    "schema_declared": graph.schema is not None,
+                    "node_types": sorted(nt.name for nt in graph.schema.node_types)
+                                  if graph.schema is not None else None,
+                    "vector_fields": {
+                        target: sorted(_vector_fields(graph, target))
+                        for target in ("nodes", "edges")
+                    },
+                }
+                for name, graph in served.graphs.items()
+            ],
+            "note": "Every other tool takes a `graph` argument naming one of these. "
+                    "They are separate graphs: nothing in one is visible from another, "
+                    "and there is no default.",
+        }
+
+    return ToolSpec(
+        name="list_graphs",
+        description=(
+            "List the graphs this server exposes, with the node types and vector fields "
+            "each one declares. Call this first: every other tool requires a `graph` "
+            "argument naming one of them, and the graphs are separate -- a question asked "
+            "of the wrong one is answered, emptily, rather than refused. describe_graph "
+            "returns one graph's full schema."
+        ),
+        parameters=_object({}),
+        call=list_graphs,
+    )
+
+
 def _describe_tool(served: Served, read_only: bool, allow_ddl: bool,
                    embed: Optional[Callable]) -> ToolSpec:
     def describe_graph(graph: Optional[str] = None, counts: bool = False) -> dict:
@@ -494,7 +556,6 @@ def _describe_tool(served: Served, read_only: bool, allow_ddl: bool,
         result = {
             "graph": graph.graph,
             "graphs": served.names,
-            "default_graph": served.default_name,
             "schema": schema.to_json() if schema is not None else None,
             "schema_mermaid": schema.to_mermaid() if schema is not None else None,
             "vector_fields": vectors,
@@ -890,6 +951,7 @@ def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
 
     static = _static_schemas(served)
     specs = [
+        *([_list_graphs_tool(served)] if served.many else []),
         _describe_tool(served, read_only, allow_ddl, embed),
         _traverse_tool(served, static["traverse_graph"], embed),
         _aggregate_tool(served, static["aggregate_graph"], embed),
@@ -907,6 +969,18 @@ def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
         # On every tool, not a chosen few: each one takes `graph`, and a
         # model that has to hunt for which graphs exist will guess.
         line = _named_graphs(served)
+        for spec in specs:
+            if "graph" in spec.parameters["properties"]:
+                # REQUIRED, not defaulted. Serving several graphs, an
+                # omitted `graph` has no safe reading: falling back to
+                # one of them answers a question about another, and for
+                # a write it puts the rows there. Advertised here rather
+                # than in each builder because it is a property of the
+                # server, and enforced in Served.pick() as well -- the
+                # handler signature is shared by both configurations and
+                # cannot say it.
+                spec.parameters["required"] = sorted(
+                    {*spec.parameters.get("required", []), "graph"})
         specs = [replace(spec, description=f"{spec.description} {line}") for spec in specs]
     return specs
 
@@ -1100,9 +1174,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="PostgreSQL DSN. Defaults to $HOPAI_DSN.")
     parser.add_argument("--graph", action="append", default=[], metavar="NAME",
                         help=f"A graph in those tables to serve (default {DEFAULT_GRAPH!r}). "
-                             f"Repeatable: several graphs share one connection pool, and "
-                             f"the first is the default. Every tool then takes an optional "
-                             f"`graph` argument naming which to use.")
+                             f"Repeatable: several graphs share one connection pool, every "
+                             f"tool then REQUIRES a `graph` argument naming one of them, "
+                             f"and list_graphs is added to say what the names are.")
     parser.add_argument("--transport", choices=("stdio", "http"), default="stdio",
                         help="stdio (default) for a client that spawns this process; "
                              "http for a long-running server.")

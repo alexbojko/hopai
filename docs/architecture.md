@@ -158,12 +158,18 @@ are not obvious from the outside.
   and `serve()` never mixes the two. They belong to the server, not to a graph — two
   graphs needing different permissions are two servers.
 - **One server holds many graphs**, because `Graph` is a handle and `in_graph()` shares
-  the engine's pool: `Served` keeps `{name: Graph}` and every tool takes an optional
-  `graph`, resolved by `Served.pick()` so an unserved name is refused rather than
-  answered from the default. Each handle keeps its own schema and vector fields, which
-  is why the registry holds handles rather than one handle and a list of names. With a
-  single graph nothing is advertised — the same rule as `search_field`, and the reason
-  the single-graph tool surface is byte-identical to what it was before this existed.
+  the engine's pool: `Served` keeps `{name: Graph}`, every tool then *requires* a `graph`,
+  and `list_graphs` is registered to answer the chicken-and-egg that creates. `Served.pick()`
+  is the enforcement — an unserved name is refused with the list, and an omitted one is
+  refused rather than defaulted, because falling back to one graph answers a question
+  about another (and for a write, puts the rows there). The handler signatures keep
+  `graph` optional since one handler serves both configurations; `tools()` marks it
+  required in the advertised schema, and a test pins the resulting rule: everything
+  advertised is accepted, everything the signature demands is advertised. Each handle
+  keeps its own schema and vector fields, which is why the registry holds handles rather
+  than one handle and a list of names. With a single graph nothing is advertised — the
+  same rule as `search_field`, and the reason the single-graph tool surface is
+  byte-identical to what it was before this existed.
 
 Handlers are synchronous and are wrapped to run in a worker thread: a blocking database
 call in an async server would stall every other request on the connection. The SDK's
