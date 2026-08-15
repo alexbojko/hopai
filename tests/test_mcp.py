@@ -686,16 +686,30 @@ class TestToolSchemas:
                              "object", "array", "null"}
         graphs = {"docs": vector_graph, "crm": vector_graph.in_graph("crm")}
         graphs["crm"].define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)])
+        seen = set()
         for spec in tools(graphs, embed=embedder()):
+            if spec.name == "list_graphs":    # the way IN cannot need a name
+                continue
             injected = {"graph": spec.parameters["properties"].get("graph")}
-            start = spec.parameters["properties"].get("start") or {}
-            for key in ("search", "keep", "search_field"):
-                injected[f"start.{key}"] = (start.get("properties") or {}).get(key)
+            start = spec.parameters["properties"].get("start")
+            if start is not None:
+                for key in ("search", "keep", "search_field"):
+                    injected[f"start.{key}"] = (start.get("properties") or {}).get(key)
             for where, schema in injected.items():
-                if schema is None:            # not every tool grows every key
-                    continue
+                # PRESENT, not merely well-formed if present. Skipping a
+                # missing key made this test pass for the mutant that
+                # renamed `keep` to `KEEP`: the key it looked up was
+                # gone, so there was nothing to check and nothing to
+                # object to. A rename is exactly what has to fail here --
+                # the handler still takes `keep`, so the model is being
+                # offered a name that will be rejected.
+                assert schema is not None, f"{spec.name}.{where} is not advertised"
                 assert schema.get("type") in json_schema_types, f"{spec.name}.{where}"
                 assert schema.get("description", "").strip(), f"{spec.name}.{where}"
+                seen.add(where)
+        # and the loop above has to have HAD something to check: every
+        # injected key reached, or this asserts nothing at all
+        assert seen == {"graph", "start.search", "start.keep", "start.search_field"}
 
     def test_search_field_is_offered_only_when_the_choice_is_real(self):
         """One declared field needs no argument. Several make the choice
@@ -730,13 +744,23 @@ class TestVectorsNeverComeFromTheModel:
             spec.call(start={"near": {"field": "summary", "vector": [0.1, 0.2, 0.3]}})
 
     @pytest.mark.parametrize("key", ["near", "keep", "via_near", "via_keep", "boost"])
-    def test_hop_vector_keys_are_refused_too(self, key):
+    @pytest.mark.parametrize("tool, arguments", [
+        ("traverse_graph", {}),
+        ("aggregate_graph", {"aggregates": {"n": {"fn": "count"}}}),
+    ])
+    def test_hop_vector_keys_are_refused_too(self, key, tool, arguments):
         """Hops are passed through to json_api verbatim, and the seeded
         path calls it with allow_vectors=True -- so the hops have to be
-        refused here or the invariant would hold only for `start`."""
-        spec = named(offline())["traverse_graph"]
-        with pytest.raises(ValueError, match=rf"traverse_graph: \['{key}'\] cannot come from"):
-            spec.call(start={"where": {"type": "person"}}, hops=[{key: 3}])
+        refused here or the invariant would hold only for `start`.
+
+        Both tools name themselves in the refusal, and both are checked:
+        a mutant that mangled aggregate_graph's caller name survived
+        while traverse_graph's was pinned. "Which of my calls was this?"
+        is the first thing a model has to answer, and the answer being
+        right for one of two tools is how it stops being reliable."""
+        spec = named(offline())[tool]
+        with pytest.raises(ValueError, match=rf"{tool}: \['{key}'\] cannot come from"):
+            spec.call(start={"where": {"type": "person"}}, hops=[{key: 3}], **arguments)
 
     def test_a_seeded_server_still_refuses_an_invented_near(self, vector_graph):
         spec = named(vector_graph, embed=embedder())["traverse_graph"]
