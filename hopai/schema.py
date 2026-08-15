@@ -744,6 +744,46 @@ ENDPOINT_TRIGGER_EXISTS = text("""
 
 
 # ---------------------------------------------------------------------
+# The schema, summarized for a tool-calling model
+# ---------------------------------------------------------------------
+
+#: Properties listed per type in a tool description before "+N more"
+#: takes over. A model needs the vocabulary, not an inventory -- and a
+#: tool description is prompt budget someone else is paying for.
+_TOOL_SUMMARY_PROPERTIES = 12
+
+
+def tool_summary(schema: GraphSchema) -> str:
+    """The declared schema as one compact paragraph for a tool
+    description: what an agent can filter on, so it stops guessing
+    labels and property names. `*` marks required, endpoint pairs are
+    grouped per kind, and long property lists are capped -- bounded on
+    purpose, never an unbounded dump."""
+    def bag(properties: tuple) -> str:
+        shown = [p.name + ("*" if p.required else "")
+                 for p in properties[:_TOOL_SUMMARY_PROPERTIES]]
+        overflow = len(properties) - _TOOL_SUMMARY_PROPERTIES
+        if overflow > 0:
+            shown.append(f"+{overflow} more")
+        return f"({', '.join(shown)})" if shown else ""
+
+    nodes = "; ".join(f"{nt.name}{bag(nt.properties)}" for nt in schema.node_types)
+    per_kind: dict = {}
+    for et in schema.edge_types:
+        pairs, _ = per_kind.setdefault(et.kind, ([], et.properties))
+        pairs.append(f"{et.source} -> {et.target}")
+    edges = "; ".join(
+        f"{kind}: {', '.join(pairs)}" + (f" {bag(properties)}" if properties else "")
+        for kind, (pairs, properties) in per_kind.items())
+    parts = ["This graph's declared schema (properties in parentheses, * = required)."]
+    if nodes:
+        parts.append(f"Node types: {nodes}.")
+    if edges:
+        parts.append(f"Edge kinds (source -> target): {edges}.")
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------
 # Violations: the dry-run before enforcement
 # ---------------------------------------------------------------------
 
