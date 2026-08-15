@@ -890,10 +890,26 @@ class TestLogging:
         assert len(caplog.records) == 1
         record = caplog.records[0]
         assert record.levelname == "WARNING"
-        # Names the call, how far it got, and the provider's own type --
-        # a log line saying only "it failed" is not worth writing.
-        assert "embed_documents" in record.getMessage()
-        assert "RuntimeError: provider is down" in record.getMessage()
+        # Names the call, how far it got, how many attempts it cost, and
+        # the provider's own type -- a log line saying only "it failed"
+        # is not worth writing. The counts are asserted because the log
+        # builds them SEPARATELY from the exception message, so one can
+        # drift while the other stays right (mutant _attempt_30).
+        assert record.getMessage() == (
+            "Embedder(function).embed_documents: provider call failed after 0 embedded, "
+            "1 attempt(s) (RuntimeError: provider is down)")
+
+    def test_the_failure_log_counts_the_attempts_it_really_made(self, slept, caplog):
+        """Three attempts reported as three. Retryable this time, so the
+        count is not trivially 1 -- and `0 embedded` is the second
+        number, which says the batch got nowhere rather than partway."""
+        client = _raises(TimeoutError("upstream"), times=99)
+        with caplog.at_level(logging.WARNING, logger="hopai.embeddings"), \
+                pytest.raises(EmbeddingError):
+            Embedder(client, retries=2).embed_documents(["a"])
+        failure = [r for r in caplog.records if "failed after" in r.getMessage()]
+        assert len(failure) == 1
+        assert "after 0 embedded, 3 attempt(s)" in failure[0].getMessage()
 
     def test_nothing_is_logged_above_debug_on_the_happy_path(self, caplog):
         """A library that chatters at INFO makes an application turn its
