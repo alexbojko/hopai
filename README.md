@@ -33,7 +33,9 @@ without being taught anything new.
   properties.
 - 🧲 **Vector search without pgvector** — exact cosine similarity on
   plain `real[]` columns, many named fields per node/edge, weighted
-  multivector queries, and similarity-seeded traversals.
+  multivector queries, and similarity-seeded traversals. Hand a field
+  your OpenAI/Cohere/Voyage/SentenceTransformer client and store text
+  instead of floats.
 - 🧪 **Tested like it matters** — SQL-level assertions, a live-Postgres
   suite, an 85% coverage gate and mutation testing in CI.
 - 📊 **Measured, not claimed** — real benchmark numbers in `benchmarks/`,
@@ -643,12 +645,59 @@ no hops, `Start(near=…, keep=N)` selects exactly what `vector_search()
 ` would, minus the score: `near=` on `Start` earns its place because a
 traversal cannot be seeded from a list of ids.
 
+### Text in, vectors out
+
+You do not have to produce the floats. Give a field the embedding
+client you already have and hopai calls it for you — on the way in, on
+the way out, and for the backfill in between:
+
+```python
+import openai
+from hopai import Vector, Near
+
+graph.define_vectors(nodes=[
+    Vector("summary", 1536, source="abstract",
+           embed=openai.OpenAI()),          # or cohere, voyage, google...
+])
+graph.migrate_vectors()
+
+graph.set_vectors(nodes=[{"id": 1, "summary": "a paper about Raft"}])
+graph.vector_search(Near("summary", text="how do nodes agree?"), k=10)
+
+graph.embed_stale()      # embed every row that has no vector yet
+# -> {"nodes": {"summary": {"embedded": ["2", "3"], "skipped": []}}, "edges": {}}
+```
+
+`source=` names the **property** holding the text and defaults to the
+field's own name, so `Vector("title", 768, embed=…)` embeds each row's
+`title`. `embed_stale()` reads that property for every row
+`stale_vectors()` reports, embeds them per field in one batched call,
+and writes them; rows whose property is missing or blank come back
+under `skipped` rather than raising, because a paper with no abstract
+legitimately has no abstract vector.
+
+**No new dependency.** hopai imports no provider package — not even to
+recognize one; clients are matched by module name and duck typing. The
+extras are a convenience: `pip install "hopai[openai]"`, `[cohere]`,
+`[voyageai]`, `[google]`, `[sentence-transformers]`, or `[embeddings]`
+for all of them. Anything with `embed_documents`/`embed_query`
+(LangChain), `get_text_embedding_batch`/`get_query_embedding`
+(LlamaIndex), a `SentenceTransformer`, or a plain
+`callable(texts) -> vectors` works with no extra at all. `Embedder`
+wraps whatever you pass and handles the parts that are easy to get
+wrong: per-provider batch caps, and the document/query asymmetry that
+several providers score differently and that silently costs recall.
+
+This is the one place hopai makes a **network call** — always to the
+client you constructed and configured, and always outside the write
+transaction, so a provider failure never leaves a half-written batch.
+
 **Re-embedding and the exit door.** `stale_vectors()` lists the rows
 with no vector or a vector the current declaration no longer fits (the
-window a dimension change opens), so a re-embed loop is safe to
-automate. And if the exact scan is outgrown, `pgvector_exit_ddl()` prints
-the migration onto pgvector — generated without importing or requiring
-the extension:
+window a dimension change opens) — the report behind `embed_stale()`,
+and what you loop over yourself for fields you fill in by hand. And if
+the exact scan is outgrown, `pgvector_exit_ddl()` prints the migration
+onto pgvector — generated without importing or requiring the extension:
 
 ```python
 for node_id in graph.stale_vectors()["nodes"]["summary"]["missing"]:
@@ -657,17 +706,21 @@ for node_id in graph.stale_vectors()["nodes"]["summary"]["missing"]:
 print("\n".join(graph.pgvector_exit_ddl()))   # one-way; read vectors.py first
 ```
 
-Two honest limits, both documented in depth in `hopai/vectors.py`: the
-search is an exact scan, so its cost is linear in the candidates left
-after filtering — measured at roughly dimensions × 0.13 µs per
-candidate row (≈0.2 ms per 1536-dim vector; an unfiltered 20k × 384-dim
-scan lands near one second — `benchmarks/bench_vectors.py` has the
-numbers), which makes a few thousand filtered candidates interactive
-and unfiltered hundreds of thousands the wrong tool. And there is
-deliberately **no LLM tool schema** for it, because a model asked to
-fill in a `"vector"` parameter will invent one, and an invented
-embedding finds confidently wrong neighbors. Embed real text in your
-application, then hand the model the results.
+One honest limit, documented in depth in `hopai/vectors.py`: the search
+is an exact scan, so its cost is linear in the candidates left after
+filtering — measured at roughly dimensions × 0.13 µs per candidate row
+(≈0.2 ms per 1536-dim vector; an unfiltered 20k × 384-dim scan lands
+near one second — `benchmarks/bench_vectors.py` has the numbers), which
+makes a few thousand filtered candidates interactive and unfiltered
+hundreds of thousands the wrong tool.
+
+And one rule, in one key: a model may send `"text"`, never `"vector"`.
+Text is embedded by the field itself, with your client, so the query
+embedding comes from the model that wrote the stored ones. A `"vector"`
+asked of a model is invented, and an invented embedding finds
+confidently wrong neighbors — so it is the single thing the tool
+schemas never advertise, and the JSON front ends refuse it unless you
+pass `allow_vectors=True` from your own code.
 
 ## 🤖 The JSON interface
 
@@ -694,10 +747,24 @@ Filters accept the same grammar, spelled as JSON operators:
 `{"and": [...]}`, `{"or": [...]}`, `{"not": ...}`, `{"gt": [key, value]}`,
 `{"gte": [...]}`, `{"lt": [...]}`, `{"lte": [...]}`, `{"between": [key, lo, hi]}`.
 
+A traversal can also select by **meaning**, with the same `near` a
+Python caller writes — a model sends the words, and the field embeds
+them with the client your application declared:
+
+```python
+traverse_json(graph, {
+    "start": {"near": {"field": "summary", "text": "distributed consensus"},
+              "keep": 25},
+    "hops": [{"via": {"kind": "cites"}, "hops": [1, 3]}],
+})
+```
+
 `hopai.TRAVERSE_TOOL_SCHEMA` is a ready-to-use JSON Schema for wiring
-this into an LLM function-calling definition directly — and with a
+this into an LLM function-calling definition directly, alongside
+`AGGREGATE_TOOL_SCHEMA`, `INGEST_TOOL_SCHEMA` and
+`VECTOR_SEARCH_TOOL_SCHEMA` — and with a
 [graph schema](#-graph-schema) defined, `graph.tool_schemas()` returns
-all three tool definitions with *your* node types, edge kinds and
+the tool definitions with *your* node types, edge kinds and
 properties summarized into the descriptions, so the model stops
 hallucinating labels:
 
@@ -819,6 +886,10 @@ translating into something that answers a different question:
   spells out the cost model and why each refusal is a refusal. Cosine
   is the only metric — on the unit-normalized vectors every current
   embedding API ships, dot and euclidean rank identically anyway.
+- Embedding is a thin seam, not a framework: no retries, no caching, no
+  rate limiting, and nothing async. Your client already does the first
+  three the way you configured them, and hopai is synchronous end to
+  end.
 - Synchronous only — every call blocks; no `AsyncSession` support yet.
 - A cycle-protection path array is carried on every recursive row. Cheap
   at moderate depth, measurably not-cheap on single-segment traversals

@@ -14,6 +14,11 @@ read.** When a design question comes up, these decide it, in order:
 
 1. **No new dependency, ever.** Postgres and SQLAlchemy are the whole stack. A feature
    needing an extension, sidecar or worker is the wrong feature. Extras stay optional.
+   `embeddings.py` is the one place hopai makes a **network call**, and it holds the
+   line rather than breaking it: no provider package is imported, the client is the
+   caller's to construct and configure, and the extras (`hopai[openai]` and friends)
+   name what you were installing anyway. A retry policy, a cache or a rate limiter
+   here would be the wrong feature — your client already has yours.
 2. **An LLM must get it right with no custom instructions.** Prefer a protocol a model
    has already seen ten thousand times — Cypher, JSON node/edge lists, JSON Schema tool
    definitions, SQLAlchemy idioms — over anything invented here, even when the invention
@@ -62,13 +67,27 @@ read.** When a design question comes up, these decide it, in order:
 - **A similarity is NULL — "missing" — when the stored vector is NULL, all zeros, or the
   wrong length.** `unnest(a, b)` pads the shorter side, so a mis-sized vector would
   otherwise score a confident cosine over the shared prefix.
-- **Vectors live in `vec_*` real columns, never in `properties`, and never pass
-  through an LLM tool schema.** JSONB storage would bloat the GIN index and every
-  result; a tool-schema `"vector"` parameter invites a model to invent an embedding,
-  and an invented embedding finds confidently wrong neighbors. Similarity is exact
-  (unnest+sum cosine, float8 accumulation); a traversal without `near=` must emit
-  byte-identical SQL to the pre-vector engine. (`test_defining_vectors_changes_no_near_less_query`,
-  `TestToolSchemasStayVectorFree`)
+- **Vectors live in `vec_*` real columns, never in `properties`.** JSONB storage would
+  bloat the GIN index and every result. Similarity is exact (unnest+sum cosine, float8
+  accumulation); a traversal without `near=` must emit byte-identical SQL to the
+  pre-vector engine. (`test_defining_vectors_changes_no_near_less_query`)
+- **A model may send `"text"`; a `"vector"` never reaches a tool schema.** Text is
+  embedded by the field itself, with the application's own client, so the query
+  embedding comes from the model that wrote the stored ones — advertise it. Floats
+  asked of a model are invented, and an invented embedding finds confidently wrong
+  neighbors, so `"vector"` is the single key parsed and never advertised, refused
+  without `allow_vectors=True`. Widening the refusal back over `text`/`keep`/`boost`
+  puts semantic search out of a tool call's reach entirely, which is what it was.
+  (`TestToolSchemasStayVectorFree` pins both halves)
+- **Embedding happens outside the transaction, batched per field.** `set_vectors()`
+  resolves every string before it takes a connection: an HTTP call inside an open
+  transaction holds row locks for a network round trip, and a provider dying halfway
+  leaves a half-written batch for a retry to collide with.
+  (`test_the_provider_is_called_before_the_transaction_opens`)
+- **`embeddings.py` imports no provider package, ever** — not even to recognize one.
+  Clients are matched by `type(client).__module__` and attribute shape; `isinstance`
+  would need the import and would make `hopai[openai]` a coupling instead of a
+  convenience. (`TestNoProviderIsImported`)
 - **Writes are one transaction**, batching included. A half-committed write makes a
   retry collide with rows that landed.
 
@@ -88,10 +107,13 @@ read.** When a design question comes up, these decide it, in order:
   aggregation triple, or ingestion operations, and hold no query logic. Widening a
   subset means adding a translation, never loosening a refusal into a near-enough
   mapping. The tool schemas (`TRAVERSE_TOOL_SCHEMA` / `AGGREGATE_TOOL_SCHEMA` /
-  `INGEST_TOOL_SCHEMA`) must stay in step with what the parsers accept — with one
-  pinned exception: the vector keys (`near`/`keep`/`via_near`/`via_keep`/`boost`) are
-  parsed but deliberately never advertised to a model, and `traverse_json`/
-  `aggregate_json` refuse them without `allow_vectors=True` (see `vectors.py`).
+  `INGEST_TOOL_SCHEMA` / `VECTOR_SEARCH_TOOL_SCHEMA`) must stay in step with what the
+  parsers accept — with exactly two pinned exceptions, and no third without a reason
+  of the same kind. A near spec's **`"vector"`** is parsed and never advertised (the
+  invariant above); **`label`** is not advertised because it names result groups for
+  the caller's own bookkeeping and builds no SQL, so there is nothing for a model to
+  decide. `test_advertises_the_keys_the_parser_reads` derives both sides from
+  `_HOP_KEYS`/`_START_KEYS`, so a widened parser and a widened schema fail apart.
   `cypher.py` has no vector spelling and is not expected to grow one — Cypher has no
   portable similarity syntax to translate, so there is nothing to refuse by name.
 - `notebooks/` is documentation that **runs**, executed by CI on every PR

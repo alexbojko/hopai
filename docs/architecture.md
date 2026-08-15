@@ -89,12 +89,40 @@ set plugs into the walk.
   transaction, missing ids fail the call); ingestion rows never carry vectors.
   `stale_vectors()` reports what needs re-embedding; `pgvector_exit_ddl()` emits the one-way
   migration off this engine without importing the extension.
-- The JSON forms exist (`"near"`/`"keep"`/`"via_near"`/`"via_keep"`/`"boost"` in specs,
-  `vector_search_json`) but the LLM tool schemas deliberately omit them, and
-  `traverse_json`/`aggregate_json` **refuse** them without `allow_vectors=True` — a model
-  fills a `"vector"` parameter by inventing floats, so the invariant is enforced rather
-  than advertised. `tests/test_vectors.py::TestToolSchemasStayVectorFree` pins both the
-  omission and the per-graph `tool_schemas()` staying vector-free.
+- The JSON forms exist for the whole family, and only `"vector"` is refused without
+  `allow_vectors=True` — `"text"` is the model's way in, since the field embeds it with
+  the application's own client, while an invented `"vector"` finds confidently wrong
+  neighbors. `_refuse_vectors()` in `json_api.py` is the single enforcement point;
+  `tests/test_vectors.py::TestToolSchemasStayVectorFree` pins both halves — that no
+  schema advertises `"vector"`, and that all of them advertise `"text"`.
+
+## The embedding seam
+
+`embeddings.py` is the only part of hopai that makes a network call, and it makes none
+of its own decisions about how: you construct the client, hopai calls one method on it.
+
+- **No provider package is ever imported**, not even to recognize one. `_provider()`
+  reads `type(client).__module__`'s first segment and dispatch is duck-typed on
+  attribute shape — `isinstance` would need the import and would make the coupling
+  real. `tests/test_embeddings.py::TestNoProviderIsImported` asserts `sys.modules`
+  stayed clean after every adapter ran.
+- `Embedder` owns the two things that are easy to get wrong: per-provider batch caps
+  (`_BATCH_CAPS`, chunked here so a provider refusing 200 inputs never becomes the
+  caller's problem) and the **document/query asymmetry** — several providers embed
+  stored text and query text differently, and getting it wrong raises nothing and
+  quietly costs recall. `embed_documents`/`embed_query`/`embed_queries` are that split.
+- `Vector(embed=, source=)` binds a field to a client and to the **property** holding
+  its text, defaulting to the field's own name. Three paths consume it: `set_vectors()`
+  when a value is a string, `Near(text=)` at query build (resolved in `validate_nears()`,
+  the first point where the spec and the graph are both in hand), and `embed_stale()`
+  for the backfill.
+- **Embedding always happens outside the transaction**, batched per field.
+  `set_vectors()` validates and resolves every row before it takes a connection: an
+  HTTP call inside an open transaction holds row locks for a network round trip, and a
+  provider dying halfway would leave a half-written batch for a retry to collide with.
+- `vector_search_many()` resolves every query's text in one call per field
+  (`_resolve_query_texts()`), because N round trips to the provider would undo the N-1
+  round trips to Postgres that call exists to save.
 
 ## The write path
 
@@ -156,7 +184,8 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/models.py` | The DDL, the typed-columns / JSONB split, the composite FK |
 | `hopai/ingest.py` | The two row spellings, edge-by-property references, merge semantics |
 | `hopai/constraints.py` | What each constraint compiles to, and the SQL semantics that surprise people |
-| `hopai/vectors.py` | Why no pgvector, the storage and cost model, cosine-only, multivector semantics, and why vectors never pass through a tool schema |
+| `hopai/vectors.py` | Why no pgvector, the storage and cost model, cosine-only, multivector semantics, and why a vector never passes through a tool schema |
+| `hopai/embeddings.py` | Which clients are accepted and how they are recognized without an import, the document/query asymmetry, and what this seam deliberately does not do |
 | `hopai/schema.py` | The graph-schema notations, the annotation mapping, what enforcement compiles to and the endpoint-type limit, and why inference is an observation rather than a `.schema` fallback |
 | `hopai/cypher.py` | The translatable subset — read, write and aggregate — and why each refusal is a refusal |
 | `tests/conftest.py` | The fixture graph's shape |

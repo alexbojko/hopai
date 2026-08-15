@@ -1194,6 +1194,10 @@ class Graph:
         query = self.build_aggregate_query(start, list(hops), aggregates)
         with Session(self.engine) as session:
             row = session.execute(query).one()
+        # strict= is unobservable here and that is on purpose:
+        # build_aggregate_query() emits exactly one labeled column per
+        # entry in `aggregates`, so the two lengths are equal by
+        # construction. Kept as a claim about that, not as a guard.
         return {name: _plain(value) for name, value in zip(aggregates, row, strict=True)}
 
     def traverse(self, start: Start, *hops: Hop) -> Subgraph:

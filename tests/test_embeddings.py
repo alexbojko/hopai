@@ -120,6 +120,22 @@ class TestDocumentQueryAsymmetry:
         embedder.embed_query("q")
         assert calls == ["search_document", "search_query"]
 
+    def test_a_batch_of_queries_stays_on_the_query_side(self, calls):
+        """embed_queries() is the batched half of embed_query(), and
+        the only thing making it a QUERY is one flag. Sending the
+        document spelling raises nothing and quietly costs recall on
+        every search vector_search_many() ranks -- which is the exact
+        failure this module exists to prevent."""
+        class Cohereish:
+            def embed(self, texts, model, input_type, embedding_types):
+                calls.append(input_type)
+                return type("R", (), {"embeddings": type("E", (), {
+                    "float_": [[1.0, 0.0]] * len(texts)})()})()
+
+        embedder = Embedder(_named("cohere.client_v2", Cohereish)(), model="embed-v4.0")
+        assert len(embedder.embed_queries(["q1", "q2"])) == 2
+        assert calls == ["search_query"]
+
     def test_voyage_sends_its_two_input_types(self, calls):
         class Voyageish:
             def embed(self, texts, model, input_type):

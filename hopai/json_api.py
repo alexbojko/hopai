@@ -167,7 +167,11 @@ def _refuse_vectors(spec: dict, caller: str) -> None:
                         f"{caller}: {key}={{...\"vector\": [...]}} cannot come from a tool "
                         f"call -- a model cannot supply a real embedding, and an invented "
                         f"one finds confidently wrong neighbors. Use "
-                        f'{{"field": {one.get("field", "summary")!r}, "text": "..."}} and let '
+                        # A placeholder rather than an example field name
+                        # when the spec named none: inventing one reads
+                        # as "you asked for summary", which they did not.
+                        f'{{"field": {one.get("field", "<your field>")!r}, "text": "..."}} '
+                        f'and let '
                         f"the field embed it, or pass allow_vectors=True if this spec came "
                         f"from your own code"
                     )

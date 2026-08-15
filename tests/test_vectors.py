@@ -40,7 +40,8 @@ from hopai.constraints import ConstraintViolation
 #: four separate mutation rounds each surfaced one more that had none.
 #: Reading the sites out of the source is what stops the fifth.
 _LABEL_ARG = {"_check_k": 1, "validate_nears": 4, "validate_boosts": 1,
-              "_field": 3, "_defined": 2, "_check_keys": 2, "_refuse_vectors": 1}
+              "_field": 3, "_defined": 2, "_check_keys": 2, "_refuse_vectors": 1,
+              "_embedder": 2, "_resolve_query_texts": 3}
 
 
 #: mutmut copies every function once per mutant into the tree it runs
@@ -706,7 +707,7 @@ class TestNearJsonPythonEquivalence:
         ({"field": "s"}, r'needs "text" to embed OR "vector".*not neither'),
         ({"field": "s", "text": "a", "vector": [1.0]},
          r'needs "text" to embed OR "vector".*not both'),
-        ({"vector": [1.0]}, r'a near spec needs "field"'),
+        ({"vector": [1.0]}, r'^a near spec needs "field" -- '),
         ({"field": "s", "vector": [1.0], "top_k": 3}, "unknown"),
         # Anchored: an unanchored "empty list" kept matching after a
         # mutant mangled the message's edges.
@@ -818,6 +819,65 @@ class TestToolSchemasStayVectorFree:
         for leaked in ("summary", "vec_summary", "embedding"):
             assert leaked not in dumped, leaked
 
+    #: The three that advertise a near spec. INGEST_TOOL_SCHEMA writes
+    #: rows and has no similarity surface at all, which is why it is in
+    #: the vector-free check above and not in these two.
+    NEAR_SCHEMAS = [TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, VECTOR_SEARCH_TOOL_SCHEMA]
+
+    @staticmethod
+    def _nodes(node):
+        """Every dict in the schema, wherever it sits."""
+        if isinstance(node, dict):
+            yield node
+            for child in node.values():
+                yield from TestToolSchemasStayVectorFree._nodes(child)
+        elif isinstance(node, list):
+            for child in node:
+                yield from TestToolSchemasStayVectorFree._nodes(child)
+
+    @pytest.mark.parametrize("schema", NEAR_SCHEMAS)
+    def test_every_ref_resolves(self, schema):
+        """A $ref naming no $def is a parameter that describes nothing.
+        Providers validate these before the model ever sees them, and
+        nothing here would have noticed -- the schema stays a dict
+        either way, and json.dumps() is just as happy."""
+        defs = schema["parameters"].get("$defs", {})
+        refs = [node["$ref"] for node in self._nodes(schema) if "$ref" in node]
+        assert refs, "no $ref at all -- did the near spec stop being shared?"
+        for ref in refs:
+            assert ref.startswith("#/$defs/"), ref
+            assert ref.split("/")[-1] in defs, f"{ref} resolves to nothing"
+
+    @pytest.mark.parametrize("schema", NEAR_SCHEMAS)
+    def test_a_near_parameter_takes_one_spec_or_a_list(self, schema):
+        """parse_near() accepts both forms, so the schema has to offer
+        both -- under `anyOf`, the key a validator actually knows. A
+        misspelled combinator leaves the parameter unconstrained, which
+        is the one failure mode a "does it serialize" test cannot see.
+
+        _near_schema() is CALLED here as well as read off the schema.
+        The schemas are module-level constants built once at import, so
+        a test that only reads them cannot exercise the builder under a
+        harness that imports the module once and varies behavior per
+        test -- which is how the mutation runner works, and how three
+        mutants in this exact function came back "survived" while
+        failing this assertion on a fresh interpreter."""
+        from hopai.json_api import _near_schema
+        built = _near_schema("anything")
+        assert set(built) == {"description", "anyOf"}
+        assert built["anyOf"] == [{"$ref": "#/$defs/near"},
+                                  {"type": "array", "items": {"$ref": "#/$defs/near"}}]
+
+        found = 0
+        for node in self._nodes(schema):
+            for name in ("near", "via_near"):
+                spec = (node.get("properties") or {}).get(name)
+                if spec is None:
+                    continue
+                found += 1
+                assert spec["anyOf"] == built["anyOf"]     # same shared shape
+        assert found, "no near parameter advertised at all"
+
     def test_descriptions_point_the_model_at_the_right_tool(self):
         """A model holding only the schema has to be told which half of
         the surface answers which question -- it used to be told that
@@ -854,6 +914,16 @@ class TestJsonFrontEndRefusesInventedVectors:
                           "keep": 2}}
         with pytest.raises(ValueError, match="cannot come from a tool call"):
             traverse_json(vg, spec)
+
+    def test_the_refusal_shows_the_rewrite_for_the_field_asked_for(self, vg):
+        """The message's whole job is to be copy-pasteable, so it names
+        the caller's own field -- and falls back to a placeholder rather
+        than an invented field name when the spec gave none, which reads
+        as "you asked for summary" to someone who did not."""
+        with pytest.raises(ValueError, match=r'\{"field": \'title\', "text": "\.\.\."\}'):
+            traverse_json(vg, {"start": {"near": {"field": "title", "vector": [1.0]}}})
+        with pytest.raises(ValueError, match=r'\{"field": \'<your field>\''):
+            traverse_json(vg, {"start": {"near": {"vector": [1.0]}}})
 
     def test_text_is_not_refused(self, fresh_graph):
         """The whole point of the narrowing: a model CAN say what it is
@@ -2746,6 +2816,31 @@ class TestNearText:
         assert "0.25" in sql                       # weight=
         assert "0.75" in sql                       # min_similarity=
         assert "coalesce" in sql.lower()           # missing="zero"
+
+    def test_a_batch_may_mix_text_and_vectors(self, vg):
+        """Queries have to agree on SHAPE -- same fields, weights,
+        thresholds -- and how each one arrived is not part of that. So
+        a caller holding one embedding already and wanting another
+        embedded is a legal batch, and the resolver has to deal the one
+        answer it asked for back to the one query that asked."""
+        log = []
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder(log=log))])
+        sql = norm(vg.build_vector_search_many_query(
+            [Near("summary", text="apple"),
+             Near("summary", [5.0, 6.0, 7.0]),
+             Near("summary", text="banana")], k=1), literal_binds=True)
+        assert log == [["apple", "banana"]]        # only the texts were sent
+        assert re.search(r"'0'.*?97.*?'1'.*?5\.0.*?'2'.*?98", sql, re.S)
+
+    def test_the_batched_resolver_names_the_call_it_serves(self, vg):
+        """_resolve_query_texts() is reached only from
+        vector_search_many(), and its refusals are the first thing a
+        caller sees when a field cannot embed -- with nothing but the
+        label to say which of the search calls they were in."""
+        with pytest.raises(ValueError,
+                           match=r"^vector_search_many\(\): field 'summary' on nodes "
+                                 r"was given text"):
+            vg.build_vector_search_many_query([Near("summary", text="apple")], k=1)
 
     def test_queries_keep_their_own_text_in_order(self, vg):
         """One batched answer has to be dealt back to the query it came
