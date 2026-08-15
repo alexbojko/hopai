@@ -73,6 +73,39 @@ class TestCoreTraversal:
         assert {n["properties"]["m"] for n in one_hop.nodes} == {"one", "one-end"}
         assert len(one_hop.edges) == 1
 
+    def test_in_graph_carries_every_table_and_column_setting(self):
+        """in_graph() is the documented way to hop between graphs on
+        CUSTOM tables too, so the new handle must inherit every name the
+        caller configured -- a mutation-run survivor showed a dropped
+        edge_end_col would go unnoticed, and a handle silently reading
+        the default column is the _scoped() bug in a different coat."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        from hopai import Graph
+
+        meta = MetaData()
+        nodes = Table("my_nodes", meta,
+                      Column("nid", BigInteger, primary_key=True),
+                      Column("tenant", Text),
+                      Column("properties", JSONB))
+        edges = Table("my_edges", meta,
+                      Column("eid", BigInteger, primary_key=True),
+                      Column("tenant", Text),
+                      Column("src", BigInteger),
+                      Column("dst", BigInteger),
+                      Column("properties", JSONB))
+        base = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+                     node_table=nodes, edge_table=edges, node_id_col="nid",
+                     edge_id_col="eid", edge_start_col="src", edge_end_col="dst",
+                     graph_col="tenant")
+        other = base.in_graph("elsewhere")
+        assert other.graph == "elsewhere"
+        assert (other.nodes_tbl, other.edges_tbl) == (nodes, edges)
+        assert (other.node_id_col, other.edge_id_col) == ("nid", "eid")
+        assert (other.edge_start_col, other.edge_end_col) == ("src", "dst")
+        assert other.graph_col == "tenant"
+
     def test_simple_forward_hop(self, graph):
         result = graph.traverse(
             Start(where={"type": "leaf"}),

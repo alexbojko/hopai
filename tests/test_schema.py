@@ -1028,6 +1028,18 @@ class TestRicherMappings:
         assert spec["location"]["properties"]["lat"] == {"type": "number"}
         assert spec["location"]["required"] == ["lat"]
 
+    def test_schema_json_keeps_a_nested_propertys_own_type_set(self, offgraph):
+        """A nullable nested object is ("null", "object"), and its JSON
+        rendering must say so -- collapsing the set to the bare "object"
+        _properties_json assumes would misdescribe a null as a
+        violation."""
+        offgraph.define_schema(nodes=[NodeType("ticket", properties=[
+            Property("location", ("null", "object"), properties=[
+                Property("lat", "number")])])])
+        spec = offgraph.schema_json["nodes"]["ticket"]["properties"]["location"]
+        assert spec["type"] == ["null", "object"]
+        assert spec["properties"]["lat"] == {"type": "number"}
+
     def test_pydantic_models_validate_the_new_shapes(self, offgraph):
         """Literal rejects a non-member, datetime parses ISO strings,
         and the nested model validates its own fields -- real validation,
@@ -1035,8 +1047,15 @@ class TestRicherMappings:
         offgraph.define_schema(nodes=[Ticket])
         model = offgraph.schema_pydantic["ticket"]
         ok = model(status="open", opened="2026-08-15T09:00:00",
-                   location={"lat": 1.5, "lon": 2.5})
+                   location={"lat": 1.5, "lon": 2.5}, day="2026-08-15")
         assert ok.opened.year == 2026 and ok.location.lat == 1.5
+        # format "date" is its own branch, distinct from "date-time":
+        # a date field parses to datetime.date, and a full timestamp is
+        # NOT a date
+        assert ok.day == date(2026, 8, 15)
+        with pytest.raises(pydantic.ValidationError):
+            model(status="open", opened="2026-08-15T09:00:00",
+                  location={"lat": 1.5, "lon": 2.5}, day="2026-08-15T09:00:00")
         with pytest.raises(pydantic.ValidationError):
             model(status="reopened", opened="2026-08-15T09:00:00",
                   location={"lat": 1.5, "lon": 2.5})

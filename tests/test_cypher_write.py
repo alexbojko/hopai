@@ -98,6 +98,30 @@ class TestPlanTranslation:
         plan = ops("CREATE (a {n: 1}) MERGE (b {n: 2}) CREATE (c {n: 3})")
         assert [step["op"] for step in plan] == ["create_nodes", "merge_nodes", "create_nodes"]
 
+    def test_a_bound_variable_is_reused_not_recreated(self):
+        """Referring to `a` in a later clause means THAT row, so the plan
+        creates it once and wires the edge to the original -- a second
+        create_nodes row for `a` would put a duplicate in the database."""
+        plan = ops("CREATE (a:person {email: 'x'}) "
+                   "CREATE (a)-[:works_at]->(b:company {name: 'acme'})")
+        assert [step["op"] for step in plan] == [
+            "create_nodes", "create_nodes", "create_edges"]
+        assert [step["rows"] for step in plan[:2]] == [
+            [{"type": "person", "email": "x"}], [{"type": "company", "name": "acme"}]]
+        assert plan[2]["rows"] == [{"start_var": "a", "end_var": "b",
+                                    "properties": {"kind": "works_at"}}]
+
+    def test_a_bound_variable_is_remerged_not_merged_twice(self):
+        """The MERGE spelling of the same promise: mentioning a bound
+        `a` again adds no second merge_nodes op, so the upsert runs once
+        per entity, not once per mention."""
+        plan = ops("MERGE (a:person {email: 'x'}) "
+                   "MERGE (b:company {name: 'acme'}) MERGE (a)-[:works_at]->(b)")
+        assert [step["op"] for step in plan] == [
+            "merge_nodes", "merge_nodes", "merge_edges"]
+        assert plan[2]["rows"] == [{"start_var": "a", "end_var": "b",
+                                    "properties": {"kind": "works_at"}}]
+
     def test_multiple_patterns_in_one_create(self):
         plan = ops("CREATE (a {n: 1}), (b {n: 2})")
         assert plan == [{"op": "create_nodes", "rows": [{"n": 1}, {"n": 2}],
@@ -146,6 +170,10 @@ class TestWriteRefusals:
     def test_redefining_a_bound_variable_is_refused(self):
         with pytest.raises(CypherError, match="already bound"):
             ops("MATCH (a {n: 1}) CREATE (a {n: 2})-[:x]->(b {n: 3})")
+        # the MERGE spelling goes through its own bound check -- a
+        # mutation-run survivor showed only the CREATE path was pinned
+        with pytest.raises(CypherError, match="already bound"):
+            ops("MERGE (a {n: 1}) MERGE (a {n: 2})")
 
     def test_multiple_relationship_types_cannot_be_written(self):
         with pytest.raises(CypherError, match="one type"):

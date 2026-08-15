@@ -128,9 +128,13 @@ class TestQueryStructure:
 
     def test_optional_on_non_last_hop_raises_before_any_sql(self, offline_graph):
         """Validation lives in build_query, so it fails without needing a
-        connection -- and names which hop is at fault."""
+        connection -- and names which hop is at fault, falling back to
+        the 'unlabeled' spelling when the hop has no label to name."""
         with pytest.raises(ValueError, match="only supported on the LAST hop"):
             offline_graph.build_query(Start(), [Hop(optional=True, label="bad"), Hop()])
+        with pytest.raises(ValueError) as exc:
+            offline_graph.build_query(Start(), [Hop(optional=True), Hop()])
+        assert str(exc.value).startswith("hop 0 (unlabeled): optional=True")
 
     def test_via_filter_applies_to_both_walk_terms(self, offline_graph):
         """A `via` filter has to constrain the recursive step too, or
@@ -845,6 +849,27 @@ class TestToolSchema:
         (description,) = {t["description"] for t in graph.tool_schemas() if t["name"] == "traverse_graph"}
         assert "+3 more" in description
         assert "p11" in description and "p12" not in description
+
+    def test_tool_summary_edges_of_the_property_bag(self):
+        """The bag's boundary cases, each a mutation-run survivor until
+        pinned: the ! unique marker actually renders; exactly-at-the-cap
+        shows no '+0 more'; one past the cap says '+1 more' instead of
+        silently truncating; and a property-less type is its bare name,
+        with nothing appended."""
+        from hopai import NodeType, Property
+        from hopai.schema import tool_summary
+        summary = tool_summary(self.offgraph().define_schema(nodes=[
+            NodeType("keyed", properties=[Property("sku", "string", unique=True)]),
+            NodeType("at_cap", properties=[
+                Property(f"c{i:02d}", "string") for i in range(12)]),
+            NodeType("over_cap", properties=[
+                Property(f"o{i:02d}", "string") for i in range(13)]),
+            NodeType("bare"),
+        ]))
+        assert "keyed(sku!)" in summary
+        assert "c11)" in summary and "more" not in summary.split("at_cap", 1)[1].split(";")[0]
+        assert "+1 more" in summary
+        assert summary.endswith("bare.")
 
 
 # ---------------------------------------------------------------------
