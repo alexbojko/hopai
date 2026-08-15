@@ -1,8 +1,9 @@
 """
 hopai -- a knowledge graph in the PostgreSQL you already run.
 
-Traversal, ingestion and real constraints on two ordinary tables. No
-graph database, no extension, no new operational dependency.
+Traversal, ingestion, updates and real constraints on two ordinary
+tables. No graph database, no extension, no new operational
+dependency.
 
 SET UP -- idempotent, so both calls belong in your start-up path:
 
@@ -25,6 +26,29 @@ and every key that is not an identity key is a property:
     graph.cypher("CREATE (a:person {email: 'a@x.com'})-[:knows]->(b:person {email: 'b@x.com'})")
     graph.cypher("MERGE (a:person {email: 'a@x.com'}) ON CREATE SET a.name = 'Alice'")
 
+CHANGE and DELETE -- the same filters a traversal uses, selecting the
+rows to update or remove. A call with no filter raises rather than
+matching the whole graph:
+
+    graph.update_nodes(where={"type": "person"}, set={"active": False})
+    graph.update_nodes(where={"email": "a@x.com"}, remove=["nickname"])
+    graph.delete_edges(where={"kind": "knows"}, start={"email": "a@x.com"})
+    graph.delete_nodes(where={"email": "a@x.com"}, detach=True)
+    graph.clear()                                   # this graph, nothing else
+
+...or the same thing in Cypher:
+
+    graph.cypher("MATCH (a:person) SET a.active = false")
+    graph.cypher("MATCH (a {email: 'a@x.com'}) DETACH DELETE a")
+    graph.cypher("MATCH (a {email: 'a@x.com'})-[r:knows]->() DELETE r")
+
+...or as a JSON document, one transaction for the whole list:
+
+    graph.mutate({"operations": [
+        {"op": "update_nodes", "where": {"type": "draft"}, "set": {"status": "archived"}},
+        {"op": "delete_nodes", "where": {"type": "spam"}, "detach": True},
+    ]})
+
 READ -- the same traversal in three interchangeable notations:
 
     from hopai import Start, Hop, traverse_json, traverse_cypher
@@ -42,8 +66,10 @@ READ -- the same traversal in three interchangeable notations:
         MATCH (a:person)-[:friend*1..4]->(b {active: true}) RETURN b
     ''')
 
-graph.cypher() returns a Subgraph for a query that reads and an
-IngestResult for one that writes.
+graph.cypher() returns a Subgraph for a query that reads, an
+IngestResult for one that writes, a MutationResult for one that deletes
+or updates, and a plain dict of numbers for one whose RETURN aggregates
+-- which one is visible in the query.
 
 A result carries every node and edge on a matching chain:
 
@@ -88,14 +114,15 @@ Several Near specs combine into one weighted score (multivector
 search). See hopai/vectors.py for the storage model, the cost model,
 and every deliberate refusal.
 
-FOR TOOL-CALLING MODELS: TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA and
-INGEST_TOOL_SCHEMA are JSON Schemas ready to hand to a function-calling
-definition, covering reading, aggregating and writing respectively --
-and `graph.tool_schemas()` returns the same three with THIS graph's
-declared schema summarized into each description, so the model knows
-what exists instead of guessing labels. (Vector search has no tool
-schema on purpose, in either form -- a model asked for an embedding
-invents one; vectors.py explains.)
+FOR TOOL-CALLING MODELS: TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
+INGEST_TOOL_SCHEMA and MUTATE_TOOL_SCHEMA are JSON Schemas ready to hand
+to a function-calling definition, covering reading, aggregating,
+writing, and changing or deleting what is already there -- and
+`graph.tool_schemas()` returns the same four with THIS graph's declared
+schema summarized into each description, so the model knows what exists
+instead of guessing labels. (Vector search has no tool schema on
+purpose, in either form -- a model asked for an embedding invents one;
+vectors.py explains.)
 
 SCHEMA -- declare the shape of the graph (node types, edge kinds, typed
 properties) as plain dataclasses or NodeType/EdgeType primitives, read
@@ -121,8 +148,8 @@ from .constraints import (
 )
 from .core import Graph, Subgraph
 from .cypher import (
-    CypherError, aggregate_cypher, cypher_to_aggregation, cypher_to_operations,
-    cypher_to_traversal, traverse_cypher,
+    CypherError, aggregate_cypher, cypher_to_aggregation, cypher_to_mutations,
+    cypher_to_operations, cypher_to_traversal, traverse_cypher,
 )
 from .filters import AND, BETWEEN, GT, GTE, LT, LTE, NOT, OR, parse_filter
 from .hop import Hop, Start
@@ -132,6 +159,7 @@ from .json_api import (
     spec_to_traversal, traverse_json, vector_search_json,
 )
 from .models import Edge, Node
+from .mutate import MUTATE_TOOL_SCHEMA, MutationResult, spec_to_mutations
 from .schema import (
     EdgeType, GraphSchema, InferenceReport, NodeType, Property, SchemaViolations, TypeConflict,
 )
@@ -153,6 +181,8 @@ __all__ = [
     "aggregate_json", "spec_to_aggregation", "AGGREGATE_TOOL_SCHEMA",
     "traverse_cypher", "cypher_to_traversal", "cypher_to_operations", "CypherError",
     "aggregate_cypher", "cypher_to_aggregation",
+    "cypher_to_mutations",
+    "spec_to_mutations", "MUTATE_TOOL_SCHEMA", "MutationResult",
     "Unique", "Required", "Check", "Index", "PropertyType", "Col", "ConstraintViolation",
     "GraphSchema", "NodeType", "EdgeType", "Property", "InferenceReport", "TypeConflict",
     "SchemaViolations",

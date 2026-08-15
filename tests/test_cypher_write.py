@@ -156,8 +156,27 @@ class TestPlanTranslation:
                 schema=schema, edge_type_key="rel", node_label_key=None)
 
     def test_a_read_query_is_refused(self):
-        with pytest.raises(CypherError, match="only reads"):
+        # Anchored: "only reads" sits mid-sentence, so an XX-padded
+        # mutant of the literal matched it unchanged.
+        with pytest.raises(CypherError, match="^this query only reads"):
             ops("MATCH (a) RETURN a")
+
+    @pytest.mark.parametrize("query", [
+        "MATCH (a) DELETE a",
+        "MATCH (a) DETACH DELETE a",
+        "MATCH (a) SET a.x = 1",
+        "MATCH (a) REMOVE a.x",
+    ])
+    def test_a_mutating_query_is_refused_by_the_write_translator(self, query):
+        """The third leg of the routing between the front ends. The read
+        translator's copy of this refusal was pinned; this one had no
+        test at all, so nothing said where a caller who reached the
+        INGESTION entry point with a delete should go instead."""
+        with pytest.raises(CypherError,
+                           match="^this query deletes or updates"):
+            ops(query)
+        with pytest.raises(CypherError, match=r"graph\.mutate_cypher\(\)"):
+            ops(query)
 
 
 class TestWriteRefusals:
@@ -166,8 +185,10 @@ class TestWriteRefusals:
         and creates all of it when it does not match -- duplicating nodes
         that already exist. Reproducing that quietly would be worse than
         refusing."""
-        with pytest.raises(CypherError, match="both endpoints already bound"):
+        with pytest.raises(CypherError) as exc:
             ops("MERGE (a {n: 1})-[:knows]->(b {n: 2})")
+        assert str(exc.value).startswith(
+            "MERGE on a relationship needs both endpoints already bound")
 
     def test_variable_length_cannot_be_written(self):
         with pytest.raises(CypherError) as exc:
@@ -224,16 +245,24 @@ class TestWriteRefusals:
         assert str(exc.value).startswith("MERGE needs properties to match on")
 
     def test_relationship_merge_needs_a_type(self):
-        with pytest.raises(CypherError, match="something to match it by"):
+        """Anchored for the same reason as the node case above: the
+        lowercased mutant of this message (_merge__mutmut_31) left the
+        middle of it untouched."""
+        with pytest.raises(CypherError) as exc:
             ops("MATCH (a {n: 1}), (b {n: 2}) MERGE (a)-[]->(b)")
+        assert str(exc.value).startswith(
+            "MERGE on a relationship needs something to match it by")
 
     def test_on_set_referring_to_an_unbound_variable(self):
         with pytest.raises(CypherError, match="does not bind"):
             ops("MERGE (a {n: 1}) ON CREATE SET b.x = 1")
 
-    def test_bare_set_and_delete_stay_unsupported(self):
+    def test_a_mutating_query_is_refused_by_the_write_translator(self):
+        """CREATE/MERGE and DELETE/SET compile to different plans run by
+        different executors, so the ingestion translator hands these
+        over by name instead of returning half of what was asked for."""
         for query in ("MATCH (a {n: 1}) SET a.x = 2", "MATCH (a {n: 1}) DELETE a"):
-            with pytest.raises(CypherError, match="not supported"):
+            with pytest.raises(CypherError, match="graph.mutate_cypher"):
                 ops(query)
 
     # Refusal texts pinned by their actionable phrase -- see the same

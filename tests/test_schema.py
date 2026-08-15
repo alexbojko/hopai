@@ -1207,6 +1207,43 @@ class TestInferenceSampling:
         assert isinstance(schema, GraphSchema)
         assert report.sampled == 5
 
+    def test_a_sample_that_saw_no_nodes_drops_the_edge_types_naming_them(
+            self, fresh_graph, monkeypatch):
+        """The MIXED sample -- the case the test above could not survive.
+
+        Nodes and edges are sampled independently, so the edge sample can
+        return rows while the node sample returns none; endpoints come
+        from a join against the FULL nodes table, so inference built
+        EdgeType('likes', source='person') against an empty node-type
+        list and GraphSchema raised out of a function whose signature
+        promises a (schema, report) pair.
+
+        Forced rather than waited for: as a TABLESAMPLE race it fired on
+        roughly one CI job in three and one local run in forty, which is
+        exactly often enough to be mistaken for infrastructure."""
+        from sqlalchemy import false, select
+
+        import hopai.schema as schema_module
+
+        real_source = schema_module._source
+
+        def node_sample_sees_nothing(table, sample_percent):
+            if table is fresh_graph.nodes_tbl:
+                return select(table).where(false()).subquery()
+            return real_source(table, 100)
+
+        monkeypatch.setattr(schema_module, "_source", node_sample_sees_nothing)
+        seed_chaotic(fresh_graph)
+        schema, report = fresh_graph.infer_schema(sample_percent=5)
+
+        assert list(schema.node_types) == []
+        # Not "no edges observed" -- they were seen and then disqualified,
+        # which is what the report has to keep saying.
+        assert list(schema.edge_types) == []
+        assert report.edge_counts == {"works_at": 2, "likes": 2, "dangles": 1}
+        assert report.skipped_endpoint_edges == 5
+        assert "not one of the above" in str(report)
+
     def test_out_of_range_percent_is_refused_offline(self, offgraph):
         """Validation names the range and runs BEFORE anything connects
         -- TABLESAMPLE with a bad percentage would otherwise surface as
