@@ -158,9 +158,11 @@ def constraint_violation(exc: IntegrityError, what: str) -> ConstraintViolation:
     message = f"{what} rejected by constraint {name!r}" if name else f"{what} rejected: {exc.orig}"
     if detail:
         message += f" -- {detail}"
-    violation = ConstraintViolation(message, constraint=name, detail=detail)
-    violation.__cause__ = exc
-    return violation
+    # No __cause__ here: every caller raises this `from exc`, which is
+    # what chains the driver's error onto it. Assigning it as well was
+    # dead code -- mutation testing flagged it in both this function and
+    # _detach_hint, and nothing can observe the difference.
+    return ConstraintViolation(message, constraint=name, detail=detail)
 
 
 # ---------------------------------------------------------------------

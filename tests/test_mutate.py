@@ -804,6 +804,11 @@ class TestCypherTranslation:
          [{"op": "update_nodes", "where": {"type": "person"}, "remove": ["x"]}]),
         ("MATCH (a:person) REMOVE a.x SET a.x = 1",
          [{"op": "update_nodes", "where": {"type": "person"}, "set": {"x": 1}}]),
+        # Last writer wins when the last writer is a null: the property
+        # has to leave `set` as well as enter `remove`, or the plan both
+        # sets and removes one key and the executor refuses to run it.
+        ("MATCH (a:person) SET a.x = 1 SET a.x = null",
+         [{"op": "update_nodes", "where": {"type": "person"}, "remove": ["x"]}]),
         # A null inside a REPLACING map is simply a key the map does not
         # carry -- recording a removal as well would hand the executor a
         # plan it refuses, since replace and remove contradict.
@@ -870,7 +875,7 @@ class TestCypherRefusals:
     @pytest.mark.parametrize("query,message", [
         ("MATCH (a:person)-[:knows]->(b) DELETE b", "traversal driving a write"),
         ("MATCH (a)-[r:knows*1..3]->(b) DELETE r", "variable-length"),
-        ("MATCH (a)-[r:knows]->(b) DELETE a, r", "one change per query"),
+        ("MATCH (a)-[r:knows]->(b) DELETE a, r", "^this query changes a, r at once"),
         ("MATCH (a)-[r]->(b) DETACH DELETE r", "is a relationship"),
         ("MATCH (a:person) SET a.x = 1 DELETE a", "both changes and deletes"),
         ("MATCH (a:person) SET a.x = 1, a = {y: 2}", "would be discarded"),
@@ -886,7 +891,8 @@ class TestCypherRefusals:
         ("MATCH (a)-[r]->(b)-[q]->(c) DELETE r",
          "^a delete or an update matches one node or one relationship, not a multi-hop"),
         ("MATCH (a:person) DELETE a RETURN count(a)", "MutationResult, not a number"),
-        ("MATCH (a:person) CREATE (b {x: 1}) DELETE a", "separate queries"),
+        ("MATCH (a:person) CREATE (b {x: 1}) DELETE a",
+         "^a query that creates or merges and also deletes or updates"),
         ("MATCH (a:person)-[r]->(b) WHERE a.x = 1 OR b.y = 2 DELETE r",
          r"several variables \(a, b\)"),
         ("MATCH (a:person) WHERE b.x = 1 DELETE a", "unknown variable"),
@@ -969,6 +975,18 @@ class TestCypherRefusals:
         with pytest.raises(CypherError, match="removes a property in Cypher"):
             cypher_to_operations("MERGE (a {n: 1}) ON MATCH SET a.x = null")
 
+    @pytest.mark.parametrize("query,rewrite", [
+        ("MATCH (a:person)-[:knows]->(b) DELETE b", "`MATCH (b {...}) DETACH DELETE b`"),
+        ("MATCH (a:person)-[:knows]->(b) SET b.x = 1", "`MATCH (b {...}) SET b.x = ...`"),
+    ])
+    def test_the_rewrite_matches_the_verb_the_caller_wrote(self, query, rewrite):
+        """The example used to be hardcoded to DETACH DELETE, so someone
+        who wrote SET was told to write a delete -- and with the example
+        pinned only by the sentence before it, that could come back."""
+        with pytest.raises(CypherError) as exc:
+            cypher_to_mutations(query)
+        assert rewrite in str(exc.value)
+
     def test_a_read_query_is_refused_by_the_mutation_translator(self):
         with pytest.raises(CypherError, match="deletes and updates nothing"):
             cypher_to_mutations("MATCH (a:person) RETURN a")
@@ -1021,6 +1039,18 @@ class TestStrictSchema:
                                       strict_schema=True).updated_nodes == 3
         assert declared.mutate_cypher("MATCH ()-[r:knows]->() SET r.weight = 2",
                                       strict_schema=True).updated_edges == 2
+
+    def test_the_discriminator_keys_reach_the_validator(self, fresh_graph):
+        """node_label_key/edge_type_key have to travel with the schema:
+        dropping edge_type_key from the validate_mutations() call left
+        every test passing, because they all use the default 'kind'."""
+        from hopai import EdgeType, NodeType, Property
+        fresh_graph.define_schema(
+            nodes=[NodeType("person", properties=[Property("name", "string")])],
+            edges=[EdgeType("knows", "person", "person")])
+        with pytest.raises(CypherError, match="unknown relationship kind 'knowss'"):
+            fresh_graph.mutate_cypher("MATCH ()-[r:knowss]->() DELETE r",
+                                      strict_schema=True, edge_type_key="rel")
 
     def test_strict_without_a_schema_names_the_fix(self, people):
         with pytest.raises(CypherError, match="define_schema"):

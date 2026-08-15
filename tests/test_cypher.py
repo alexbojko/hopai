@@ -455,7 +455,7 @@ class TestSemanticRefusals:
         """These translate now, but into a MutationResult -- so the read
         entry point sends them to the one that changes rows rather than
         returning the subgraph the MATCH alone would have matched."""
-        with pytest.raises(CypherError, match="this query deletes or updates"):
+        with pytest.raises(CypherError, match="^this query deletes or updates"):
             tr(query)
 
     def test_a_write_query_is_refused_by_the_read_translator(self):
