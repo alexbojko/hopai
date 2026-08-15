@@ -909,7 +909,12 @@ class TestLogging:
             Embedder(client, retries=2).embed_documents(["a"])
         failure = [r for r in caplog.records if "failed after" in r.getMessage()]
         assert len(failure) == 1
-        assert "after 0 embedded, 3 attempt(s)" in failure[0].getMessage()
+        # Whole message: the owner travels down a SECOND path here (the
+        # loop running out, not a terminal error), so it can go missing
+        # on one and not the other.
+        assert failure[0].getMessage() == (
+            "Embedder(function).embed_documents: provider call failed after 0 embedded, "
+            "3 attempt(s) (TimeoutError: upstream)")
 
     def test_nothing_is_logged_above_debug_on_the_happy_path(self, caplog):
         """A library that chatters at INFO makes an application turn its

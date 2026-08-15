@@ -728,11 +728,27 @@ graph.define_vectors(nodes=[
 graph.migrate_vectors()
 
 graph.set_vectors(nodes=[{"id": 1, "summary": "a paper about Raft"}])
-graph.vector_search(Near("summary", text="how do nodes agree?"), k=10)
+graph.vector_search(Near("summary", "how do nodes agree?"), k=10)
 
 graph.embed_stale()      # embed every row that has no vector yet
 # -> {"nodes": {"summary": {"embedded": ["2", "3"], "skipped": []}}, "edges": {}}
 ```
+
+`Near`'s second argument takes **either** a vector or the text to embed
+into one — a string and a sequence of numbers can never be confused for
+one another, so there is no keyword to remember:
+
+```python
+Near("summary", "how do nodes agree?")   # embedded by the field's client
+Near("summary", [0.12, 0.44, ...])       # you already have the floats
+Near("summary", text="[0.1, 0.2]")       # explicit, for a string that
+                                         # looks like a serialized vector
+```
+
+A string that looks like a serialized vector (`"[0.1, 0.2]"`) is
+**refused** rather than embedded, since embedding those characters
+ranks against whatever the phrase means and attaches a confident score
+to it. `text=` is how you say you meant it.
 
 `source=` names the **property** holding the text and defaults to the
 field's own name, so `Vector("title", 768, embed=…)` embeds each row's

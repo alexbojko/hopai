@@ -255,8 +255,15 @@ class Near:
     """A similarity spec: one field, one query -- as a vector, or as
     text the field's own embedder turns into one.
 
-        Near("summary", [0.1, 0.4, ...])      # you embedded it
-        Near("summary", text="raft consensus")  # the field's embed= did
+        Near("summary", [0.1, 0.4, ...])       # you embedded it
+        Near("summary", "raft consensus")      # the field's embed= will
+        Near("summary", text="raft consensus")  # the same, said explicitly
+
+    The second argument takes either, because the two can never be
+    confused for one another: a str is text, a sequence of numbers is a
+    vector, and nothing is both. `text=` stays for the caller who wants
+    to be explicit and for the JSON form, where the distinction is a
+    key rather than a type.
 
     Where it appears decides what it does -- rank candidates in
     vector_search(), pick the top-k seed set on Start, prune to the
@@ -268,12 +275,17 @@ class Near:
     ranks, so passing one there raises with the rewrite named. It
     looks like GT/BETWEEN, which is exactly why the guard exists.
 
-    text:            embed this with the field's declared embedder,
-                     as a QUERY rather than as a document -- several
-                     providers score the two differently and getting
-                     it wrong quietly costs recall. Resolved when the
-                     query is built, because only then is the graph
-                     (and so the field's embedder) known.
+    query:           the vector to rank against, or the text to embed
+                     into one. Text is embedded as a QUERY rather than
+                     as a document -- several providers score the two
+                     differently and getting it wrong quietly costs
+                     recall. Resolved when the query is built, because
+                     only then is the graph (and so the field's
+                     embedder) known.
+    text:            the same thing, said explicitly. Use it when the
+                     string might otherwise be mistaken for something
+                     to parse -- it is the only way to embed a string
+                     that looks like a serialized vector.
     weight:          this field's coefficient in the combined score
                      (only meaningful when several Near are combined).
     min_similarity:  drop rows whose similarity ON THIS FIELD is below
@@ -287,21 +299,40 @@ class Near:
     #: where=/via= by name without importing this module.
     _is_near = True
 
-    def __init__(self, field: str, vector=None, weight: float = 1.0,
+    def __init__(self, field: str, query=None, weight: float = 1.0,
                  min_similarity: Optional[float] = None, missing: str = "exclude",
                  text: Optional[str] = None):
         if not isinstance(field, str) or not field:
             raise TypeError(f"Near field must be a vector field name, got {field!r}")
         self.field = field
-        if (vector is None) == (text is None):
+        if (query is None) == (text is None):
             raise TypeError(
-                f"Near({field!r}) takes a query vector OR text= to embed, not "
+                f"Near({field!r}) takes a query vector or text to embed, not "
                 f"{'both' if text is not None else 'neither'}"
             )
+        if text is None and isinstance(query, str):
+            # A string in the query slot is text -- except when it is a
+            # vector someone forgot to parse. `"[0.1, 0.2]"` would embed
+            # the LITERAL BRACKETS and rank against whatever that means,
+            # which is a confidently wrong answer rather than an error.
+            # Refused by name; text= is the way to embed such a string
+            # on purpose.
+            # startswith/endswith rather than slicing into a membership
+            # test: `"" in "[("` is True, so a blank string took this
+            # branch and was refused as a serialized vector.
+            stripped = query.strip()
+            if stripped.startswith(("[", "(")) and stripped.endswith(("]", ")")):
+                raise ValueError(
+                    f"Near({field!r}): {query[:40]!r} looks like a serialized vector, not "
+                    f"text to embed -- parse it into a list of numbers first, or pass "
+                    f"text= if you really mean to embed those characters"
+                )
+            text, query = query, None
         if text is not None:
             if not isinstance(text, str) or not text.strip():
                 raise ValueError(
-                    f"Near({field!r}): text= must be a non-empty string, got {text!r}"
+                    f"Near({field!r}): the text to embed must be a non-empty string, "
+                    f"got {text!r}"
                 )
             # Deferred on purpose: the embedder belongs to the field,
             # which belongs to the graph, which a Near does not know.
@@ -312,7 +343,7 @@ class Near:
             self.vector = ()
         else:
             self.text = None
-            self.vector = _clean_vector(vector, f"Near({field!r})")
+            self.vector = _clean_vector(query, f"Near({field!r})")
             if _norm(self.vector) == 0.0:
                 raise ValueError(
                     f"Near({field!r}): the query vector is all zeros, which has no "
@@ -1093,6 +1124,11 @@ def build_search_many_query(graph, queries, target: str = "nodes", k: Optional[i
     # it says what the column holds; recorded here so the next reader
     # (or the next mutation run, which flags dropping it) does not
     # re-derive that it is inert.
+    # n{i}'s DOUBLE_PRECISION is inert for the same reason and measured
+    # the same way -- identical compiled SQL, and identical similarities
+    # to twelve decimal places against a live database, since the norm
+    # arrives as a Python float and Postgres divides in float8 either
+    # way. v{i} is the one that matters: it renders ::REAL[].
     columns = [sa_column("q", SAString)]
     for i in range(len(template)):
         columns.append(sa_column(f"v{i}", ARRAY(REAL)))

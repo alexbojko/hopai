@@ -14,7 +14,7 @@ method on it.
                embed=Embedder(openai.OpenAI(), model="text-embedding-3-small")),
     ])
     graph.set_vectors(nodes=[{"id": 1, "summary": "a paper about Raft"}])
-    graph.vector_search(Near("summary", text="how do nodes agree?"), k=10)
+    graph.vector_search(Near("summary", "how do nodes agree?"), k=10)
 
 NO NEW DEPENDENCY, STILL. hopai imports no provider package, ever --
 not even to recognize one. Clients are matched by module name and

@@ -292,15 +292,15 @@ class TestVectorDDL:
 # ---------------------------------------------------------------------
 
 class TestNearValidation:
-    # None is absent here on purpose: it now means "no vector was given",
-    # which is either the text= form or the neither-of-them refusal --
-    # see TestNearText.
-    @pytest.mark.parametrize("bad", ["x", 42, [], (), {}])
+    # None and "x" are absent on purpose: None means "no query was
+    # given" (the neither-of-them refusal) and a str is TEXT to embed,
+    # not a malformed vector -- both live in TestNearText.
+    @pytest.mark.parametrize("bad", [42, [], (), {}])
     def test_vector_must_be_a_non_empty_sequence(self, bad):
         with pytest.raises(TypeError, match="non-empty list of numbers"):
             Near("summary", bad)
 
-    @pytest.mark.parametrize("bad,name", [("x", "str"), (42, "int"), ({}, "dict")])
+    @pytest.mark.parametrize("bad,name", [(42, "int"), ({}, "dict")])
     def test_the_refusal_names_the_type_actually_passed(self, bad, name):
         """`got {type(vector).__name__}` is the whole diagnostic -- every
         case above matches only the shared sentence, so the type name
@@ -2827,14 +2827,48 @@ class TestVectorSourceAndEmbedder:
 class TestNearText:
     def test_text_and_vector_are_alternatives(self):
         for kwargs, word in (({}, "neither"),
-                             ({"vector": [1.0, 0.0, 0.0], "text": "x"}, "both")):
-            with pytest.raises(TypeError, match=f"vector OR text= to embed, not {word}"):
+                             ({"query": [1.0, 0.0, 0.0], "text": "x"}, "both")):
+            with pytest.raises(TypeError, match=f"vector or text to embed, not {word}"):
                 Near("summary", **kwargs)
 
     @pytest.mark.parametrize("bad", ["", "   ", 5])
     def test_text_must_say_something(self, bad):
-        with pytest.raises((ValueError, TypeError), match="text="):
+        with pytest.raises((ValueError, TypeError),
+                           match="the text to embed must be a non-empty string"):
             Near("summary", text=bad)
+
+    def test_a_bare_string_is_text_to_embed(self):
+        """The terse form. A str and a sequence of numbers can never be
+        confused for one another, so the second argument takes either
+        and the caller does not have to remember a keyword."""
+        assert Near("summary", "raft consensus").text == "raft consensus"
+        assert Near("summary", "raft consensus").vector == ()
+        # ...and the same spec written explicitly is the same spec.
+        assert repr(Near("summary", "raft consensus")) \
+            == repr(Near("summary", text="raft consensus"))
+
+    def test_a_sequence_in_the_same_slot_is_still_a_vector(self):
+        spec = Near("summary", [0.1, 0.4, 0.9])
+        assert spec.text is None and len(spec.vector) == 3
+
+    @pytest.mark.parametrize("looks_like", ["[0.1, 0.2]", "(1, 2)", "  [1,2]  "])
+    def test_a_serialized_vector_is_refused_rather_than_embedded(self, looks_like):
+        """The one case where the two forms could be confused, and it
+        would be silent: embedding the literal characters '[0.1, 0.2]'
+        ranks against whatever that phrase means to the model, with a
+        confident score attached and nothing to notice."""
+        with pytest.raises(ValueError, match="looks like a serialized vector"):
+            Near("summary", looks_like)
+
+    def test_text_is_the_way_to_embed_such_a_string_on_purpose(self):
+        """The guard above must not make a legitimate string
+        unreachable -- text= is unambiguous by construction."""
+        assert Near("summary", text="[0.1, 0.2]").text == "[0.1, 0.2]"
+
+    def test_ordinary_brackets_inside_a_sentence_are_not_a_vector(self):
+        """The guard is anchored at both ends, so prose that merely
+        mentions brackets still embeds."""
+        assert Near("summary", "a paper about [databases]").text is not None
 
     def test_repr_shows_the_text_rather_than_a_dimension_count(self):
         """An unresolved Near has no dimensions yet, and "0 dims" would
