@@ -131,7 +131,25 @@ def _chunks(rows: list, size: int = BATCH_SIZE):
         yield rows[i:i + size]
 
 
-def _translate(exc: IntegrityError, what: str) -> ConstraintViolation:
+@contextmanager
+def one_transaction(graph, connection=None):
+    """One transaction per call, and one shared by a whole document.
+
+    Every write goes through here -- ingestion, batching, and the
+    deletes and updates in mutate.py alike. A per-batch transaction
+    would let a 2500-row write half-commit, and an agent retrying after
+    that failure hits unique violations on the rows it believes never
+    landed. Passing an existing connection joins the caller's
+    transaction instead of opening a second one, which is what makes a
+    multi-operation plan atomic."""
+    if connection is not None:
+        yield connection
+    else:
+        with graph.engine.begin() as opened:
+            yield opened
+
+
+def constraint_violation(exc: IntegrityError, what: str) -> ConstraintViolation:
     """Turn the driver's IntegrityError into something that names the
     constraint the caller declared."""
     diag = getattr(exc.orig, "diag", None)
@@ -140,9 +158,11 @@ def _translate(exc: IntegrityError, what: str) -> ConstraintViolation:
     message = f"{what} rejected by constraint {name!r}" if name else f"{what} rejected: {exc.orig}"
     if detail:
         message += f" -- {detail}"
-    violation = ConstraintViolation(message, constraint=name, detail=detail)
-    violation.__cause__ = exc
-    return violation
+    # No __cause__ here: every caller raises this `from exc`, which is
+    # what chains the driver's error onto it. Assigning it as well was
+    # dead code -- mutation testing flagged it in both this function and
+    # _detach_hint, and nothing can observe the difference.
+    return ConstraintViolation(message, constraint=name, detail=detail)
 
 
 # ---------------------------------------------------------------------
@@ -158,20 +178,8 @@ class Ingestor:
 
     # -- helpers --------------------------------------------------------
 
-    @contextmanager
     def _transaction(self, connection=None):
-        """One transaction per call, and one shared by a whole document.
-
-        Every write goes through here, batching included. A per-batch
-        transaction would let a 2500-row write half-commit, and an agent
-        retrying after that failure hits unique violations on the rows it
-        believes never landed. Passing an existing connection joins the
-        caller's transaction instead of opening a second one."""
-        if connection is not None:
-            yield connection
-        else:
-            with self.g.engine.begin() as opened:
-                yield opened
+        return one_transaction(self.g, connection)
 
     def _graph_stamp(self) -> dict:
         """The graph column for an inserted row, or nothing when the
@@ -234,7 +242,7 @@ class Ingestor:
                     else:
                         conn.execute(insert(table), chunk)
             except IntegrityError as exc:
-                raise _translate(exc, "node") from exc
+                raise constraint_violation(exc, "node") from exc
             if explicit_ids:
                 self._sync_identity_sequence(conn, table, id_column)
         return ids if return_ids else len(payload)
@@ -281,7 +289,7 @@ class Ingestor:
                 for chunk in _chunks(payload):
                     conn.execute(insert(table), chunk)
             except IntegrityError as exc:
-                raise _translate(exc, "edge") from exc
+                raise constraint_violation(exc, "edge") from exc
         return len(payload)
 
     def merge_edges(self, rows: list, on: list, replace: bool = False, connection=None) -> int:
@@ -432,7 +440,7 @@ class Ingestor:
                 if returning is not None:
                     ids.extend(row[0] for row in result)
             except IntegrityError as exc:
-                raise _translate(exc, what) from exc
+                raise constraint_violation(exc, what) from exc
             except ProgrammingError as exc:
                 if "no unique or exclusion constraint" not in str(exc.orig):
                     raise

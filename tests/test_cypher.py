@@ -441,11 +441,21 @@ class TestSemanticRefusals:
         "MATCH (a)-[]->(b) RETURN b LIMIT 10",
         "MATCH (a)-[]->(b) WITH b MATCH (b)-[]->(c) RETURN c",
         "MATCH (a)-[]->(b) RETURN b UNION MATCH (c)-[]->(d) RETURN d",
-        "MATCH (a) SET a.x = 1",
-        "MATCH (a) DETACH DELETE a",
     ])
     def test_unsupported_clauses_refused(self, query):
         with pytest.raises(CypherError, match="not supported"):
+            tr(query)
+
+    @pytest.mark.parametrize("query", [
+        "MATCH (a) SET a.x = 1",
+        "MATCH (a) DETACH DELETE a",
+        "MATCH (a) REMOVE a.x",
+    ])
+    def test_a_mutating_query_is_refused_by_the_read_translator(self, query):
+        """These translate now, but into a MutationResult -- so the read
+        entry point sends them to the one that changes rows rather than
+        returning the subgraph the MATCH alone would have matched."""
+        with pytest.raises(CypherError, match="^this query deletes or updates"):
             tr(query)
 
     def test_a_write_query_is_refused_by_the_read_translator(self):
@@ -725,7 +735,11 @@ class TestAggregationRefusals:
         """A write produces an IngestResult; quietly dropping the count
         would be worse than either running it or refusing."""
         from hopai import cypher_to_operations
-        with pytest.raises(CypherError, match="after a write"):
+        # Anchored, like the MERGE refusals in test_cypher_write.py: the
+        # loosely-matched middle survives a lowercased first word, and
+        # "return with an aggregate" is not a sentence anyone wrote.
+        with pytest.raises(CypherError,
+                           match="^RETURN with an aggregate after a write"):
             cypher_to_operations("CREATE (a:person {email: 'a@x.com'}) RETURN count(a)")
 
     def test_a_plain_traversal_is_refused_by_the_aggregation_translator(self):

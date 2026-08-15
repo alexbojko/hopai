@@ -8,8 +8,17 @@ beside it.
         --threshold 85 \
         --mutmut-stats mutants/mutmut-cicd-stats.json \
         --mutmut-results survivors.txt \
+        --mutmut-diffs diffs.txt \
         --mutation-note "3 changed files" \
         --run-url https://... > comment.md
+
+`--mutmut-diffs` is the concatenated output of `mutmut show <id>` for
+every survivor, which puts each mutation IN the comment: a survivor's
+name says where to look, its diff says whether it is a real gap, an
+equivalent mutant or a message nobody pinned. Without it triage starts
+by running `mutmut show` forty times, which is the job the comment
+exists to save. `--list-survivors` prints the ids to feed it, so which
+mutants matter is decided here and not re-implemented in the workflow.
 
 Two numbers that answer different questions, which is why they share a
 comment rather than a job:
@@ -43,6 +52,19 @@ from pathlib import Path
 MARKER = "<!-- hopai-pr-report -->"
 
 _SURVIVOR_RE = re.compile(r"^\s*(?P<id>[\w.]+):\s*(?P<status>\w+)\s*$")
+
+#: Each `mutmut show` block opens with `# <id>: <status>`.
+_SHOW_HEADER_RE = re.compile(r"^#\s*(?P<id>\S+):\s*\w")
+
+#: Per side of one change. Bounded because this lands in a table cell --
+#: enough to recognize the edit, and the mutant id is there for the
+#: reader who needs the whole hunk.
+CHANGE_LIMIT = 90
+#: Rows, and a character budget: GitHub rejects a comment body over
+#: 65536 characters and this table is the only part that grows with the
+#: size of the diff. Whatever is dropped is always named.
+MAX_ROWS = 200
+TABLE_BUDGET = 40_000
 
 
 def coverage_percent(xml_path: Path) -> float:
@@ -79,6 +101,80 @@ def survivors(text: str) -> list:
     return found
 
 
+def mutation_changes(text: str) -> dict:
+    """{mutant id: (removed, added)} from concatenated `mutmut show`
+    output.
+
+    Only the -/+ lines are kept: the context lines are the same source
+    the reader already has, and the removed/added pair IS the mutation.
+    A hunk that changes several lines joins them, so a multi-line
+    mutation never renders as a partial one."""
+    changes: dict = {}
+    current, removed, added = None, [], []
+
+    def flush() -> None:
+        if current is not None and (removed or added):
+            changes[current] = (" ⏎ ".join(removed), " ⏎ ".join(added))
+
+    for line in text.splitlines():
+        header = _SHOW_HEADER_RE.match(line)
+        if header:
+            flush()
+            current, removed, added = header.group("id"), [], []
+        elif line.startswith(("---", "+++", "@@")):
+            continue                      # file headers and hunk ranges
+        elif line.startswith("-"):
+            removed.append(line[1:].strip())
+        elif line.startswith("+"):
+            added.append(line[1:].strip())
+    flush()
+    return changes
+
+
+def _cell(text: str, limit: int = CHANGE_LIMIT) -> str:
+    """Source as a table cell: one line, bounded, and unable to break
+    the table.
+
+    An unescaped `|` ends the cell early -- and `properties || incoming`
+    is ordinary code here, so this is not hypothetical. Backticked
+    content falls back to <code>, since a code span cannot contain the
+    character that delimits it."""
+    flat = " ".join(text.split())
+    if len(flat) > limit:
+        flat = flat[:limit - 1] + "…"
+    if "`" in flat:
+        flat = (flat.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    .replace("`", "&#96;").replace("|", "&#124;"))
+        return f"<code>{flat}</code>"
+    return "`" + flat.replace("|", "\\|") + "`"
+
+
+def _survivor_rows(found: list, changes: dict) -> list:
+    """The table body, plus the line naming anything left out."""
+    header = (["| Mutant | Status | Change |", "| --- | --- | --- |"] if changes
+              else ["| Mutant | Status |", "| --- | --- |"])
+    rows, budget = [], TABLE_BUDGET
+    for index, (name, status) in enumerate(found):
+        if changes:
+            removed, added = changes.get(name, ("", ""))
+            change = (f"{_cell(removed)} → {_cell(added)}" if removed or added
+                      else "—")
+            row = f"| `{name}` | {status} | {change} |"
+        else:
+            row = f"| `{name}` | {status} |"
+        budget -= len(row)
+        if index >= MAX_ROWS or budget <= 0:
+            # Never a silent cap: a truncated table that looks complete
+            # would read as "these are all the survivors".
+            rows.append(f"| … and {len(found) - index} more, not shown "
+                        f"(comment size limit) | | |" if changes
+                        else f"| … and {len(found) - index} more, not shown "
+                             f"(comment size limit) | |")
+            break
+        rows.append(row)
+    return header + rows
+
+
 def _bar(percent: float, width: int = 20) -> str:
     filled = round(percent / 100 * width)
     return "█" * filled + "░" * (width - filled)
@@ -102,7 +198,8 @@ def render_coverage(percent: float, threshold: float, by_file: list) -> str:
     return "\n".join(lines)
 
 
-def render_mutation(stats: dict, found: list, note: str, attempted: bool = False) -> str:
+def render_mutation(stats: dict, found: list, note: str, attempted: bool = False,
+                    changes: dict = None) -> str:
     """Mutation half of the comment. `note` explains the scope, or why
     there was nothing to run.
 
@@ -141,23 +238,25 @@ def render_mutation(stats: dict, found: list, note: str, attempted: bool = False
                   + "."]
 
     if found:
+        # Folded by default: on a large PR this is the longest thing in
+        # the comment, and it is reference material for whoever triages
+        # rather than something every reader needs open.
         lines += ["", f"<details><summary>{len(found)} survivor(s) — "
-                  f"each is a change no test objected to</summary>", "",
-                  "| Mutant | Status |", "| --- | --- |"]
-        lines += [f"| `{name}` | {status} |" for name, status in found[:40]]
-        if len(found) > 40:
-            lines.append(f"| … and {len(found) - 40} more | |")
-        lines += ["", "Inspect one with `mutmut show <mutant>`.", "", "</details>"]
+                  f"each is a change no test objected to</summary>", ""]
+        lines += _survivor_rows(found, changes or {})
+        lines += ["", "Each row is the source before → after the mutation. "
+                  "`mutmut show <mutant>` prints the surrounding hunk; "
+                  "CLAUDE.md has the triage rule.", "", "</details>"]
     elif total:
         lines += ["", "No survivors — every mutant on the changed lines was caught."]
     return "\n".join(lines)
 
 
 def render(percent, threshold, by_file, stats, found, note, run_url,
-           attempted: bool = False) -> str:
+           attempted: bool = False, changes: dict = None) -> str:
     parts = [MARKER, "## Test quality report", "",
              render_coverage(percent, threshold, by_file), "",
-             render_mutation(stats, found, note, attempted)]
+             render_mutation(stats, found, note, attempted, changes)]
     if run_url:
         parts += ["", f"<sub>[CI run]({run_url})</sub>"]
     return "\n".join(parts) + "\n"
@@ -165,10 +264,16 @@ def render(percent, threshold, by_file, stats, found, note, run_url,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--coverage-xml", type=Path, required=True)
+    parser.add_argument("--coverage-xml", type=Path)
     parser.add_argument("--threshold", type=float, default=85.0)
     parser.add_argument("--mutmut-stats", type=Path)
     parser.add_argument("--mutmut-results", type=Path)
+    parser.add_argument("--mutmut-diffs", type=Path,
+                        help="concatenated `mutmut show <id>` output for the survivors; "
+                             "without it the table falls back to names alone")
+    parser.add_argument("--list-survivors", action="store_true",
+                        help="print the survivor ids and exit -- what the workflow "
+                             "loops over to collect the diffs")
     parser.add_argument("--mutation-note", default="")
     parser.add_argument("--mutation-attempted", action="store_true",
                         help="mutmut was run; missing results therefore mean a broken "
@@ -176,14 +281,21 @@ def main() -> None:
     parser.add_argument("--run-url", default="")
     args = parser.parse_args()
 
-    stats = (mutation_stats(args.mutmut_stats)
-             if args.mutmut_stats and args.mutmut_stats.is_file() else None)
     found = (survivors(args.mutmut_results.read_text())
              if args.mutmut_results and args.mutmut_results.is_file() else [])
+    if args.list_survivors:
+        print("\n".join(name for name, _ in found))
+        return
+
+    stats = (mutation_stats(args.mutmut_stats)
+             if args.mutmut_stats and args.mutmut_stats.is_file() else None)
+    changes = (mutation_changes(args.mutmut_diffs.read_text())
+               if args.mutmut_diffs and args.mutmut_diffs.is_file() else {})
 
     print(render(coverage_percent(args.coverage_xml), args.threshold,
                  coverage_by_file(args.coverage_xml), stats, found,
-                 args.mutation_note, args.run_url, args.mutation_attempted), end="")
+                 args.mutation_note, args.run_url, args.mutation_attempted,
+                 changes), end="")
 
 
 if __name__ == "__main__":

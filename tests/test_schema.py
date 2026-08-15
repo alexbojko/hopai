@@ -1207,41 +1207,42 @@ class TestInferenceSampling:
         assert isinstance(schema, GraphSchema)
         assert report.sampled == 5
 
-    def test_a_sample_that_saw_no_nodes_still_returns_a_schema(self, fresh_graph, monkeypatch):
-        """The flake this test exists for: TABLESAMPLE draws PAGES, so a
-        5% sample of a small table can catch edge pages and no node
-        pages at all. The endpoint-triple join reads the FULL nodes
-        table on purpose, so it still names `person` as a source -- and
-        GraphSchema refuses an edge type whose endpoints no NodeType
-        backs. infer_schema(sample_percent=5) therefore raised, at
-        random, from a call whose whole contract is to return an
-        observation.
+    def test_a_sample_that_saw_no_nodes_drops_the_edge_types_naming_them(
+            self, fresh_graph, monkeypatch):
+        """The MIXED sample -- the case the test above could not survive.
 
-        Simulated rather than waited for: whether a real 5% draw lands
-        in that state is luck, and a test that reproduces a bug one run
-        in ten is not a regression test. Emptying the node-side counts
-        is exactly what such a draw does.
+        Nodes and edges are sampled independently, so the edge sample can
+        return rows while the node sample returns none; endpoints come
+        from a join against the FULL nodes table, so inference built
+        EdgeType('likes', source='person') against an empty node-type
+        list and GraphSchema raised out of a function whose signature
+        promises a (schema, report) pair.
 
-        The percentage is 100 for the same reason: the only draw in play
-        must be the simulated one. At 5 the EDGE side is a coin toss
-        too, and a run that sampled no edges reports zero skipped edges
-        and fails an assertion about the fix rather than about the bug.
-        (It did, on every Python in the matrix.)"""
+        Forced rather than waited for: as a TABLESAMPLE race it fired on
+        roughly one CI job in three and one local run in forty, which is
+        exactly often enough to be mistaken for infrastructure."""
+        from sqlalchemy import false, select
+
+        import hopai.schema as schema_module
+
+        real_source = schema_module._source
+
+        def node_sample_sees_nothing(table, sample_percent):
+            if table is fresh_graph.nodes_tbl:
+                return select(table).where(false()).subquery()
+            return real_source(table, 100)
+
+        monkeypatch.setattr(schema_module, "_source", node_sample_sees_nothing)
         seed_chaotic(fresh_graph)
-        from hopai import schema as schema_module
+        schema, report = fresh_graph.infer_schema(sample_percent=5)
 
-        counts = schema_module._observed_counts
-        monkeypatch.setattr(schema_module, "_observed_counts",
-                            lambda connection, graph, source, discriminator: (
-                                {} if discriminator == "type"
-                                else counts(connection, graph, source, discriminator)))
-
-        schema, report = fresh_graph.infer_schema(sample_percent=100)
-        assert schema.node_types == () and schema.edge_types == ()
-        # counted, never dropped in silence: works_at x2, likes x2, plus
-        # the edge into the untyped node an exact scan skips anyway
-        assert report.skipped_endpoint_edges == 5
+        assert list(schema.node_types) == []
+        # Not "no edges observed" -- they were seen and then disqualified,
+        # which is what the report has to keep saying.
+        assert list(schema.edge_types) == []
         assert report.edge_counts == {"works_at": 2, "likes": 2, "dangles": 1}
+        assert report.skipped_endpoint_edges == 5
+        assert "not one of the above" in str(report)
 
     def test_out_of_range_percent_is_refused_offline(self, offgraph):
         """Validation names the range and runs BEFORE anything connects

@@ -67,5 +67,29 @@ because of bugs, not taste:
   before reaching Postgres — and survivors were reported as `segfault` rather than as
   findings. Linux never hit it. `NullPool` is there for the same class of reason.
 
+- **Write-side mutants can come back `timeout` rather than killed.** mutmut runs mutants
+  concurrently against the one Postgres the suite uses, and `fresh_graph` starts each
+  test with `DROP SCHEMA ... CASCADE` — so two mutant processes can sit waiting on each
+  other's locks and be reported as timeouts. Before treating one as a finding, apply the
+  mutation by hand and run the suite: `hopai.mutate.xǁMutatorǁdelete_edges__mutmut_18`
+  came back `timeout` and fails the suite in nine seconds on its own.
+
+- **A `survived` verdict is only as fresh as the last run against that source.** mutmut
+  caches per mutant and re-runs one only when its source changed — so adding the test
+  that kills a mutant leaves the old verdict in `mutmut results` until that function is
+  edited. Three verdicts here were stale in exactly that way; applying the mutation by
+  hand is what showed it. `rm -rf mutants/` for a clean read.
+- **A module-level constant's builder reports `survived`, always, and cannot be
+  killed.** `MUTATE_TOOL_SCHEMA` is built by calling `_operation_schema()` at import
+  time. In the generated `mutants/hopai/mutate.py` the constant is built around line
+  15090 while `mutants_x__operation_schema__mutmut[...] = ...` is registered near the
+  end of the file — so when the constant is built the mutant table is still empty, the
+  dispatcher falls through to the original body, and the mutation is never in effect.
+  Every mutant of such a function is reported `survived` no matter what the tests
+  assert. Five of them (`x__operation_schema__mutmut_1/5/8/13/17`) were checked by
+  applying each change to `hopai/mutate.py` itself: all five fail `TestToolSchema`
+  immediately. Treat this class as a harness artifact, and verify by hand rather than
+  writing a test that cannot run.
+
 CI scopes mutation to the files a PR changed and caps it with a wall-clock budget; a
 full run over `hopai/` is thousands of mutants.

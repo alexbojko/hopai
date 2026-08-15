@@ -800,7 +800,7 @@ class TestToolSchema:
         graph = self.offgraph()
         self.declare(graph)
         tools = graph.tool_schemas()
-        assert len(tools) == 3
+        assert len(tools) == 4
         for tool in tools:
             json.dumps(tool)
             description = tool["description"]
@@ -813,9 +813,10 @@ class TestToolSchema:
         """Schema stays optional: no schema means the static definitions,
         equal but never SHARED -- an integration mutating its copy must
         not corrupt the module constants every other caller reads."""
-        from hopai import INGEST_TOOL_SCHEMA
+        from hopai import INGEST_TOOL_SCHEMA, MUTATE_TOOL_SCHEMA
         tools = self.offgraph().tool_schemas()
-        assert tools == [TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA]
+        assert tools == [TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA,
+                         MUTATE_TOOL_SCHEMA]
         tools[0]["description"] = "vandalized"
         tools[2]["parameters"]["properties"].clear()
         assert TRAVERSE_TOOL_SCHEMA["description"] != "vandalized"
@@ -827,10 +828,10 @@ class TestToolSchema:
         the schema is presentation here, not grammar."""
         graph = self.offgraph()
         self.declare(graph)
-        from hopai import INGEST_TOOL_SCHEMA
+        from hopai import INGEST_TOOL_SCHEMA, MUTATE_TOOL_SCHEMA
         for tool, constant in zip(graph.tool_schemas(),
                                   (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
-                                   INGEST_TOOL_SCHEMA), strict=True):
+                                   INGEST_TOOL_SCHEMA, MUTATE_TOOL_SCHEMA), strict=True):
             assert tool["parameters"] == constant["parameters"]
             assert tool["name"] == constant["name"]
             assert tool["description"].startswith(constant["description"])

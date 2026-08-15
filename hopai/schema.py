@@ -1015,6 +1015,48 @@ def validate_operations(schema: GraphSchema, operations: list,
             _check_vocabulary(dict(op["where"]), node_types, node_label_key, "label")
 
 
+def validate_mutations(schema: GraphSchema, operations: list,
+                       node_label_key: Optional[str] = "type",
+                       edge_type_key: Optional[str] = "kind") -> None:
+    """The delete/update twin.
+
+    A hallucinated label costs more here than on the read path. There it
+    returns an empty subgraph, which at least looks like a result; a
+    delete that matched nothing reports success, and "0 rows" is exactly
+    what a correct delete of an already-clean graph reports too. The
+    properties an update WRITES are checked as well, against the type
+    its filter names -- the same rule validate_operations() applies to
+    a created row."""
+    node_types = {nt.name: {p.name for p in nt.properties} for nt in schema.node_types}
+    edge_kinds: dict = {}
+    for et in schema.edge_types:
+        edge_kinds.setdefault(et.kind, set()).update(p.name for p in et.properties)
+
+    for op in operations:
+        edges = op["op"].endswith("_edges")
+        declared = edge_kinds if edges else node_types
+        key = edge_type_key if edges else node_label_key
+        what = "relationship kind" if edges else "label"
+        if key is not None:
+            _check_vocabulary(op.get("where"), declared, key, what)
+            written = {**(op.get("set") or {}), **dict.fromkeys(op.get("remove") or ())}
+            for name in _discriminator_values(op.get("where"), key):
+                _check_vocabulary({key: name, **written}, declared, key, what)
+        if edges and node_label_key is not None:
+            for side in ("start", "end"):
+                _check_vocabulary(op.get(side), node_types, node_label_key, "label")
+
+
+def _discriminator_values(filt, discriminator: str) -> list:
+    """Every value a filter pins the discriminator to -- what a mutation
+    names as the type it is changing, since `set` carries no label of
+    its own."""
+    pairs: list = []
+    _filter_vocabulary(filt, pairs, set())
+    named = [value for key, value in pairs if key == discriminator]
+    return [v for value in named for v in (value if isinstance(value, list) else [value])]
+
+
 # ---------------------------------------------------------------------
 # The schema, summarized for a tool-calling model
 # ---------------------------------------------------------------------
@@ -1202,7 +1244,8 @@ class InferenceReport:
             f"edges: {sum(self.edge_counts.values())} with a kind across "
             f"{len(self.edge_counts)} kind(s) {dict(sorted(self.edge_counts.items()))}, "
             f"{self.untyped_edges} kindless, "
-            f"{self.skipped_endpoint_edges} skipped (endpoint node carries no type)",
+            f"{self.skipped_endpoint_edges} skipped (endpoint node's type is not "
+            f"one of the above)",
         ]
         for c in self.conflicts:
             lines.append(f"conflict: {c.table}/{c.type_name}.{c.key} observed as "
@@ -1330,26 +1373,22 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
 
     node_types = [NodeType(name, properties=props)
                   for name, props in sorted(node_props.items())]
-    observed = {nt.name for nt in node_types}
+    # The endpoint join above reads the WHOLE nodes table, while
+    # node_types comes from the sample -- so under sample_percent an edge
+    # can name an endpoint type the node sample never saw. Inference then
+    # built EdgeType(source='person') against an empty node-type list and
+    # GraphSchema rejected the schema its own inference had just
+    # produced, which is a raise from a function whose signature promises
+    # a (schema, report) pair. An unobserved type is not a type this run
+    # can claim, so the edge type goes the same way an untyped endpoint
+    # does -- counted, not silently dropped.
+    observed = {t.name for t in node_types}
     edge_types = []
     skipped = 0
     for row in sorted(triples, key=lambda r: (r.kind or "", r.source or "", r.target or "")):
         if not _named(row.kind):
             continue  # already counted as kindless below
-        if not (_named(row.source) and _named(row.target)):
-            skipped += row.rows
-            continue
         if row.source not in observed or row.target not in observed:
-            # ONLY reachable while sampling, and it used to raise. The
-            # triple join reads the full nodes table on purpose (see the
-            # docstring), while the node types come from the SAMPLED
-            # rows -- so a draw that missed every page of a type names
-            # an endpoint no NodeType backs, and GraphSchema rightly
-            # refuses that pair. Raising made infer_schema(sample_percent=5)
-            # fail at random on a small table, from a call whose whole
-            # contract is to return an observation. The honest answer is
-            # the one sampling gives everywhere else: this triple was
-            # not observed -- counted here, never dropped in silence.
             skipped += row.rows
             continue
         edge_types.append(EdgeType(row.kind, source=row.source, target=row.target,

@@ -23,7 +23,8 @@ import pytest
 
 from hopai import (
     AGGREGATE_TOOL_SCHEMA, CypherError, EdgeType, Graph,
-    INGEST_TOOL_SCHEMA, Hop, NodeType, Property, Start, TRAVERSE_TOOL_SCHEMA, Unique, Vector,
+    INGEST_TOOL_SCHEMA, Hop, MUTATE_TOOL_SCHEMA, NodeType, Property, Start,
+    TRAVERSE_TOOL_SCHEMA, Unique, Vector,
 )
 from hopai.mcp import DEFAULT_KEEP, SERVER_INSTRUCTIONS, ToolSpec, _seed, build_parser
 from hopai.mcp import build_server, main, tools
@@ -131,6 +132,19 @@ class TestToolInventory:
             "describe_graph", "traverse_graph", "aggregate_graph", "cypher", "infer_schema",
         }
 
+    def test_mutations_are_opt_in(self):
+        """Creating rows and destroying them are not the same power: a
+        delete matches by filter and does not come back, so the default
+        write server does not get one. Without this the flag could
+        collapse into `not read_only` and every writing server would
+        quietly gain a delete tool."""
+        assert "mutate_graph" not in named(offline())
+        assert "mutate_graph" in named(offline(), allow_mutations=True)
+
+    def test_mutations_and_read_only_contradict_each_other(self):
+        with pytest.raises(ValueError, match="contradict"):
+            tools(offline(), read_only=True, allow_mutations=True)
+
     def test_ddl_is_opt_in(self):
         """enforce_schema runs ALTER TABLE. Being allowed to write rows
         is not the same permission as being allowed to change what the
@@ -182,7 +196,7 @@ class TestManyGraphs:
         exactly as it was: an argument that has one legal value is noise
         in front of a model, and the schemas here are hand-written, so
         nothing else would notice it appearing."""
-        for spec in tools(offline(), allow_ddl=True):
+        for spec in tools(offline(), allow_ddl=True, allow_mutations=True):
             assert "graph" not in spec.parameters["properties"], spec.name
 
     def test_several_graphs_require_the_name_on_every_tool(self):
@@ -190,7 +204,7 @@ class TestManyGraphs:
         `graph` has no safe reading. Falling back to one of them answers
         a question about another -- and for a write, puts the rows
         there. `graph` is exactly the argument a model forgets."""
-        specs = tools(self.two(), allow_ddl=True)
+        specs = tools(self.two(), allow_ddl=True, allow_mutations=True)
         assert specs, "expected the usual inventory"
         for spec in specs:
             if spec.name == "list_graphs":
@@ -231,6 +245,7 @@ class TestManyGraphs:
         ("cypher", {"query": "MATCH (a) RETURN count(a)"}),
         ("infer_schema", {}),
         ("ingest_graph", {"nodes": [{"id": 1}]}),
+        ("mutate_graph", {"operations": [{"op": "delete_nodes", "where": {"type": "paper"}}]}),
         ("define_schema", {"schema": {"nodes": {}, "edges": []}}),
         ("enforce_schema", {}),
     ])
@@ -244,7 +259,7 @@ class TestManyGraphs:
 
         `graph="nope"` proves the argument arrived: the refusal names it
         back, and it is raised before any connection is opened."""
-        spec = {s.name: s for s in tools(self.two(), allow_ddl=True)}[tool]
+        spec = {s.name: s for s in tools(self.two(), allow_ddl=True, allow_mutations=True)}[tool]
         with pytest.raises(ValueError,
                            match=rf"{tool}: this server does not serve a graph named 'nope'"):
             spec.call(graph="nope", **arguments)
@@ -355,14 +370,18 @@ class TestToolSchemas:
     @pytest.mark.parametrize("name, static", [
         ("traverse_graph", TRAVERSE_TOOL_SCHEMA),
         ("aggregate_graph", AGGREGATE_TOOL_SCHEMA),
+        ("mutate_graph", MUTATE_TOOL_SCHEMA),
     ])
     def test_the_advertised_schema_is_hopais_own(self, name, static):
         """The SDK would derive `{"type": "object"}` from `start: dict`
         and leave the model to guess `where`, `via`, `hops` and
         `direction`. hopai ships hand-written schemas that spell those
         out and are kept in step with the parsers; this is the test that
-        they are what actually reaches a client."""
-        assert named(offline())[name].parameters == static["parameters"]
+        they are what actually reaches a client. mutate_graph is the one
+        with a `oneOf` per operation -- the part a derived schema loses
+        most, since `operations: list` says nothing about which four
+        shapes an entry may take."""
+        assert named(offline(), allow_mutations=True)[name].parameters == static["parameters"]
 
     def test_ingest_adds_the_merge_keys_to_the_static_schema(self):
         """Update, not just create: without merge_nodes_on a model can
@@ -377,12 +396,12 @@ class TestToolSchemas:
         takes is a promise broken at call time, with a TypeError the
         model cannot act on -- and the schemas are hand-written here, so
         nothing else would catch it."""
-        for spec in tools(offline(), allow_ddl=False):
+        for spec in tools(offline(), allow_mutations=True):
             accepted = set(inspect.signature(spec.call).parameters)
             assert set(spec.parameters["properties"]) <= accepted, spec.name
 
     def test_required_parameters_are_exactly_the_handlers_required_ones(self):
-        for spec in tools(offline()):
+        for spec in tools(offline(), allow_mutations=True):
             needed = {name for name, p in inspect.signature(spec.call).parameters.items()
                       if p.default is inspect.Parameter.empty}
             assert set(spec.parameters.get("required", [])) == needed, spec.name
@@ -415,7 +434,7 @@ class TestToolSchemas:
         one, and an invented embedding finds confidently wrong
         neighbors."""
         forbidden = {"near", "via_near", "via_keep", "boost", "vector", "embedding"}
-        for spec in tools(vector_graph, embed=embedder(), allow_ddl=True):
+        for spec in tools(vector_graph, embed=embedder(), allow_ddl=True, allow_mutations=True):
             assert not parameter_names(spec.parameters) & forbidden, spec.name
 
     def test_descriptions_carry_this_graphs_vocabulary(self):
@@ -549,7 +568,7 @@ class TestToolSchemas:
             named(graphs, embed=embedder())["search_similar"].call(query="x", graph="nope")
 
     @pytest.mark.parametrize("options", [{}, {"allow_ddl": True}, {"read_only": True},
-                                         {"embed": embedder()}])
+                                         {"allow_mutations": True}, {"embed": embedder()}])
     @pytest.mark.parametrize("many", [False, True])
     def test_every_built_schema_is_a_well_formed_object_schema(self, options, many,
                                                               vector_graph):
@@ -734,11 +753,41 @@ class TestCypherTool:
         with pytest.raises(CypherError, match="unknown label 'persn'"):
             spec.call(query="MATCH (a:persn) RETURN count(a)")
 
-    def test_delete_is_refused_with_the_librarys_own_message(self):
-        """There is no delete API anywhere in hopai, and this server
-        does not invent one. The message names what to do instead."""
-        with pytest.raises(CypherError, match="no delete API"):
-            named(offline())["cypher"].call(query="MATCH (a) DETACH DELETE a")
+    def test_a_writing_server_still_refuses_a_delete(self):
+        """The gap this closes: hopai gained DELETE, and `read_only`
+        was the only gate in front of Cypher. A server started to let an
+        agent CREATE would have picked up DETACH DELETE with it --
+        classified as a write and waved through -- which is not a
+        sentence anyone said. Refused before a connection is opened."""
+        with pytest.raises(ValueError, match="does not allow deleting"):
+            named(offline())["cypher"].call(query="MATCH (a:person) DETACH DELETE a")
+
+    def test_allow_mutations_lets_the_same_query_through_the_gate(self):
+        """The other half: a flag that refused everything would be
+        indistinguishable from one that was never read. Past the gate,
+        this one reaches the database that is not there."""
+        spec = named(offline(), allow_mutations=True)["cypher"]
+        with pytest.raises(Exception) as raised:
+            spec.call(query="MATCH (a:person) DETACH DELETE a")
+        assert "does not allow deleting" not in str(raised.value)
+
+    def test_a_read_only_server_refuses_a_delete_as_a_delete(self):
+        """read_only and allow_mutations cannot both be set, so a
+        read-only server has to refuse a DELETE through the mutation
+        gate -- checked first for exactly this reason. Without it a
+        DELETE would fall through to the write branch and be described
+        to the model as a write it could ask to have enabled."""
+        with pytest.raises(ValueError, match="does not allow deleting"):
+            named(offline(), read_only=True)["cypher"].call(
+                query="MATCH (a:person) DETACH DELETE a")
+
+    def test_the_description_says_which_way_the_mutation_gate_is_set(self):
+        """Both wordings, because a model that reads "refused" and one
+        that reads "supported" ask for different things. A description
+        naming DELETE unconditionally would send the first one into a
+        refusal loop."""
+        assert "are refused" in named(offline())["cypher"].description
+        assert "DETACH DELETE" in named(offline(), allow_mutations=True)["cypher"].description
 
     def test_strict_schema_reaches_the_query(self):
         """The flag is forwarded, not just accepted. Without this a
@@ -816,12 +865,24 @@ class TestDescribeGraph:
         assert enforce["endpoints"].default is False
         assert inspect.signature(specs["define_schema"].call).parameters["save"].default is True
 
-    def test_it_names_the_missing_delete_api(self):
+    def test_it_says_a_server_without_mutations_cannot_delete(self):
         """A model that cannot find a delete tool will otherwise try to
         emulate one -- with a Cypher DELETE, or by "updating" a node to
-        look deleted."""
+        look deleted. hopai HAS a delete now, so the absence is this
+        server's choice and has to be reported as one."""
         described = named(offline())["describe_graph"].call()
-        assert any("No delete" in line for line in described["refusals"])
+        assert described["deletes_and_updates_allowed"] is False
+        assert any("No delete and no update" in line for line in described["refusals"])
+
+    def test_it_reports_the_delete_semantics_once_they_are_reachable(self):
+        """The two refusals that only exist once mutate_graph does:
+        telling a model about all=true and detach=true while it has no
+        way to delete is advice for a tool it cannot see."""
+        described = named(offline(), allow_mutations=True)["describe_graph"].call()
+        assert described["deletes_and_updates_allowed"] is True
+        assert any("all=true" in line for line in described["refusals"])
+        assert any("detach=true" in line for line in described["refusals"])
+        assert not any("No delete and no update" in line for line in described["refusals"])
 
     def test_a_declared_schema_arrives_as_json_and_as_a_diagram(self):
         g = offline()
@@ -889,8 +950,8 @@ class TestCommandLine:
 
     def test_defaults_are_the_cautious_ones(self):
         args = build_parser().parse_args(["--dsn", "postgresql://x/y"])
-        assert (args.transport, args.host, args.read_only, args.allow_ddl) == (
-            "stdio", "127.0.0.1", False, False)
+        assert (args.transport, args.host, args.read_only, args.allow_ddl,
+                args.allow_mutations) == ("stdio", "127.0.0.1", False, False, False)
         # the rest of them too: a default that drifts to None surfaces
         # as a server bound somewhere else, or named something else
         assert (args.port, args.path, args.name) == (8000, "/mcp", "hopai")
@@ -953,7 +1014,7 @@ class TestCommandLine:
                      "--no-load-schema", "--vector", "nodes:summary:1536",
                      "--vector", "edges:rel:8", "--transport", "http", "--host", "0.0.0.0",
                      "--port", "9999", "--path", "/graph", "--name", "kg",
-                     "--allow-ddl", "--embed", "json:dumps"]) == 0
+                     "--allow-ddl", "--allow-mutations", "--embed", "json:dumps"]) == 0
         assert set(served["graph"]) == {"default"}
         only = served["graph"]["default"]
         assert only.vectors["nodes"]["summary"].dimensions == 1536
@@ -961,6 +1022,7 @@ class TestCommandLine:
         assert served["transport"] == "http"
         assert (served["host"], served["port"], served["path"]) == ("0.0.0.0", 9999, "/graph")
         assert (served["name"], served["read_only"], served["allow_ddl"]) == ("kg", False, True)
+        assert served["allow_mutations"] is True
         assert (served["embed"], served["strict_schema"]) == (json.dumps, False)
 
     def test_an_unreachable_saved_schema_is_reported_not_fatal(self, monkeypatch, capsys):
@@ -1005,9 +1067,10 @@ class TestServerRegistration:
         what a client actually lists. _register() replaces the schema
         the SDK derives from the handler's Python signature, and if a
         future SDK stops honouring that, this is what fails."""
-        server = build_server(vector_graph, embed=embedder(), allow_ddl=True)
+        server = build_server(vector_graph, embed=embedder(), allow_ddl=True,
+                              allow_mutations=True)
         listed = {tool.name: tool for tool in asyncio.run(server.list_tools())}
-        specs = named(vector_graph, embed=embedder(), allow_ddl=True)
+        specs = named(vector_graph, embed=embedder(), allow_ddl=True, allow_mutations=True)
         assert set(listed) == set(specs)
         for name, tool in listed.items():
             assert advertised(tool) == specs[name].parameters, name
@@ -1107,6 +1170,55 @@ class TestWriteToolsLive:
         found = named(fresh_graph)["traverse_graph"].call(start={"where": {"email": "a@x.com"}})
         assert len(found["nodes"]) == 1
         assert found["nodes"][0]["properties"]["name"] == "Alicia"
+
+    def test_mutate_updates_and_deletes_in_one_ordered_transaction(self, fresh_graph):
+        """The tool is a translation into Graph.mutate() and nothing
+        else -- so what this pins is that the model's `operations` list
+        arrives whole, in order, and that the counts come back as the
+        four separate numbers a caller needs (one total would make "3"
+        mean three of something unstated)."""
+        named(fresh_graph)["ingest_graph"].call(
+            nodes=[{"id": 1, "type": "draft", "title": "a"},
+                   {"id": 2, "type": "draft", "title": "b"},
+                   {"id": 3, "type": "person"}],
+            edges=[{"start_id": 3, "end_id": 1, "kind": "wrote"}])
+        result = named(fresh_graph, allow_mutations=True)["mutate_graph"].call(operations=[
+            {"op": "update_nodes", "where": {"type": "draft"},
+             "set": {"status": "archived"}},
+            {"op": "delete_edges", "where": {"kind": "wrote"}},
+            {"op": "delete_nodes", "where": {"type": "draft", "title": "b"}},
+        ])
+        assert result["updated_nodes"] == 2
+        assert (result["deleted_edges"], result["deleted_nodes"]) == (1, 1)
+        left = named(fresh_graph)["traverse_graph"].call(start={"where": {"type": "draft"}})
+        assert [n["properties"]["status"] for n in left["nodes"]] == ["archived"]
+
+    def test_a_filterless_delete_refuses_rather_than_emptying_the_graph(self, fresh_graph):
+        """The library's own refusal, reaching the model through the
+        tool rather than being caught and softened by it. A server that
+        swallowed it would turn the one unrecoverable mistake into a
+        successful-looking call."""
+        named(fresh_graph)["ingest_graph"].call(nodes=[{"id": 1, "type": "person"}])
+        with pytest.raises((ValueError, TypeError), match="all="):
+            named(fresh_graph, allow_mutations=True)["mutate_graph"].call(
+                operations=[{"op": "delete_nodes"}])
+        assert named(fresh_graph)["aggregate_graph"].call(
+            start={"where": {}}, aggregates={"n": {"fn": "count"}}) == {"n": 1}
+
+    def test_cypher_deletes_once_the_server_is_allowed_to(self, fresh_graph):
+        """The other route to the same power: the gate is in front of
+        the Cypher tool as well as being the reason mutate_graph exists,
+        and an agent that found DELETE working through one and refused
+        through the other would be right to be confused."""
+        named(fresh_graph)["ingest_graph"].call(
+            nodes=[{"id": 1, "type": "person", "email": "a@x.com"},
+                   {"id": 2, "type": "company"}],
+            edges=[{"start_id": 1, "end_id": 2, "kind": "works_at"}])
+        result = named(fresh_graph, allow_mutations=True)["cypher"].call(
+            query="MATCH (a:person {email: 'a@x.com'}) DETACH DELETE a")
+        assert (result["deleted_nodes"], result["deleted_edges"]) == (1, 1)
+        assert named(fresh_graph)["aggregate_graph"].call(
+            start={"where": {"type": "person"}}, aggregates={"n": {"fn": "count"}}) == {"n": 0}
 
     def test_define_schema_declares_and_persists_it(self, fresh_graph):
         """Saved, not just declared: the next process to serve this

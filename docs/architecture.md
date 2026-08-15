@@ -108,6 +108,42 @@ committing is the worst failure this library has: the caller is told it failed, 
 and the retry collides with rows that landed. `tests/test_ingest.py::TestAtomicity`
 guards it.
 
+## The delete/update path
+
+`mutate.py` is ingestion's counterpart and deliberately shares its plumbing:
+`one_transaction()` and `constraint_violation()` live in `ingest.py` and are used by
+both, so "one transaction per call" and "an IntegrityError names the constraint the
+caller declared" are one implementation, not two that drift.
+
+- **`where=` is `filters.resolve()`**, the same compiler a traversal's `where=` goes
+  through — a fourth filter dialect for deletes would be a fourth thing to get wrong.
+- **A blank filter raises** (`Mutator._guard`), in one place, so the Python API, the JSON
+  document and the Cypher translator obey the same rule. `all=True` is the explicit
+  opt-in; passing it *with* a filter also raises, since one of the two is being ignored.
+- **`detach=True` deletes incident edges first, in the same transaction.** Between two
+  transactions an edge inserted in the gap would fail the node delete with the error
+  detach was meant to prevent. Without it, the composite foreign key refuses and the
+  driver's error is rewritten to name `detach=True` (`_detach_hint`).
+- **The `*_statement` methods build without executing**, like `build_query` — which is
+  how the graph discriminator is asserted on with no database
+  (`tests/test_mutate.py::TestStatementShape`).
+- **Both front ends emit the same operation dicts** (`MUTATION_OPS`), run by one
+  executor: `spec_to_mutations()` for JSON, `cypher_to_mutations()` for Cypher.
+- **`all=True` is decided by the front end, never by the executor** — only the front end
+  knows whether the caller wrote no filter or wrote one that translation discarded
+  (`node_label_key=None`). `_MutateTranslator._operation` refuses in the second case;
+  the executor only sees a flag that was meant.
+- **`strict_schema` applies to mutations too**, via `schema.validate_mutations()` —
+  the delete/update twin of `validate_operations()`, checking the filter's vocabulary
+  and the properties an update writes against the type its filter names.
+- **The booleans go through `_flag()`**, which rejects anything that is not `True` or
+  `False`. `"false"` is truthy, and these arguments decide how many rows survive.
+
+A mutating `MATCH` binds a *set* of rows; the ingesting one binds a single node. That
+asymmetry is Cypher's own — `MATCH (a:person) SET a.x = 1` updates every person, while an
+edge has to attach to exactly one row — and `_MutateTranslator`'s docstring is where it is
+written down.
+
 ## Multi-graph
 
 One pair of tables holds every graph, discriminated by `graph_id`.
@@ -125,7 +161,9 @@ One pair of tables holds every graph, discriminated by `graph_id`.
   the whole table and would make one graph's rules law everywhere. Schema enforcement
   (`enforce_schema()`) rides the same `scope_check`, and its reconcile-on-re-enforce
   only ever touches constraints carrying its own graph's `ck_schema_*` name prefix.
-- `merge_*` conflict targets go through the same `scope_index()`.
+- `merge_*` conflict targets go through the same `scope_index()`, and so does every
+  delete and update — including the subquery behind `delete_edges(start=...)`, which
+  would otherwise resolve an endpoint against another graph's node.
 - `graph_col=None` disables all of it for callers bringing their own tables.
 - `save_schema()` adds a third table, `hopai_schema(graph_id, document, saved_at)`, and
   it sits **outside** the two-table invariant on purpose: it is metadata about a graph,
@@ -154,9 +192,17 @@ are not obvious from the outside.
   `json_api.refuse_vectors()` runs on what the model sent *before* the embedding is
   injected, which is why that function lost its underscore.
 - **Permissions decide which tools are registered**, rather than being checked inside a
-  handler. `read_only` drops every write tool, `allow_ddl` is what adds `enforce_schema`,
-  and `serve()` never mixes the two. They belong to the server, not to a graph — two
-  graphs needing different permissions are two servers.
+  handler. `read_only` drops every write tool, `allow_mutations` is what adds
+  `mutate_graph`, `allow_ddl` is what adds `enforce_schema`, and `serve()` never mixes
+  `read_only` with either. They belong to the server, not to a graph — two graphs needing
+  different permissions are two servers. `allow_mutations` is separate from the write
+  level because creating rows and destroying them are not the same power: a delete matches
+  by filter and does not come back. The one tool that cannot be gated by registration is
+  `cypher`, since one tool covers all four kinds — it calls `cypher.classify_cypher()` and
+  refuses by permission *before* opening a connection, which is why that function is in
+  `cypher.py` rather than inlined in `Graph.cypher()`. Classifying `"mutate"` apart from
+  `"write"` is what keeps a write-enabled server from picking up `DETACH DELETE` with
+  `CREATE`.
 - **One server holds many graphs**, because `Graph` is a handle and `in_graph()` shares
   the engine's pool: `Served` keeps `{name: Graph}`, every tool then *requires* a `graph`,
   and `list_graphs` is registered to answer the chicken-and-egg that creates. `Served.pick()`
@@ -199,10 +245,11 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/hop.py` | Why `Start` and `Hop` are separate types |
 | `hopai/models.py` | The DDL, the typed-columns / JSONB split, the composite FK |
 | `hopai/ingest.py` | The two row spellings, edge-by-property references, merge semantics |
+| `hopai/mutate.py` | What `where=` selects, why a blank filter refuses, the three update semantics and what `detach` does |
 | `hopai/constraints.py` | What each constraint compiles to, and the SQL semantics that surprise people |
 | `hopai/vectors.py` | Why no pgvector, the storage and cost model, cosine-only, multivector semantics, and why vectors never pass through a tool schema |
 | `hopai/schema.py` | The graph-schema notations, the annotation mapping, what enforcement compiles to and the endpoint-type limit, and why inference is an observation rather than a `.schema` fallback |
 | `hopai/cypher.py` | The translatable subset — read, write and aggregate — and why each refusal is a refusal |
-| `hopai/mcp.py` | The tool inventory, the three permission levels, why similarity takes text, and the 1.x/2.x SDK adapter |
+| `hopai/mcp.py` | The tool inventory, the four permission levels, why similarity takes text, and the 1.x/2.x SDK adapter |
 | `tests/conftest.py` | The fixture graph's shape |
 | `benchmarks/README.md` | Measured numbers, including where raw CTEs beat this library 2-5x |

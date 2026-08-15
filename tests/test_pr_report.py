@@ -17,8 +17,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from pr_report import (  # noqa: E402
-    MARKER, coverage_by_file, coverage_percent, render, render_coverage,
-    render_mutation, survivors,
+    MARKER, MAX_ROWS, coverage_by_file, coverage_percent, mutation_changes, render,
+    render_coverage, render_mutation, survivors,
 )
 
 COVERAGE_XML = """<?xml version="1.0" ?>
@@ -103,10 +103,16 @@ class TestMutationSection:
         body = render_mutation({"total": 2, "killed": 1}, [("m", "survived")], "scope")
         assert "never blocks" in body and "triage" in body
 
-    def test_survivors_are_listed_and_capped(self):
+    def test_every_survivor_is_listed(self):
+        """The list used to stop at 40. Triage needs all of them -- the
+        table is folded, so length costs nothing to a reader who is not
+        triaging, and a hidden survivor is one nobody sorts into gap,
+        equivalent or out of scope. Only the comment's size limit caps
+        it now, and that says what it dropped."""
         found = [(f"m{i}", "survived") for i in range(60)]
         body = render_mutation({"total": 60, "killed": 0}, found, "scope")
-        assert "and 20 more" in body
+        assert "| `m59` | survived |" in body
+        assert "not shown" not in body
 
     def test_no_survivors_says_so(self):
         body = render_mutation({"total": 5, "killed": 5}, [], "scope")
@@ -139,6 +145,111 @@ class TestMutationSection:
 
     def test_zero_mutants_does_not_divide_by_zero(self):
         assert "0%" in render_mutation({"total": 0, "killed": 0}, [], "scope")
+
+
+SHOW_OUTPUT = """\
+# hopai.mutate.xǁMutatorǁ_guard__mutmut_8: survived
+--- hopai/mutate.py
++++ hopai/mutate.py
+@@ -6,7 +6,7 @@
+         them is.\"\"\"
+-    _flag(all, call, "all")
++    _flag(all, call, "ALL")
+     unfiltered = all_(self._blank(f) for f in filters)
+# hopai.mutate.x_merge__mutmut_1: survived
+--- hopai/mutate.py
++++ hopai/mutate.py
+@@ -1 +1 @@
+-        value = value.op("||")(incoming)
++        value = value.op("&&")(incoming)
+"""
+
+
+class TestMutationChanges:
+    """The diff is what makes a survivor triageable in the comment
+    instead of at a checkout."""
+
+    def test_pairs_each_mutant_with_its_edit(self):
+        changes = mutation_changes(SHOW_OUTPUT)
+        assert changes["hopai.mutate.xǁMutatorǁ_guard__mutmut_8"] == (
+            '_flag(all, call, "all")', '_flag(all, call, "ALL")')
+
+    def test_file_headers_are_not_read_as_the_change(self):
+        """`--- hopai/mutate.py` and `+++ hopai/mutate.py` start with the
+        diff markers and are not the mutation; taking them would make
+        every row read as "the file changed into itself"."""
+        removed, added = mutation_changes(SHOW_OUTPUT)["hopai.mutate.x_merge__mutmut_1"]
+        assert "hopai/mutate.py" not in removed + added
+        assert removed == 'value = value.op("||")(incoming)'
+
+    def test_a_multi_line_hunk_keeps_every_line(self):
+        """A mutation spanning two lines rendered as one of them would
+        be a diff that does not say what changed."""
+        text = ("# m: survived\n--- a.py\n+++ a.py\n@@ -1,2 +1,2 @@\n"
+                "-one\n-two\n+uno\n+dos\n")
+        assert mutation_changes(text)["m"] == ("one ⏎ two", "uno ⏎ dos")
+
+    def test_output_for_no_mutants_is_empty_not_an_error(self):
+        assert mutation_changes("") == {}
+
+
+class TestSurvivorTable:
+    def test_the_change_column_appears_when_diffs_are_available(self):
+        body = render_mutation({"total": 10, "killed": 9},
+                               [("hopai.mutate.xǁMutatorǁ_guard__mutmut_8", "survived")],
+                               "note", changes=mutation_changes(SHOW_OUTPUT))
+        assert "| Mutant | Status | Change |" in body
+        assert '`_flag(all, call, "all")` → `_flag(all, call, "ALL")`' in body
+
+    def test_it_stays_folded_and_two_columns_without_diffs(self):
+        """The diffs are best-effort -- `mutmut show` failing must cost
+        the column, not the report."""
+        body = render_mutation({"total": 10, "killed": 9},
+                               [("m1", "survived")], "note")
+        assert "<details><summary>" in body and "<details open" not in body
+        assert "| Mutant | Status |" in body and "Change" not in body
+
+    def test_a_pipe_in_the_source_cannot_break_the_table(self):
+        """`properties || incoming` is ordinary code here, and an
+        unescaped pipe ends the cell early -- the row after it silently
+        loses its columns."""
+        body = render_mutation({"total": 2, "killed": 1},
+                               [("hopai.mutate.x_merge__mutmut_1", "survived")],
+                               "note", changes=mutation_changes(SHOW_OUTPUT))
+        row = next(line for line in body.splitlines() if line.startswith("| `hopai"))
+        assert row.count("|") - row.count("\\|") == 4      # the four real delimiters
+        assert "\\|\\|" in row
+
+    def test_a_mutant_with_no_diff_still_gets_a_row(self):
+        body = render_mutation({"total": 2, "killed": 1}, [("m1", "timeout")],
+                               "note", changes={"other": ("a", "b")})
+        assert "| `m1` | timeout | — |" in body
+
+    def test_a_long_change_is_bounded_and_marked(self):
+        long = "x" * 400
+        body = render_mutation({"total": 2, "killed": 1}, [("m1", "survived")],
+                               "note", changes={"m1": (long, long)})
+        row = next(line for line in body.splitlines() if line.startswith("| `m1`"))
+        assert "…" in row and len(row) < 300
+
+    def test_a_capped_table_says_what_it_dropped(self):
+        """A truncated table that looked complete would read as "these
+        are all the survivors" -- the one thing the report must not
+        imply."""
+        found = [(f"m{i}", "survived") for i in range(MAX_ROWS + 20)]
+        body = render_mutation({"total": 999, "killed": 1}, found, "note",
+                               changes={"m0": ("a", "b")})
+        assert "and 20 more, not shown" in body
+        assert f"{len(found)} survivor(s)" in body      # the count is still honest
+
+    def test_the_comment_stays_under_the_github_limit(self):
+        """GitHub rejects a body over 65536 characters, and this table is
+        the only part that grows with the diff."""
+        found = [(f"hopai.module.x_function_with_a_long_name__mutmut_{i}", "survived")
+                 for i in range(400)]
+        changes = {name: ("a" * 200, "b" * 200) for name, _ in found}
+        body = render_mutation({"total": 999, "killed": 1}, found, "note", changes=changes)
+        assert len(body) < 65_000
 
 
 class TestWholeComment:

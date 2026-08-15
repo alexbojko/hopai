@@ -45,7 +45,8 @@ server set up for another's -- and that is not a discovery convenience,
 it is the boundary.
 
 What one server cannot do is give two graphs DIFFERENT permissions:
-read_only and allow_ddl are properties of the server, not of a graph.
+read_only, allow_mutations and allow_ddl are properties of the server,
+not of a graph.
 An agent that may read `docs` and write `crm` is two servers, and that
 is the honest boundary -- a per-call argument was never one.
 
@@ -59,20 +60,35 @@ THE TOOLS, and the call each one is:
     cypher            Graph.cypher()       -- read or write, one syntax
     search_similar    Graph.vector_search()          (needs `embed`)
     ingest_graph      Graph.ingest()       -- create, or merge on keys
+    mutate_graph      Graph.mutate()       -- update or delete by filter
     infer_schema      Graph.infer_schema() -- observe, adopt nothing
     define_schema     Graph.define_schema() + save_schema()
     enforce_schema    Graph.schema_violations() / enforce_schema()
 
-PERMISSIONS. Three levels, because "an agent may read this graph" and
-"an agent may run ALTER TABLE on it" are not the same sentence:
+PERMISSIONS. Four levels, because "an agent may read this graph", "may
+add to it", "may delete from it" and "may run ALTER TABLE on it" are
+four different sentences, and an operator who can only say one of them
+ends up saying the largest:
 
-    read_only=True    the four read tools only
-    (default)         the above plus ingest_graph, define_schema, and
-                      writing Cypher
-    allow_ddl=True    the above plus enforce_schema, which runs DDL
+    read_only=True         the read tools only
+    (default)              the above plus ingest_graph, define_schema,
+                           and writing Cypher
+    allow_mutations=True   the above plus mutate_graph, and Cypher
+                           DELETE / DETACH DELETE / SET / REMOVE
+    allow_ddl=True         adds enforce_schema, which runs DDL
+
+allow_mutations is its own flag rather than part of the write level
+because creating rows and destroying them are not the same power. A
+delete matches by filter and is unrecoverable; that belongs to a
+sentence someone said on purpose. The library agrees with the
+distinction from the other side -- a filterless delete refuses, and
+`all=True` is the opt-in.
 
 The gate is which tools get REGISTERED, not a check inside a handler:
 a tool the model cannot see is a tool it cannot be talked into calling.
+The one exception is `cypher`, which is one tool covering all four
+kinds -- it classifies the query first (cypher.classify_cypher) and
+refuses by permission before opening a connection.
 
 SIMILARITY, and the rule it must not break. Vectors never pass through
 a tool schema -- a model asked for an embedding invents one, and an
@@ -89,12 +105,6 @@ anywhere accepts a list of floats. json_api.refuse_vectors() -- the one
 place that invariant is enforced -- still runs on every spec BEFORE the
 embedding is injected, so a model that invents a `near` is refused by
 the same code that refuses it in traverse_json().
-
-NOT HERE: delete. hopai has no delete API, in Python or in Cypher, so
-this server has no delete tool and `cypher` refuses DELETE with the
-message cypher.py already gives. A tool that quietly deleted "just the
-node" and left its edges, or approximated the missing feature any other
-way, is the failure mode this whole library is written against.
 
 NO AUTHENTICATION. Over stdio the client is the process that spawned
 this one, which is the trust boundary. Over HTTP it binds 127.0.0.1 by
@@ -313,7 +323,7 @@ class Served:
 
 
 def _static_schemas(served: Served) -> dict:
-    """hopai's three hand-written tool schemas, keyed by name, with
+    """hopai's four hand-written tool schemas, keyed by name, with
     their descriptions fitted to what this server serves.
 
     One graph: `Graph.tool_schemas()`, which is the library's own way of
@@ -329,13 +339,15 @@ def _static_schemas(served: Served) -> dict:
 
     from .ingest import INGEST_TOOL_SCHEMA
     from .json_api import AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA
+    from .mutate import MUTATE_TOOL_SCHEMA
     # Their descriptions are left exactly as written: _described() adds a
     # single graph's vocabulary and has nothing to add here, and tools()
     # appends the line that names the graphs to every spec. Running them
     # through _described() anyway was a no-op that read like a step --
     # a mutant broke the assignment and no test could tell.
     return {tool["name"]: copy.deepcopy(tool)
-            for tool in (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA)}
+            for tool in (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA,
+                         MUTATE_TOOL_SCHEMA)}
 
 
 def _graph_key(served: Served) -> dict:
@@ -571,7 +583,7 @@ def _list_graphs_tool(served: Served) -> ToolSpec:
     )
 
 
-def _describe_tool(served: Served, read_only: bool, allow_ddl: bool,
+def _describe_tool(served: Served, read_only: bool, allow_ddl: bool, allow_mutations: bool,
                    embed: Optional[Callable]) -> ToolSpec:
     def describe_graph(graph: Optional[str] = None, counts: bool = False) -> dict:
         graph = served.pick(graph, "describe_graph")
@@ -596,13 +608,26 @@ def _describe_tool(served: Served, read_only: bool, allow_ddl: bool,
                 _vector_fields(graph, "nodes") or _vector_fields(graph, "edges")),
             "seed_traversal_by_meaning": _seeds_from_text(graph, embed),
             "writes_allowed": not read_only,
+            "deletes_and_updates_allowed": allow_mutations,
             "ddl_allowed": allow_ddl,
+            # What the library refuses, plus -- when mutations are off
+            # -- the fact that nothing here can delete. A model that
+            # finds no delete tool and is not told why emulates one, by
+            # "updating" a node to look deleted or by trying a Cypher
+            # DELETE it will only be refused for.
             "refusals": [
-                "No delete: hopai has no delete API, in Python or in Cypher. Deleting "
-                "rows is a database operation someone does with SQL, not a tool here.",
                 "No fuzzy or substring matching: property filters are exact.",
                 "No grouping (RETURN b.city, count(b)) and no edge-property aggregates.",
-            ],
+            ] + ([
+                "A delete or update with no filter refuses rather than matching the whole "
+                "graph; say all=true if that is genuinely what you mean.",
+                "Deleting a node that still has edges refuses and names detach=true, "
+                "rather than cascading silently.",
+            ] if allow_mutations else [
+                "No delete and no update on this server: mutate_graph is not registered "
+                "and Cypher DELETE / DETACH DELETE / SET / REMOVE are refused. Do not "
+                "emulate one by marking a node deleted -- ask the operator instead.",
+            ]),
         }
         if schema is None:
             result["note"] = (
@@ -725,12 +750,23 @@ def _search_tool(served: Served, embed: Callable) -> ToolSpec:
     )
 
 
-def _cypher_tool(served: Served, read_only: bool, strict_schema: bool) -> ToolSpec:
+def _cypher_tool(served: Served, read_only: bool, allow_mutations: bool,
+                 strict_schema: bool) -> ToolSpec:
     from .cypher import classify_cypher
 
     def cypher(query: str, graph: Optional[str] = None) -> dict:
         chosen = served.pick(graph, "cypher")
-        if read_only and classify_cypher(query) == "write":
+        # Classified before running, and against the permission that
+        # matches: DELETE is not the same power as CREATE, so a server
+        # allowed to write is not thereby allowed to delete.
+        kind = classify_cypher(query)
+        if kind == "mutate" and not allow_mutations:
+            raise ValueError(
+                "this server does not allow deleting or updating rows, and that query "
+                "does (DELETE/DETACH DELETE/SET/REMOVE) -- ask the operator for a server "
+                "started with allow_mutations=True, or rewrite it as a read"
+            )
+        if read_only and kind == "write":
             raise ValueError(
                 "this server is read-only and that query writes -- run a MATCH instead, "
                 "or ask the operator for a server started without read_only=True"
@@ -751,15 +787,27 @@ def _cypher_tool(served: Served, read_only: bool, strict_schema: bool) -> ToolSp
         if not read_only else
         " This server is READ-ONLY: CREATE and MERGE are refused."
     )
+    # Named separately from `writing` because they are separate
+    # permissions -- a write-enabled server still refuses DELETE unless
+    # the operator said allow_mutations, and a description that folded
+    # the two together would promise one of them wrongly either way.
+    mutating = (
+        " SET, REMOVE, DELETE and DETACH DELETE change or remove existing rows; a DELETE "
+        "whose MATCH has no filter refuses rather than emptying the graph, and deleting a "
+        "node that still has edges needs DETACH DELETE."
+        if allow_mutations else
+        " DELETE, DETACH DELETE, SET and REMOVE are refused on this server: it is not "
+        "permitted to change or remove existing rows."
+    )
     return ToolSpec(
         name="cypher",
         description=_described(served, (
-            f"Run a Cypher query against this graph. Supported: {reading}{writing} "
+            f"Run a Cypher query against this graph. Supported: {reading}{writing}"
+            f"{mutating} "
             f"Labels compile to the `type` property and relationship types to `kind`. "
             f"Anything outside the supported subset is REFUSED with a message naming the "
-            f"rewrite -- including DELETE, which does not exist here at all, and bare `<>` "
-            f"negation, whose Cypher meaning differs from this engine's. Read the refusal "
-            f"and rewrite; do not retry the same query."
+            f"rewrite -- including bare `<>` negation, whose Cypher meaning differs from "
+            f"this engine's. Read the refusal and rewrite; do not retry the same query."
         )),
         parameters=_object({
             "query": {"type": "string", "description": "The Cypher query."},
@@ -796,6 +844,15 @@ def _ingest_tool(served: Served, schema: dict) -> ToolSpec:
         "description": "The same for edges.",
     }
     return ToolSpec(schema["name"], schema["description"], schema["parameters"], ingest_graph)
+
+
+def _mutate_tool(served: Served, schema: dict) -> ToolSpec:
+    def mutate_graph(operations: list, graph: Optional[str] = None) -> dict:
+        chosen = served.pick(graph, "mutate_graph")
+        return chosen.mutate({"operations": operations}).to_dict()
+
+    schema["parameters"]["properties"].update(_graph_key(served))
+    return ToolSpec(schema["name"], schema["description"], schema["parameters"], mutate_graph)
 
 
 def _infer_schema_tool(served: Served) -> ToolSpec:
@@ -944,12 +1001,13 @@ def _enforce_schema_tool(served: Served) -> ToolSpec:
 
 
 def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
-          embed: Optional[Callable] = None, strict_schema: bool = False) -> list:
+          allow_mutations: bool = False, embed: Optional[Callable] = None,
+          strict_schema: bool = False) -> list:
     """Every tool this server would register, as ToolSpecs -- the single
     source of what hopai offers over MCP.
 
     `graph` is one Graph, or a {name: Graph} mapping to serve several
-    over one connection pool (the first is the default). With several,
+    over one connection pool. With several,
     every tool grows an optional `graph` parameter naming which to use;
     with one, no tool mentions graphs at all.
 
@@ -983,14 +1041,19 @@ def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
             "allow_ddl=True and read_only=True contradict each other -- enforce_schema "
             "runs ALTER TABLE, which is not a read. Pick one"
         )
+    if allow_mutations and read_only:
+        raise ValueError(
+            "allow_mutations=True and read_only=True contradict each other -- deleting "
+            "and updating rows is not a read. Pick one"
+        )
 
     static = _static_schemas(served)
     specs = [
         *([_list_graphs_tool(served)] if served.many else []),
-        _describe_tool(served, read_only, allow_ddl, embed),
+        _describe_tool(served, read_only, allow_ddl, allow_mutations, embed),
         _traverse_tool(served, static["traverse_graph"], embed),
         _aggregate_tool(served, static["aggregate_graph"], embed),
-        _cypher_tool(served, read_only, strict_schema),
+        _cypher_tool(served, read_only, allow_mutations, strict_schema),
         _infer_schema_tool(served),
     ]
     if embed is not None:
@@ -998,6 +1061,8 @@ def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
     if not read_only:
         specs.append(_ingest_tool(served, static["ingest_graph"]))
         specs.append(_define_schema_tool(served))
+    if allow_mutations:
+        specs.append(_mutate_tool(served, static["mutate_graph"]))
     if allow_ddl:
         specs.append(_enforce_schema_tool(served))
     if served.many:
@@ -1095,7 +1160,8 @@ def _register(spec: ToolSpec, tool_class):
 
 
 def build_server(graph, *, name: str = "hopai", read_only: bool = False,
-                 allow_ddl: bool = False, embed: Optional[Callable] = None,
+                 allow_ddl: bool = False, allow_mutations: bool = False,
+                 embed: Optional[Callable] = None,
                  strict_schema: bool = False, http: Optional[dict] = None):
     """The configured MCP server object, not yet running.
 
@@ -1111,7 +1177,8 @@ def build_server(graph, *, name: str = "hopai", read_only: bool = False,
     server_class, tool_class, era = _sdk()
     registered = [_register(spec, tool_class)
                   for spec in tools(graph, read_only=read_only, allow_ddl=allow_ddl,
-                                    embed=embed, strict_schema=strict_schema)]
+                                    allow_mutations=allow_mutations, embed=embed,
+                                    strict_schema=strict_schema)]
     settings = http if (http and era == 1) else {}
     return server_class(name, instructions=_instructions(Served(graph)), tools=registered,
                         **settings)
@@ -1125,8 +1192,8 @@ def serve(graph, *, transport: str = "stdio", host: str = "127.0.0.1",
         serve(graph, transport="http", port=8000)       # HTTP on /mcp
         serve({"docs": docs, "crm": crm})               # several graphs, one pool
 
-    Takes build_server()'s options (read_only, allow_ddl, embed,
-    strict_schema, name). HTTP binds 127.0.0.1 unless told otherwise:
+    Takes build_server()'s options (read_only, allow_ddl, allow_mutations,
+    embed, strict_schema, name). HTTP binds 127.0.0.1 unless told otherwise:
     there is no authentication here, and a graph an agent may write to
     is not a thing to put on 0.0.0.0 by accident."""
     if transport not in ("stdio", "http"):
@@ -1221,6 +1288,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--name", default="hopai", help="Server name shown to the client.")
     parser.add_argument("--read-only", action="store_true",
                         help="Register only the reading tools.")
+    parser.add_argument("--allow-mutations", action="store_true",
+                        help="Also register mutate_graph, and allow Cypher DELETE / "
+                             "DETACH DELETE / SET / REMOVE. Separate from writing "
+                             "because deleting by filter is unrecoverable.")
     parser.add_argument("--allow-ddl", action="store_true",
                         help="Also register enforce_schema, which runs DDL.")
     parser.add_argument("--strict-schema", action="store_true",
@@ -1283,7 +1354,8 @@ def main(argv: Optional[list] = None) -> int:
 
     serve(graphs, transport=args.transport, host=args.host, port=args.port, path=args.path,
           name=args.name, read_only=args.read_only, allow_ddl=args.allow_ddl,
-          embed=args.embed, strict_schema=args.strict_schema)
+          allow_mutations=args.allow_mutations, embed=args.embed,
+          strict_schema=args.strict_schema)
     return 0
 
 
