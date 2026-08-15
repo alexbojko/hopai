@@ -1901,6 +1901,15 @@ class TestVectorCallerNamesArePinned:
         with pytest.raises(TypeError, match=r"^vector_search_many\(\): queries must be"):
             vg.build_vector_search_many_query([])
 
+    @pytest.mark.parametrize("bad,exception", [([], ValueError), ("score", TypeError)])
+    def test_search_many_names_itself_on_boosts_too(self, vg, bad, exception):
+        """Each call site passes its own name to validate_boosts(), so
+        each one needs its own assertion -- the batch site was reachable
+        only through a message no test read, and a bad boost= there
+        reported no caller at all."""
+        with pytest.raises(exception, match=r"^vector_search_many\(\): boost="):
+            vg.build_vector_search_many_query([Near("summary", [1.0, 0.0, 0.0])], boost=bad)
+
     @pytest.mark.parametrize("caller,run", [
         ("traverse_json()", lambda g, s: traverse_json(g, s)),
         ("aggregate_json()", lambda g, s: aggregate_json(
