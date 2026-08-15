@@ -182,14 +182,29 @@ class TestVectorDDL:
         assert "array_ndims(vec_summary) = 1" in checks[0]
         assert "array_length(vec_summary, 1) = 3" in checks[0]
 
-    def test_create_schema_emits_a_nullable_column(self, vg):
+    def test_create_schema_emits_a_nullable_real_array_column(self, vg):
         """define_vectors() attaches the vec_* columns to the shared
         Table metadata, so create_schema() emits them -- and a NOT NULL
         there would make the tables unusable outright. Vectors are
         written only by set_vectors(), which UPDATEs rows that already
-        exist, so a row has to be insertable without one first."""
+        exist, so a row has to be insertable without one first.
+
+        The type is asserted against a FRESH table rather than the
+        fixture's, because Table metadata is shared between handles:
+        _attach() only appends when the column is absent, so whether
+        this graph's call is the one that set the type depends on which
+        test ran first. Against a table nobody has touched it does not."""
         ddl = str(CreateTable(vg.nodes_tbl).compile(dialect=postgresql.dialect()))
         assert re.search(r"vec_summary REAL\[\](?!\s+NOT NULL)", ddl), ddl
+
+        from sqlalchemy import BigInteger, Column, MetaData, Table
+        from sqlalchemy.dialects.postgresql import ARRAY, REAL
+        from hopai.vectors import _attach
+
+        fresh = Table("t", MetaData(), Column("id", BigInteger))
+        column = _attach(fresh, "vec_x")
+        assert isinstance(column.type, ARRAY) and isinstance(column.type.item_type, REAL)
+        assert column.nullable is True
 
     def test_check_is_graph_scoped(self, vg):
         """A CHECK binds the whole table; without the guard one graph's
@@ -2836,11 +2851,18 @@ class TestNearText:
         """_resolve_query_texts() is reached only from
         vector_search_many(), and its refusals are the first thing a
         caller sees when a field cannot embed -- with nothing but the
-        label to say which of the search calls they were in."""
+        label to say which of the search calls they were in.
+
+        It raises through TWO helpers, and each takes the label
+        separately: _field() for a name that is not declared at all,
+        _embedder() for one that is but cannot embed itself."""
         with pytest.raises(ValueError,
                            match=r"^vector_search_many\(\): field 'summary' on nodes "
                                  r"was given text"):
             vg.build_vector_search_many_query([Near("summary", text="apple")], k=1)
+        with pytest.raises(ValueError,
+                           match=r"^vector_search_many\(\): no vector field 'ghost'"):
+            vg.build_vector_search_many_query([Near("ghost", text="apple")], k=1)
 
     def test_queries_keep_their_own_text_in_order(self, vg):
         """One batched answer has to be dealt back to the query it came
