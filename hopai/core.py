@@ -146,8 +146,8 @@ class Graph:
         if not isinstance(graph, str) or not graph:
             raise ValueError(f"graph must be a non-empty string, got {graph!r}")
         self.graph = graph
-        self.nodes_tbl = node_table if node_table is not None else Node.__table__
-        self.edges_tbl = edge_table if edge_table is not None else Edge.__table__
+        self.nodes_tbl = node_table if node_table is not None else Node
+        self.edges_tbl = edge_table if edge_table is not None else Edge
         self.node_id_col = node_id_col
         self.edge_id_col = edge_id_col
         self.edge_start_col = edge_start_col

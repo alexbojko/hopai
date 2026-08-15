@@ -39,7 +39,7 @@ def norm(statement, literal_binds: bool = False) -> str:
 
 
 def filter_sql(filt, literal_binds: bool = False) -> str:
-    nt = Node.__table__
+    nt = Node
     return norm(select(nt.c.id).where(resolve(nt.c.properties, filt)), literal_binds)
 
 

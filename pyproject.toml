@@ -30,7 +30,6 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "sqlmodel>=0.0.39",
     "sqlalchemy>=2.0",
     "psycopg2-binary>=2.9",
 ]
@@ -44,9 +43,8 @@ Changelog = "https://github.com/alexbojko/hopai/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 networkx = ["networkx>=3.0"]
-# sqlmodel already drags pydantic in transitively, so this extra exists
-# to pin the MAJOR version: schema_pydantic generates v2 models, and
-# sqlmodel's own floor still tolerates v1 in some resolutions.
+# schema_pydantic generates v2 models; this extra pins the MAJOR version
+# so v1, tolerated by some resolutions, is never silently what lands.
 pydantic = ["pydantic>=2.0"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "networkx>=3.0", "pydantic>=2.0", "ruff>=0.6"]
 # Only for executing notebooks/ -- see scripts/run_notebooks.py. Deliberately

@@ -29,17 +29,17 @@ deliberately real columns, not JSONB keys, so the GIN index and every
 traversal result stay exactly as above.
 
 If your table/column names differ, pass them to Graph() -- see core.py.
-Nothing in this library requires the SQLModel classes below specifically;
+Nothing in this library requires the Table objects below specifically;
 they're the default, not a hard dependency of the query-building logic.
 """
 
 from __future__ import annotations
 
 from sqlalchemy import (
-    BigInteger, Column, ForeignKeyConstraint, Identity, Text, UniqueConstraint, text,
+    BigInteger, Column, ForeignKeyConstraint, Identity, MetaData, Table, Text,
+    UniqueConstraint, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlmodel import Field, SQLModel
 
 #: The graph a row belongs to. One pair of tables holds every graph, and
 #: every query carries `graph_id = ...` -- so a new graph costs a string,
@@ -53,49 +53,36 @@ DEFAULT_GRAPH = "default"
 # follow a batch of explicit ids.
 _IDENTITY = Identity(always=False)
 
+#: Owns Node/Edge (and nothing else -- callers passing their own
+#: node_table/edge_table to Graph() bring their own MetaData) so
+#: create_schema()/drop_schema() on the defaults never collide with a
+#: caller's own declarative or Core metadata.
+metadata = MetaData()
 
-class Node(SQLModel, table=True):
-    __tablename__ = "nodes"
+Node = Table(
+    "nodes", metadata,
+    Column("id", BigInteger, _IDENTITY, primary_key=True),
+    Column("graph_id", Text, nullable=False, server_default=text(f"'{DEFAULT_GRAPH}'")),
+    Column("properties", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
     # UNIQUE(id, graph_id) is redundant on its own -- id is already the
     # primary key -- and exists solely so edges can carry a COMPOSITE
     # foreign key. That is what makes an edge between two different
     # graphs impossible rather than merely discouraged.
-    __table_args__ = (UniqueConstraint("id", "graph_id", name="uq_nodes_id_graph"),)
+    UniqueConstraint("id", "graph_id", name="uq_nodes_id_graph"),
+)
 
-    id: int = Field(sa_column=Column(BigInteger, _IDENTITY, primary_key=True))
-    graph_id: str = Field(
-        default=DEFAULT_GRAPH,
-        sa_column=Column(Text, nullable=False, server_default=text(f"'{DEFAULT_GRAPH}'")),
-    )
-    properties: dict = Field(
-        default_factory=dict,
-        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'::jsonb")),
-    )
-
-
-class Edge(SQLModel, table=True):
-    __tablename__ = "edges"
+Edge = Table(
+    "edges", metadata,
+    Column("id", BigInteger, _IDENTITY, primary_key=True),
+    Column("graph_id", Text, nullable=False, server_default=text(f"'{DEFAULT_GRAPH}'")),
+    Column("start_id", BigInteger, nullable=False),
+    Column("end_id", BigInteger, nullable=False),
+    Column("properties", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
     # Both endpoints are tied to the edge's OWN graph_id, so an edge can
     # only ever join two nodes of its own graph. Postgres refuses the
     # write; nothing has to remember to check.
-    __table_args__ = (
-        ForeignKeyConstraint(["start_id", "graph_id"], ["nodes.id", "nodes.graph_id"],
-                             name="fk_edges_start_same_graph"),
-        ForeignKeyConstraint(["end_id", "graph_id"], ["nodes.id", "nodes.graph_id"],
-                             name="fk_edges_end_same_graph"),
-    )
-
-    id: int = Field(sa_column=Column(BigInteger, Identity(always=False), primary_key=True))
-    graph_id: str = Field(
-        default=DEFAULT_GRAPH,
-        sa_column=Column(Text, nullable=False, server_default=text(f"'{DEFAULT_GRAPH}'")),
-    )
-    # Explicit BigInteger: SQLModel would infer plain INTEGER from the
-    # annotation, which does not match a BIGINT primary key and quietly
-    # caps the graph at two billion nodes.
-    start_id: int = Field(sa_column=Column(BigInteger, nullable=False))
-    end_id: int = Field(sa_column=Column(BigInteger, nullable=False))
-    properties: dict = Field(
-        default_factory=dict,
-        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'::jsonb")),
-    )
+    ForeignKeyConstraint(["start_id", "graph_id"], ["nodes.id", "nodes.graph_id"],
+                         name="fk_edges_start_same_graph"),
+    ForeignKeyConstraint(["end_id", "graph_id"], ["nodes.id", "nodes.graph_id"],
+                         name="fk_edges_end_same_graph"),
+)

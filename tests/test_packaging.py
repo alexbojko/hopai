@@ -126,7 +126,7 @@ class TestDistributionMetadata:
     def test_declares_its_runtime_dependencies(self, pyproject):
         """An install that imports and then dies on `import sqlalchemy`
         is worse than one that refuses to install."""
-        for requirement in ("sqlmodel", "sqlalchemy", "psycopg2-binary"):
+        for requirement in ("sqlalchemy", "psycopg2-binary"):
             assert requirement in pyproject
 
     def test_networkx_stays_optional(self, pyproject):
@@ -139,9 +139,8 @@ class TestDistributionMetadata:
     def test_pydantic_stays_optional(self, pyproject):
         """schema_pydantic imports it lazily and the hopai[pydantic]
         extra pins v2. pydantic must never become a DIRECT required
-        dependency: sqlmodel already brings it transitively at ITS
-        chosen floor, and a direct pin here would silently take over
-        every install's resolution."""
+        dependency: making it hard would put a validation library in
+        the install path of a project that never calls schema_pydantic."""
         required = pyproject.split("[project.optional-dependencies]")[0]
         assert "pydantic" not in required
 
