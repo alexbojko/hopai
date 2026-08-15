@@ -352,9 +352,10 @@ class GraphSchema:
                 "the pydantic representation needs pydantic v2 -- pip install hopai[pydantic]"
             ) from exc
         if int(pydantic.VERSION.split(".")[0]) < 2:
-            # sqlmodel tolerates pydantic v1, so v1 can genuinely be what
-            # is installed -- and v1's create_model builds models with
-            # different semantics rather than failing, which is worse.
+            # some other dependency in the environment can still pull in
+            # v1 even though hopai[pydantic] pins v2 -- and v1's
+            # create_model builds models with different semantics rather
+            # than failing, which is worse.
             raise ImportError(
                 f"the pydantic representation needs pydantic v2, found {pydantic.VERSION} "
                 f"-- pip install hopai[pydantic]"
@@ -406,8 +407,8 @@ class GraphSchema:
 def _is_pydantic_model(obj) -> bool:
     # Duck-typed on purpose: recognizing a pydantic model must not cost
     # hopai a pydantic import -- the caller who passed one already paid
-    # it. model_fields is the v2 marker; v1 models (which sqlmodel still
-    # tolerates) fall through and are refused as unsupported input.
+    # it. model_fields is the v2 marker; v1 models fall through and are
+    # refused as unsupported input.
     return isinstance(obj, type) and isinstance(getattr(obj, "model_fields", None), dict)
 
 
