@@ -54,6 +54,27 @@ read.** When a design question comes up, these decide it, in order:
   Cypher would not — and bare `count(b)`/`sum(b.x)` with hops mean per-*path* in Cypher,
   which hopai cannot express. `cypher.py`'s AGGREGATION docstring holds the acceptance
   matrix; loosening a refusal into a near-enough mapping is the bug, not the fix.
+- **A delete or update with no filter refuses.** `where=None`/`{}` is what an empty
+  variable looks like, and matching everything on it is unrecoverable. `all=True` is the
+  opt-in; `all=True` *with* a filter refuses too, since one of them is being ignored.
+  (`test_a_delete_with_no_filter_refuses`)
+- **`all` / `detach` / `replace` are checked, not coerced.** `all="false"` is truthy in
+  Python, and JSON booleans arriving as the strings `"true"`/`"false"` is an ordinary
+  tool-call failure — coercing let the string `"false"` mean *every row*.
+- **A constraint the options discard is not "no filter".** `node_label_key=None` throws
+  labels away; on the read path that widens a result set, in front of a `DELETE` it
+  widened it to the whole graph *and* auto-supplied the `all=True` opt-in. An operation
+  left with nothing refuses instead.
+- **Deleting a node that still has edges refuses and the message names `detach=True`.**
+  Cascading instead would leave the corruption the composite FK exists to prevent.
+- **A mutating `MATCH` binds a set of rows; an ingesting one binds a single node.** That
+  is Cypher's own asymmetry — `SET` applies to every match, an edge attaches to exactly
+  one — so neither may be "fixed" into the other.
+- **`SET x = {...}` refuses unless the map carries the label/type property, and
+  `SET x.k = null` means REMOVE.** Cypher's `SET n = {map}` never erases a label and a
+  relationship's type cannot be changed at all; `= null` removes a property, where a
+  stored JSON null is absent to Cypher and *present* to `Required`. Both are the same
+  spelling meaning something else, which is the one thing this library must not do.
 - **Every read and write goes through `Graph._scoped()`.** Forgetting the graph
   discriminator does not error; it silently touches another graph's rows.
 - **The dimension CHECK's name is `_graph_token`-based, never `_auto_name()` +
@@ -103,16 +124,17 @@ read.** When a design question comes up, these decide it, in order:
   **equivalent** (record the one-line proof; "probably fine" is not a proof), or
   **out of scope** (say so explicitly). A run reporting `0 checked`, or all `segfault`,
   is a broken harness, not a clean sweep.
-- `json_api.py` and `cypher.py` are front ends that emit `(Start, [Hop])`, an
-  aggregation triple, or ingestion operations, and hold no query logic. Widening a
-  subset means adding a translation, never loosening a refusal into a near-enough
-  mapping. The tool schemas (`TRAVERSE_TOOL_SCHEMA` / `AGGREGATE_TOOL_SCHEMA` /
-  `INGEST_TOOL_SCHEMA` / `VECTOR_SEARCH_TOOL_SCHEMA`) must stay in step with what the
-  parsers accept — with exactly two pinned exceptions, and no third without a reason
-  of the same kind. A near spec's **`"vector"`** is parsed and never advertised (the
-  invariant above); **`label`** is not advertised because it names result groups for
-  the caller's own bookkeeping and builds no SQL, so there is nothing for a model to
-  decide. `test_advertises_the_keys_the_parser_reads` derives both sides from
+- `json_api.py`, `mutate.py`'s spec parser and `cypher.py` are front ends that emit
+  `(Start, [Hop])`, an aggregation triple, or ingestion/mutation operations, and hold no
+  query logic. Widening a subset means adding a translation, never loosening a refusal
+  into a near-enough mapping. The tool schemas (`TRAVERSE_TOOL_SCHEMA` /
+  `AGGREGATE_TOOL_SCHEMA` / `INGEST_TOOL_SCHEMA` / `MUTATE_TOOL_SCHEMA` /
+  `VECTOR_SEARCH_TOOL_SCHEMA`) must stay in step with what the parsers accept — with
+  exactly two pinned exceptions, and no third without a reason of the same kind. A near
+  spec's **`"vector"`** is parsed and never advertised (the invariant above); **`label`**
+  is not advertised because it names result groups for the caller's own bookkeeping and
+  builds no SQL, so there is nothing for a model to decide.
+  `test_advertises_the_keys_the_parser_reads` derives both sides from
   `_HOP_KEYS`/`_START_KEYS`, so a widened parser and a widened schema fail apart.
   `cypher.py` has no vector spelling and is not expected to grow one — Cypher has no
   portable similarity syntax to translate, so there is nothing to refuse by name.
@@ -160,6 +182,15 @@ from hopai import Graph, Start, Hop
 g = Graph("postgresql+psycopg2://u:p@localhost/db")   # never connects
 print(g.build_query(Start(where={"type": "person"}), [Hop(hops=(1, 3))])
        .compile(dialect=postgresql.dialect()))
+```
+
+Deletes and updates build the same way — `Mutator`'s `*_statement` methods take no
+connection, which is how the graph discriminator is asserted on with nothing running:
+
+```python
+from hopai.mutate import Mutator
+print(Mutator(g).delete_nodes_statement({"type": "draft"})
+      .compile(dialect=postgresql.dialect()))
 ```
 
 ## Deeper detail

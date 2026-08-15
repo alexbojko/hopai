@@ -1015,6 +1015,48 @@ def validate_operations(schema: GraphSchema, operations: list,
             _check_vocabulary(dict(op["where"]), node_types, node_label_key, "label")
 
 
+def validate_mutations(schema: GraphSchema, operations: list,
+                       node_label_key: Optional[str] = "type",
+                       edge_type_key: Optional[str] = "kind") -> None:
+    """The delete/update twin.
+
+    A hallucinated label costs more here than on the read path. There it
+    returns an empty subgraph, which at least looks like a result; a
+    delete that matched nothing reports success, and "0 rows" is exactly
+    what a correct delete of an already-clean graph reports too. The
+    properties an update WRITES are checked as well, against the type
+    its filter names -- the same rule validate_operations() applies to
+    a created row."""
+    node_types = {nt.name: {p.name for p in nt.properties} for nt in schema.node_types}
+    edge_kinds: dict = {}
+    for et in schema.edge_types:
+        edge_kinds.setdefault(et.kind, set()).update(p.name for p in et.properties)
+
+    for op in operations:
+        edges = op["op"].endswith("_edges")
+        declared = edge_kinds if edges else node_types
+        key = edge_type_key if edges else node_label_key
+        what = "relationship kind" if edges else "label"
+        if key is not None:
+            _check_vocabulary(op.get("where"), declared, key, what)
+            written = {**(op.get("set") or {}), **dict.fromkeys(op.get("remove") or ())}
+            for name in _discriminator_values(op.get("where"), key):
+                _check_vocabulary({key: name, **written}, declared, key, what)
+        if edges and node_label_key is not None:
+            for side in ("start", "end"):
+                _check_vocabulary(op.get(side), node_types, node_label_key, "label")
+
+
+def _discriminator_values(filt, discriminator: str) -> list:
+    """Every value a filter pins the discriminator to -- what a mutation
+    names as the type it is changing, since `set` carries no label of
+    its own."""
+    pairs: list = []
+    _filter_vocabulary(filt, pairs, set())
+    named = [value for key, value in pairs if key == discriminator]
+    return [v for value in named for v in (value if isinstance(value, list) else [value])]
+
+
 # ---------------------------------------------------------------------
 # The schema, summarized for a tool-calling model
 # ---------------------------------------------------------------------
@@ -1190,12 +1232,6 @@ class InferenceReport:
     skipped_endpoint_edges: int
     conflicts: tuple
     sampled: Optional[float] = None
-    #: Edges whose endpoints ARE typed, but whose type the node sample
-    #: never saw. Always 0 for an unsampled run, where node types and
-    #: endpoint types are read from the same full table. Distinct from
-    #: skipped_endpoint_edges, which counts a genuinely untyped endpoint
-    #: -- that is a fact about the data, this is a gap in the sample.
-    unsampled_endpoint_edges: int = 0
 
     def __str__(self) -> str:
         lines = []
@@ -1208,12 +1244,9 @@ class InferenceReport:
             f"edges: {sum(self.edge_counts.values())} with a kind across "
             f"{len(self.edge_counts)} kind(s) {dict(sorted(self.edge_counts.items()))}, "
             f"{self.untyped_edges} kindless, "
-            f"{self.skipped_endpoint_edges} skipped (endpoint node carries no type)",
+            f"{self.skipped_endpoint_edges} skipped (endpoint node's type is not "
+            f"one of the above)",
         ]
-        if self.unsampled_endpoint_edges:
-            lines.append(
-                f"{self.unsampled_endpoint_edges} edge(s) dropped: their endpoint type "
-                f"was not in the sample -- re-run without sample_percent to see them")
         for c in self.conflicts:
             lines.append(f"conflict: {c.table}/{c.type_name}.{c.key} observed as "
                          f"{list(c.json_types)}")
@@ -1301,16 +1334,7 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
     `sampled` and says estimates. The endpoint-triple join samples the
     edges side only: sampling the node side too would count edges whose
     node fell outside the sample as endpoint-less, manufacturing
-    skipped-edge noise the data does not contain.
-
-    That asymmetry has a consequence worth stating: an endpoint type can
-    be observed without a node of that type being sampled, and an edge
-    type naming a node type the schema does not define is one this
-    library's own GraphSchema refuses. Those edge types are DROPPED and
-    counted as `unsampled_endpoint_edges`, so a sampled inference stays
-    a well-formed pair whatever the sample contained -- and stays
-    adoptable by define_schema(), which is the whole point of returning
-    a schema rather than a pile of observations."""
+    skipped-edge noise the data does not contain."""
     from sqlalchemy import and_, func, select
 
     if sample_percent is not None and not 0 < sample_percent <= 100:
@@ -1349,28 +1373,23 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
 
     node_types = [NodeType(name, properties=props)
                   for name, props in sorted(node_props.items())]
-    # Endpoint types come from the FULL node table (see the docstring:
-    # sampling that side would manufacture skipped-edge noise), while
-    # node types come from the sampled one. So a sampled run can observe
-    # an endpoint type it never sampled a node of -- and TABLESAMPLE
-    # SYSTEM is page-level, so on a small table that is common rather
-    # than exotic. Emitting such an edge type built a GraphSchema whose
-    # own constructor rejects it, turning infer_schema() into a raise.
-    # Drop them and say so: an inferred schema describes what the sample
-    # contained, and this keeps its output always adoptable by
-    # define_schema().
-    sampled_types = {nt_.name for nt_ in node_types}
+    # The endpoint join above reads the WHOLE nodes table, while
+    # node_types comes from the sample -- so under sample_percent an edge
+    # can name an endpoint type the node sample never saw. Inference then
+    # built EdgeType(source='person') against an empty node-type list and
+    # GraphSchema rejected the schema its own inference had just
+    # produced, which is a raise from a function whose signature promises
+    # a (schema, report) pair. An unobserved type is not a type this run
+    # can claim, so the edge type goes the same way an untyped endpoint
+    # does -- counted, not silently dropped.
+    observed = {t.name for t in node_types}
     edge_types = []
     skipped = 0
-    unsampled = 0
     for row in sorted(triples, key=lambda r: (r.kind or "", r.source or "", r.target or "")):
         if not _named(row.kind):
             continue  # already counted as kindless below
-        if not (_named(row.source) and _named(row.target)):
+        if row.source not in observed or row.target not in observed:
             skipped += row.rows
-            continue
-        if not {row.source, row.target} <= sampled_types:
-            unsampled += row.rows
             continue
         edge_types.append(EdgeType(row.kind, source=row.source, target=row.target,
                                    properties=edge_props.get(row.kind, ())))
@@ -1383,7 +1402,6 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
         skipped_endpoint_edges=skipped,
         conflicts=tuple(conflicts),
         sampled=sample_percent,
-        unsampled_endpoint_edges=unsampled,
     )
     return GraphSchema(node_types, edge_types), report
 

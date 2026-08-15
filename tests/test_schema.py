@@ -1183,60 +1183,6 @@ class TestInferenceSampling:
         assert sampled.untyped_edges == exact.untyped_edges
         assert sampled.skipped_endpoint_edges == exact.skipped_endpoint_edges
 
-    def test_an_endpoint_type_outside_the_sample_drops_its_edge_type(self, fresh_graph):
-        """The sampled run must stay a well-formed pair whatever the
-        sample contained.
-
-        Endpoint types are read from the FULL node table on purpose,
-        while node types come from the sampled one -- so a run can
-        observe `person -> company` without having sampled a single
-        `person` node. Emitting that EdgeType built a GraphSchema its
-        own constructor rejects, so infer_schema() RAISED instead of
-        returning. TABLESAMPLE SYSTEM is page-level, so on a small table
-        that was roughly a 1-in-12 coin flip, and it turned up as a
-        spurious red on unrelated PRs (#41).
-
-        Forced deterministically here by emptying the node sample rather
-        than waiting for the dice: sample_percent is threaded through
-        _source(), so patching it to yield no node rows reproduces the
-        exact condition every time. The percentage is 100 so the EDGE
-        side is fully sampled -- at 5 the edge side can empty too, and
-        then there is no edge type to drop and nothing under test."""
-        from hopai import schema as schema_module
-
-        seed_chaotic(fresh_graph)
-        real_source = schema_module._source
-
-        def empty_nodes(table, sample_percent):
-            # The node side samples to nothing; the edge side is untouched.
-            if table is fresh_graph.nodes_tbl and sample_percent is not None:
-                return real_source(table, sample_percent).select().where(
-                    text("false")).subquery()
-            return real_source(table, sample_percent)
-
-        schema_module._source = empty_nodes
-        try:
-            schema, report = fresh_graph.infer_schema(sample_percent=100)
-        finally:
-            schema_module._source = real_source
-
-        assert schema.node_types == ()
-        assert schema.edge_types == ()          # dropped, not raised
-        assert report.unsampled_endpoint_edges > 0
-        assert "endpoint type was not in the sample" in str(report)
-        # The point of dropping rather than emitting: what comes back is
-        # still something define_schema() accepts.
-        fresh_graph.define_schema(schema=schema)
-
-    def test_an_unsampled_run_never_drops_an_edge_type(self, fresh_graph):
-        """The guard must be inert without sampling, where node types
-        and endpoint types are read from the same full table -- a drop
-        there would mean silently losing edge kinds from an exact run."""
-        seed_chaotic(fresh_graph)
-        _, exact = fresh_graph.infer_schema()
-        assert exact.unsampled_endpoint_edges == 0
-        assert "not in the sample" not in str(exact)
-
     def test_report_says_estimates_only_when_sampling(self, fresh_graph):
         """The epistemics flag: an exact run must NOT carry it (or every
         report would cry wolf), a sampled run must lead with it --
@@ -1260,6 +1206,47 @@ class TestInferenceSampling:
         schema, report = fresh_graph.infer_schema(sample_percent=5)
         assert isinstance(schema, GraphSchema)
         assert report.sampled == 5
+
+    def test_a_sample_that_saw_no_nodes_drops_the_edge_types_naming_them(
+            self, fresh_graph, monkeypatch):
+        """The MIXED sample -- the case the test above could not survive.
+
+        Nodes and edges are sampled independently, so the edge sample can
+        return rows while the node sample returns none; endpoints come
+        from a join against the FULL nodes table, so inference built
+        EdgeType('likes', source='person') against an empty node-type
+        list and GraphSchema raised out of a function whose signature
+        promises a (schema, report) pair.
+
+        Forced rather than waited for: as a TABLESAMPLE race it fired on
+        roughly one CI job in three and one local run in forty, which is
+        exactly often enough to be mistaken for infrastructure."""
+        from sqlalchemy import false, select
+
+        import hopai.schema as schema_module
+
+        real_source = schema_module._source
+
+        def node_sample_sees_nothing(table, sample_percent):
+            if table is fresh_graph.nodes_tbl:
+                return select(table).where(false()).subquery()
+            return real_source(table, 100)
+
+        monkeypatch.setattr(schema_module, "_source", node_sample_sees_nothing)
+        seed_chaotic(fresh_graph)
+        schema, report = fresh_graph.infer_schema(sample_percent=5)
+
+        assert list(schema.node_types) == []
+        # Not "no edges observed" -- they were seen and then disqualified,
+        # which is what the report has to keep saying.
+        assert list(schema.edge_types) == []
+        assert report.edge_counts == {"works_at": 2, "likes": 2, "dangles": 1}
+        assert report.skipped_endpoint_edges == 5
+        assert "not one of the above" in str(report)
+        # The point of dropping rather than raising: what comes back is
+        # still something define_schema() accepts. An inferred schema
+        # its own library refuses is not a usable answer.
+        fresh_graph.define_schema(schema=schema)
 
     def test_out_of_range_percent_is_refused_offline(self, offgraph):
         """Validation names the range and runs BEFORE anything connects

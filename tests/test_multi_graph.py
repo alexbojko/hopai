@@ -97,6 +97,69 @@ class TestIsolation:
             assert {n["properties"]["n"] for n in got} == {i}
 
 
+class TestScopedMutations:
+    """Deleting and updating are where forgetting the discriminator
+    stops being a wrong answer and becomes someone else's missing data,
+    so each of these checks the other graph still has everything."""
+
+    def test_a_delete_leaves_the_other_graph_intact(self, two):
+        marketing, support = two
+        assert marketing.delete_nodes(where={"type": "person"},
+                                      detach=True).deleted_nodes == 2
+        assert names(marketing) == set()
+        assert names(support, Hop()) == {"s1", "s2"}
+
+    def test_a_detach_deletes_only_this_graph_s_edges(self, two):
+        marketing, support = two
+        assert marketing.delete_nodes(where={"name": "m1"}, detach=True).deleted_edges == 1
+        assert len(support.traverse(Start(), Hop()).edges) == 1
+
+    def test_an_update_reaches_no_further_than_its_graph(self, two):
+        marketing, support = two
+        marketing.update_nodes(where={"type": "person"}, set={"checked": True})
+        assert all(n["properties"].get("checked")
+                   for n in marketing.traverse(Start()).nodes)
+        assert not any(n["properties"].get("checked")
+                       for n in support.traverse(Start()).nodes)
+
+    def test_deleting_edges_by_property_stops_at_the_graph_boundary(self, two):
+        """Edge statements need their own scope proof: a property-only
+        edge filter carries no ids, so nothing else keeps it inside this
+        graph. Dropping the discriminator from the edge DELETE left
+        every other test in this class passing."""
+        marketing, support = two
+        assert marketing.delete_edges(where={"kind": "knows"}).deleted_edges == 1
+        assert len(support.traverse(Start(), Hop()).edges) == 1
+
+    def test_updating_edges_by_property_stops_at_the_graph_boundary(self, two):
+        marketing, support = two
+        assert marketing.update_edges(where={"kind": "knows"},
+                                      set={"weight": 1}).updated_edges == 1
+        assert all("weight" not in e["properties"]
+                   for e in support.traverse(Start(), Hop()).edges)
+
+    def test_an_endpoint_filter_resolves_inside_this_graph_only(self, two):
+        """A node name that exists only in the other graph matches
+        nothing here. (Node ids are a global primary key, so this cannot
+        catch an unscoped subquery on its own -- the two tests above are
+        what pin the edge statements; this one pins the reading of the
+        endpoint filter itself.)"""
+        marketing, support = two
+        assert marketing.delete_edges(start={"name": "s1"}).deleted_edges == 0
+        assert len(support.traverse(Start(), Hop()).edges) == 1
+
+    def test_clear_empties_one_graph_and_not_the_other(self, two):
+        marketing, support = two
+        assert marketing.clear().to_dict()["deleted_nodes"] == 2
+        assert names(marketing) == set()
+        assert names(support, Hop()) == {"s1", "s2"}
+
+    def test_a_cypher_delete_is_scoped_too(self, two):
+        marketing, support = two
+        assert marketing.cypher("MATCH (n) DETACH DELETE n").deleted_nodes == 2
+        assert names(support, Hop()) == {"s1", "s2"}
+
+
 class TestCrossGraphEdges:
     def test_an_edge_between_graphs_is_rejected_by_the_database(self, two):
         """The composite foreign key makes this impossible rather than

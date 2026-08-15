@@ -3,9 +3,10 @@ Shared setup for the hopai notebooks.
 
 Every notebook owns one PostgreSQL schema outright and rebuilds it in its
 first cell, so "Run All" means the same thing the second time and no
-notebook depends on what another one left behind. That matters more here
-than it would elsewhere: hopai has no delete API, so a re-run against
-leftover rows would double the graph rather than reproduce it.
+notebook depends on what another one left behind. `graph.clear()` would
+empty a graph in place, but dropping the schema also resets the identity
+sequences and any constraints a notebook declared, which is what makes a
+re-run identical rather than merely similar.
 
     from demo_graph import arrows, connect, names, node_ids, seed
 
