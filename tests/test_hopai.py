@@ -167,7 +167,10 @@ class TestCoreTraversal:
             Start(where={"type": "hub"}),
             Hop(hops=(1, 10), direction="backward"),
         )
-        assert result.elapsed_ms < 5000  # generous ceiling; should be near-instant
+        # Bounded on BOTH sides: a ceiling alone is satisfied by 0.0, so
+        # dropping the measurement entirely (Subgraph's elapsed_ms
+        # default) passed unnoticed. A real round trip cannot take zero.
+        assert 0 < result.elapsed_ms < 5000  # generous ceiling; should be near-instant
         assert len(result.nodes) > 0
 
 

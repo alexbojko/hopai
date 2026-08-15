@@ -71,6 +71,16 @@ class TestPlanTranslation:
         assert plan[1]["rows"][0]["start_var"] == "b"
         assert plan[1]["rows"][0]["end_var"] == "a"
 
+    def test_backward_arrow_reverses_a_merged_edge_too(self):
+        """MERGE swaps the endpoints in its own branch, so the CREATE
+        pin above never covered it -- and an unreversed MERGE writes the
+        edge pointing the wrong way, which no later read can tell from
+        data that was always like that."""
+        plan = ops("MATCH (a {n: 1}), (b {n: 2}) MERGE (a)<-[:knows]-(b)")
+        assert plan[-1]["op"] == "merge_edges"
+        assert plan[-1]["rows"][0]["start_var"] == "b"
+        assert plan[-1]["rows"][0]["end_var"] == "a"
+
     def test_match_before_create_becomes_a_lookup(self):
         assert ops("MATCH (a {email: 'a'}), (b {email: 'b'}) CREATE (a)-[:knows]->(b)") == [
             {"op": "match", "var": "a", "where": {"email": "a"}},
