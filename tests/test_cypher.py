@@ -1251,8 +1251,33 @@ class TestStrictSchema:
                              strict_schema=True)
 
     def test_strict_flag_without_a_schema_names_the_fix(self, offline_graph):
-        with pytest.raises(CypherError, match="define_schema"):
+        with pytest.raises(CypherError) as exc:
             traverse_cypher(offline_graph, "MATCH (a:person) RETURN a", strict_schema=True)
+        # verbatim: the padded-string mutants keep every inner word, so
+        # a substring match cannot tell them from the real message
+        assert str(exc.value) == (
+            "strict_schema=True needs a schema and none is defined for this Graph "
+            "-- call define_schema(...) first"
+        )
+
+    def test_aggregating_queries_validate_their_whole_chain(self):
+        """The aggregation translator forwards start, hops AND both
+        discriminator keys to validation. Each was droppable on its own:
+        a hop-position label, a relationship kind, and a kind under a
+        configured key all have to refuse here exactly as they do on the
+        traversal path."""
+        with pytest.raises(CypherError, match="unknown label 'companyy'"):
+            cypher_to_aggregation(
+                "MATCH (a:person)-[:works_at]->(b:companyy) RETURN count(DISTINCT b)",
+                schema=self.schema())
+        with pytest.raises(CypherError, match="unknown relationship kind 'worksat'"):
+            cypher_to_aggregation(
+                "MATCH (a:person)-[:worksat]->(b:company) RETURN count(DISTINCT b)",
+                schema=self.schema())
+        with pytest.raises(CypherError, match="unknown relationship kind 'worksat'"):
+            cypher_to_aggregation(
+                "MATCH (a:person)-[:worksat]->(b:company) RETURN count(DISTINCT b)",
+                schema=self.schema(), edge_type_key="rel")
 
     def test_default_stays_permissive(self):
         """Without the flag, the exact queries strict mode refuses keep

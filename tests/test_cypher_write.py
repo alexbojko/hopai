@@ -133,6 +133,18 @@ class TestPlanTranslation:
         assert plan[0]["rows"] == [{"label": "Person"}, {"label": "Person"}]
         assert plan[1]["rows"][0]["properties"] == {"rel": "KNOWS"}
 
+    def test_configured_type_key_reaches_schema_validation(self):
+        """The write path forwards edge_type_key to validation as well
+        as to translation: with the kind under 'rel', validation has to
+        read it there or strict mode silently stops checking kinds."""
+        from hopai import EdgeType, GraphSchema, NodeType
+        schema = GraphSchema(node_types=[NodeType("person"), NodeType("company")],
+                             edge_types=[EdgeType("works_at", source="person",
+                                                  target="company")])
+        with pytest.raises(CypherError, match="unknown relationship kind 'worksat'"):
+            ops("MATCH (a {email: 'a'}), (b {name: 'acme'}) CREATE (a)-[:worksat]->(b)",
+                schema=schema, edge_type_key="rel", node_label_key=None)
+
     def test_a_read_query_is_refused(self):
         with pytest.raises(CypherError, match="only reads"):
             ops("MATCH (a) RETURN a")
@@ -148,8 +160,22 @@ class TestWriteRefusals:
             ops("MERGE (a {n: 1})-[:knows]->(b {n: 2})")
 
     def test_variable_length_cannot_be_written(self):
-        with pytest.raises(CypherError, match="variable-length"):
+        with pytest.raises(CypherError) as exc:
             ops("CREATE (a {n: 1})-[:knows*1..3]->(b {n: 2})")
+        # verbatim, per the hop.py rule: an XX-padded mutant keeps every
+        # inner word, so a substring match cannot see it
+        assert str(exc.value) == (
+            "a variable-length relationship cannot be written -- `*` says how far to "
+            "walk, and there is no such thing as creating half an edge"
+        )
+
+    def test_multiple_labels_cannot_be_written(self):
+        """Two labels map onto ONE property, so a write has to refuse
+        rather than pick: `(a:person:admin)` would silently drop one of
+        them into a graph nobody could query back."""
+        with pytest.raises(CypherError) as exc:
+            ops("CREATE (a:person:admin {email: 'x'})")
+        assert "has multiple labels (person:admin)" in str(exc.value)
 
     def test_anonymous_endpoints_are_refused(self):
         with pytest.raises(CypherError, match="has to be named"):
@@ -268,6 +294,14 @@ class TestWriteRefusals:
         assert plan[0]["op"] == "create_nodes"
         assert plan[1]["op"] == "create_edges"
         assert plan[1]["rows"][0]["properties"] == {}
+
+    def test_typeless_backward_arrow_creates_a_reversed_edge_with_no_kind(self):
+        """The backward twin of the test above, and it needs its own:
+        `<--` is a separate return in _parse_rel, so the same
+        props-to-None mutant survived on this arm alone -- and
+        `properties.update(None)` is a TypeError, not a wrong edge."""
+        plan = ops("CREATE (a {x: 1})<--(b {y: 2})")
+        assert plan[1]["rows"][0] == {"start_var": "b", "end_var": "a", "properties": {}}
 
     def test_null_property_values_are_literals(self):
         plan = ops("CREATE (a {gone: NULL, missing: null})")
