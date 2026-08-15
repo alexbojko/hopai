@@ -38,11 +38,26 @@ at all. Each graph keeps its OWN schema and vector fields --
 `in_graph()` carries neither on purpose, since a different graph is
 allowed a different shape.
 
-`list_graphs` lists what this server was CONFIGURED to serve, not every
-graph_id in the tables. Enumerating the database would hand a model
-rows the operator never chose to expose -- one tenant's graph from a
-server set up for another's -- and that is not a discovery convenience,
-it is the boundary.
+WHICH graphs, from the command line: by default ALL of them.
+`hopai-mcp --dsn ...` calls Graph.graphs(), which lists the graph_ids
+that have rows, and serves every one. `--graph NAME` restricts it and is
+repeatable.
+
+That way round because the DSN is the boundary. A process holding these
+credentials can already read every graph in the database, so declining
+to enumerate them protects nothing. The alternative default -- the one
+this replaced -- served only the graph literally named 'default', which
+had a server pointed at a database whose rows live in 'docs' and 'crm'
+answer "nothing here": confidently, and about graphs it had simply not
+been told to look at. That is the failure this library is written
+against, and it is worse than the exposure it was avoiding.
+
+So an agent that must not see `crm` gets `--graph docs` -- a server that
+does not serve it, rather than one that declines to admit it exists.
+
+`list_graphs` still reports what this server SERVES, discovered or
+named. It is never a live query, so a graph created after start-up is
+not silently in scope.
 
 What one server cannot do is give two graphs DIFFERENT permissions:
 read_only, allow_mutations and allow_ddl are properties of the server,
@@ -1275,10 +1290,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dsn", default=os.environ.get("HOPAI_DSN"),
                         help="PostgreSQL DSN. Defaults to $HOPAI_DSN.")
     parser.add_argument("--graph", action="append", default=[], metavar="NAME",
-                        help=f"A graph in those tables to serve (default {DEFAULT_GRAPH!r}). "
-                             f"Repeatable: several graphs share one connection pool, every "
-                             f"tool then REQUIRES a `graph` argument naming one of them, "
-                             f"and list_graphs is added to say what the names are.")
+                        help="RESTRICT the server to this graph. Repeatable. Without it "
+                             "every graph in the database is served, which is what the "
+                             "DSN already grants. With more than one graph served, every "
+                             "tool REQUIRES a `graph` argument naming one of them, and "
+                             "list_graphs is added to say what the names are.")
     parser.add_argument("--transport", choices=("stdio", "http"), default="stdio",
                         help="stdio (default) for a client that spawns this process; "
                              "http for a long-running server.")
@@ -1318,20 +1334,41 @@ def main(argv: Optional[list] = None) -> int:
     if not args.dsn:
         parser.error("no database to serve -- pass --dsn or set HOPAI_DSN")
 
-    names = args.graph or [DEFAULT_GRAPH]
-    duplicates = sorted({n for n in names if names.count(n) > 1})
+    duplicates = sorted({n for n in args.graph if args.graph.count(n) > 1})
     if duplicates:
         parser.error(f"--graph {duplicates} given more than once -- name each graph once")
-    unknown = {g for g, _, _ in args.vector if g is not None} - set(names)
-    if unknown:
-        parser.error(f"--vector names graph(s) {sorted(unknown)} that --graph does not "
-                     f"serve: {names}")
 
     # One engine, one pool: the first handle opens it and in_graph()
     # shares it, which is the whole reason a server can hold many graphs
     # without holding many pools.
-    first = Graph(args.dsn, graph=names[0])
-    graphs = {names[0]: first, **{name: first.in_graph(name) for name in names[1:]}}
+    first = Graph(args.dsn, graph=(args.graph or [DEFAULT_GRAPH])[0])
+    if args.graph:
+        names = args.graph
+    else:
+        # No --graph: serve what is in the database. The DSN is the
+        # boundary -- anything this process can enumerate it can already
+        # read -- and defaulting to the single graph named 'default'
+        # instead meant a server pointed at a database whose rows live
+        # in 'docs' and 'crm' answered "nothing here", confidently and
+        # wrongly, about graphs it simply had not been told to look at.
+        try:
+            names = first.graphs()
+        except Exception as exc:            # noqa: BLE001 - any driver error, same fix
+            parser.error(f"cannot list the graphs in this database: {exc}. Pass --graph "
+                         f"to name the ones to serve without looking them up")
+        # An empty database has no graphs to find, and refusing to start
+        # would make the server useless exactly when it is being set up.
+        names = names or [DEFAULT_GRAPH]
+        print(f"hopai-mcp: serving every graph in this database: {names}. "
+              f"Pass --graph to serve fewer.", file=sys.stderr)
+
+    unknown = {g for g, _, _ in args.vector if g is not None} - set(names)
+    if unknown:
+        parser.error(f"--vector names graph(s) {sorted(unknown)} that this server does "
+                     f"not serve: {names}")
+
+    graphs = {names[0]: (first if names[0] == first.graph else first.in_graph(names[0])),
+              **{name: first.in_graph(name) for name in names[1:]}}
 
     for name, graph in graphs.items():
         fields = [(target, field) for chosen, target, field in args.vector

@@ -216,6 +216,16 @@ are not obvious from the outside.
   than one handle and a list of names. With a single graph nothing is advertised — the
   same rule as `search_field`, and the reason the single-graph tool surface is
   byte-identical to what it was before this existed.
+- **Which graphs is decided in `main()`, not in `Served`.** With no `--graph`, the CLI
+  calls `Graph.graphs()` — `SELECT DISTINCT graph_id FROM nodes` — and serves every one;
+  `--graph` restricts it and skips the lookup entirely, so a restricted server never
+  enumerates. `Served` itself only ever receives a finished `{name: Graph}`, which keeps
+  discovery out of the request path: `list_graphs` reports the served set rather than
+  re-querying, so a graph created after start-up is not silently in scope. The default is
+  full access because the DSN already is — the alternative served only the graph literally
+  named `default`, which is how a server pointed at a database of `docs` and `crm` came to
+  answer "nothing here". An empty database still starts, on `DEFAULT_GRAPH`, since refusing
+  would break the server exactly when someone is setting it up.
 
 Handlers are synchronous and are wrapped to run in a worker thread: a blocking database
 call in an async server would stall every other request on the connection. The SDK's

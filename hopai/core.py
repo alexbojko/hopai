@@ -164,6 +164,32 @@ class Graph:
                      edge_id_col=self.edge_id_col, edge_start_col=self.edge_start_col,
                      edge_end_col=self.edge_end_col, graph_col=self.graph_col)
 
+    def graphs(self) -> list:
+        """Every graph that has rows in these tables, in name order.
+
+        The counterpart to in_graph(): that moves to a graph you can
+        name, this says which names there are. What it answers is "what
+        is actually in this database", which is not the same question as
+        "what did someone configure" -- a server or a UI that wants the
+        second must keep its own list, because the DSN is the whole
+        boundary here. Anyone who can run this query can already read
+        every one of these graphs.
+
+        Derived from `nodes`: an edge cannot exist without its endpoints
+        (the composite foreign key sees to that), so a graph with rows
+        has nodes. A graph that exists only as a saved schema, with no
+        rows yet, is NOT here -- nothing has been written to it.
+
+        With graph_col=None the tables carry no discriminator, so there
+        is exactly one graph and this returns its name without querying.
+        """
+        if self.graph_col is None:
+            return [self.graph]
+        column = self.nodes_tbl.c[self.graph_col]
+        with self.engine.connect() as connection:
+            return [row[0] for row in connection.execute(
+                select(column).distinct().order_by(column))]
+
     def _scoped(self, table):
         """`graph_id = <this graph>` for one table, or an alias of it.
 

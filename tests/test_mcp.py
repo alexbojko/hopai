@@ -1163,6 +1163,69 @@ class TestCommandLine:
         assert served["graph"]["crm"].vectors["nodes"]["notes"].dimensions == 8
         assert served["graph"]["docs"].vectors is None
 
+    def test_without_graph_every_graph_in_the_database_is_served(self, monkeypatch, capsys):
+        """The default is full access, because the DSN already is: a
+        process holding these credentials can read every graph in the
+        database, so declining to enumerate them protects nothing.
+
+        What the old default did instead was serve the graph literally
+        named 'default' -- so a server pointed at a database whose rows
+        live in 'docs' and 'crm' answered "nothing here", confidently
+        and about graphs it had never been told to look at."""
+        served = {}
+        monkeypatch.setattr("hopai.core.Graph.graphs", lambda self: ["crm", "docs"])
+        monkeypatch.setattr("hopai.mcp.serve",
+                            lambda graph, **options: served.update(graph=graph, **options))
+        main(["--dsn", "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+              "--no-load-schema"])
+        assert list(served["graph"]) == ["crm", "docs"]
+        # the HANDLES have to agree with the names, and share the pool
+        assert [g.graph for g in served["graph"].values()] == ["crm", "docs"]
+        assert served["graph"]["crm"].engine is served["graph"]["docs"].engine
+        # said out loud on stderr, which is a stdio client's log: an
+        # operator who did not mean to serve everything should find out
+        # at start-up rather than from a model naming someone else's graph
+        assert "serving every graph in this database" in capsys.readouterr().err
+
+    def test_graph_restricts_and_never_looks_the_others_up(self, monkeypatch):
+        """`--graph` is the opt-in restriction, and it has to be a real
+        one: discovering first and then filtering would still reach a
+        database the operator may have scoped the credentials for. The
+        exploding stub is the assertion -- if discovery ran, this fails."""
+        served = {}
+        monkeypatch.setattr("hopai.core.Graph.graphs",
+                            lambda self: pytest.fail("--graph must not enumerate"))
+        monkeypatch.setattr("hopai.mcp.serve",
+                            lambda graph, **options: served.update(graph=graph, **options))
+        main(["--dsn", "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+              "--no-load-schema", "--graph", "docs"])
+        assert list(served["graph"]) == ["docs"]
+
+    def test_an_empty_database_still_starts(self, monkeypatch):
+        """Nothing has been written yet, so there is nothing to
+        discover. Refusing to start would make the server useless
+        exactly when someone is setting it up -- and with one graph
+        served, no tool mentions graphs at all."""
+        served = {}
+        monkeypatch.setattr("hopai.core.Graph.graphs", lambda self: [])
+        monkeypatch.setattr("hopai.mcp.serve",
+                            lambda graph, **options: served.update(graph=graph, **options))
+        main(["--dsn", "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+              "--no-load-schema"])
+        assert list(served["graph"]) == ["default"]
+
+    def test_a_database_that_cannot_be_listed_names_the_fix(self, capsys):
+        """Discovery needs a connection, and the DSN may be wrong or the
+        database down. The message has to name `--graph`, which is the
+        way to start without looking anything up -- otherwise the
+        operator is told only that something failed."""
+        with pytest.raises(SystemExit):
+            main(["--dsn", "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+                  "--no-load-schema"])
+        error = capsys.readouterr().err
+        assert "cannot list the graphs in this database" in error
+        assert "--graph" in error
+
     def test_a_graph_named_twice_is_refused(self, capsys):
         with pytest.raises(SystemExit):
             main(["--dsn", "postgresql://x/y", "--graph", "docs", "--graph", "docs"])
@@ -1172,7 +1235,7 @@ class TestCommandLine:
         with pytest.raises(SystemExit):
             main(["--dsn", "postgresql://x/y", "--graph", "docs",
                   "--vector", "crm:nodes:notes:8"])
-        assert "--graph does not serve" in capsys.readouterr().err
+        assert "this server does not serve" in capsys.readouterr().err
 
     def test_main_declares_the_vector_fields_and_forwards_every_option(self, monkeypatch):
         """Everything main() does between parsing and serving, with the
@@ -1186,6 +1249,7 @@ class TestCommandLine:
         monkeypatch.setattr("hopai.mcp.serve",
                             lambda graph, **options: served.update(graph=graph, **options))
         assert main(["--dsn", "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+                     "--graph", "default",
                      "--no-load-schema", "--vector", "nodes:summary:1536",
                      "--vector", "edges:rel:8", "--transport", "http", "--host", "0.0.0.0",
                      "--port", "9999", "--path", "/graph", "--name", "kg",
@@ -1208,7 +1272,8 @@ class TestCommandLine:
         monkeypatch.setattr("hopai.mcp.serve", lambda graph, **options: None)
         monkeypatch.setattr("hopai.core.Graph.load_schema",
                             lambda self: (_ for _ in ()).throw(ValueError("no saved schema")))
-        main(["--dsn", "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline"])
+        main(["--dsn", "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+              "--graph", "default"])
         assert "serving 'default' without a declared schema" in capsys.readouterr().err
 
 
