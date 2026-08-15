@@ -756,13 +756,18 @@ class TestVectorsNeverComeFromTheModel:
         made every search-seeded call refuse its own embedding -- and
         survived on aggregate_graph, which no test had ever seeded.
 
-        Both tools, because they inject separately. Getting past the
-        gate is the assertion: the offline graph then fails on the
-        connection that is not there, which is proof it got that far."""
+        Both tools, because they inject separately. OperationalError is
+        the assertion, and it has to be that specific: `pytest.raises
+        (Exception)` plus "not the refusal" passes for ANY failure, so a
+        handler mutated into a TypeError reads as a success. Reaching
+        the connection that is not there is what proves the whole call
+        was built -- the embedding made, the spec assembled, the query
+        compiled -- with only the database missing."""
+        from sqlalchemy.exc import OperationalError
+
         spec = named(vector_graph, embed=embedder())[tool]
-        with pytest.raises(Exception) as raised:
+        with pytest.raises(OperationalError):
             spec.call(start={"search": "graph databases"}, **arguments)
-        assert "cannot come from a tool call" not in str(raised.value)
 
     def test_keep_without_search_is_refused(self):
         spec = named(offline())["traverse_graph"]
@@ -865,12 +870,16 @@ class TestCypherTool:
 
     def test_allow_mutations_lets_the_same_query_through_the_gate(self):
         """The other half: a flag that refused everything would be
-        indistinguishable from one that was never read. Past the gate,
-        this one reaches the database that is not there."""
+        indistinguishable from one that was never read. OperationalError
+        rather than "some exception that is not the refusal" -- the
+        looser form passes for any failure at all, including a handler
+        mutated into a TypeError. This one proves the query was
+        translated and compiled, with only the database missing."""
+        from sqlalchemy.exc import OperationalError
+
         spec = named(offline(), allow_mutations=True)["cypher"]
-        with pytest.raises(Exception) as raised:
+        with pytest.raises(OperationalError):
             spec.call(query="MATCH (a:person) DETACH DELETE a")
-        assert "does not allow deleting" not in str(raised.value)
 
     def test_a_read_only_server_refuses_a_delete_as_a_delete(self):
         """read_only and allow_mutations cannot both be set, so a
