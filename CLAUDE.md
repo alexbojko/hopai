@@ -51,6 +51,24 @@ read.** When a design question comes up, these decide it, in order:
   matrix; loosening a refusal into a near-enough mapping is the bug, not the fix.
 - **Every read and write goes through `Graph._scoped()`.** Forgetting the graph
   discriminator does not error; it silently touches another graph's rows.
+- **The dimension CHECK's name is `_graph_token`-based, never `_auto_name()` +
+  `scope_name()`.** Independent 63-char truncation let two graphs share one constraint —
+  silently disabling one graph's enforcement and letting its `drop_vectors()` remove the
+  other's. (`test_field_and_graph_can_never_share_a_constraint_name`)
+- **Similarity is a LATERAL, never a correlated scalar subquery.** The planner pulls a
+  scalar subquery up and re-evaluates it at every site the outer query names it — filter,
+  score, `ORDER BY` — so the `unnest` ran 2–3× per candidate for identical results. It
+  reads tidier as a subquery and costs 2×; `benchmarks/README.md` has the measurement.
+- **A similarity is NULL — "missing" — when the stored vector is NULL, all zeros, or the
+  wrong length.** `unnest(a, b)` pads the shorter side, so a mis-sized vector would
+  otherwise score a confident cosine over the shared prefix.
+- **Vectors live in `vec_*` real columns, never in `properties`, and never pass
+  through an LLM tool schema.** JSONB storage would bloat the GIN index and every
+  result; a tool-schema `"vector"` parameter invites a model to invent an embedding,
+  and an invented embedding finds confidently wrong neighbors. Similarity is exact
+  (unnest+sum cosine, float8 accumulation); a traversal without `near=` must emit
+  byte-identical SQL to the pre-vector engine. (`test_defining_vectors_changes_no_near_less_query`,
+  `TestToolSchemasStayVectorFree`)
 - **Writes are one transaction**, batching included. A half-committed write makes a
   retry collide with rows that landed.
 
@@ -70,7 +88,12 @@ read.** When a design question comes up, these decide it, in order:
   aggregation triple, or ingestion operations, and hold no query logic. Widening a
   subset means adding a translation, never loosening a refusal into a near-enough
   mapping. The tool schemas (`TRAVERSE_TOOL_SCHEMA` / `AGGREGATE_TOOL_SCHEMA` /
-  `INGEST_TOOL_SCHEMA`) must stay in step with what the parsers accept.
+  `INGEST_TOOL_SCHEMA`) must stay in step with what the parsers accept — with one
+  pinned exception: the vector keys (`near`/`keep`/`via_near`/`via_keep`/`boost`) are
+  parsed but deliberately never advertised to a model, and `traverse_json`/
+  `aggregate_json` refuse them without `allow_vectors=True` (see `vectors.py`).
+  `cypher.py` has no vector spelling and is not expected to grow one — Cypher has no
+  portable similarity syntax to translate, so there is nothing to refuse by name.
 - `notebooks/` is documentation that **runs**, executed by CI on every PR
   (`python scripts/run_notebooks.py`). A change to a public API means re-running
   them with `--save` and reading the output diff — a stale notebook is a broken
@@ -104,7 +127,7 @@ print(g.build_query(Start(where={"type": "person"}), [Hop(hops=(1, 3))])
 | Read | For |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | The read and write pipelines, multi-graph internals, result gotchas, and which module docstring explains what |
-| [notebooks/README.md](notebooks/README.md) | The eight runnable notebooks, how they are executed in CI, and how to regenerate their outputs |
+| [notebooks/README.md](notebooks/README.md) | The nine runnable notebooks, how they are executed in CI, and how to regenerate their outputs |
 | [docs/testing.md](docs/testing.md) | Fixtures, the database-free suite, coverage gate, mutmut config and its fork-safety quirks |
 | [docs/releasing.md](docs/releasing.md) | release-please, PyPI trusted publishing, and the traps already hit |
 | [README.md](README.md) | The user-facing API |

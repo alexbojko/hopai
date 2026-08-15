@@ -134,6 +134,7 @@ class Graph:
         self.edge_end_col = edge_end_col
         self.graph_col = graph_col
         self._schema = None
+        self._vectors = None
         if graph_col is not None:
             for table in (self.nodes_tbl, self.edges_tbl):
                 if graph_col not in table.c:
@@ -154,9 +155,10 @@ class Graph:
         `Graph` is a cheap handle, so this is how you move between graphs
         rather than building a second engine and pool for each.
 
-        The new handle starts with NO schema -- a different graph is
-        allowed a different shape, so a schema never travels implicitly;
-        call define_schema() on the new handle if it has one."""
+        The new handle starts with NO schema and NO vector fields -- a
+        different graph is allowed a different shape (different vector
+        dimensions included), so neither travels implicitly; call
+        define_schema()/define_vectors() on the new handle."""
         return Graph(self.engine, graph=graph, node_table=self.nodes_tbl,
                      edge_table=self.edges_tbl, node_id_col=self.node_id_col,
                      edge_id_col=self.edge_id_col, edge_start_col=self.edge_start_col,
@@ -199,11 +201,24 @@ class Graph:
         edge_id_col = getattr(et.c, self.edge_id_col)
         node_id_col = getattr(nt.c, self.node_id_col)
 
-        seed = (
-            select(node_id_col.label("node_id"))
-            .where(and_(self._scoped(nt), resolve(nt.c.properties, start.where)))
-            .cte("seed")
-        )
+        seed_condition = and_(self._scoped(nt), resolve(nt.c.properties, start.where))
+        if start.near is not None:
+            # Similarity-seeded: the seed CTE becomes "the k most
+            # similar nodes that also pass `where`", ranked inside the
+            # same statement -- see hopai/vectors.py. Everything
+            # downstream (walks, matches, dead-end pruning) is
+            # unchanged, which is the point of doing it in the seed.
+            from .vectors import ranked_ids, validate_nears
+            from .vectors import validate_boosts
+            nears = validate_nears(self, "nodes", start.near, start.keep, "Start", "keep")
+            seed = ranked_ids(self, nt, node_id_col, nt, seed_condition, nears, start.keep,
+                              validate_boosts(start.boost, "Start")).cte("seed")
+        else:
+            seed = (
+                select(node_id_col.label("node_id"))
+                .where(seed_condition)
+                .cte("seed")
+            )
         prev_match = seed
         pairs = []
 
@@ -213,56 +228,137 @@ class Graph:
             else:
                 join_col, move_col = edge_end_col, edge_start_col
 
-            walk_base = (
-                select(
+            def _edge_cols(alias, direction=hop.direction):
+                """(join, move, id) for one edge alias, given direction."""
+                if direction == "forward":
+                    join, move = self.edge_start_col, self.edge_end_col
+                else:
+                    join, move = self.edge_end_col, self.edge_start_col
+                return (getattr(alias.c, join), getattr(alias.c, move),
+                        getattr(alias.c, self.edge_id_col))
+
+            via_nears = None
+            if hop.via_near is not None:
+                # Similarity-ranked edges. Each anchor row joins to a
+                # LATERAL yielding the edges worth following FROM IT,
+                # and that lateral hands back exactly the (edge_id,
+                # to_id) pair the plain join produced -- so depth, the
+                # local path, the cycle guard and edge reconstruction
+                # are all untouched below.
+                from .vectors import edge_beam, validate_nears
+                via_nears = validate_nears(self, "edges", hop.via_near, hop.via_keep,
+                                           f"hop {i} ({hop.label or 'unlabeled'}) via_near",
+                                           "via_keep")
+
+            if via_nears is not None:
+                base_alias = et.alias(f"via_base_{i}")
+                base_join, base_move, base_id = _edge_cols(base_alias)
+                base_beam = edge_beam(self, base_alias, base_join, prev_match.c.node_id,
+                                      base_move, base_id, hop.via, via_nears, hop.via_keep,
+                                      f"beam_{i}", correlate=(prev_match,))
+                walk_base = select(
                     prev_match.c.node_id.label("from_id"),
-                    move_col.label("to_id"),
+                    base_beam.c.move_id.label("to_id"),
                     literal(1).label("depth"),
-                    array([prev_match.c.node_id, move_col]).label("local_path"),
-                    array([edge_id_col]).label("local_edges"),
+                    array([prev_match.c.node_id, base_beam.c.move_id]).label("local_path"),
+                    array([base_beam.c.edge_id]).label("local_edges"),
+                ).select_from(prev_match.join(base_beam, literal(True)))
+            else:
+                walk_base = (
+                    select(
+                        prev_match.c.node_id.label("from_id"),
+                        move_col.label("to_id"),
+                        literal(1).label("depth"),
+                        array([prev_match.c.node_id, move_col]).label("local_path"),
+                        array([edge_id_col]).label("local_edges"),
+                    )
+                    .select_from(et.join(prev_match, join_col == prev_match.c.node_id))
+                    .where(and_(self._scoped(et), resolve(et.c.properties, hop.via)))
                 )
-                .select_from(et.join(prev_match, join_col == prev_match.c.node_id))
-                .where(and_(self._scoped(et), resolve(et.c.properties, hop.via)))
-            )
             walk = walk_base.cte(f"walk_{i}", recursive=True)
             w = walk.alias()
-            e = et.alias()
-            if hop.direction == "forward":
-                e_join, e_move = getattr(e.c, self.edge_start_col), getattr(e.c, self.edge_end_col)
-            else:
-                e_join, e_move = getattr(e.c, self.edge_end_col), getattr(e.c, self.edge_start_col)
 
-            recursive_term = (
-                select(
-                    w.c.from_id,
-                    e_move,
-                    w.c.depth + 1,
-                    w.c.local_path.op("||")(e_move),
-                    w.c.local_edges.op("||")(getattr(e.c, self.edge_id_col)),
+            if via_nears is not None:
+                rec_alias = et.alias(f"via_rec_{i}")
+                rec_join, rec_move, rec_id = _edge_cols(rec_alias)
+                # The cycle guard goes INSIDE the beam, not after it: a
+                # top-via_keep beam that spent slots on edges leading
+                # back into the path would follow fewer than via_keep usable
+                # edges, and how many is invisible from the outside.
+                rec_beam = edge_beam(
+                    self, rec_alias, rec_join, w.c.to_id, rec_move, rec_id, hop.via,
+                    via_nears, hop.via_keep, f"beam_rec_{i}",
+                    extra=[sa_not_(rec_move == sa_any_(w.c.local_path))],
+                    correlate=(w,),
                 )
-                .select_from(w.join(e, e_join == w.c.to_id))
-                .where(
-                    and_(
-                        w.c.depth < hop.max_hops,
-                        self._scoped(e),
-                        resolve(e.c.properties, hop.via),
-                        sa_not_(e_move == sa_any_(w.c.local_path)),
+                recursive_term = (
+                    select(
+                        w.c.from_id,
+                        rec_beam.c.move_id,
+                        w.c.depth + 1,
+                        w.c.local_path.op("||")(rec_beam.c.move_id),
+                        w.c.local_edges.op("||")(rec_beam.c.edge_id),
+                    )
+                    .select_from(w.join(rec_beam, literal(True)))
+                    .where(w.c.depth < hop.max_hops)
+                )
+            else:
+                e = et.alias()
+                e_join, e_move, e_id = _edge_cols(e)
+                recursive_term = (
+                    select(
+                        w.c.from_id,
+                        e_move,
+                        w.c.depth + 1,
+                        w.c.local_path.op("||")(e_move),
+                        w.c.local_edges.op("||")(e_id),
+                    )
+                    .select_from(w.join(e, e_join == w.c.to_id))
+                    .where(
+                        and_(
+                            w.c.depth < hop.max_hops,
+                            self._scoped(e),
+                            resolve(e.c.properties, hop.via),
+                            sa_not_(e_move == sa_any_(w.c.local_path)),
+                        )
                     )
                 )
-            )
             full_walk = walk.union_all(recursive_term)
 
-            match_i = (
-                select(distinct(full_walk.c.to_id).label("node_id"))
-                .select_from(
-                    full_walk.join(
-                        nt, and_(node_id_col == full_walk.c.to_id, self._scoped(nt),
-                                 resolve(nt.c.properties, hop.where))
-                    )
+            if hop.near is not None:
+                # Rank AFTER deduplication: many walks can reach one
+                # node, and its similarity is one number -- computing
+                # it per walk row would multiply the per-row subquery
+                # by the path count for the same answer.
+                from .vectors import ranked_ids, validate_nears
+                nears = validate_nears(self, "nodes", hop.near, hop.keep,
+                                       f"hop {i} ({hop.label or 'unlabeled'})", "keep")
+                reached = (
+                    select(distinct(full_walk.c.to_id).label("node_id"))
+                    .where(full_walk.c.depth >= hop.min_hops)
+                    .subquery(f"reached_{i}")
                 )
-                .where(full_walk.c.depth >= hop.min_hops)
-                .cte(f"match_{i}")
-            )
+                joined = reached.join(
+                    nt, and_(node_id_col == reached.c.node_id, self._scoped(nt),
+                             resolve(nt.c.properties, hop.where))
+                )
+                from .vectors import validate_boosts
+                match_i = ranked_ids(
+                    self, nt, reached.c.node_id, joined, None, nears, hop.keep,
+                    validate_boosts(hop.boost, f"hop {i} ({hop.label or 'unlabeled'})"),
+                ).cte(f"match_{i}")
+            else:
+                match_i = (
+                    select(distinct(full_walk.c.to_id).label("node_id"))
+                    .select_from(
+                        full_walk.join(
+                            nt, and_(node_id_col == full_walk.c.to_id, self._scoped(nt),
+                                     resolve(nt.c.properties, hop.where))
+                        )
+                    )
+                    .where(full_walk.c.depth >= hop.min_hops)
+                    .cte(f"match_{i}")
+                )
             pairs.append((full_walk, match_i))
             prev_match = match_i
 
@@ -782,6 +878,181 @@ class Graph:
                 f"declare it with define_schema(...)")
         self._schema = schema_from_document(row[0])
         return self._schema
+
+    # -- vectors --------------------------------------------------------
+
+    def define_vectors(self, nodes: Optional[list] = None, edges: Optional[list] = None) -> dict:
+        """Declare named vector fields: Vector(name, dimensions)
+        entries per target. The migration they imply is a separate,
+        explicit migrate_vectors(), because ALTER TABLE should be a
+        conscious moment. Calling this again replaces the declaration.
+
+        Not purely in-memory, unlike define_schema(): the vec_*
+        columns are attached to the SHARED SQLAlchemy Table metadata,
+        so create_schema() on any handle for these tables emits them
+        from now on. Nothing else touches the database until
+        migrate_vectors().
+
+            graph.define_vectors(nodes=[Vector("summary", 1536)])
+            graph.migrate_vectors()
+
+        Returns the normalized registry; hopai/vectors.py explains the
+        storage model and every refusal."""
+        from .vectors import attach_columns, build_registry
+        self._vectors = build_registry(nodes, edges)
+        attach_columns(self)
+        return self._vectors
+
+    @property
+    def vectors(self) -> Optional[dict]:
+        """The declared vector fields as {"nodes": {name: Vector},
+        "edges": {...}}, or None when define_vectors() has not been
+        called on this handle -- that is the existence check.
+
+        A copy: handing out the live registry made editing the
+        returned dict silently redeclare the graph."""
+        if self._vectors is None:
+            return None
+        return {target: dict(fields) for target, fields in self._vectors.items()}
+
+    def vector_ddl(self) -> list:
+        """The exact SQL migrate_vectors() would run, without running
+        it -- the same contract as constraint_ddl() and schema_ddl()."""
+        from .vectors import vector_ddl
+        return vector_ddl(self)
+
+    def migrate_vectors(self) -> list:
+        """Apply the declared vector fields: one nullable real[]
+        column per field plus a per-graph dimension CHECK. Idempotent
+        and drift-refusing -- see hopai/vectors.py. Belongs next to
+        create_schema() in your start-up path once vectors are in use."""
+        from .vectors import migrate_vectors
+        return migrate_vectors(self)
+
+    def drop_vectors(self, node_fields: Optional[list] = None,
+                     edge_fields: Optional[list] = None) -> list:
+        """Drop the named fields FOR THIS GRAPH: their dimension
+        constraints go, their values in this graph's rows are set to
+        NULL. The shared columns stay -- other graphs may use them."""
+        from .vectors import drop_vectors
+        return drop_vectors(self, node_fields, edge_fields)
+
+    def set_vectors(self, nodes: Optional[list] = None, edges: Optional[list] = None) -> int:
+        """Store vectors on existing rows, one transaction for the
+        whole call. Each row is {"id": ..., <field>: <vector or None>}:
+
+            graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
+
+        This is the ONLY write path for vectors -- add_nodes/merge
+        rows never carry them (hopai/vectors.py says why). Returns the
+        number of rows updated; an id matching no row in this graph
+        fails the whole call by name."""
+        from .vectors import set_vectors
+        return set_vectors(self, nodes, edges)
+
+    def get_vectors(self, node_ids: Optional[list] = None, edge_ids: Optional[list] = None,
+                    node_fields: Optional[list] = None,
+                    edge_fields: Optional[list] = None) -> dict:
+        """Read stored vectors back by id -- traversal and search
+        results never include them (6KB of floats has no business in
+        every subgraph). String or integer ids are both accepted.
+
+            graph.get_vectors(node_ids=[1, 2])
+            # -> {"nodes": {"1": {"summary": [...]}}, "edges": {}}
+
+        `node_ids`/`edge_ids`, not `nodes`/`edges`: every OTHER
+        *_vectors call takes field names or rows there, and passing a
+        field name to this one used to surface as a raw driver error
+        about bigint. The field filters are per target for the same
+        reason -- node and edge field names are separate namespaces."""
+        from .vectors import get_vectors
+        return get_vectors(self, node_ids, edge_ids, node_fields, edge_fields)
+
+    def stale_vectors(self, node_fields=None, edge_fields=None, limit=None) -> dict:
+        """Which rows need (re-)embedding, per field: those with no
+        vector, and those whose stored vector no longer matches the
+        declared dimensions.
+
+            for node_id in graph.stale_vectors()["nodes"]["summary"]["missing"]:
+                graph.set_vectors(nodes=[{"id": node_id, "summary": embed(...)}])
+
+        The second category is the window a dimension change opens --
+        migrate_vectors() refuses to reinterpret stored vectors and
+        set_vectors() refuses to write the wrong size, so this is what
+        closes it without hand-writing the catalog query."""
+        from .vectors import stale_vectors
+        return stale_vectors(self, node_fields, edge_fields, limit)
+
+    def pgvector_exit_ddl(self, index: Optional[str] = "hnsw") -> list:
+        """The migration off this library's exact search and onto
+        pgvector, as SQL to read before running -- generated without
+        importing, requiring or checking for the extension.
+
+        Outgrowing hopai's exact scan should be a documented door
+        rather than a rewrite. Read hopai/vectors.py's docstring on
+        this first: the conversion is one-way, it makes the search
+        approximate, and the column is shared by every graph in the
+        table."""
+        from .vectors import pgvector_exit_ddl
+        return pgvector_exit_ddl(self, index=index)
+
+    def build_vector_search_query(self, *near, target: str = "nodes", k: int = 10,
+                                  where=None, boost=None):
+        """The single statement vector_search() runs, for inspection
+        with no database -- the same contract as build_query()."""
+        from .vectors import build_search_query
+        return build_search_query(self, list(near), target=target, k=k, where=where,
+                                  boost=boost)
+
+    def build_vector_search_many_query(self, queries, target: str = "nodes", k: int = 10,
+                                       where=None, boost=None):
+        """The single statement vector_search_many() runs."""
+        from .vectors import build_search_many_query
+        return build_search_many_query(self, queries, target=target, k=k, where=where,
+                                       boost=boost)
+
+    def vector_search_many(self, queries, target: str = "nodes", k: int = 10, where=None,
+                           boost=None) -> list:
+        """Rank several queries in ONE round trip, returning one result
+        list per query, in order:
+
+            graph.vector_search_many([Near("summary", q1), Near("summary", q2)], k=5)
+            # -> [[...5 hits for q1...], [...5 hits for q2...]]
+
+        This is the shape retrieval actually has -- a question expanded
+        into several sub-queries -- and it costs ONE round trip instead
+        of N. It does not reduce the arithmetic: every query still
+        scores every candidate (measured at 1.08x against a loop on a
+        local database), so the win is latency, which is where the
+        cost actually is when the database is not on localhost. Each
+        entry may
+        itself be a list of Near specs (a multivector query); every
+        query must share the same field shape, which the call refuses
+        rather than silently ranking them differently."""
+        from .vectors import search_many
+        return search_many(self, queries, target=target, k=k, where=where, boost=boost)
+
+    def vector_search(self, *near, target: str = "nodes", k: int = 10, where=None,
+                      boost=None) -> list:
+        """Exact cosine similarity search over this graph's nodes or
+        edges -- one statement, no extension, no approximation.
+
+            graph.vector_search(Near("summary", embedding), k=10,
+                                where={"type": "person"})
+            # -> [{"id": "1", "similarity": 0.93, "properties": {...}}, ...]
+
+        Several Near specs combine into one weighted score
+        (multivector search); `where` is the same filter language as
+        traversal and is applied BEFORE ranking, so a selective filter
+        makes the search cheaper, never slower. Edge results also
+        carry start_id/end_id. Rows are ordered most-similar first;
+        ids are strings, like every other result. `boost` adds
+        property terms to the score for hybrid retrieval; a boosted
+        `similarity` is the combined score and can exceed 1, and
+        reordering with `k` changes which rows come back. The cost
+        model and every design refusal live in hopai/vectors.py."""
+        from .vectors import search
+        return search(self, list(near), target=target, k=k, where=where, boost=boost)
 
     # -- writing --------------------------------------------------------
 
