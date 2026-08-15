@@ -1220,7 +1220,13 @@ class TestInferenceSampling:
         Simulated rather than waited for: whether a real 5% draw lands
         in that state is luck, and a test that reproduces a bug one run
         in ten is not a regression test. Emptying the node-side counts
-        is exactly what such a draw does."""
+        is exactly what such a draw does.
+
+        The percentage is 100 for the same reason: the only draw in play
+        must be the simulated one. At 5 the EDGE side is a coin toss
+        too, and a run that sampled no edges reports zero skipped edges
+        and fails an assertion about the fix rather than about the bug.
+        (It did, on every Python in the matrix.)"""
         seed_chaotic(fresh_graph)
         from hopai import schema as schema_module
 
@@ -1230,9 +1236,12 @@ class TestInferenceSampling:
                                 {} if discriminator == "type"
                                 else counts(connection, graph, source, discriminator)))
 
-        schema, report = fresh_graph.infer_schema(sample_percent=5)
+        schema, report = fresh_graph.infer_schema(sample_percent=100)
         assert schema.node_types == () and schema.edge_types == ()
-        assert report.skipped_endpoint_edges > 0     # counted, not dropped in silence
+        # counted, never dropped in silence: works_at x2, likes x2, plus
+        # the edge into the untyped node an exact scan skips anyway
+        assert report.skipped_endpoint_edges == 5
+        assert report.edge_counts == {"works_at": 2, "likes": 2, "dangles": 1}
 
     def test_out_of_range_percent_is_refused_offline(self, offgraph):
         """Validation names the range and runs BEFORE anything connects
