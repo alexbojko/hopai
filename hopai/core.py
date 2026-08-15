@@ -583,17 +583,23 @@ class Graph:
         self._defined_schema("schema_violations()")
         return find_violations(self, sample)
 
-    def schema_ddl(self) -> list:
+    def schema_ddl(self, endpoints: bool = False) -> list:
         """The exact SQL enforce_schema() would run, without running it.
         For review, for a migration file, or for showing an agent what
-        it is about to change -- the same contract as constraint_ddl()."""
-        from .schema import compile_edge_constraints, compile_node_constraints
+        it is about to change -- the same contract as constraint_ddl().
+        endpoints=True appends the endpoint-trigger DDL."""
+        from .schema import (
+            compile_edge_constraints, compile_endpoint_ddl, compile_node_constraints,
+        )
         schema = self._defined_schema("schema_ddl()")
         node_target, edge_target = self._schema_targets()
-        return [ddl for _, ddl in (compile_node_constraints(schema, node_target)
-                                   + compile_edge_constraints(schema, edge_target))]
+        ddl = [statement for _, statement in (compile_node_constraints(schema, node_target)
+                                              + compile_edge_constraints(schema, edge_target))]
+        if endpoints and schema.edge_types:
+            ddl.extend(compile_endpoint_ddl(schema, self))
+        return ddl
 
-    def enforce_schema(self) -> list:
+    def enforce_schema(self, endpoints: bool = False) -> list:
         """Compile the declared schema to Postgres CHECK constraints, so
         EVERY write path is validated by the server -- add_nodes, merge,
         Cypher CREATE/MERGE, even SQL from another service -- and a
@@ -604,14 +610,24 @@ class Graph:
         row -- on pre-schema data that can fail, and it should fail in a
         call whose name says it enforces.
 
-        Idempotent, and it reconciles: a schema-derived constraint that
-        the current schema no longer produces is dropped, so re-running
-        after a schema change converges instead of accreting. Only
-        constraints this mechanism named (ck_schema_*) are ever touched
-        -- define_constraints() declarations are not its to drop.
-        Returns the constraint names now in force, in order."""
+        endpoints=True additionally polices the declared (kind, source,
+        target) triples with a CONSTRAINT TRIGGER -- the one rule a
+        CHECK cannot express, because it must look at the endpoint
+        nodes. It fires per edge write, which is why it is an opt-in
+        with its cost stated here rather than the default. It validates
+        edges as they are written; retyping a NODE under existing edges
+        is not re-checked.
+
+        Idempotent, and it reconciles: a schema-derived constraint or
+        trigger that the current call no longer produces is dropped, so
+        re-running after a schema change -- or without endpoints=True --
+        converges instead of accreting. Only objects this mechanism
+        named (ck_schema_*) are ever touched; define_constraints()
+        declarations are not its to drop. Returns the names now in
+        force, in order."""
         from .schema import (
-            SCHEMA_CHECKS, compile_edge_constraints, compile_node_constraints,
+            ENDPOINT_TRIGGER_EXISTS, SCHEMA_CHECKS, compile_edge_constraints,
+            compile_endpoint_ddl, compile_node_constraints, endpoint_names,
             schema_constraint_prefixes,
         )
         schema = self._defined_schema("enforce_schema()")
@@ -633,6 +649,21 @@ class Graph:
                     if name not in existing:
                         connection.execute(text(ddl))
                     applied.append(name)
+
+            trigger_name, function_name = endpoint_names(self)
+            wanted = endpoints and bool(schema.edge_types)
+            present = connection.execute(ENDPOINT_TRIGGER_EXISTS, {
+                "name": trigger_name, "table": edge_target.qualified}).first() is not None
+            function_q = (f'"{self.edges_tbl.schema}"."{function_name}"'
+                          if self.edges_tbl.schema else f'"{function_name}"')
+            if wanted:
+                for ddl in compile_endpoint_ddl(schema, self):
+                    connection.execute(text(ddl))
+                applied.append(trigger_name)
+            elif present:
+                connection.execute(text(
+                    f'DROP TRIGGER IF EXISTS "{trigger_name}" ON {edge_target.qualified}'))
+                connection.execute(text(f'DROP FUNCTION IF EXISTS {function_q}()'))
         return applied
 
     # -- writing --------------------------------------------------------

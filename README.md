@@ -324,9 +324,17 @@ print(report)   # per rule: row counts + sample ids -- the work list
 ```
 
 Enforcement covers property presence and JSON type per node type and
-edge kind. It does **not** police endpoint types ("`works_at` connects
-only person → company") — that needs a trigger, not a CHECK, and hopai
-says so rather than half-enforcing it.
+edge kind. Endpoint types ("`works_at` connects only person → company")
+need a look at the endpoint *nodes*, which a CHECK can't do — so that
+one is an explicit opt-in backed by a constraint trigger, priced
+per edge write:
+
+```python
+graph.enforce_schema(endpoints=True)
+graph.add_edges([{"start_id": robot, "end_id": acme, "kind": "works_at"}])
+# ConstraintViolation: works_at connects robot -> company,
+#                      but the schema declares: works_at: person -> company
+```
 
 **Grew the graph first, never declared anything?** The schema is
 sitting in the data, and Postgres can compute it:
