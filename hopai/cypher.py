@@ -1564,6 +1564,29 @@ def cypher_to_operations(
 # Public API
 # ---------------------------------------------------------------------
 
+def classify_cypher(query: str) -> str:
+    """Which of the three things a query is -- `"write"`, `"aggregate"`
+    or `"read"` -- decided by parsing it, exactly as `Graph.cypher()`
+    decides which call to make.
+
+    Here rather than inlined in `Graph.cypher()` because a front end
+    that has to know BEFORE running is a real caller: hopai/mcp.py
+    refuses a write on a read-only server, and a plan-then-confirm UI
+    asks the same question. Two implementations of "is this a write"
+    is how one of them ends up letting a CREATE through.
+
+    Raises CypherError for a query that does not parse -- the same
+    error running it would raise, at the same point."""
+    clauses = _Parser(_tokenize(query)).parse()
+    if any(isinstance(c, _WriteClause) for c in clauses):
+        return "write"
+    # A non-aggregating RETURN never becomes a _ReturnClause (it is
+    # parsed and ignored), so this really is "returns numbers".
+    if any(isinstance(c, _ReturnClause) for c in clauses):
+        return "aggregate"
+    return "read"
+
+
 def cypher_to_traversal(
     query: str,
     *,

@@ -1126,14 +1126,11 @@ class Graph:
         driver reaches for first; traverse_cypher(), write_cypher() and
         aggregate_cypher() are the same thing when you would rather be
         explicit."""
-        from .cypher import (
-            _Parser, _ReturnClause, _tokenize, _WriteClause, aggregate_cypher,
-            traverse_cypher,
-        )
-        clauses = _Parser(_tokenize(query)).parse()
-        if any(isinstance(c, _WriteClause) for c in clauses):
+        from .cypher import aggregate_cypher, classify_cypher, traverse_cypher
+        kind = classify_cypher(query)
+        if kind == "write":
             return self.write_cypher(query, **options)
-        if any(isinstance(c, _ReturnClause) for c in clauses):
+        if kind == "aggregate":
             return aggregate_cypher(self, query, **options)
         return traverse_cypher(self, query, **options)
 

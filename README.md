@@ -28,6 +28,9 @@ without being taught anything new.
 - 🤖 **Three front ends, one engine** — Python, JSON (with a ready-made
   LLM tool schema), and a Cypher subset all compile through the same
   query builder.
+- 🔌 **An MCP server in one command** — `hopai-mcp` exposes reading,
+  writing, schema and similarity tools over stdio or HTTP, with
+  permissions that decide which tools exist at all.
 - 🔐 **Constraints Neo4j puts behind an enterprise licence** — unique,
   composite, partial, existence, type and CHECK constraints on JSONB
   properties.
@@ -804,10 +807,89 @@ translating into something that answers a different question:
   comma-separated patterns, `WITH` (except the `WITH DISTINCT` unit
   above) / `ORDER BY` / `LIMIT`, and `OPTIONAL MATCH` anywhere but last.
 
+## 🔌 MCP server
+
+The same graph as an [MCP](https://modelcontextprotocol.io/) server, so
+Claude Desktop, an IDE or an agent framework can use it with nothing to
+write:
+
+```bash
+pip install "hopai[mcp]"
+
+hopai-mcp --dsn postgresql+psycopg2://user:pass@localhost/db            # stdio
+hopai-mcp --dsn ... --transport http --port 8000                       # HTTP
+```
+
+```jsonc
+// claude_desktop_config.json — or any other MCP client's config
+{
+  "mcpServers": {
+    "hopai": {
+      "command": "hopai-mcp",
+      "args": ["--dsn", "postgresql+psycopg2://user:pass@localhost/db", "--read-only"]
+    }
+  }
+}
+```
+
+Nine tools, each one a call this README already documents:
+
+| Tool | Is | Needs |
+| --- | --- | --- |
+| `describe_graph` | the declared schema, the vector fields, what this server refuses | |
+| `traverse_graph` | `traverse_json()` | |
+| `aggregate_graph` | `aggregate_json()` | |
+| `cypher` | `graph.cypher()` — reading, or writing | |
+| `search_similar` | `graph.vector_search()` | `embed=` |
+| `ingest_graph` | `graph.ingest()` — create, or merge on keys | writes |
+| `infer_schema` | `graph.infer_schema()` — observes, declares nothing | |
+| `define_schema` | `graph.define_schema()` + `save_schema()` | writes |
+| `enforce_schema` | dry-run violations, or the DDL itself | `--allow-ddl` |
+
+**Permissions are which tools exist**, not a check inside a handler:
+`--read-only` registers the reading tools only, the default adds writing,
+and DDL takes `--allow-ddl` on top. A tool a model cannot see is one it
+cannot be talked into calling.
+
+**Search by meaning takes text, never vectors.** A model asked to fill in
+an embedding invents one, and an invented embedding finds confidently
+wrong neighbours — so no tool here has anywhere to put floats. Give the
+server an embedding function instead, and `search_similar` appears
+alongside a `start.search` on the traversal tools that seeds the walk
+from the most similar nodes:
+
+```python
+from hopai import Graph, Vector
+from hopai.mcp import serve
+
+graph = Graph(dsn)
+graph.define_vectors(nodes=[Vector("summary", 1536)])
+graph.define_schema(nodes=[Person, Company], edges=[WorksAt])
+
+serve(graph, embed=lambda text: my_embedding_api(text))     # transport="http" for HTTP
+```
+
+```jsonc
+// "What has Alice's team written about retrieval?", in one call
+{"start": {"search": "retrieval augmented generation", "keep": 25},
+ "hops":  [{"via": {"kind": "wrote"}, "direction": "backward"}]}
+```
+
+With a schema declared, every tool description carries *your* node types
+and edge kinds (the same summary `graph.tool_schemas()` produces), so the
+model stops guessing labels. There is **no delete tool**, because there
+is no delete API to expose — see below. And there is **no
+authentication**: over HTTP it binds `127.0.0.1`, and anything else
+belongs behind something that authenticates.
+
 ## 🚧 What this doesn't do (yet)
 
 - No disjoint multi-pattern matching (`MATCH (a)-[]->(b), (c)-[]->(d)`
   joined on shared variables) — one linear chain of hops only.
+- **No delete, and no update-by-query.** Rows are removed with SQL for
+  now, and `DELETE` / `DETACH DELETE` / `REMOVE` / `SET` on matched rows
+  refuse by name rather than half-implementing it. Updating a row you
+  can identify by key *is* supported — that is `merge_nodes(on=[...])`.
 - `OPTIONAL` only on the last hop, not mid-chain.
 - Aggregation covers `count`/`sum`/`avg`/`min`/`max` over the last
   step's matched nodes, numeric properties only. No grouping

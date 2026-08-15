@@ -133,6 +133,36 @@ One pair of tables holds every graph, discriminated by `graph_id`.
   exists, it is created lazily on first save (never by `create_schema()`), and its one
   row per `graph_id` is the same per-graph discipline as everything above.
 
+## The MCP server
+
+`hopai/mcp.py` is a front end in the same sense `json_api.py` and `cypher.py` are: each
+tool is one call into those, and there is no query logic in it. Three things about it
+are not obvious from the outside.
+
+- **The advertised JSON Schemas are hopai's own.** The MCP SDK derives a tool's input
+  schema from its handler's Python annotations, which turns `start: dict` into
+  `{"type": "object"}` and leaves the model to guess `where`/`via`/`hops`/`direction`.
+  `_register()` builds the tool and then replaces that schema with the hand-written one
+  (`TRAVERSE_TOOL_SCHEMA` and friends, via `graph.tool_schemas()` so the descriptions
+  carry this graph's vocabulary). Argument *validation* still runs against the handler
+  signature, so `tests/test_mcp.py` asserts the two agree about every top-level
+  parameter — an advertised parameter no handler accepts is a promise broken at call
+  time.
+- **Similarity arrives as text.** Vectors never travel through a tool schema, so
+  `search_similar` and `start.search` take words, and the server embeds them with the
+  operator's `embed` callable. The refusal is not re-implemented here:
+  `json_api.refuse_vectors()` runs on what the model sent *before* the embedding is
+  injected, which is why that function lost its underscore.
+- **Permissions decide which tools are registered**, rather than being checked inside a
+  handler. `read_only` drops every write tool, `allow_ddl` is what adds `enforce_schema`,
+  and `serve()` never mixes the two.
+
+Handlers are synchronous and are wrapped to run in a worker thread: a blocking database
+call in an async server would stall every other request on the connection. The SDK's
+1.x/2.x split (`FastMCP` → `MCPServer`) is contained entirely in `_sdk()`, plus the one
+place the eras disagree about where HTTP bind settings go — the constructor on 1.x,
+`run()` on 2.0.
+
 ## Two gotchas in the results
 
 - **Ids come back as strings.** `build_query` casts them so node and edge ids share one
@@ -159,5 +189,6 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/vectors.py` | Why no pgvector, the storage and cost model, cosine-only, multivector semantics, and why vectors never pass through a tool schema |
 | `hopai/schema.py` | The graph-schema notations, the annotation mapping, what enforcement compiles to and the endpoint-type limit, and why inference is an observation rather than a `.schema` fallback |
 | `hopai/cypher.py` | The translatable subset — read, write and aggregate — and why each refusal is a refusal |
+| `hopai/mcp.py` | The tool inventory, the three permission levels, why similarity takes text, and the 1.x/2.x SDK adapter |
 | `tests/conftest.py` | The fixture graph's shape |
 | `benchmarks/README.md` | Measured numbers, including where raw CTEs beat this library 2-5x |

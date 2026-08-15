@@ -443,6 +443,43 @@ class TestAtomicityAndDispatch:
         read = keyed_graph.cypher("MATCH (a:person) RETURN a")
         assert len(read.nodes) == 1 and hasattr(read, "to_networkx")   # Subgraph
 
+    @pytest.mark.parametrize("query, kind", [
+        ("CREATE (a:person {email: 'a@x.com'})", "write"),
+        ("MERGE (a:person {email: 'a@x.com'})", "write"),
+        ("MATCH (a:person)-[:knows]->(b) RETURN b", "read"),
+        ("MATCH (a:person) RETURN count(DISTINCT a)", "aggregate"),
+        ("MATCH (a:person) WHERE a.age > 18", "read"),
+    ])
+    def test_classification_is_available_without_running_anything(self, query, kind):
+        """The decision Graph.cypher() makes, exposed so a front end can
+        make it FIRST: hopai/mcp.py refuses a write on a read-only
+        server before a connection is opened. This needs no database at
+        all -- which is the point, and why a second implementation of
+        "is this a write" must not appear."""
+        from hopai.cypher import classify_cypher
+        assert classify_cypher(query) == kind
+
+    def test_classification_and_dispatch_cannot_disagree(self, keyed_graph):
+        """The classifier IS the dispatcher: if these ever came apart, a
+        read-only server would refuse queries it runs anyway, or run
+        ones it promised to refuse."""
+        from hopai.cypher import classify_cypher
+        from hopai.ingest import IngestResult
+
+        for query, expected in [("CREATE (a:person {email: 'a@x.com'})", IngestResult),
+                                ("MATCH (a:person) RETURN a", type(keyed_graph.traverse(
+                                    Start(where={"type": "person"})))),
+                                ("MATCH (a:person) RETURN count(a)", dict)]:
+            result = keyed_graph.cypher(query)
+            assert isinstance(result, expected)
+            assert classify_cypher(query) == {
+                IngestResult: "write", dict: "aggregate"}.get(expected, "read")
+
+    def test_an_unparseable_query_raises_where_running_it_would(self):
+        from hopai.cypher import classify_cypher
+        with pytest.raises(CypherError, match="unexpected"):
+            classify_cypher("SELECT * FROM nodes")
+
     def test_cypher_operations_does_not_execute(self, fresh_graph):
         fresh_graph.cypher_operations("CREATE (a {n: 1})")
         assert properties_of(fresh_graph) == []
