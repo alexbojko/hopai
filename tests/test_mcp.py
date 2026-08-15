@@ -224,6 +224,31 @@ class TestManyGraphs:
         with pytest.raises(ValueError, match="every call names one -- pass graph="):
             named(self.two())["describe_graph"].call()
 
+    @pytest.mark.parametrize("tool, arguments", [
+        ("describe_graph", {}),
+        ("traverse_graph", {"start": {"where": {"type": "paper"}}}),
+        ("aggregate_graph", {"start": {"where": {}}, "aggregates": {"n": {"fn": "count"}}}),
+        ("cypher", {"query": "MATCH (a) RETURN count(a)"}),
+        ("infer_schema", {}),
+        ("ingest_graph", {"nodes": [{"id": 1}]}),
+        ("define_schema", {"schema": {"nodes": {}, "edges": []}}),
+        ("enforce_schema", {}),
+    ])
+    def test_every_tool_routes_the_NAMED_graph(self, tool, arguments):
+        """The argument has to reach Served.pick() in every handler, not
+        most of them. A handler that passed None instead would quietly
+        use the wrong graph on a single-graph server and refuse
+        everything on a multi-graph one -- the exact failure the
+        required name exists to prevent, and one that survives a
+        DB-free suite unless asserted here.
+
+        `graph="nope"` proves the argument arrived: the refusal names it
+        back, and it is raised before any connection is opened."""
+        spec = {s.name: s for s in tools(self.two(), allow_ddl=True)}[tool]
+        with pytest.raises(ValueError,
+                           match=rf"{tool}: this server does not serve a graph named 'nope'"):
+            spec.call(graph="nope", **arguments)
+
     def test_a_named_graph_is_the_one_used(self):
         described = named(self.two())["describe_graph"].call(graph="crm")
         assert described["graph"] == "crm"
@@ -285,6 +310,18 @@ class TestManyGraphs:
         assert start["properties"]["search_field"]["enum"] == ["notes", "summary"]
         with pytest.raises(ValueError, match=r"defined: \['notes'\]"):
             specs["search_similar"].call(query="x", field="summary", graph="crm")
+
+    def test_a_seeded_traversal_embeds_against_the_graph_it_was_given(self):
+        """`start.search` must resolve its field on the CHOSEN graph:
+        handing _seed the wrong graph -- or no embedder -- searches
+        somewhere the caller did not ask for. Refused before any
+        connection, so this needs no database."""
+        graphs = self.two()
+        graphs["docs"].define_vectors(nodes=[Vector("summary", 3)])
+        spec = named(graphs, embed=embedder())["traverse_graph"]
+        with pytest.raises(ValueError,
+                           match="traverse_graph: no vector fields are defined for nodes"):
+            spec.call(start={"search": "anything"}, graph="crm")
 
     def test_an_embedder_needs_vectors_on_only_one_of_them(self):
         graphs = self.two()
@@ -466,6 +503,16 @@ class TestToolSchemas:
         with pytest.raises((ValueError, TypeError), match=re.escape(message)):
             ToolSpec(**fields)
 
+    def test_search_similar_offers_no_field_when_there_is_one(self):
+        """Same rule as `search_field`: an argument with one legal value
+        is noise. Pinned on both sides, because the boundary is a
+        comparison a mutant can slide by one."""
+        one = offline()
+        one.define_vectors(nodes=[Vector("summary", 3)])
+        spec = named(one, embed=embedder())["search_similar"]
+        assert "field" not in spec.parameters["properties"]
+        assert inspect.signature(spec.call).parameters["k"].default == 10
+
     def test_search_similar_advertises_the_fields_that_exist(self):
         """The enum is what stops a model inventing a field name. It is
         built from the registry, and a mutation that read the registry
@@ -477,6 +524,29 @@ class TestToolSchemas:
         spec = named(g, embed=embedder())["search_similar"]
         assert spec.parameters["properties"]["field"]["enum"] == ["rel", "summary", "title"]
         assert spec.parameters["required"] == ["query"]
+
+        # two is already a choice: the boundary is a comparison, and a
+        # mutant that slid it to `> 2` kept three fields working
+        two = offline()
+        two.define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)])
+        assert "field" in named(two, embed=embedder())["search_similar"].parameters["properties"]
+
+    def test_search_refusals_name_the_tool_and_the_graphs_fields(self):
+        """Both refusals carry the caller: "which of my calls was this?"
+        is the first thing a model has to answer."""
+        g = offline()
+        g.define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)])
+        spec = named(g, embed=embedder())["search_similar"]
+        with pytest.raises(ValueError, match=r"search_similar: no vector field 'sumary'"):
+            spec.call(query="x", field="sumary")
+        with pytest.raises(ValueError, match="search_similar: this graph defines several"):
+            spec.call(query="x")
+
+    def test_search_names_itself_when_the_graph_is_unknown(self):
+        graphs = {"docs": offline().in_graph("docs"), "crm": offline().in_graph("crm")}
+        graphs["docs"].define_vectors(nodes=[Vector("summary", 3)])
+        with pytest.raises(ValueError, match="search_similar: this server does not serve"):
+            named(graphs, embed=embedder())["search_similar"].call(query="x", graph="nope")
 
     @pytest.mark.parametrize("options", [{}, {"allow_ddl": True}, {"read_only": True},
                                          {"embed": embedder()}])
@@ -501,8 +571,24 @@ class TestToolSchemas:
             assert spec.parameters["type"] == "object", spec.name
             assert isinstance(spec.parameters["properties"], dict), spec.name
             assert isinstance(spec.parameters.get("required", []), list), spec.name
+            def well_formed(node, where):
+                """Nested too: an `items` or a sub-object schema reaches
+                the model just as surely as a top-level one, and a
+                mutant blanked the `properties` of define_schema's
+                edge entries."""
+                for key in ("items", "additionalProperties"):
+                    if isinstance(node.get(key), dict):
+                        well_formed(node[key], f"{where}.{key}")
+                if node.get("type") == "object" and "properties" in node:
+                    assert isinstance(node["properties"], dict), where
+                    assert isinstance(node.get("required", []), list), where
+                    for child, spec_ in node["properties"].items():
+                        assert isinstance(spec_, dict), f"{where}.{child}"
+                        well_formed(spec_, f"{where}.{child}")
+
             for name, prop in spec.parameters["properties"].items():
                 where = f"{spec.name}.{name}"
+                well_formed(prop, where)
                 # A JSON Schema type, not merely a truthy string: "STRING"
                 # is not one, and a mutant that wrote it survived here.
                 assert prop.get("anyOf") or prop.get("type") in json_schema_types, where
@@ -637,6 +723,17 @@ class TestCypherTool:
             named(offline(), read_only=True)["cypher"].call(
                 query="CREATE (a:person {email: 'a@x.com'})")
 
+    def test_read_only_refuses_writes_and_only_writes(self):
+        """`read_only and is_write`, not `or`: a server that refused
+        every query would be useless in exactly the configuration most
+        people deploy. The read gets past the gate and fails on the
+        schema instead, which is the proof."""
+        g = offline()
+        g.define_schema(nodes=[NodeType("person")])
+        spec = named(g, read_only=True, strict_schema=True)["cypher"]
+        with pytest.raises(CypherError, match="unknown label 'persn'"):
+            spec.call(query="MATCH (a:persn) RETURN count(a)")
+
     def test_delete_is_refused_with_the_librarys_own_message(self):
         """There is no delete API anywhere in hopai, and this server
         does not invent one. The message names what to do instead."""
@@ -666,6 +763,15 @@ class TestCypherTool:
 
 
 class TestDescribeGraph:
+    def test_node_vectors_alone_are_enough_to_search(self):
+        """Asserted on a nodes-only graph: with fields on both targets,
+        a mutant reading the wrong one still finds the other and the
+        flag comes out right by accident."""
+        g = offline()
+        g.define_vectors(nodes=[Vector("summary", 3)])
+        described = named(g, embed=embedder())["describe_graph"].call()
+        assert described["search_by_meaning"] is True
+
     def test_it_reports_the_permissions_it_was_started_with(self, vector_graph):
         described = named(vector_graph, embed=embedder(), read_only=True)["describe_graph"].call()
         assert described["writes_allowed"] is False
@@ -686,8 +792,12 @@ class TestDescribeGraph:
         assert described["search_by_meaning"] is True
         assert described["seed_traversal_by_meaning"] is False
 
-    def test_neither_is_claimed_without_an_embedder(self):
-        described = named(offline())["describe_graph"].call()
+    def test_neither_is_claimed_without_an_embedder(self, vector_graph):
+        """With vector fields but no embedder there is still nothing to
+        search BY: the model sends text and only the operator's callable
+        turns it into a vector. Asserted on a graph that HAS fields,
+        since one without them reports False either way."""
+        described = named(vector_graph)["describe_graph"].call()
         assert described["search_by_meaning"] is False
         assert described["seed_traversal_by_meaning"] is False
 
@@ -695,6 +805,16 @@ class TestDescribeGraph:
         described = named(offline())["describe_graph"].call()
         assert described["schema"] is None
         assert "infer_schema" in described["note"]
+
+    def test_the_dangerous_arguments_default_to_the_safe_side(self):
+        """dry_run on, endpoints off, save on: each is the reading or
+        the reversible choice, and each is a default a model reaches by
+        omitting the argument."""
+        specs = named(offline(), allow_ddl=True)
+        enforce = inspect.signature(specs["enforce_schema"].call).parameters
+        assert enforce["dry_run"].default is True
+        assert enforce["endpoints"].default is False
+        assert inspect.signature(specs["define_schema"].call).parameters["save"].default is True
 
     def test_it_names_the_missing_delete_api(self):
         """A model that cannot find a delete tool will otherwise try to
@@ -736,15 +856,24 @@ class TestCommandLine:
             ["--vector", "crm:edges:rel:8"]).vector[0]
         assert (chosen, target, field.name, field.dimensions) == ("crm", "edges", "rel", 8)
 
-    @pytest.mark.parametrize("value", ["summary:1536", "nodes:summary", "rows:summary:8",
-                                       "nodes:summary:many", "a:b:rows:summary:8"])
-    def test_a_malformed_vector_spec_is_rejected_with_the_form(self, value, capsys):
+    @pytest.mark.parametrize("value, expected", [
+        ("summary:1536", "--vector takes TARGET:NAME:DIMENSIONS"),
+        ("nodes:summary", "--vector takes TARGET:NAME:DIMENSIONS"),
+        ("a:b:rows:summary:8", "--vector takes TARGET:NAME:DIMENSIONS"),
+        ("rows:summary:8", "target must be 'nodes' or 'edges'"),
+        ("nodes:summary:many", "dimensions must be a positive integer"),
+    ])
+    def test_a_malformed_vector_spec_says_which_part_is_wrong(self, value, expected, capsys):
+        """Each message, not one shared substring: argparse prints the
+        flag and its metavar in the usage line whatever the message
+        says, so asserting on those passes even when the message itself
+        has been blanked -- which is how three mutants survived."""
         with pytest.raises(SystemExit):
             build_parser().parse_args(["--vector", value])
-        assert "--vector" in capsys.readouterr().err
+        assert expected in capsys.readouterr().err
 
     @pytest.mark.parametrize("value, expected", [
-        ("no_colon_here", "MODULE:FUNCTION"),
+        ("no_colon_here", "--embed takes MODULE:FUNCTION"),
         ("nosuchmodule_xyz:embed", "cannot import"),
         ("json:no_such_attribute", "no attribute"),
         ("json:__doc__", "not callable"),
@@ -762,6 +891,52 @@ class TestCommandLine:
         args = build_parser().parse_args(["--dsn", "postgresql://x/y"])
         assert (args.transport, args.host, args.read_only, args.allow_ddl) == (
             "stdio", "127.0.0.1", False, False)
+        # the rest of them too: a default that drifts to None surfaces
+        # as a server bound somewhere else, or named something else
+        assert (args.port, args.path, args.name) == (8000, "/mcp", "hopai")
+        assert args.graph == [] and args.load_schema is True
+        # serve() carries its own copies of these, for callers who never
+        # go through the parser at all
+        from hopai.mcp import serve
+        defaults = inspect.signature(serve).parameters
+        assert (defaults["port"].default, defaults["path"].default,
+                defaults["host"].default) == (8000, "/mcp", "127.0.0.1")
+
+    def test_an_unknown_transport_is_rejected_at_the_command_line(self):
+        """Not left to serve(): the CLI knows the two it accepts, and
+        finding out after a server is built is later than necessary."""
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--dsn", "postgresql://x/y", "--transport", "grpc"])
+
+    def test_graph_is_repeatable_and_the_first_is_the_handle_that_opens_the_pool(
+            self, monkeypatch):
+        """The CLI half of many-graphs-one-pool: `--graph` appends, the
+        first Graph opens the engine and in_graph() shares it, and the
+        order given is the order served."""
+        served = {}
+        monkeypatch.setattr("hopai.mcp.serve",
+                            lambda graph, **options: served.update(graph=graph, **options))
+        main(["--dsn", "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+              "--no-load-schema", "--graph", "docs", "--graph", "crm",
+              "--vector", "crm:nodes:notes:8"])
+        assert list(served["graph"]) == ["docs", "crm"]
+        # the keys come from the flags; the HANDLES have to agree with them
+        assert [g.graph for g in served["graph"].values()] == ["docs", "crm"]
+        assert served["graph"]["docs"].engine is served["graph"]["crm"].engine
+        # ...and a prefixed --vector lands on that graph alone
+        assert served["graph"]["crm"].vectors["nodes"]["notes"].dimensions == 8
+        assert served["graph"]["docs"].vectors is None
+
+    def test_a_graph_named_twice_is_refused(self, capsys):
+        with pytest.raises(SystemExit):
+            main(["--dsn", "postgresql://x/y", "--graph", "docs", "--graph", "docs"])
+        assert "given more than once" in capsys.readouterr().err
+
+    def test_a_vector_for_an_unserved_graph_is_refused(self, capsys):
+        with pytest.raises(SystemExit):
+            main(["--dsn", "postgresql://x/y", "--graph", "docs",
+                  "--vector", "crm:nodes:notes:8"])
+        assert "--graph does not serve" in capsys.readouterr().err
 
     def test_main_declares_the_vector_fields_and_forwards_every_option(self, monkeypatch):
         """Everything main() does between parsing and serving, with the
@@ -892,6 +1067,13 @@ class TestReadToolsLive:
     def test_describe_can_count_the_nodes(self, graph):
         described = named(graph, read_only=True)["describe_graph"].call(counts=True)
         assert described["counts"]["nodes"] == 7
+
+    def test_infer_schema_passes_the_sample_through(self, graph):
+        """The percentage has to reach infer_schema: a model asking for
+        a sample of a large graph and silently getting a full scan is a
+        scan nobody chose."""
+        result = named(graph, read_only=True)["infer_schema"].call(sample_percent=100)
+        assert result["report"]["sampled"] == 100
 
     def test_infer_schema_observes_without_declaring(self, graph):
         result = named(graph, read_only=True)["infer_schema"].call()
