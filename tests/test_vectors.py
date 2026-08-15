@@ -878,6 +878,30 @@ class TestSetGetVectorsLive:
         assert stored["docvec"] == pytest.approx([0.1, 0.2, 0.3], abs=1e-6)
         assert stored["titlevec"] is None
 
+    def test_one_call_writing_both_targets_counts_both(self, fresh_graph):
+        """`nodes=` and `edges=` in ONE call is a supported shape -- the
+        signature offers it and the whole call is one transaction -- but
+        every test wrote a single target, so the count accumulated
+        across chunks was never observed. `total = len(chunk)` in place
+        of `+=` returns the LAST group's size and nothing objected: the
+        rows land correctly, the number reported is just wrong."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "type": "doc"}, {"id": 2, "type": "doc"},
+                     {"id": 3, "type": "doc"}])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "k"},
+                     {"start_id": 2, "end_id": 3, "kind": "k"}])
+        with g.engine.connect() as conn:
+            edge_ids = [row[0] for row in conn.execute(text("SELECT id FROM edges ORDER BY id"))]
+
+        written = g.set_vectors(
+            nodes=[{"id": i, "docvec": [1.0, 0.0, 0.0]} for i in (1, 2, 3)],
+            edges=[{"id": e, "relvec": [0.0, 1.0, 0.0]} for e in edge_ids])
+        assert written == 5                      # 3 nodes + 2 edges, not 2
+        # ...and both groups really landed, so the count is not right by
+        # accident while one target was skipped.
+        assert len(g.get_vectors(node_ids=[1, 2, 3])["nodes"]) == 3
+        assert len(g.get_vectors(edge_ids=edge_ids)["edges"]) == 2
+
     def test_string_ids_from_results_are_accepted_back(self, fresh_graph):
         """Traversal and search hand back string ids; making the caller
         int() them before set_vectors would be a first-use papercut."""
