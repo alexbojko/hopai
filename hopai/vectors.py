@@ -447,6 +447,12 @@ def _boost_columns(table, boosts: list) -> list:
                 func.jsonb_typeof(table.c.properties[boost.key]) == "number",
                 cast(table.c.properties[boost.key].astext, DOUBLE_PRECISION),
             ))
+        # The type_ is documentation, not machinery, and measured so:
+        # Boost coerces `default` with float() at construction, so
+        # SQLAlchemy infers Float from the value and the compiled SQL and
+        # bound parameter types are identical without it. Kept because it
+        # says what the column holds; recorded so the next mutation run,
+        # which flags dropping it, does not re-derive that it is inert.
         columns.append(
             func.coalesce(value, literal(boost.default, type_=DOUBLE_PRECISION))
             .label(f"boost_{i}")
@@ -571,6 +577,12 @@ def _attach(table, column_name: str):
     "Unconsumed column names", which names nothing the caller can act
     on."""
     if column_name not in table.c:
+        # nullable=True is SQLAlchemy's own default for a non-primary-key
+        # column, so stating it is unobservable -- an equivalent mutant
+        # when dropped. It is stated anyway because it is load-bearing
+        # for the reader: vectors are written only by set_vectors()
+        # UPDATEing rows that already exist, so NOT NULL here would make
+        # every insert impossible.
         table.append_column(Column(column_name, ARRAY(REAL), nullable=True))
     return table.c[column_name]
 

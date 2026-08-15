@@ -717,6 +717,21 @@ class TestRetry:
         for index, wait in enumerate(slept):
             assert 0 <= wait <= 1.0 * (2 ** index)
 
+    def test_the_jitter_window_starts_at_zero(self, slept, monkeypatch):
+        """FULL jitter, which means the low end is 0 and not the
+        previous delay: `uniform(1, window)` still looks like jitter and
+        still passes a bounds check, but it puts a floor under every
+        wait and re-correlates the retries the jitter exists to spread.
+
+        Asserted on the ARGUMENTS rather than on samples -- the one
+        thing a random draw cannot be tested by is its own output."""
+        windows = []
+        monkeypatch.setattr(embeddings_module.random, "uniform",
+                            lambda low, high: windows.append((low, high)) or high)
+        client = _raises(TimeoutError("upstream"), times=3)
+        Embedder(client, retries=3, backoff=0.5).embed_documents(["a"])
+        assert windows == [(0, 0.5), (0, 1.0), (0, 2.0)]
+
     def test_backoff_is_capped(self, slept):
         client = _raises(TimeoutError("upstream"), times=4)
         Embedder(client, retries=4, backoff=100.0).embed_documents(["a"])
