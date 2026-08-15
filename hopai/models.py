@@ -23,6 +23,11 @@ evolving attributes without a schema migration per new property.
     CREATE INDEX ON nodes USING GIN (properties);
     CREATE INDEX ON edges USING GIN (properties);
 
+Vector fields add optional `vec_<name> real[]` columns BESIDE the
+properties bag (via Graph.migrate_vectors() -- see vectors.py):
+deliberately real columns, not JSONB keys, so the GIN index and every
+traversal result stay exactly as above.
+
 If your table/column names differ, pass them to Graph() -- see core.py.
 Nothing in this library requires the SQLModel classes below specifically;
 they're the default, not a hard dependency of the query-building logic.

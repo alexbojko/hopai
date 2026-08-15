@@ -29,6 +29,35 @@ local Postgres 16) the aggregate answered in 75ms warm against the
 traversal's 653ms — the difference is the `hop_edges`/`edge_rows` CTEs
 and the hydration of ~10k nodes and edges that a count does not need.
 
+## Vector search
+
+```bash
+python bench_vectors.py --dsn "postgresql+psycopg2://user:pass@host/db" --rows 20000 --dims 384
+```
+
+Self-contained (generates its own vectors), and exists so the cost
+model in `hopai/vectors.py` stays a measurement. The transferable
+number is `us_per_element`: the exact-cosine scan pays a fixed
+executor cost per vector element, so a candidate row costs about
+`dimensions x that`. Recorded during development (Postgres 16, one
+core): **0.13 µs/element** — an unfiltered 20k × 384-dim search in
+~1.0 s, the same search `where=`-filtered to 25 % of rows in ~0.25 s,
+a similarity-seeded traversal within a few ms of its seed search.
+
+That number was **0.28 µs/element until the similarity moved into a
+LATERAL**. As a correlated scalar subquery inside a plain sub-SELECT
+it was pulled up by the planner and re-evaluated at every site the
+outer query named it — the filter, the score, the `ORDER BY` — so the
+`unnest` ran twice per candidate (three times with `min_similarity`)
+for identical results. `EXPLAIN ANALYZE` showed the duplicate SubPlans
+at `loops=<candidates>` each. Worth knowing before "simplifying" the
+LATERAL back into a scalar subquery: it reads tidier and costs 2×.
+
+Per-element casting variants (array-level float8 cast, float4
+accumulation) were measured within ±15 % of each other — the cost is
+the executor's per-tuple work, not the arithmetic — which is why the
+SQL keeps the formulation whose float8 accumulation is correct.
+
 ## Comparing against Neo4j and Apache AGE
 
 These require separate running instances this repo doesn't set up for
