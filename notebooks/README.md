@@ -1,7 +1,6 @@
 # Runnable documentation
 
-Ten notebooks that go from an empty database to the SQL underneath, and out again
-to the tools a model calls. They are
+Nine notebooks that go from an empty database to the SQL underneath. They are
 documentation, so they are meant to be read with the outputs already there —
 on GitHub, or on the [documentation site](https://hopai.readthedocs.io/),
 which renders these same files and is published on every release — and they
@@ -18,7 +17,6 @@ run, so nothing in them can quietly stop being true.
 | [07 · Many graphs](07_many_graphs.ipynb) | Thousands of isolated graphs in one pair of tables, and what keeps them apart |
 | [08 · Under the hood](08_under_the_hood.ipynb) | The emitted SQL read with no database, then `EXPLAIN ANALYZE` with one |
 | [09 · Vector search](09_vector_search.ipynb) | Exact cosine similarity on nodes and edges, multivector and hybrid ranking, similarity as a traversal seed and as an edge beam, and the two refusals |
-| [10 · The MCP server](10_mcp_server.ipynb) | The same graph as tools a model can call: the four permission levels, why the advertised schemas are hopai's own, every refusal, similarity that takes text instead of floats, and many graphs behind one server |
 
 Read them in order the first time; after that each one stands alone.
 

@@ -921,15 +921,12 @@ translating into something that answers a different question:
 ## 🔌 MCP server
 
 The same graph as an [MCP](https://modelcontextprotocol.io/) server, so
-Claude Desktop, an IDE or an agent framework can use it with nothing to
-write:
+Claude Desktop, Claude Code, an IDE or an agent framework can use it with
+nothing to write:
 
 ```bash
 pip install "hopai[mcp]"
-
-hopai-mcp --dsn postgresql+psycopg2://user:pass@localhost/db            # stdio
-hopai-mcp --dsn ... --transport http --port 8000                       # HTTP
-hopai-mcp --dsn ... --graph docs --graph crm    # several graphs, one pool
+hopai-mcp --dsn postgresql+psycopg2://user:pass@localhost/db --read-only
 ```
 
 ```jsonc
@@ -944,101 +941,19 @@ hopai-mcp --dsn ... --graph docs --graph crm    # several graphs, one pool
 }
 ```
 
-Each tool is a call this README already documents:
-
-| Tool | Is | Needs |
-| --- | --- | --- |
-| `list_graphs` | the graphs this server serves, and what each declares | >1 graph |
-| `describe_graph` | the declared schema, the vector fields, what this server refuses | |
-| `traverse_graph` | `traverse_json()` | |
-| `aggregate_graph` | `aggregate_json()` | |
-| `cypher` | `graph.cypher()` — reading, writing, or mutating | |
-| `search_similar` | `graph.vector_search()` | `embed=` |
-| `ingest_graph` | `graph.ingest()` — create, or merge on keys | writes |
-| `mutate_graph` | `graph.mutate()` — update or delete by filter | `--allow-mutations` |
-| `infer_schema` | `graph.infer_schema()` — observes, declares nothing | |
-| `define_schema` | `graph.define_schema()` + `save_schema()` | writes |
-| `enforce_schema` | dry-run violations, or the DDL itself | `--allow-ddl` |
-
-**Permissions are which tools exist**, not a check inside a handler:
+Eleven tools — traverse, aggregate, Cypher, ingest, update/delete, schema
+inference and declaration, and similarity search — each one a call this
+README already documents. **Permissions decide which tools exist**:
 `--read-only` registers the reading tools only, the default adds writing,
-`--allow-mutations` adds deleting and updating, and DDL takes
-`--allow-ddl` on top. A tool a model cannot see is one it cannot be
-talked into calling.
+`--allow-mutations` adds deleting, `--allow-ddl` adds `enforce_schema`. A
+tool a model cannot see is one it cannot be talked into calling.
 
-Deleting is its own flag rather than part of writing because creating
-rows and destroying them are not the same power — a delete matches by
-filter and does not come back. Without it `mutate_graph` is not
-registered and `cypher` refuses `DELETE` / `DETACH DELETE` / `SET` /
-`REMOVE`, classifying the query *before* opening a connection.
+Every graph in the database is served unless `--graph` narrows it, and
+**search by meaning takes text, never vectors** — you supply the embedding
+function, so no tool has anywhere for a model to put invented floats.
 
-**Every graph in the database, unless you say otherwise.** `Graph` is a
-cheap handle and [`in_graph()`](#-many-graphs-one-database) shares the
-pool, so serving one graph per process would mean N processes for
-something this library gives away:
-
-```bash
-hopai-mcp --dsn ...                      # every graph in those tables
-hopai-mcp --dsn ... --graph docs         # only `docs`
-```
-
-```python
-serve({"docs": graph, "crm": graph.in_graph("crm")})    # or an explicit mapping
-graph.graphs()                                          # what is actually in there
-```
-
-`--graph` is the **restriction**, not the way to opt in — because the DSN
-is the boundary. A process holding those credentials can already read
-every graph in the database, so declining to enumerate them protects
-nothing, while defaulting to the graph literally named `default` had a
-server pointed at a database whose rows live in `docs` and `crm` answer
-*"nothing here"* — confidently, about graphs it had simply not been told
-to look at. An agent that must not see `crm` gets `--graph docs`.
-
-With more than one served, every tool **requires** a `graph` argument —
-an enum of the served names — and `list_graphs` appears to say what those
-names are. There is no default on purpose: an omitted `graph` has no safe
-reading, since falling back to one graph answers a question about
-another, and for a write it puts the rows there. With a single graph, no
-tool mentions graphs at all.
-
-Each graph keeps its own schema and vector fields, because `in_graph()`
-deliberately carries neither. `list_graphs` reports what the server
-*serves* — discovered at start-up or named with `--graph` — and never
-re-queries, so a graph created afterwards is not silently in scope. And
-one server *cannot* give two graphs different permissions: `--read-only`
-belongs to the server, so "read `docs`, write `crm`" is two servers,
-which is the honest boundary anyway.
-
-**Search by meaning takes text, never vectors.** A model asked to fill in
-an embedding invents one, and an invented embedding finds confidently
-wrong neighbours — so no tool here has anywhere to put floats. Give the
-server an embedding function instead, and `search_similar` appears
-alongside a `start.search` on the traversal tools that seeds the walk
-from the most similar nodes:
-
-```python
-from hopai import Graph, Vector
-from hopai.mcp import serve
-
-graph = Graph(dsn)
-graph.define_vectors(nodes=[Vector("summary", 1536)])
-graph.define_schema(nodes=[Person, Company], edges=[WorksAt])
-
-serve(graph, embed=lambda text: my_embedding_api(text))     # transport="http" for HTTP
-```
-
-```jsonc
-// "What has Alice's team written about retrieval?", in one call
-{"start": {"search": "retrieval augmented generation", "keep": 25},
- "hops":  [{"via": {"kind": "wrote"}, "direction": "backward"}]}
-```
-
-With a schema declared, every tool description carries *your* node types
-and edge kinds (the same summary `graph.tool_schemas()` produces), so the
-model stops guessing labels. And there is **no authentication**: over
-HTTP it binds `127.0.0.1`, and anything else belongs behind something
-that authenticates.
+📖 **[Full guide](https://hopai.readthedocs.io/en/latest/mcp/)** — client
+setup, every tool, every flag, and troubleshooting.
 
 ## 🚧 What this doesn't do (yet)
 
@@ -1074,7 +989,7 @@ that authenticates.
 
 ## 📓 Runnable documentation
 
-Everything above, as ten notebooks you can execute against a throwaway
+Everything above, as nine notebooks you can execute against a throwaway
 database — quick start, traversal semantics, aggregation, the JSON and
 Cypher front ends, constraints, graph schema, multi-graph, the SQL
 underneath, and vector search:
