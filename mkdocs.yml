@@ -93,6 +93,8 @@ nav:
       - 07 · Many graphs: notebooks/07_many_graphs.ipynb
       - 08 · Under the hood: notebooks/08_under_the_hood.ipynb
       - 09 · Vector search: notebooks/09_vector_search.ipynb
+  - Guides:
+      - MCP server: mcp.md
   - Internals:
       - Architecture: architecture.md
       - Testing: testing.md
