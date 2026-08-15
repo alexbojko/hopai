@@ -155,7 +155,18 @@ jobs:
       # Wall-clock cap on mutmut. Mutation is worth having and not worth
       # waiting on: past this the run is stopped and whatever it finished
       # is reported as partial.
-      MUTATION_BUDGET_SECONDS: "900"
+      #
+      # Raised from 900 because the budget is not spent on mutants
+      # alone. Before the first one, mutmut runs the whole suite for a
+      # baseline and again under tracing to map tests to lines, and that
+      # cost grows with the suite -- at ~1400 tests it consumed the old
+      # budget outright and the run reported zero checked, which reads
+      # like a clean sweep and is the opposite. The per-mutant cost is
+      # small by comparison (thousands checked inside the same budget
+      # once the baseline is paid), so headroom buys mutants, not
+      # waiting. If this is exhausted again the report now says so by
+      # name rather than blaming `also_copy`.
+      MUTATION_BUDGET_SECONDS: "1800"
 
     steps:
       - uses: actions/checkout@v4
@@ -223,8 +234,14 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
+          # 124 is timeout(1) saying it killed the run. Recorded rather
+          # than folded into "stopped early": a budget exhausted before
+          # the first mutant and a broken mutants tree both report zero
+          # checked, and they need opposite fixes.
           timeout "${MUTATION_BUDGET_SECONDS}" mutmut run || \
-            echo "::notice::mutmut stopped early (budget or non-zero exit); reporting partial results"
+            { status=$?
+              [ "$status" = 124 ] && echo "MUTATION_TIMED_OUT=1" >> "$GITHUB_ENV"
+              echo "::notice::mutmut stopped early (exit $status); reporting partial results"; }
           mutmut export-cicd-stats || true
           mutmut results > survivors.txt 2>&1 || true
           # The mutation OF each survivor, for the report's table --
@@ -253,6 +270,8 @@ jobs:
           # can be reported as a broken harness rather than as an empty
           # scope. The two must never look alike.
           MUTATION_ATTEMPTED: ${{ steps.scope.outputs.run == 'true' && '1' || '' }}
+          # Exported by the step above when timeout(1) killed the run.
+          MUTATION_BUDGET: ${{ env.MUTATION_BUDGET_SECONDS }}
         run: |
           set -euo pipefail
           python scripts/pr_report.py \
@@ -263,6 +282,7 @@ jobs:
             --mutmut-diffs diffs.txt \
             --mutation-note "${MUTATION_NOTE}" \
             ${MUTATION_ATTEMPTED:+--mutation-attempted} \
+            ${MUTATION_TIMED_OUT:+--mutation-timed-out "${MUTATION_BUDGET}"} \
             --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"

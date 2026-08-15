@@ -143,6 +143,30 @@ class TestMutationSection:
         body = render_mutation(None, [], "nothing changed", attempted=False)
         assert "HARNESS FAILED" not in body
 
+    def test_a_spent_budget_is_not_reported_as_a_broken_tree(self):
+        """Zero checked has two causes needing OPPOSITE fixes, and the
+        message used to assert one of them: a reader whose budget ran
+        out was sent hunting for a missing `also_copy` entry that was
+        never missing. Before the first mutant mutmut runs the suite for
+        a baseline and again under tracing, and that fixed cost grows
+        with the suite -- so this is the one that arrives as a project
+        succeeds."""
+        body = render_mutation(None, [], "7 changed files", attempted=True,
+                               timed_out="900")
+        assert "BUDGET SPENT" in body
+        assert "900s wall-clock budget" in body
+        assert "MUTATION_BUDGET_SECONDS" in body
+        # The other diagnosis must be absent, not merely outweighed.
+        assert "also_copy" not in body
+
+    def test_a_broken_tree_still_says_also_copy(self):
+        """And the reverse: no budget was hit, so the missing-file
+        diagnosis is the right one and must survive."""
+        body = render_mutation(None, [], "7 changed files", attempted=True)
+        assert "also_copy" in body
+        assert "BUDGET SPENT" not in body
+        assert "was not stopped by its budget" in body
+
     def test_zero_mutants_does_not_divide_by_zero(self):
         assert "0%" in render_mutation({"total": 0, "killed": 0}, [], "scope")
 
