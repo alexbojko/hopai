@@ -326,6 +326,18 @@ report = graph.schema_violations()   # read-only; falsy when clean
 print(report)   # per rule: row counts + sample ids -- the work list
 ```
 
+Property schemas go further than presence and type: `values=` (or an
+`Enum` annotation) enforces an allowed set, `unique=True` compiles to a
+*partial* unique index — unique among rows of that type only — nested
+dataclasses become nested object schemas, and `datetime`/`date` map to
+strings with a JSON Schema format. And with a schema defined, the
+Cypher front end can refuse hallucinated vocabulary outright:
+
+```python
+graph.cypher("MATCH (a:persn) RETURN a", strict_schema=True)
+# CypherError: unknown label 'persn' -- the schema declares: company, person
+```
+
 Enforcement covers property presence and JSON type per node type and
 edge kind. Endpoint types ("`works_at` connects only person → company")
 need a look at the endpoint *nodes*, which a CHECK can't do — so that
