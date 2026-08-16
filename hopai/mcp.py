@@ -194,7 +194,18 @@ Graph.traverse() a Python caller uses) and the check happens on its
 actual, exact node count, before the result reaches the client. The
 cost lands on the rare call that turns out to be oversized -- the one
 already about to be refused -- and a call that stays under the ceiling,
-the common case, pays nothing beyond what it already paid to run.
+the common case, pays nothing beyond what it already paid to run. That
+oversized call is NOT new cost this feature introduces: the identical
+query, hydrating the identical full result in Python, already ran
+before max_nodes existed -- the client just threw the result away
+after. This feature adds the refusal; it does not add the work.
+
+The oversized result is fully materialized in Python before the check
+discards it, so a match in the millions still costs the memory a match
+in the millions costs -- max_nodes bounds what reaches the caller, not
+peak memory during the call that gets refused. A server expecting
+traversals that large regularly should narrow `where=` at the query
+level, not rely on this ceiling to keep them cheap.
 
 NO AUTHENTICATION. Over stdio the client is the process that spawned
 this one, which is the trust boundary. Over HTTP it binds 127.0.0.1 by
