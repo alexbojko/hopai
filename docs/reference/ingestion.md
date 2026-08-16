@@ -1,18 +1,8 @@
 # Getting data in
 
-```python
-# "Alice is a person, Acme is a company, and Alice has worked at Acme
-#  since 2019."
-graph.add_nodes([
-    {"type": "person", "name": "Alice"},          # ids assigned by Postgres
-    {"type": "company", "name": "Acme"},
-])
-graph.add_edges([
-    {"start": {"name": "Alice"},    # endpoints looked up by property, so you
-     "end": {"name": "Acme"},       # never have to juggle generated ids
-     "kind": "works_at", "since": 2019},
-])
-```
+`add_nodes()`/`add_edges()` are demonstrated in
+[`01_quickstart`](../notebooks/01_quickstart.ipynb) — this page is the rules
+behind that call, not a repeat of it.
 
 A row is written one of two ways, and the rule is one line: **a row with
 a `properties` key is nested; any other row is flat, and every key that

@@ -85,7 +85,21 @@ notebooks = ["nbclient>=0.10", "nbformat>=5.9", "ipykernel>=6.29",
 # because the two do opposite things: `notebooks` EXECUTES them against a
 # database, while the site only renders the outputs already committed --
 # so a docs build needs no PostgreSQL and no Jupyter kernel.
-docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocs-jupyter>=0.25"]
+#
+# mkdocstrings[python] renders docs/api/*.md by importing `hopai` itself and
+# reading live signatures and docstrings -- the one part of the site that
+# cannot go stale, because there is no second copy of that text to forget to
+# update. `import hopai` needs no extra beyond the base dependencies (every
+# optional import inside the package is deferred to where it's used, the
+# same discipline embeddings.py documents for provider packages), so this
+# extra stays exactly as install-light as it was before.
+#
+# ruff is already the project's formatter/linter (see `dev`); mkdocstrings
+# reuses whichever of it or Black is installed to wrap long signatures onto
+# multiple lines instead of one unreadable one, so it rides along here too
+# rather than pulling in Black as a second tool for the same job.
+docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocs-jupyter>=0.25",
+        "mkdocstrings[python]>=0.26", "ruff>=0.6"]
 # Pinned <4 deliberately: the config surface this project relies on
 # (`source_paths`, `also_copy`, `mutate_only_covered_lines`, and the
 # `export-cicd-stats` JSON the PR comment parses) is the documented 3.x

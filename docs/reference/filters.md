@@ -1,5 +1,9 @@
 # Filters
 
+A quick-reference cheat sheet for the one filter grammar every `where=`/`via=`
+accepts — see [`02_traversal`](../notebooks/02_traversal.ipynb) for it used
+in context, and [hopai.filters](../api/filters.md) for exact signatures.
+
 Anywhere a `where=` or `via=` is accepted:
 
 ```python

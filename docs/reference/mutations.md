@@ -46,17 +46,9 @@ failure and this one would empty the graph.
 pointing at a node that no longer exists is exactly the corruption it
 was added to prevent.
 
-The same thing in Cypher, and as one JSON document for a tool-calling
-model (`MUTATE_TOOL_SCHEMA`):
-
-```python
-graph.cypher("MATCH (a:person) WHERE a.age > 65 SET a.retired = true")
-graph.cypher("MATCH (a {email: 'a@x.com'})-[r:knows]->() DELETE r")
-graph.cypher("MATCH (a {email: 'a@x.com'}) DETACH DELETE a")
-
-graph.mutate({"operations": [                    # in order, one transaction
-    {"op": "update_nodes", "where": {"type": "draft"}, "set": {"status": "archived"}},
-    {"op": "delete_nodes", "where": {"type": "spam"}, "detach": True},
-]})
-```
+The same operations translate from Cypher (`SET`/`REMOVE`/`DELETE`/`DETACH
+DELETE`) and compile from one JSON document, `{"operations": [...]}`
+(`MUTATE_TOOL_SCHEMA` is the ready-made tool definition), run in order as one
+transaction — demonstrated in
+["Changing and deleting, in the same three notations"](../notebooks/04_json_and_cypher.ipynb).
 

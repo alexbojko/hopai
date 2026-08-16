@@ -49,6 +49,41 @@ edges this many times → land on nodes like this → then again.** You get
 back the whole matching subgraph, not just the endpoints. The full walkthrough
 is [`01_quickstart`](notebooks/01_quickstart.ipynb).
 
+## 🔭 Every way to ask
+
+One engine, five ways to reach it — the same "Alice's friends" question as
+above, and what else it answers:
+
+```python
+# JSON -- for an LLM tool call, an HTTP handler, or config-driven traversal
+traverse_json(graph, {"start": {"where": {"name": "Alice"}},
+                      "hops": [{"via": {"kind": "friend"}, "hops": [1, 4]}]})
+
+# Cypher -- for a caller, or a model, that already thinks in it
+graph.cypher("MATCH (a:person {name: 'Alice'})-[:friend*1..4]->(b) RETURN b")
+
+# Aggregate -- a number instead of a subgraph, computed in the database
+graph.aggregate(Start(where={"name": "Alice"}),
+                Hop(via={"kind": "friend"}, hops=(1, 4)),
+                aggregates={"count": Count()})               # {"count": 12}
+
+# Vector search -- exact cosine similarity, no pgvector, no extension
+graph.vector_search(Near("summary", query_embedding), k=10,
+                    where={"type": "person"})
+
+# ...or seed a traversal from similarity instead of a property match
+graph.traverse(Start(near=Near("summary", query_embedding), keep=25),
+               Hop(via={"kind": "cites"}, hops=(1, 3)))
+
+# Change and delete -- the same filters, selecting rows to update or remove
+graph.update_nodes(where={"name": "Alice"}, set={"active": False})
+```
+
+Every one of these compiles through the same query builder, so the SQL, the
+semantics and the invariants are identical no matter which front end wrote
+the call. The ["Learn more"](#-learn-more) table below is where each one's
+full reference lives.
+
 ## ✨ Highlights
 
 - 🐘 **Plain PostgreSQL** — two tables, a recursive CTE, no extension, no
@@ -107,9 +142,14 @@ isolation on one connection pool in
 ## 📚 Learn more
 
 Nothing below is summarized away — every section the README used to spell
-out inline now has a full, standalone write-up under **Reference**, plus a
-**runnable notebook** for the topics that have one, executed in CI on every
-PR so neither can drift from the API:
+out inline now has a full write-up in one of three places, and each links
+to the others: a **runnable notebook** for the topics that have one
+(executed in CI on every PR, so it can't drift from the API), a **guide**
+under Reference explaining the semantics and the gotchas a notebook doesn't
+narrate, and a generated **API reference** — [`hopai.core`](https://hopai.readthedocs.io/en/latest/api/core/)
+for `Graph` itself, and one page per module for everything else — built
+straight from the library's own docstrings and signatures, so it is the one
+tier of this table that is structurally unable to go stale:
 
 | Topic | Notebook | Full reference |
 | --- | --- | --- |

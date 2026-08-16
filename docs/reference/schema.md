@@ -85,3 +85,9 @@ merge: `ON CONFLICT` would never match, so every "merge" silently
 inserts a duplicate instead of updating one. `Col("user_id")` is always
 the fix when the real column genuinely is what you mean.
 
+See the [Extra columns](https://hopai.readthedocs.io/en/latest/architecture/#extra-columns)
+section of architecture.md for how this is implemented (the write/read/
+constraint paths, and why merge's `on=` and `update_nodes()` treat it
+differently), and [hopai.core](../api/core.md) for `Graph.__init__`'s exact
+parameters.
+

@@ -13,11 +13,18 @@ repo_url: https://github.com/alexbojko/hopai
 repo_name: alexbojko/hopai
 copyright: MIT-licensed
 
-# The site has NO sources of its own. docs/index.md and docs/notebooks are
-# symlinks to README.md and notebooks/, so there is exactly one copy of every
-# page and no generated markdown to keep in step -- editing the README or a
-# notebook IS editing the site. Nothing here may become a second place to
-# write documentation.
+# Three tiers, three different guarantees against going stale.
+# docs/index.md and docs/notebooks are symlinks to README.md and notebooks/,
+# so there is exactly one copy of the landing page and the executed examples
+# -- editing the README or a notebook IS editing the site, and neither may
+# gain a second copy anywhere else. docs/reference/*.md are real files: a
+# deliberate SECOND place, holding the guide prose (semantics, gotchas, error
+# messages) neither a notebook nor a docstring is the right shape for --
+# reviewed like any other doc, not regenerated. docs/api/*.md are real files
+# too, but hold no prose of their own: each is a `mkdocstrings` directive
+# that renders straight from hopai's own docstrings and signatures at build
+# time, so that tier cannot drift from the code no matter how stale the page
+# on disk looks.
 docs_dir: docs
 
 # A notebook added to notebooks/ arrives in the site automatically (docs/ is a
@@ -51,6 +58,25 @@ hooks:
 
 plugins:
   - search
+  - mkdocstrings:
+      handlers:
+        python:
+          # No `paths:` needed -- the build installs hopai itself
+          # (`pip install -e ".[docs]"`), so the handler imports the real,
+          # importable package rather than reading source off disk.
+          options:
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            separate_signature: true
+            show_signature_annotations: true
+            merge_init_into_class: true
+            docstring_section_style: spacy
+            members_order: source
+            # hopai's docstrings are prose, not Args:/Returns: blocks --
+            # nothing to mis-parse either way, so this only matters if one
+            # ever gains structured sections.
+            docstring_style: google
   - mkdocs-jupyter:
       # The committed outputs are the documentation -- CI executes the
       # notebooks against a real PostgreSQL on every PR (see the `notebooks`
@@ -107,6 +133,22 @@ nav:
       - The JSON interface: reference/json-interface.md
       - Cypher as input syntax: reference/cypher.md
       - What this doesn't do (yet): reference/limits.md
+  - API reference:
+      - hopai.core (Graph, Subgraph): api/core.md
+      - hopai.hop (Start, Hop): api/hop.md
+      - hopai.filters: api/filters.md
+      - hopai.aggregates: api/aggregates.md
+      - hopai.ingest: api/ingest.md
+      - hopai.mutate: api/mutate.md
+      - hopai.constraints: api/constraints.md
+      - hopai.schema: api/schema.md
+      - hopai.vectors: api/vectors.md
+      - hopai.embeddings: api/embeddings.md
+      - hopai.cypher: api/cypher.md
+      - hopai.json_api: api/json_api.md
+      - hopai.models: api/models.md
+      - hopai.asyncio: api/asyncio.md
+      - hopai.mcp: api/mcp.md
   - Guides:
       - MCP server: mcp.md
   - Internals:
