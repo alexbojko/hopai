@@ -95,6 +95,27 @@ class TestRowShapes:
         assert "add_nodes()" in message and "'summary'" in message and "declared vector field" in message
         assert count(fresh_graph) == 0
 
+    def test_refusal_only_suggests_embed_stale_when_the_field_has_an_embedder(self, fresh_graph):
+        """Without this, the refusal always pointed at embed_stale() --
+        wrong when the field has no embed= (like every fixture above),
+        since following that advice hits a second, unrelated ValueError
+        from _embedder() instead of fixing anything."""
+        fresh_graph.define_vectors(nodes=[Vector("summary", 3)])
+        fresh_graph.migrate_vectors()
+        with pytest.raises(ValueError, match="set_vectors") as excinfo:
+            fresh_graph.add_nodes([{"id": 1, "summary": [1.0, 0.0, 0.0]}])
+        assert "embed_stale" not in str(excinfo.value)
+        assert "no embed=" in str(excinfo.value)
+
+    def test_refusal_suggests_embed_stale_when_the_field_has_an_embedder(self, fresh_graph):
+        """The other half of the fix above: when embed_stale() really is
+        a usable next step, the message still says so."""
+        fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=lambda t: [[1.0, 0.0, 0.0]])])
+        fresh_graph.migrate_vectors()
+        with pytest.raises(ValueError, match="set_vectors") as excinfo:
+            fresh_graph.add_nodes([{"id": 1, "summary": [1.0, 0.0, 0.0]}])
+        assert "embed_stale" in str(excinfo.value)
+
     def test_source_text_at_a_vector_field_name_still_writes_and_leaves_vector_null(self, fresh_graph):
         """The text path this fix must not touch: a string is exactly
         what source= reads and embed_stale() later fills the vector

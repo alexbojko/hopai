@@ -645,12 +645,19 @@ def _refuse_vector_property(properties: dict, vector_fields: dict, method: str,
         if name not in vector_fields or isinstance(value, str):
             continue
         id_repr = repr(row_id) if row_id is not None else "..."
+        set_vectors_hint = (
+            f"Pass the floats to set_vectors({target}=[{{\"id\": {id_repr}, "
+            f"{name!r}: [...]}}]) instead"
+        )
+        text_hint = (
+            ", or write the SOURCE TEXT here and let embed_stale() fill the vector."
+            if vector_fields[name].embed is not None
+            else f" -- {name!r} has no embed= configured, so it takes floats only."
+        )
         raise ValueError(
             f"{method}(): {name!r} is a declared vector field, and {value!r} is not "
             f"text to embed -- writing it as a property would store the embedding in "
-            f"JSONB, where similarity never reads it. Pass the floats to "
-            f"set_vectors({target}=[{{\"id\": {id_repr}, {name!r}: [...]}}]) instead, "
-            f"or write the SOURCE TEXT here and let embed_stale() fill the vector."
+            f"JSONB, where similarity never reads it. {set_vectors_hint}{text_hint}"
         )
 
 
