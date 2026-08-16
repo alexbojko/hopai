@@ -227,11 +227,14 @@ class Ingestor:
 
     # -- nodes ----------------------------------------------------------
 
-    def _node_payload(self, rows: list) -> tuple:
+    def _node_payload(self, rows: list, method: str = "add_nodes") -> tuple:
         id_column = self._node_id_col()
+        vector_fields = _vector_fields(self.g, "nodes")
         payload, explicit_ids = [], False
         for row in rows:
             identity, properties = split_row(row, self._node_keys, "node")
+            if vector_fields:
+                _refuse_vector_property(properties, vector_fields, method, "nodes", identity.get("id"))
             record = {"properties": properties, **self._graph_stamp()}
             if "id" in identity:
                 record[id_column.name] = identity["id"]
@@ -282,7 +285,7 @@ class Ingestor:
     def merge_nodes(self, rows: list, on: list, replace: bool = False, connection=None) -> int:
         table = self.g.nodes_tbl
         id_column = self._node_id_col()
-        payload, explicit_ids = self._node_payload(rows)
+        payload, explicit_ids = self._node_payload(rows, method="merge_nodes")
         if not payload:
             return 0
 
@@ -313,23 +316,26 @@ class Ingestor:
 
     def merge_edges(self, rows: list, on: list, replace: bool = False, connection=None) -> int:
         with self._transaction(connection) as conn:
-            payload = self._edge_payload(rows, conn)
+            payload = self._edge_payload(rows, conn, method="merge_edges")
             if not payload:
                 return 0
             self._merge_payload(conn, self.g.edges_tbl, payload, on, replace, "edge")
         return len(payload)
 
-    def _edge_payload(self, rows: list, connection) -> list:
+    def _edge_payload(self, rows: list, connection, method: str = "add_edges") -> list:
         """Normalize edge rows, resolving any property references to node
         ids in one batched lookup rather than one query per edge."""
         start_col = self.g.edge_start_col
         end_col = self.g.edge_end_col
         edge_id_col = self.g.edge_id_col
+        vector_fields = _vector_fields(self.g, "edges")
 
         split = []
         references = []
         for row in rows:
             identity, properties = split_row(row, self._edge_keys, "edge")
+            if vector_fields:
+                _refuse_vector_property(properties, vector_fields, method, "edges", identity.get("id"))
             for side in ("start", "end"):
                 if side in row:
                     if isinstance(row[side], dict):
@@ -614,6 +620,38 @@ def _networkx_row(identity: dict, data, extra_cols: tuple) -> dict:
             row[column] = properties.pop(column)
     row["properties"] = properties
     return row
+
+
+def _vector_fields(graph, target: str) -> dict:
+    """The declared vector fields for `target` ("nodes"/"edges"), or {}
+    when define_vectors() was never called -- read fresh on every call
+    rather than cached at Ingestor.__init__, since the Ingestor is
+    cached on Graph and outlives a later define_vectors()."""
+    vectors = graph.vectors
+    return vectors.get(target, {}) if vectors else {}
+
+
+def _refuse_vector_property(properties: dict, vector_fields: dict, method: str,
+                            target: str, row_id) -> None:
+    """A declared vector field's floats landing in `properties` instead
+    of its vec_* column is silent corruption (#50): nothing errors,
+    similarity just finds nothing for that row, and every read echoes
+    the raw floats back in the JSONB bag. Refuse and name the rewrite
+    rather than routing the value to set_vectors() ourselves -- that
+    would fold a second write, with its own transaction and network
+    call, into this one, and "embedding happens outside the
+    transaction" stops being true the moment ingest.py does it too."""
+    for name, value in properties.items():
+        if name not in vector_fields or isinstance(value, str):
+            continue
+        id_repr = repr(row_id) if row_id is not None else "..."
+        raise ValueError(
+            f"{method}(): {name!r} is a declared vector field, and {value!r} is not "
+            f"text to embed -- writing it as a property would store the embedding in "
+            f"JSONB, where similarity never reads it. Pass the floats to "
+            f"set_vectors({target}=[{{\"id\": {id_repr}, {name!r}: [...]}}]) instead, "
+            f"or write the SOURCE TEXT here and let embed_stale() fill the vector."
+        )
 
 
 def _reference_key(reference: dict) -> tuple:

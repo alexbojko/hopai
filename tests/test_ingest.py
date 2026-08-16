@@ -18,7 +18,7 @@ import pytest
 from sqlalchemy import text
 
 from hopai import (
-    INGEST_TOOL_SCHEMA, ConstraintViolation, Hop, IngestResult, Required, Start, Unique,
+    INGEST_TOOL_SCHEMA, ConstraintViolation, Hop, IngestResult, Required, Start, Unique, Vector,
 )
 from hopai.ingest import BATCH_SIZE, split_row
 
@@ -81,6 +81,30 @@ class TestRowShapes:
             == ({"id": 1}, {"a": 2})
         assert split_row({"id": 1, "properties": {"a": 2}}, frozenset({"id", "properties"}), "node") \
             == ({"id": 1}, {"a": 2})
+
+    def test_a_declared_vector_fields_floats_are_refused_not_stored(self, fresh_graph):
+        """Without the fix these land in `properties` (issue #50):
+        similarity silently finds nothing for the row, the invariant
+        'vectors live in vec_* columns, never in properties' is broken
+        from outside the engine, and every read echoes the floats back."""
+        fresh_graph.define_vectors(nodes=[Vector("summary", 3)])
+        fresh_graph.migrate_vectors()
+        with pytest.raises(ValueError, match="set_vectors") as excinfo:
+            fresh_graph.add_nodes([{"id": 1, "title": "raft", "summary": [1.0, 0.0, 0.0]}])
+        message = str(excinfo.value)
+        assert "add_nodes()" in message and "'summary'" in message and "declared vector field" in message
+        assert count(fresh_graph) == 0
+
+    def test_source_text_at_a_vector_field_name_still_writes_and_leaves_vector_null(self, fresh_graph):
+        """The text path this fix must not touch: a string is exactly
+        what source= reads and embed_stale() later fills the vector
+        from -- it keeps writing to `properties`, unindexed, until then."""
+        fresh_graph.define_vectors(nodes=[Vector("summary", 3)])
+        fresh_graph.migrate_vectors()
+        fresh_graph.add_nodes([{"id": 1, "title": "raft", "summary": "a paper about Raft"}])
+        assert properties_of(fresh_graph, title="raft")[0]["summary"] == "a paper about Raft"
+        with fresh_graph.engine.connect() as conn:
+            assert conn.execute(text("SELECT vec_summary FROM nodes WHERE id = 1")).scalar() is None
 
 
 # ---------------------------------------------------------------------
@@ -179,6 +203,16 @@ class TestEdges:
     def test_foreign_key_is_enforced(self, fresh_graph):
         with pytest.raises(ConstraintViolation):
             fresh_graph.add_edges([{"start_id": 999, "end_id": 998}])
+
+    def test_a_declared_vector_fields_floats_are_refused_on_add_edges(self, fresh_graph):
+        fresh_graph.define_vectors(edges=[Vector("relvec", 3)])
+        fresh_graph.migrate_vectors()
+        fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+        with pytest.raises(ValueError, match="set_vectors") as excinfo:
+            fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "relvec": [1.0, 0.0, 0.0]}])
+        message = str(excinfo.value)
+        assert "add_edges()" in message and "'relvec'" in message
+        assert count(fresh_graph, "edges") == 0
 
 
 # ---------------------------------------------------------------------
@@ -283,6 +317,28 @@ class TestMerge:
         with fresh_graph.engine.connect() as conn:
             props = conn.execute(text("SELECT properties FROM edges")).scalar()
         assert props == {"kind": "knows", "weight": 3}   # 'keep' replaced away
+
+    def test_a_declared_vector_fields_floats_are_refused_on_merge_nodes(self, fresh_graph):
+        """The refusal fires before merge_nodes ever builds its ON
+        CONFLICT statement, so this needs no Unique() -- the same
+        row that would corrupt add_nodes() corrupts merge_nodes()."""
+        fresh_graph.define_vectors(nodes=[Vector("summary", 3)])
+        fresh_graph.migrate_vectors()
+        with pytest.raises(ValueError, match="set_vectors") as excinfo:
+            fresh_graph.merge_nodes([{"email": "a@x.com", "summary": [1.0, 0.0, 0.0]}],
+                                    on=["email"])
+        assert "merge_nodes()" in str(excinfo.value)
+
+    def test_a_declared_vector_fields_floats_are_refused_on_merge_edges(self, fresh_graph):
+        from hopai import Col
+        fresh_graph.define_vectors(edges=[Vector("relvec", 3)])
+        fresh_graph.migrate_vectors()
+        fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+        with pytest.raises(ValueError, match="set_vectors") as excinfo:
+            fresh_graph.merge_edges(
+                [{"start_id": 1, "end_id": 2, "kind": "knows", "relvec": [1.0, 0.0, 0.0]}],
+                on=[Col("start_id"), Col("end_id"), "kind"])
+        assert "merge_edges()" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------
