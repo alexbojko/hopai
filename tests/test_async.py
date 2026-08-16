@@ -596,7 +596,14 @@ class TestArgumentsReachTheSyncCall:
             await async_fresh_graph.add_nodes([{"id": 1, "rank": 0}, {"id": 2, "rank": 100}])
             await async_fresh_graph.set_vectors(nodes=[
                 {"id": 1, "summary": [1.0, 0.0]},
-                {"id": 2, "summary": [0.0, 1.0]},
+                # Not fully orthogonal (0.1 instead of 0.0 on the first
+                # axis): with the default scale="normalized" (#55), rank 0
+                # vs 100 normalizes to a boost of exactly 0 vs 1 * weight,
+                # so an exactly-orthogonal node 2 would only TIE node 1's
+                # similarity of 1.0 rather than beat it -- a tie the id
+                # tiebreak resolves in node 1's favor, which would make
+                # this assert the wrong thing for the wrong reason.
+                {"id": 2, "summary": [0.1, 1.0]},
             ])
             # Node 1 is the better cosine match; node 2's `rank` is large
             # enough that the boost has to reorder them. A dropped boost=

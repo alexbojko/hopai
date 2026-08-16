@@ -1852,6 +1852,40 @@ class TestBoost:
         assert "jsonb_typeof" in sql          # non-numeric reads as absent
         assert "coalesce" in sql              # absent contributes `missing`, never NULL
 
+    def test_scale_normalized_is_the_default_and_emits_a_window_function(self, vg):
+        """#55: the default rescales the boost with a min-max window
+        function over the select's own candidate rows -- OVER () with no
+        PARTITION BY, so it is the whole result set at that select level,
+        not the whole table."""
+        sql = norm(vg.build_vector_search_query(
+            Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.2)), literal_binds=True)
+        assert "OVER ()" in sql
+        assert "min(coalesce" in sql and "max(coalesce" in sql
+        assert "nullif" in sql
+
+    def test_scale_raw_emits_no_window_function(self, vg):
+        """The escape hatch's whole point: with scale="raw" the compiled
+        SQL has no OVER() at all -- the coefficient multiplies the
+        coalesced property exactly as #55 found it."""
+        sql = norm(vg.build_vector_search_query(
+            Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.2, scale="raw")),
+            literal_binds=True)
+        assert "OVER ()" not in sql
+        assert "boost_0" in sql and "* 0.2" in sql
+
+    def test_scale_must_be_normalized_or_raw(self):
+        with pytest.raises(ValueError, match=r"scale must be one of"):
+            Boost("score", scale="clamped")
+
+    def test_scale_reaches_ranked_ids_too(self, vg):
+        """Boost's normalization is not vector_search()-only -- Start/Hop
+        near= builds its seed/match set through ranked_ids(), which calls
+        the same _boost_columns()."""
+        sql = norm(vg.build_query(
+            Start(near=Near("summary", [1.0, 0.0, 0.0]), keep=5,
+                 boost=Boost("score", 0.2)), []), literal_binds=True)
+        assert "OVER ()" in sql
+
     def test_callable_boost_is_passed_the_properties_column(self, vg):
         sql = norm(vg.build_vector_search_query(
             Near("summary", [1.0, 0.0, 0.0]),
@@ -1906,11 +1940,27 @@ class TestBoost:
         assert repr(Boost("score", 0.5)) == "Boost('score', weight=0.5)"
         assert repr(Boost("score", 1.0, default=-1.0)) \
             == "Boost('score', weight=1.0, default=-1.0)"
+        # scale="normalized" is the default -- it stays out of repr like
+        # any other unstated default, so a caller who never touched the
+        # knob does not see an implementation detail in every repr.
+        assert repr(Boost("score", 0.5, scale="normalized")) == "Boost('score', weight=0.5)"
+        assert repr(Boost("score", 0.5, scale="raw")) == "Boost('score', weight=0.5, scale='raw')"
 
     def test_json_form_matches_the_python_form(self, vg):
         python = vg.build_vector_search_query(
             Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.5, default=-1.0))
         parsed = parse_boost({"property": "score", "weight": 0.5, "default": -1.0})
+        assert norm(vg.build_vector_search_query(Near("summary", [1.0, 0.0, 0.0]), boost=parsed),
+                    literal_binds=True) == norm(python, literal_binds=True)
+
+    def test_json_form_carries_scale_too(self, vg):
+        """scale="raw" from JSON must reach the same query shape as the
+        Python form -- otherwise a caller behind json_api.py has no way
+        to reach the escape hatch #55 added."""
+        python = vg.build_vector_search_query(
+            Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.5, scale="raw"))
+        parsed = parse_boost({"property": "score", "weight": 0.5, "scale": "raw"})
+        assert parsed.scale == "raw"
         assert norm(vg.build_vector_search_query(Near("summary", [1.0, 0.0, 0.0]), boost=parsed),
                     literal_binds=True) == norm(python, literal_binds=True)
 
@@ -1927,6 +1977,11 @@ class TestBoost:
 
 class TestBoostLive:
     def test_boost_reorders_without_changing_membership(self, fresh_graph):
+        """scale="normalized" is the default (#55): the boost is rescaled
+        into similarity's own range by a min-max window over the
+        candidates (0.0/0.9/default-0.0 here -> 0/1/0), so node 2's
+        contribution is weight * 1.0, not weight * 0.9 -- 1.0 rather than
+        the raw property."""
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": 1, "n": "closest", "score": 0.0},
                      {"id": 2, "n": "runner-up", "score": 0.9},
@@ -1941,7 +1996,52 @@ class TestBoostLive:
         # Same rows, different order -- and the missing property is 0,
         # not a dropped row.
         assert {h["id"] for h in boosted} == set(plain)
+        assert boosted[0]["similarity"] == pytest.approx(0.8 + 1.0, abs=1e-6)
+
+    def test_scale_raw_reproduces_the_old_unbounded_behavior(self, fresh_graph):
+        """The regression test that scale="raw" is a real, working escape
+        hatch and not just accepted and ignored: identical setup to
+        test_boost_reorders_without_changing_membership, but the
+        combined score is exactly what it was BEFORE #55 -- the raw
+        property multiplied straight in, unbounded, node 2's runner-up
+        cosine buried under a boost of 0.9 rather than the normalized 1.0
+        above."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "n": "closest", "score": 0.0},
+                     {"id": 2, "n": "runner-up", "score": 0.9},
+                     {"id": 3, "n": "no-score"}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 2, "docvec": [0.8, 0.6, 0.0]},
+                             {"id": 3, "docvec": [0.6, 0.8, 0.0]}])
+        boosted = g.vector_search(Near("docvec", QUERY), boost=Boost("score", 1.0, scale="raw"),
+                                  k=10)
+        assert [h["id"] for h in boosted] == ["2", "1", "3"]
         assert boosted[0]["similarity"] == pytest.approx(0.8 + 0.9, abs=1e-6)
+
+    def test_a_thousand_fold_property_no_longer_dominates_a_perfect_match(self, fresh_graph):
+        """The bug report itself: Boost("importance", 0.2) on a view count
+        in the thousands used to multiply an unbounded quantity by 0.2 and
+        add it to a cosine that never exceeds 1 -- so a perfect match
+        (similarity 1.0) could still lose to a mediocre match with a big
+        enough property. Under the new default it cannot: the property is
+        rescaled into [-1, 1] before `weight` is applied, so 20% weight
+        really is 20%, capped at a 0.2 contribution."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "n": "perfect-match", "importance": 0.0},
+                     {"id": 2, "n": "irrelevant-match", "importance": 4200.0}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 2, "docvec": [0.0, 1.0, 0.0]}])  # orthogonal: sim 0.0
+        hits = g.vector_search(Near("docvec", QUERY), boost=Boost("importance", 0.2), k=10)
+        assert [h["id"] for h in hits] == ["1", "2"]
+        # The perfect match's contribution is bounded: it starts at 1.0
+        # and the whole boost term can add at most `weight` (0.2), so it
+        # can never be beaten by a property alone, however large.
+        assert hits[0]["similarity"] <= 1.0 + 0.2 + 1e-6
+        # Node 2 is exactly the pre-#55 winner: raw would have added
+        # 0.2 * 4200 = 840 to a similarity that never exceeds 1.
+        raw_hits = g.vector_search(Near("docvec", QUERY),
+                                   boost=Boost("importance", 0.2, scale="raw"), k=10)
+        assert [h["id"] for h in raw_hits] == ["2", "1"]
 
     def test_non_numeric_property_contributes_missing_not_an_error(self, fresh_graph):
         """One row carrying "high" where a number was expected must not
@@ -1955,16 +2055,49 @@ class TestBoostLive:
         assert hits[1]["similarity"] == pytest.approx(1.0, abs=1e-6)
 
     def test_boost_applies_to_a_ranked_traversal_seed(self, fresh_graph):
+        """Boost's normalization is not vector_search()-only: Start(near=)
+        builds its ranked seed through the same ranked_ids()/
+        _boost_columns() path (#55)."""
         g = _migrated(fresh_graph)
+        # weight=2.0: at weight=1.0 the normalized boost (0 vs. the
+        # candidate-set max, 1.0) exactly cancels node 1's similarity
+        # lead (1.0 vs 0.0), a real tie this test must not depend on
+        # Postgres breaking one particular way.
         g.add_nodes([{"id": 1, "score": 0.0}, {"id": 2, "score": 5.0}, {"id": 3, "n": "target"}])
         g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
                              {"id": 2, "docvec": [0.0, 1.0, 0.0]}])
         g.add_edges([{"start_id": 1, "end_id": 3, "kind": "k"},
                      {"start_id": 2, "end_id": 3, "kind": "k"}])
         result = g.traverse(Start(near=Near("docvec", QUERY), keep=1,
-                                  boost=Boost("score", 1.0)), Hop(via={"kind": "k"}))
-        # Node 2 loses on similarity and wins on the boost.
+                                  boost=Boost("score", 2.0)), Hop(via={"kind": "k"}))
+        # Node 2 loses on similarity (0.0 vs node 1's 1.0) and wins on the
+        # boost (normalized to 1.0, weight 2.0 -> +2.0 vs node 1's +0.0).
         assert {n["id"] for n in result.nodes} == {"2", "3"}
+
+    def test_zero_spread_boost_is_a_no_op_and_keeps_combined_not_null(self, fresh_graph):
+        """Every candidate sharing one boost value means no spread to
+        normalize against -- nullif(0, 0) is NULL, and left uncoalesced
+        that NULL would propagate through `total = term + term` in
+        _combined() and null out rows whose SIMILARITY was real, breaking
+        `combined IS NOT NULL`'s meaning for every row a constant boost
+        touches. It must instead contribute nothing, identically to no
+        boost at all -- including when a boost is the only ranking signal
+        near= min_similarity=None would otherwise refuse (min_similarity
+        keeps this call legal without k)."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "score": 3.0}, {"id": 2, "score": 3.0}, {"id": 3, "score": 3.0}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 2, "docvec": [0.8, 0.6, 0.0]},
+                             {"id": 3, "docvec": [0.0, 1.0, 0.0]}])
+        plain = g.vector_search(Near("docvec", QUERY, min_similarity=-1.0), k=10)
+        boosted = g.vector_search(Near("docvec", QUERY, min_similarity=-1.0),
+                                  boost=Boost("score", 1.0), k=10)
+        assert [(h["id"], h["similarity"]) for h in boosted] \
+            == [(h["id"], h["similarity"]) for h in plain]
+        # combined IS NOT NULL still means "some similarity had a
+        # direction" -- all three rows, including the orthogonal one
+        # (similarity 0.0, a real direction, not missing), still score.
+        assert {h["id"] for h in boosted} == {"1", "2", "3"}
 
 
 # ---------------------------------------------------------------------

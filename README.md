@@ -772,9 +772,16 @@ combined score, no longer a cosine in `[-1, 1]`:
 graph.vector_search(Near("summary", q), boost=Boost("importance", 0.2), k=10)
 ```
 
-Store the property already scaled to roughly `[0, 1]`: a cosine lives in
-`[-1, 1]`, so a raw view count wouldn't boost the ranking, it would
-replace it — and hopai won't guess a normalization on your behalf.
+By default the property is rescaled into similarity's own `[-1, 1]`
+range with a min-max window function over the candidate rows — the ones
+still in play after `where=` — before `weight` is applied, so
+`Boost("importance", 0.2)` means "20% weight" whatever raw range
+`importance` holds: a raw view count in the thousands would otherwise
+overwhelm a cosine that never exceeds 1, and the "boost" would replace
+the ranking instead of nudging it. `Boost("importance", 0.2,
+scale="raw")` opts back into the unscaled coefficient — for a property
+you already normalized, or when you want the per-query window function
+off the query path.
 
 Two things worth knowing about the traversal forms. A traversal returns
 a **subgraph, not a ranking** — the scores and their order don't survive

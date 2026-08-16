@@ -81,6 +81,13 @@ set plugs into the walk.
   `combined IS NOT NULL` meaning "some similarity had a direction" — but a boost is not
   consequence-free: it reorders, and with a `keep`/`k` limit reordering decides
   membership, so a boosted `similarity` is the combined score and can exceed 1.
+  `scale="normalized"` (the default) rescales the coalesced value into similarity's
+  own range with a min-max window function over the candidate set, at the same
+  select level `_boost_columns()` builds the column at — a zero-spread candidate
+  set coalesces the result to 0 rather than propagating the window function's NULL,
+  which is what keeps the invariant true even when a boost carries no signal.
+  `scale="raw"` is the unscaled, unbounded escape hatch: today's only behavior
+  before this normalization existed.
 - `Hop(via_near=)` compiles to `edge_beam()`: a LATERAL, per anchor row, yielding the
   `(edge_id, move_id)` pair the plain join produced — so depth, the local path and edge
   reconstruction are untouched. The cycle guard goes *inside* the beam, or a top-`via_keep`
