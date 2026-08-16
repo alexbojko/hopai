@@ -450,6 +450,11 @@ def _map_annotation(owner: str, field: str, annotation) -> tuple:
     plus allowed values, datetime/date become "string" with a JSON
     Schema format, and a nested dataclass/pydantic model becomes an
     "object" with a nested property schema."""
+    # False, not None: equivalent-mutant proof (issue #42) -- every read
+    # of this local is a truthiness check (the `if optional else` below,
+    # and `not optional` at _bag_properties' one call site), and False
+    # and None are both falsy with nothing here ever using `is`/`==`, so
+    # the two are indistinguishable at every use site.
     optional = False
     origin = typing.get_origin(annotation)
     if origin is Union or origin is _pytypes.UnionType:
@@ -713,6 +718,16 @@ def _pydantic_model(name: str, properties: tuple, create_model):
         elif p.format == "date":
             annotation = _datetime.date
         else:
+            # equivalent-mutant proof (issue #42): if this filter failed
+            # to drop "null" (or matched a name that never occurs), the
+            # line below wraps the result in Optional[...] unconditionally
+            # whenever "null" IS in p.json_type -- and typing.Optional
+            # over a Union that already contains NoneType is a no-op
+            # (Union de-dupes), so the member SET built here is identical
+            # either way; confirmed by comparing generated pydantic
+            # models' accept/reject behavior across every non-empty
+            # subset of JSON_TYPES and a battery of boundary values
+            # (0, 1, "true", "3.14", ...) -- zero differences.
             non_null = [_PYTHON_TYPES[t] for t in p.json_type if t != "null"]
             annotation = (non_null[0] if len(non_null) == 1
                           else Union[tuple(non_null)] if non_null else type(None))
