@@ -140,9 +140,24 @@ path:
                              # re-declares it
 
 See hopai/schema.py for both notations and the annotation mapping.
+
+ASYNC -- traverse, aggregate, ingestion, mutation and vector search/
+storage, all reachable from an async app through the SAME query
+builders and execute-and-hydrate code Graph runs, via SQLAlchemy's own
+sync/async bridge rather than a second implementation:
+
+    from hopai.asyncio import AsyncGraph
+
+    graph = AsyncGraph("postgresql+psycopg://user:pass@host/db")   # needs
+    result = await graph.traverse(Start(where={"type": "person"}))  # hopai[asyncio]
+
+Schema and constraint declaration (create_schema(), enforce_schema(),
+define_constraints(), ...) stay on the sync Graph -- one-time setup
+calls with no concurrency to gain. See hopai/asyncio.py.
 """
 
 from .aggregates import Avg, Count, Max, Min, Sum, parse_aggregate
+from .asyncio import AsyncGraph
 from .constraints import (
     Check, Col, ConstraintViolation, Index, PropertyType, Required, Unique,
 )
@@ -174,7 +189,7 @@ from .vectors import Boost, Near, Vector, parse_boost, parse_near
 __version__ = "0.0.1"  # x-release-please-version
 
 __all__ = [
-    "Graph", "Subgraph", "Start", "Hop",
+    "Graph", "AsyncGraph", "Subgraph", "Start", "Hop",
     "OR", "AND", "NOT", "GT", "GTE", "LT", "LTE", "BETWEEN", "parse_filter",
     "Count", "Sum", "Avg", "Min", "Max", "parse_aggregate",
     "traverse_json", "spec_to_traversal", "TRAVERSE_TOOL_SCHEMA",

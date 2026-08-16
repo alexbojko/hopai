@@ -26,6 +26,12 @@ DSN = os.environ.get(
 )
 SCHEMA = "hopai_test"
 
+# AsyncGraph (hopai/asyncio.py) needs an async DBAPI -- psycopg2 has none.
+# Same server, same credentials, just the driver swapped: psycopg3 (the
+# `asyncio` extra) speaks both sync and async, so one DSN's worth of
+# connection info serves both engines.
+ASYNC_DSN = DSN.replace("+psycopg2", "+psycopg")
+
 SETUP_SQL = f"""
 DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;
 CREATE SCHEMA {SCHEMA};
@@ -98,6 +104,15 @@ def _engine(schema: str):
                                        "gssencmode": "disable"})
 
 
+def _async_engine(schema: str):
+    """The async counterpart of _engine() -- same NullPool/gssencmode
+    reasoning, psycopg3 instead of psycopg2."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+    return create_async_engine(ASYNC_DSN, poolclass=NullPool,
+                               connect_args={"options": f"-c search_path={schema}",
+                                             "gssencmode": "disable"})
+
+
 @pytest.fixture(scope="session")
 def engine():
     eng = _engine(SCHEMA)
@@ -137,7 +152,34 @@ def graph(engine):
     return Graph(engine)
 
 
+def _require_async_driver():
+    """AsyncGraph needs psycopg3 (the `asyncio` extra); a contributor
+    running the plain `dev` extra install from before it was added
+    should get a skip naming the fix, not an ImportError with no
+    context -- same courtesy the `engine` fixture extends for a missing
+    database, and same HOPAI_REQUIRE_DB escape hatch so CI still fails
+    loudly if the driver is ever missing there."""
+    try:
+        import psycopg  # noqa: F401
+    except ImportError:
+        if os.environ.get("HOPAI_REQUIRE_DB"):
+            raise
+        pytest.skip("no psycopg3 driver installed -- pip install hopai[asyncio] "
+                    "(or HOPAI_REQUIRE_DB=1 to make this an error)")
+
+
+@pytest.fixture()
+def async_graph(engine):
+    """An AsyncGraph over the SAME seeded, read-only schema `graph`
+    reads -- for traverse/aggregate/vector_search tests that need no
+    write isolation of their own."""
+    _require_async_driver()
+    from hopai.asyncio import AsyncGraph
+    return AsyncGraph(_async_engine(SCHEMA))
+
+
 WRITE_SCHEMA = "hopai_write"
+ASYNC_WRITE_SCHEMA = "hopai_async_write"
 
 
 @pytest.fixture(scope="session")
@@ -163,6 +205,41 @@ def fresh_graph(write_engine):
     graph = Graph(write_engine)
     graph.create_schema()
     return graph
+
+
+@pytest.fixture()
+def async_fresh_graph():
+    """An empty AsyncGraph, schema owned outright, rebuilt for every
+    test -- the async counterpart of fresh_graph().
+
+    Schema setup stays on a plain sync Graph even here: AsyncGraph
+    deliberately does not implement create_schema() (see the "WHAT THIS
+    DOES NOT COVER" section of hopai/asyncio.py's module docstring) --
+    it is a one-time admin call, not a traversal/mutation the design is
+    for. The returned handle is what the test actually exercises."""
+    _require_async_driver()
+    from hopai import Graph
+    from hopai.asyncio import AsyncGraph
+
+    setup_engine = _engine(ASYNC_WRITE_SCHEMA)
+    with setup_engine.begin() as conn:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {ASYNC_WRITE_SCHEMA} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {ASYNC_WRITE_SCHEMA}"))
+    Graph(setup_engine).create_schema()
+    setup_engine.dispose()
+    return AsyncGraph(_async_engine(ASYNC_WRITE_SCHEMA))
+
+
+@pytest.fixture()
+def async_admin_graph(async_fresh_graph):
+    """A plain sync Graph on the SAME schema async_fresh_graph owns --
+    the documented escape hatch for the admin/schema-DDL calls
+    AsyncGraph deliberately does not implement (define_constraints(),
+    create_schema(), ...). Depends on async_fresh_graph purely for
+    ordering (so the schema already exists); it adds nothing schema-wise
+    of its own."""
+    from hopai import Graph
+    return Graph(_engine(ASYNC_WRITE_SCHEMA))
 
 
 @pytest.fixture(scope="session")
