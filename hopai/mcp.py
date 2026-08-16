@@ -138,6 +138,64 @@ advertises it, and a field with no embedder refuses by name when the
 text is resolved. Sending both `search` and a `start.near` is refused
 rather than resolved: one of the two would have to be silently dropped.
 
+SIZE. `traverse_graph` and a Cypher MATCH both return the ENTIRE
+matching subgraph, whatever its size -- fine for a Python caller, not
+fine for a model: a broad traversal returns everything, the MCP client
+silently truncates the result to fit its context window, and the model
+never learns it got a partial answer. That is rule 4's "silently
+different answer", produced by the CLIENT on hopai's behalf rather than
+by hopai -- and letting it happen is no better than causing it.
+
+`max_nodes` (`--max-nodes` on the CLI, default 500; `None`/`none`
+disables it) is a server-set ceiling, not a per-call argument -- a model
+choosing its own would defeat the point. Crossing it REFUSES the whole
+call, naming the real count and the real ceiling, rather than returning
+a silently truncated subgraph:
+
+    traverse_graph: this matches 4,312 nodes, over the 500-node ceiling
+    this server was started with. Nothing was returned, because a
+    truncated subgraph is not a subgraph. Narrow it: add properties to
+    `where`, reduce `hops`, or call aggregate_graph if a count is what
+    you wanted. To rank by relevance instead, use start.search with
+    `keep` (needs an embedder; describe_graph says whether this server
+    has one).
+
+NODES, not edges or bytes: nodes are the unit a model actually reads
+one at a time, and Count() -- the existing counting machinery -- already
+counts nodes, so a node ceiling is what that machinery can enforce
+without inventing a second one. A `properties` bag heavy enough to blow
+a context window at a low node count is a real failure mode this does
+not catch, but it is a differently-shaped problem (bound the
+properties, not the traversal) and conflating the two would make the
+ceiling answer neither question precisely.
+
+WHY THE CHECK RUNS AFTER THE READ, NOT BEFORE IT. The obvious design
+counts first -- run `aggregate_graph`'s `Count()` over the same
+start/hops, refuse before touching the traversal at all if it is over
+the ceiling. That was measured and rejected, and not on performance: it
+is WRONG. `Count()` aggregates the LAST hop's matched nodes only
+(hopai/core.py's build_aggregate_query, and the CLAUDE.md invariant
+that names it), while the subgraph a traversal actually reports is the
+union of every node on every hop's matching edges -- deliberately
+bigger, so a hop spanning several edges reports all of them and dead
+ends still show the nodes that led to them. The two numbers are not the
+same question. Measured on benchmarks/generate_graph.py's hub data,
+`forward_bounded_4hop` returns 10,350 nodes while `Count()` over the
+IDENTICAL chain reports 225 -- a 46x undercount, and unboundedly worse
+with a broad early hop narrowed by a late filter (a synthetic hub-then-
+rare-leaf chain measured a 26x undercount on 53 actual nodes). A
+pre-count gate built on `Count()` would wave through exactly the
+oversized result this feature exists to catch, which is worse than no
+gate at all -- an approximation rule 4 forbids, not a shortcut it
+allows.
+
+So the traversal runs to completion (through the same traverse_json()/
+Graph.traverse() a Python caller uses) and the check happens on its
+actual, exact node count, before the result reaches the client. The
+cost lands on the rare call that turns out to be oversized -- the one
+already about to be refused -- and a call that stays under the ceiling,
+the common case, pays nothing beyond what it already paid to run.
+
 NO AUTHENTICATION. Over stdio the client is the process that spawned
 this one, which is the trust boundary. Over HTTP it binds 127.0.0.1 by
 default and anyone who can reach the port gets the tools that are
@@ -210,6 +268,66 @@ _WITH_MEANING = (
 #: Default seed size for start.search. Big enough that a real answer is
 #: usually inside it, small enough that the walk stays cheap.
 DEFAULT_KEEP = 25
+
+#: Default node ceiling for traverse_graph and a Cypher MATCH -- see the
+#: module docstring's SIZE section for what it counts and why. Chosen as
+#: "comfortably more than a model reads in one tool result, comfortably
+#: less than blows a context window" rather than measured against any
+#: one client; an operator with a bigger (or no) budget passes their own.
+DEFAULT_MAX_NODES = 500
+
+
+#: Per-caller narrowing advice, in each one's own vocabulary --
+#: traverse_graph's `where`/`hops`/aggregate_graph versus Cypher's
+#: WHERE/`*min..max`/aggregating RETURN. Keyed by the same caller name
+#: the refusal message opens with.
+_NARROW = {
+    "traverse_graph": (
+        "Narrow it: add properties to `where`, reduce `hops`, or call aggregate_graph "
+        "if a count is what you wanted."
+    ),
+    "cypher": (
+        "Narrow it: add properties to WHERE, reduce the `*min..max` hop range, or "
+        "write an aggregating RETURN (e.g. RETURN count(...)) if a count is what you "
+        "wanted."
+    ),
+}
+
+
+def _max_nodes_message(caller: str, count: int, max_nodes: int, can_search: bool) -> str:
+    """The max_nodes refusal, shared by traverse_graph and Cypher's
+    MATCH path so the wording (and the reasoning behind it -- the module
+    docstring's SIZE section) lives in exactly one place.
+
+    `can_search` decides whether the `start.search` sentence is present
+    at all -- the same conditional-sentence pattern _with_search() uses
+    for _NO_MEANING/_WITH_MEANING. Pointing a model at a lever this
+    server cannot actually pull (no embedder, or Cypher, which has no
+    `start.search` spelling at all) sends it at a dead end instead of a
+    fix, which is worse than not mentioning it."""
+    message = (
+        f"{caller}: this matches {count:,} nodes, over the {max_nodes:,}-node ceiling "
+        f"this server was started with. Nothing was returned, because a truncated "
+        f"subgraph is not a subgraph. {_NARROW[caller]}"
+    )
+    if can_search:
+        message += (
+            " To rank by relevance instead, use start.search with `keep` (needs an "
+            "embedder; describe_graph says whether this server has one)."
+        )
+    return message
+
+
+def _enforce_max_nodes(caller: str, count: int, max_nodes: Optional[int], can_search: bool) -> None:
+    """Raise the max_nodes refusal if `count` -- the ALREADY-COMPUTED,
+    exact size of a traversal's result -- is over the ceiling.
+
+    Called on a result that has already been built (traverse_json()'s
+    dict, or a Cypher read's Subgraph), never used to decide whether to
+    run the traversal in the first place -- see the module docstring's
+    SIZE section for why a pre-count would be wrong, not just slower."""
+    if max_nodes is not None and count > max_nodes:
+        raise ValueError(_max_nodes_message(caller, count, max_nodes, can_search))
 
 
 @dataclass(frozen=True)
@@ -631,7 +749,7 @@ def _list_graphs_tool(served: Served) -> ToolSpec:
 
 
 def _describe_tool(served: Served, read_only: bool, allow_ddl: bool, allow_mutations: bool,
-                   embed: Optional[Callable]) -> ToolSpec:
+                   embed: Optional[Callable], max_nodes: Optional[int]) -> ToolSpec:
     def describe_graph(graph: Optional[str] = None, counts: bool = False) -> dict:
         graph = served.pick(graph, "describe_graph")
         schema = graph.schema
@@ -657,6 +775,12 @@ def _describe_tool(served: Served, read_only: bool, allow_ddl: bool, allow_mutat
             "writes_allowed": not read_only,
             "deletes_and_updates_allowed": allow_mutations,
             "ddl_allowed": allow_ddl,
+            # None means disabled -- reported as such rather than left
+            # out, so a model can tell "no ceiling" from "didn't ask"
+            # without a second call. See the module docstring's SIZE
+            # section for what this counts and why traverse_graph/cypher
+            # enforce it after the read rather than before.
+            "max_nodes": max_nodes,
             # What the library refuses, plus -- when mutations are off
             # -- the fact that nothing here can delete. A model that
             # finds no delete tool and is not told why emulates one, by
@@ -710,7 +834,8 @@ def _describe_tool(served: Served, read_only: bool, allow_ddl: bool, allow_mutat
     )
 
 
-def _traverse_tool(served: Served, schema: dict, embed: Optional[Callable]) -> ToolSpec:
+def _traverse_tool(served: Served, schema: dict, embed: Optional[Callable],
+                   max_nodes: Optional[int]) -> ToolSpec:
     if served.seeds_from_text(embed):
         schema = _with_search(schema, served, _NO_MEANING)
     schema["parameters"]["properties"].update(_graph_key(served))
@@ -723,7 +848,17 @@ def _traverse_tool(served: Served, schema: dict, embed: Optional[Callable]) -> T
         # allow_vectors: every vector in this spec was put there by
         # _seed() from an embedding of the model's TEXT, and both
         # refusals above have already run against what the model sent.
-        return traverse_json(chosen, spec, allow_vectors=True)
+        result = traverse_json(chosen, spec, allow_vectors=True)
+        # AFTER the traversal, on its exact node count -- not a
+        # aggregate_graph pre-count. See the module docstring's SIZE
+        # section for why a pre-count is wrong rather than merely
+        # slower: this call site is the reason it stays wrong for
+        # traverse_graph specifically, since traverse_json() already ran
+        # exactly what a Python caller's graph.traverse() runs, and
+        # `result` IS the answer -- there is nothing left to guess at.
+        _enforce_max_nodes("traverse_graph", len(result["nodes"]), max_nodes,
+                          can_search=_seeds_from_text(chosen, embed))
+        return result
 
     return ToolSpec(schema["name"], schema["description"], schema["parameters"], traverse_graph)
 
@@ -803,7 +938,7 @@ def _search_tool(served: Served, embed: Callable) -> ToolSpec:
 
 
 def _cypher_tool(served: Served, read_only: bool, allow_mutations: bool,
-                 strict_schema: bool) -> ToolSpec:
+                 strict_schema: bool, max_nodes: Optional[int]) -> ToolSpec:
     from .cypher import classify_cypher
 
     def cypher(query: str, graph: Optional[str] = None) -> dict:
@@ -824,6 +959,24 @@ def _cypher_tool(served: Served, read_only: bool, allow_mutations: bool,
                 "or ask the operator for a server started without read_only=True"
             )
         result = chosen.cypher(query, **({"strict_schema": True} if strict_schema else {}))
+        # The SAME ceiling traverse_graph enforces, on the SAME kind of
+        # result: a plain MATCH (kind == "read") is the only one of the
+        # four kinds classify_cypher() reports that returns a Subgraph,
+        # and it goes through the identical traversal engine
+        # traverse_graph does -- so it is exactly as capable of returning
+        # an unbounded result, and a model reaching for Cypher instead of
+        # traverse_graph must not find that a way around the ceiling.
+        # "aggregate" already returns a number, not a subgraph; "write"
+        # and "mutate" return an IngestResult/MutationResult -- capping
+        # either would cap a write, which the issue this exists for
+        # never asked for and CLAUDE.md's mutation invariants would not
+        # want silently reinterpreted as a node count.
+        #
+        # can_search=False always: Cypher has no `start.search` spelling
+        # to point a model at (cypher.py's own docstring says so), so
+        # the sentence would send it at a dead end.
+        if kind == "read":
+            _enforce_max_nodes("cypher", len(result.nodes), max_nodes, can_search=False)
         # Subgraph and IngestResult both know how to serialize themselves;
         # an aggregating RETURN already comes back as a plain dict.
         return result.to_dict() if hasattr(result, "to_dict") else result
@@ -1054,7 +1207,7 @@ def _enforce_schema_tool(served: Served) -> ToolSpec:
 
 def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
           allow_mutations: bool = False, embed: Optional[Callable] = None,
-          strict_schema: bool = False) -> list:
+          strict_schema: bool = False, max_nodes: Optional[int] = DEFAULT_MAX_NODES) -> list:
     """Every tool this server would register, as ToolSpecs -- the single
     source of what hopai offers over MCP.
 
@@ -1062,6 +1215,11 @@ def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
     over one connection pool. With several,
     every tool grows an optional `graph` parameter naming which to use;
     with one, no tool mentions graphs at all.
+
+    `max_nodes` caps how many nodes traverse_graph and a Cypher MATCH
+    may return before refusing instead -- see the module docstring's
+    SIZE section. `None` disables it. A SERVER setting, not a per-call
+    argument a model could widen for itself.
 
     Separated from build_server() so the tools can be inspected, tested
     and called with no SDK installed and no server running: `call` is an
@@ -1077,6 +1235,18 @@ def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
                 f"nothing to search -- call define_vectors(nodes=[Vector('summary', 1536)]) "
                 f"on {served.names} (or pass --vector nodes:summary:1536) before serving"
             )
+    if max_nodes is not None and (isinstance(max_nodes, bool)
+                                  or not isinstance(max_nodes, int) or max_nodes <= 0):
+        # bool is checked explicitly: isinstance(True, int) is True in
+        # Python, and max_nodes=True would otherwise silently become a
+        # 1-node ceiling instead of the type error it actually is --
+        # the same "checked, not coerced" rule CLAUDE.md names for
+        # all=/detach=/replace=, applied to the one place this flag
+        # arrives as a Python value rather than JSON.
+        raise TypeError(
+            f"max_nodes must be a positive integer or None (to disable the ceiling), "
+            f"got {max_nodes!r}"
+        )
     if strict_schema:
         # Every graph, not just the default: a per-call `graph` argument
         # would otherwise reach one that cannot be strict, and the
@@ -1102,10 +1272,10 @@ def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
     static = _static_schemas(served)
     specs = [
         *([_list_graphs_tool(served)] if served.many else []),
-        _describe_tool(served, read_only, allow_ddl, allow_mutations, embed),
-        _traverse_tool(served, static["traverse_graph"], embed),
+        _describe_tool(served, read_only, allow_ddl, allow_mutations, embed, max_nodes),
+        _traverse_tool(served, static["traverse_graph"], embed, max_nodes),
         _aggregate_tool(served, static["aggregate_graph"], embed),
-        _cypher_tool(served, read_only, allow_mutations, strict_schema),
+        _cypher_tool(served, read_only, allow_mutations, strict_schema, max_nodes),
         _infer_schema_tool(served),
     ]
     if embed is not None:
@@ -1214,7 +1384,8 @@ def _register(spec: ToolSpec, tool_class):
 def build_server(graph, *, name: str = "hopai", read_only: bool = False,
                  allow_ddl: bool = False, allow_mutations: bool = False,
                  embed: Optional[Callable] = None,
-                 strict_schema: bool = False, http: Optional[dict] = None):
+                 strict_schema: bool = False, max_nodes: Optional[int] = DEFAULT_MAX_NODES,
+                 http: Optional[dict] = None):
     """The configured MCP server object, not yet running.
 
     For mounting hopai's tools inside an application that owns the
@@ -1222,6 +1393,7 @@ def build_server(graph, *, name: str = "hopai", read_only: bool = False,
     tools); serve() is the whole thing when it does not.
 
     `graph` is one Graph or a {name: Graph} mapping -- see tools().
+    `max_nodes` is tools()'s own argument, forwarded unchanged.
 
     `http` carries the HTTP bind settings, which mcp 1.x takes on the
     constructor and mcp 2.0 takes on run() -- serve() fills it in, and
@@ -1230,7 +1402,7 @@ def build_server(graph, *, name: str = "hopai", read_only: bool = False,
     registered = [_register(spec, tool_class)
                   for spec in tools(graph, read_only=read_only, allow_ddl=allow_ddl,
                                     allow_mutations=allow_mutations, embed=embed,
-                                    strict_schema=strict_schema)]
+                                    strict_schema=strict_schema, max_nodes=max_nodes)]
     settings = http if (http and era == 1) else {}
     return server_class(name, instructions=_instructions(Served(graph)), tools=registered,
                         **settings)
@@ -1245,7 +1417,7 @@ def serve(graph, *, transport: str = "stdio", host: str = "127.0.0.1",
         serve({"docs": docs, "crm": crm})               # several graphs, one pool
 
     Takes build_server()'s options (read_only, allow_ddl, allow_mutations,
-    embed, strict_schema, name). HTTP binds 127.0.0.1 unless told otherwise:
+    embed, strict_schema, max_nodes, name). HTTP binds 127.0.0.1 unless told otherwise:
     there is no authentication here, and a graph an agent may write to
     is not a thing to put on 0.0.0.0 by accident."""
     if transport not in ("stdio", "http"):
@@ -1318,6 +1490,18 @@ def _callable(value: str):
     return function
 
 
+def _max_nodes(value: str) -> Optional[int]:
+    """--max-nodes 500 (a positive count), or --max-nodes none to
+    disable the ceiling entirely -- see tools()/the module docstring's
+    SIZE section for what it caps and why."""
+    if value.strip().lower() in ("none", "unlimited"):
+        return None
+    if not value.isdigit() or int(value) <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--max-nodes must be a positive integer or 'none', got {value!r}")
+    return int(value)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hopai-mcp",
@@ -1361,6 +1545,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--load-schema", action=argparse.BooleanOptionalAction, default=True,
                         help="Adopt the schema saved in the database, if there is one "
                              "(default). --no-load-schema skips the lookup.")
+    parser.add_argument("--max-nodes", type=_max_nodes, default=DEFAULT_MAX_NODES,
+                        metavar="N|none",
+                        help=f"Refuse a traverse_graph call or Cypher MATCH whose result "
+                             f"would exceed this many nodes, naming the real count instead "
+                             f"of letting the MCP client silently truncate it (default "
+                             f"{DEFAULT_MAX_NODES}). 'none' disables the ceiling.")
     return parser
 
 
@@ -1433,7 +1623,7 @@ def main(argv: Optional[list] = None) -> int:
     serve(graphs, transport=args.transport, host=args.host, port=args.port, path=args.path,
           name=args.name, read_only=args.read_only, allow_ddl=args.allow_ddl,
           allow_mutations=args.allow_mutations, embed=args.embed,
-          strict_schema=args.strict_schema)
+          strict_schema=args.strict_schema, max_nodes=args.max_nodes)
     return 0
 
 
