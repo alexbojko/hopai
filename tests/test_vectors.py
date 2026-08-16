@@ -40,7 +40,7 @@ from hopai.constraints import ConstraintViolation
 #: four separate mutation rounds each surfaced one more that had none.
 #: Reading the sites out of the source is what stops the fifth.
 _LABEL_ARG = {"_check_k": 1, "validate_nears": 4, "validate_boosts": 1,
-              "_field": 3, "_defined": 2, "_check_keys": 2, "_refuse_vectors": 1,
+              "_field": 3, "_defined": 2, "_check_keys": 2, "refuse_vectors": 1,
               "_embedder": 2, "_resolve_query_texts": 3}
 
 
@@ -962,8 +962,8 @@ class TestJsonFrontEndRefusesInventedVectors:
         spec = {"start": {"near": {"field": "summary", "text": "a"}, "keep": 2,
                           "boost": {"property": "rank", "weight": 0.5}}}
         spec_to_traversal(spec)                        # parses
-        from hopai.json_api import _refuse_vectors
-        _refuse_vectors(spec, "traverse_json()")       # and is not refused
+        from hopai.json_api import refuse_vectors
+        refuse_vectors(spec, "traverse_json()")       # and is not refused
 
     def test_application_code_opts_in(self, fresh_graph):
         """A caller holding a REAL embedding says so, and it runs."""

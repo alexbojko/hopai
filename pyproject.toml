@@ -34,6 +34,12 @@ dependencies = [
     "psycopg2-binary>=2.9",
 ]
 
+[project.scripts]
+# Installed always, but it imports hopai/mcp.py, which asks for the SDK
+# by name (`pip install 'hopai[mcp]'`) when the extra is missing -- a
+# command that explains itself beats one that is not there.
+hopai-mcp = "hopai.mcp:main"
+
 [project.urls]
 Homepage = "https://github.com/alexbojko/hopai"
 Documentation = "https://hopai.readthedocs.io/"
@@ -43,10 +49,25 @@ Changelog = "https://github.com/alexbojko/hopai/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 networkx = ["networkx>=3.0"]
+# The MCP server (hopai/mcp.py). Opt-in, like every other extra: the
+# SDK brings a web stack (starlette, uvicorn, httpx) that a library
+# doing multi-hop SQL has no business installing for everyone.
+#
+# The floor is 1.10, the first release whose high-level server accepts
+# pre-built tools on the constructor -- which is how hopai advertises
+# its OWN hand-written JSON Schemas instead of ones derived from Python
+# signatures. Both eras are supported and exercised: 2.0 renamed FastMCP
+# to MCPServer, and hopai/mcp.py's _sdk() is the entire difference.
+mcp = ["mcp>=1.10"]
 # schema_pydantic generates v2 models; this extra pins the MAJOR version
 # so v1, tolerated by some resolutions, is never silently what lands.
 pydantic = ["pydantic>=2.0"]
-dev = ["pytest>=8.0", "pytest-cov>=5.0", "networkx>=3.0", "pydantic>=2.0", "ruff>=0.6"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "networkx>=3.0", "pydantic>=2.0", "ruff>=0.6",
+       # In `dev` so CI actually registers the tools against a real SDK.
+       # tests/test_mcp.py skips the SDK-backed classes without it, and
+       # a suite that silently stops testing the server is how the
+       # schema-override in _register() would rot unnoticed.
+       "mcp>=1.10"]
 # Only for executing notebooks/ -- see scripts/run_notebooks.py. Deliberately
 # NOT part of `dev`: the notebooks are documentation, and running the test
 # suite should not require a Jupyter stack. jupyterlab is left out too; nbclient

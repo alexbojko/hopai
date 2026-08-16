@@ -95,14 +95,20 @@ read.** When a design question comes up, these decide it, in order:
   bloat the GIN index and every result. Similarity is exact (unnest+sum cosine, float8
   accumulation); a traversal without `near=` must emit byte-identical SQL to the
   pre-vector engine. (`test_defining_vectors_changes_no_near_less_query`)
-- **A model may send `"text"`; a `"vector"` never reaches a tool schema.** Text is
-  embedded by the field itself, with the application's own client, so the query
-  embedding comes from the model that wrote the stored ones — advertise it. Floats
-  asked of a model are invented, and an invented embedding finds confidently wrong
-  neighbors, so `"vector"` is the single key parsed and never advertised, refused
-  without `allow_vectors=True`. Widening the refusal back over `text`/`keep`/`boost`
-  puts semantic search out of a tool call's reach entirely, which is what it was.
-  (`TestToolSchemasStayVectorFree` pins both halves)
+- **A model may send `"text"`; a `"vector"` never reaches a tool schema.** Floats asked
+  of a model are invented, and an invented embedding finds confidently wrong neighbors,
+  so `"vector"` is the single key parsed and never advertised, refused without
+  `allow_vectors=True` — nowhere does a schema offer a place to put floats.
+  (`TestToolSchemasStayVectorFree`, `test_no_tool_advertises_a_vector_parameter`)
+  Text is the model's way IN and is meant to be advertised: the field embeds it with
+  the application's own client, so the query embedding comes from the model that wrote
+  the stored ones. Widening the refusal back over `text`/`keep`/`boost` puts semantic
+  search out of a tool call's reach entirely, which is what it was. **There are two
+  sanctioned embedders and they are not interchangeable**: the field's own `embed=`
+  (`Vector(..., embed=client)`, per field, matches the stored vectors' model) and the
+  MCP server's operator-supplied `serve(graph, embed=…)` (one callable for the whole
+  server, used for `start.search`). A field-level embedder is the better answer where
+  both apply, since a server-wide one cannot know which model wrote which field.
 - **Embedding happens outside the transaction, batched per field.** `set_vectors()`
   resolves every string before it takes a connection: an HTTP call inside an open
   transaction holds row locks for a network round trip, and a provider dying halfway
@@ -127,10 +133,15 @@ read.** When a design question comes up, these decide it, in order:
   **equivalent** (record the one-line proof; "probably fine" is not a proof), or
   **out of scope** (say so explicitly). A run reporting `0 checked`, or all `segfault`,
   is a broken harness, not a clean sweep.
-- `json_api.py`, `mutate.py`'s spec parser and `cypher.py` are front ends that emit
-  `(Start, [Hop])`, an aggregation triple, or ingestion/mutation operations, and hold no
-  query logic. Widening a subset means adding a translation, never loosening a refusal
-  into a near-enough mapping. The tool schemas (`TRAVERSE_TOOL_SCHEMA` /
+- `json_api.py`, `mutate.py`'s spec parser, `cypher.py` and `mcp.py` are front ends that
+  emit `(Start, [Hop])`, an aggregation triple, or ingestion/mutation operations, and hold
+  no query logic. Widening a subset means adding a translation, never loosening a refusal
+  into a near-enough mapping. `mcp.py` goes one step further out — every tool it registers
+  is a call into the others — and it must keep advertising hopai's hand-written schemas
+  rather than the ones the MCP SDK derives from Python signatures, which say
+  `{"type": "object"}` and leave a model guessing. A tool that offers a parameter no
+  handler accepts, or a permission enforced inside a handler instead of by not registering
+  the tool, is the defect. The tool schemas (`TRAVERSE_TOOL_SCHEMA` /
   `AGGREGATE_TOOL_SCHEMA` / `INGEST_TOOL_SCHEMA` / `MUTATE_TOOL_SCHEMA` /
   `VECTOR_SEARCH_TOOL_SCHEMA`) must stay in step with what the parsers accept — with
   exactly two pinned exceptions, and no third without a reason of the same kind. A near
@@ -141,6 +152,9 @@ read.** When a design question comes up, these decide it, in order:
   `_HOP_KEYS`/`_START_KEYS`, so a widened parser and a widened schema fail apart.
   `cypher.py` has no vector spelling and is not expected to grow one — Cypher has no
   portable similarity syntax to translate, so there is nothing to refuse by name.
+  `mcp.py` calls `json_api.refuse_vectors()` on what the model sent *before* injecting
+  the embedding of its text; that function is the single enforcement site and must not
+  be copied into a front end.
 - `notebooks/` is documentation that **runs**, executed by CI on every PR
   (`python scripts/run_notebooks.py`). A change to a public API means re-running
   them with `--save` and reading the output diff — a stale notebook is a broken
@@ -174,6 +188,10 @@ pytest tests/ -v
 ruff check .
 
 pip install -e ".[docs]" && mkdocs serve    # the documentation site on :8000
+
+# The MCP server. `dev` already brings the SDK, so tests/test_mcp.py runs;
+# the tool surface itself is testable with no SDK and no database.
+hopai-mcp --dsn postgresql+psycopg2://postgres:testpass@localhost:5432/hopai --read-only
 ```
 
 Query building never connects, so the emitted SQL can be inspected with no database —

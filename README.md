@@ -31,6 +31,9 @@ use it without being taught anything new.
 - 🤖 **Three front ends, one engine** — Python, JSON (with a ready-made
   LLM tool schema), and a Cypher subset all compile through the same
   query builder.
+- 🔌 **An MCP server in one command** — `hopai-mcp` exposes reading,
+  writing, schema and similarity tools over stdio or HTTP, with
+  permissions that decide which tools exist at all.
 - 🔐 **Constraints Neo4j puts behind an enterprise licence** — unique,
   composite, partial, existence, type and CHECK constraints on JSONB
   properties.
@@ -1043,6 +1046,43 @@ translating into something that answers a different question:
   `*` (pass `max_var_length=N` to cap it), undirected `-[]-`,
   comma-separated patterns, `WITH` (except the `WITH DISTINCT` unit
   above) / `ORDER BY` / `LIMIT`, and `OPTIONAL MATCH` anywhere but last.
+
+## 🔌 MCP server
+
+The same graph as an [MCP](https://modelcontextprotocol.io/) server, so
+Claude Desktop, Claude Code, an IDE or an agent framework can use it with
+nothing to write:
+
+```bash
+pip install "hopai[mcp]"
+hopai-mcp --dsn postgresql+psycopg2://user:pass@localhost/db --read-only
+```
+
+```jsonc
+// claude_desktop_config.json — or any other MCP client's config
+{
+  "mcpServers": {
+    "hopai": {
+      "command": "hopai-mcp",
+      "args": ["--dsn", "postgresql+psycopg2://user:pass@localhost/db", "--read-only"]
+    }
+  }
+}
+```
+
+Eleven tools — traverse, aggregate, Cypher, ingest, update/delete, schema
+inference and declaration, and similarity search — each one a call this
+README already documents. **Permissions decide which tools exist**:
+`--read-only` registers the reading tools only, the default adds writing,
+`--allow-mutations` adds deleting, `--allow-ddl` adds `enforce_schema`. A
+tool a model cannot see is one it cannot be talked into calling.
+
+Every graph in the database is served unless `--graph` narrows it, and
+**search by meaning takes text, never vectors** — you supply the embedding
+function, so no tool has anywhere for a model to put invented floats.
+
+📖 **[Full guide](https://hopai.readthedocs.io/en/latest/mcp/)** — client
+setup, every tool, every flag, and troubleshooting.
 
 ## 🚧 What this doesn't do (yet)
 

@@ -2164,6 +2164,39 @@ def _refuse_mixed(clauses: list) -> None:
 # Public API
 # ---------------------------------------------------------------------
 
+def classify_cypher(query: str) -> str:
+    """Which of the four things a query is -- `"mutate"`, `"write"`,
+    `"aggregate"` or `"read"` -- decided by parsing it, exactly as
+    `Graph.cypher()` decides which call to make.
+
+    Here rather than inlined in `Graph.cypher()` because a front end
+    that has to know BEFORE running is a real caller: hopai/mcp.py
+    refuses a write on a read-only server, and a plan-then-confirm UI
+    asks the same question. Two implementations of "is this a write"
+    is how one of them ends up letting a DELETE through.
+
+    `"mutate"` and `"write"` are reported apart because they are not
+    the same permission: creating rows and deleting them are different
+    things to be allowed, and a caller that treats them as one can only
+    grant both.
+
+    Raises CypherError for a query that does not parse -- the same
+    error running it would raise, at the same point."""
+    clauses = _Parser(_tokenize(query)).parse()
+    # Order matters and matches Graph.cypher(): a query carrying both a
+    # MATCH ... DELETE and a CREATE is a mutation, and the mutation is
+    # the half a permission check has to see.
+    if any(isinstance(c, _MutateClause) for c in clauses):
+        return "mutate"
+    if any(isinstance(c, _WriteClause) for c in clauses):
+        return "write"
+    # A non-aggregating RETURN never becomes a _ReturnClause (it is
+    # parsed and ignored), so this really is "returns numbers".
+    if any(isinstance(c, _ReturnClause) for c in clauses):
+        return "aggregate"
+    return "read"
+
+
 def cypher_to_traversal(
     query: str,
     *,

@@ -2,8 +2,9 @@
 hopai.json_api
 
 A JSON-in / JSON-out interface, for callers that can't or shouldn't write
-Python: an LLM tool call, a future HTTP endpoint or MCP server, a config
-file. Everything here is a thin translation layer over Graph.traverse()
+Python: an LLM tool call, an HTTP endpoint, a config file. It is what
+hopai/mcp.py serves over MCP, and what an agent framework wires up
+directly. Everything here is a thin translation layer over Graph.traverse()
 and hopai.filters.parse_filter() -- there is no separate logic to
 trust here, just a different way to describe the same traversal.
 
@@ -142,7 +143,7 @@ def spec_to_traversal(spec: dict) -> tuple:
     return start, hops
 
 
-def _refuse_vectors(spec: dict, caller: str) -> None:
+def refuse_vectors(spec: dict, caller: str) -> None:
     """The one place the "a VECTOR never travels through the LLM"
     invariant is ENFORCED rather than advertised.
 
@@ -156,7 +157,17 @@ def _refuse_vectors(spec: dict, caller: str) -> None:
     Omitting the key from the tool schemas is not a defence on its own:
     the schemas carry no additionalProperties:false, the JSON grammar
     documents `vector` for callers that hold real floats, and this
-    function is what an agent integration actually calls."""
+    function is what an agent integration actually calls.
+
+    Public, and named without the underscore, because it is not only
+    this module's business: hopai/mcp.py embeds the model's TEXT into
+    a real vector itself and then passes allow_vectors=True, so it has
+    to make this exact refusal first -- against the same keys, with the
+    same message. A second copy of the rule is a second place for it to
+    rot.
+
+    `spec` itself is the third scope, not just start/hops: a
+    vector_search_json() spec carries its near at the top level."""
     for scope in (spec.get("start") or {}, *(spec.get("hops") or []), spec):
         if not isinstance(scope, dict):
             continue
@@ -194,7 +205,7 @@ def traverse_json(graph: Graph, spec: dict, allow_vectors: bool = False) -> dict
     Application code holding real vectors opts in explicitly.
     """
     if not allow_vectors:
-        _refuse_vectors(spec, "traverse_json()")
+        refuse_vectors(spec, "traverse_json()")
     start, hops = spec_to_traversal(spec)
     subgraph: Subgraph = graph.traverse(start, *hops)
     return subgraph.to_dict()
@@ -232,7 +243,7 @@ def aggregate_json(graph: Graph, spec: dict, allow_vectors: bool = False) -> dic
     traverse_json() gives.
     """
     if not allow_vectors:
-        _refuse_vectors(spec, "aggregate_json()")
+        refuse_vectors(spec, "aggregate_json()")
     start, hops, aggregates = spec_to_aggregation(spec)
     return graph.aggregate(start, *hops, aggregates=aggregates)
 
@@ -256,7 +267,7 @@ def vector_search_json(graph: Graph, spec: dict, allow_vectors: bool = False) ->
     """
     _check_keys(spec, _SEARCH_KEYS, "vector search spec")
     if not allow_vectors:
-        _refuse_vectors(spec, "vector_search_json()")
+        refuse_vectors(spec, "vector_search_json()")
     if "near" not in spec:
         raise ValueError('spec must have a "near" key, e.g. '
                          '{"near": {"field": "summary", "text": "..."}}')
