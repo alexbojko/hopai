@@ -58,6 +58,33 @@ accumulation) were measured within ±15 % of each other — the cost is
 the executor's per-tuple work, not the arithmetic — which is why the
 SQL keeps the formulation whose float8 accumulation is correct.
 
+### Boost normalization (`scale="normalized"`, the default)
+
+`Boost`'s default min-max window-function rescaling adds a per-query cost
+on top of the search above, measured the same way — 20k rows, 384 dims,
+`where=`-filtered to ~25% of rows (~5000 candidates), 5 repeats, warm:
+
+| | ms |
+| --- | ---: |
+| no boost | 13.5 |
+| `scale="raw"` | 13.2 |
+| `scale="normalized"` (default) | 13.2 |
+
+Indistinguishable from noise at this scale — the two window functions
+(`min`/`max`) are cheap next to the LATERAL similarity scan they ride
+alongside. One caveat worth recording rather than glossing over: the
+normalized form's SQL evaluates `min(coalesced) OVER ()` **twice**
+(once directly, once again inside `max - min`) where two distinct
+window functions would suffice — at a much larger candidate count
+(~200k, well past where a single traversal is comfortable regardless)
+that redundant third pass measured roughly 8% slower than a form that
+computes `lo`/`hi` once and reuses them. Left as the simpler
+implementation rather than restructured, since the win is invisible at
+the candidate-set sizes this library targets (see "What this costs" in
+the main README) and the restructuring itself would touch every boost
+call site — a real optimization if `Boost` is ever profiled at that
+scale, not a correctness concern either way.
+
 ## Comparing against Neo4j and Apache AGE
 
 These require separate running instances this repo doesn't set up for
