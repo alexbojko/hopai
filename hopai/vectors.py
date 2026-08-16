@@ -637,7 +637,8 @@ def _defined(graph, target: str, caller: str) -> dict:
         raise ValueError(
             f"{caller} needs vector fields and none are defined for {target} on this Graph -- "
             f"call define_vectors({target}=[Vector('name', dimensions)]) first (a handle from "
-            f"in_graph() starts without them, like a schema)"
+            f"in_graph() starts lazy -- a search or load_vectors() recovers it from the "
+            f"database, but this call didn't go through either)"
         )
     return registry[target]
 
@@ -1114,8 +1115,10 @@ def _raise_if_unmigrated(graph, target: str, field_names: list, conn,
         return
     raise ValueError(
         f"{caller}: vector field(s) {missing} are declared for {target} in this graph but "
-        f"never migrated -- call migrate_vectors() to add the column(s), or load_vectors() "
-        f"if another handle already migrated them and this one just needs to catch up"
+        f"never migrated -- call migrate_vectors() to add the column(s). load_vectors() "
+        f"reads the same catalog this check just did and would find nothing either, since "
+        f"the column genuinely does not exist yet for ANY graph -- it only helps once "
+        f"migrate_vectors() has actually run, on some other handle this one forgot to match"
     ) from exc
 
 

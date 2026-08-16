@@ -1321,8 +1321,13 @@ class TestInGraphLazyVectorsLive:
     """in_graph() no longer starts PERMANENTLY blank on vectors -- see
     its docstring. Offline behavior (test_in_graph_starts_without_vectors
     in TestVectorDeclaration) is unchanged: `.vectors` itself never
-    touches the database, only vector_search()/vector_search_many()
-    do, the first time they actually need a connection."""
+    touches the database, on ANY handle including one from in_graph(),
+    so reading it before ever connecting still answers None for a lazy
+    handle even when the database could prove otherwise -- only
+    vector_search()/vector_search_many()/load_vectors() actually
+    connect and trigger the recovery. .vectors's own docstring says so
+    explicitly (issue #53's review flagged the silent-until-asked gap;
+    the fix is stating it, not making a property connect)."""
 
     def test_in_graph_handle_searches_a_field_migrated_by_the_originating_handle(
             self, fresh_graph):

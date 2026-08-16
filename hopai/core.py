@@ -1063,6 +1063,17 @@ class Graph:
         "edges": {...}}, or None when define_vectors() has not been
         called on this handle -- that is the existence check.
 
+        NEVER CONNECTS, on any handle, including one from in_graph():
+        that guarantee -- a Graph you only build queries with never
+        touches the network -- outranks this property being perfectly
+        live. A handle from in_graph() is marked to recover its vectors
+        lazily from the database (see in_graph()'s docstring), but that
+        recovery happens on first CONNECTION -- a search, or an
+        explicit load_vectors() call -- never on reading this property.
+        Until then, this answers None for such a handle even when the
+        database can prove the graph has fields; call load_vectors()
+        yourself first if you need the true answer without searching.
+
         A copy: handing out the live registry made editing the
         returned dict silently redeclare the graph."""
         if self._vectors is None:
