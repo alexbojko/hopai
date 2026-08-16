@@ -3117,3 +3117,69 @@ class TestNearText:
             literal_binds=True)
         # ord('a')=97 for query 0, ord('b')=98 for query 1.
         assert re.search(r"'0'.*?97.*?'1'.*?98", sql, re.S)
+
+
+class TestGraphVectorWrappersForwardEveryArgument:
+    """Graph's vector methods are one-line delegations into vectors.py,
+    and the mutation runs kept picking a different one apiece: `boost`
+    dropped from vector_search_many (twice -- once on Graph, once on
+    AsyncGraph), `edge_fields` dropped from drop_vectors. Same defect,
+    different member each round, because every prior test called each
+    wrapper with the defaults for everything it was not itself about.
+
+    So this closes the FAMILY rather than its members: each wrapper is
+    called with a non-default, individually recognizable value for every
+    argument it accepts, and every one of those has to arrive at the
+    function underneath. Nothing connects -- the delegate is recorded
+    and replaced, which is also why a new wrapper joining this table
+    costs one line."""
+
+    #: {Graph method: the arguments to pass}. Every VALUE here has to
+    #: arrive at the delegate; which of them travel positionally and
+    #: which by keyword is the wrapper's business, not this test's.
+    CALLS = {
+        "drop_vectors": {"node_fields": ["nf"], "edge_fields": ["ef"]},
+        "get_vectors": {"node_ids": ["ni"], "edge_ids": ["ei"],
+                        "node_fields": ["nf"], "edge_fields": ["ef"]},
+        "stale_vectors": {"node_fields": ["nf"], "edge_fields": ["ef"],
+                          "limit": 7, "after": "cur"},
+        "embed_stale": {"node_fields": ["nf"], "edge_fields": ["ef"],
+                        "limit": 7, "batch": 3},
+        "set_vectors": {"nodes": ["N"], "edges": ["E"]},
+        "vector_search_many": {"queries": ["Q"], "target": "edges", "k": 3,
+                               "where": {"w": 1}, "boost": "B"},
+    }
+
+    #: The two names that differ: Graph says vector_*, vectors.py does
+    #: not repeat the word it is already a module about.
+    DELEGATE = {"vector_search_many": "search_many", "vector_search": "search"}
+
+    @staticmethod
+    def _record(monkeypatch, name: str) -> dict:
+        seen: dict = {}
+
+        def recorder(*args, **kwargs):
+            seen["passed"] = [*args, *kwargs.values()]
+            return "recorded"
+
+        monkeypatch.setattr(f"hopai.vectors.{name}", recorder)
+        return seen
+
+    @pytest.mark.parametrize("name", sorted(CALLS))
+    def test_every_argument_reaches_vectors_py(self, offline_graph, monkeypatch, name):
+        arguments = self.CALLS[name]
+        seen = self._record(monkeypatch, self.DELEGATE.get(name, name))
+        getattr(offline_graph, name)(**arguments)
+        for keyword, value in arguments.items():
+            assert value in seen["passed"], f"{name}() dropped {keyword}={value!r}"
+
+    def test_vector_search_forwards_its_varargs_and_options(self, offline_graph, monkeypatch):
+        """Separate because `near` is *args here and a list one layer
+        down -- the wrapper's one piece of real work, and the shape a
+        table cannot express."""
+        seen = self._record(monkeypatch, "search")
+        near = Near("summary", [1.0, 0.0, 0.0])
+        offline_graph.vector_search(near, target="edges", k=3, where={"w": 1}, boost="B")
+        assert [near] in seen["passed"]
+        for value in ("edges", 3, {"w": 1}, "B"):
+            assert value in seen["passed"]
