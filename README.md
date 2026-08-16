@@ -704,9 +704,9 @@ nothing extra:
 from hopai import Vector, Near
 
 graph.define_vectors(nodes=[Vector("summary", 1536), Vector("title", 384)],
-                     edges=[Vector("relation", 384)])
-graph.migrate_vectors()      # ALTER TABLE, idempotent; vector_ddl() previews it
-                              # (the dimension CHECK it adds is real SA metadata too)
+                     edges=[Vector("relation", 384)],
+                     migrate=True)   # ALTER TABLE, idempotent; vector_ddl() previews it
+                                     # (the dimension CHECK it adds is real SA metadata too)
 
 graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
 
@@ -714,6 +714,13 @@ graph.vector_search(Near("summary", query_embedding), k=10,
                     where={"type": "person"})
 # [{"id": "1", "similarity": 0.93, "properties": {...}}, ...]
 ```
+
+`migrate=True` runs `migrate_vectors()` for you and hands back what it
+returned, so the DDL stays visible instead of happening invisibly. Skip it
+(`migrate=False`, the default) and call `migrate_vectors()` yourself when
+migrations run separately from application code — a deploy step with
+schema-changing credentials, kept apart from the read-only process that
+declares fields and calls `vector_search()`.
 
 Declare as many fields as you need — each is one migration-managed
 column, dimension-checked by the server **per graph**, so two graphs
@@ -834,8 +841,7 @@ from hopai import Vector, Near
 graph.define_vectors(nodes=[
     Vector("summary", 1536, source="abstract",
            embed=openai.OpenAI()),          # or cohere, voyage, google...
-])
-graph.migrate_vectors()
+], migrate=True)
 
 graph.set_vectors(nodes=[{"id": 1, "summary": "a paper about Raft"}])
 graph.vector_search(Near("summary", "how do nodes agree?"), k=10)

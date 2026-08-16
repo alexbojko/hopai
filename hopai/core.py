@@ -36,7 +36,7 @@ import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from typing import Optional
+from typing import Optional, Union
 
 from sqlalchemy import String, and_, cast, create_engine, distinct, func, literal, select, text
 from sqlalchemy import union as sa_union
@@ -1063,7 +1063,8 @@ class Graph:
 
     # -- vectors --------------------------------------------------------
 
-    def define_vectors(self, nodes: Optional[list] = None, edges: Optional[list] = None) -> dict:
+    def define_vectors(self, nodes: Optional[list] = None, edges: Optional[list] = None,
+                       migrate: bool = False) -> Union[dict, list]:
         """Declare named vector fields: Vector(name, dimensions)
         entries per target. The migration they imply is a separate,
         explicit migrate_vectors(), because ALTER TABLE should be a
@@ -1073,16 +1074,32 @@ class Graph:
         columns are attached to the SHARED SQLAlchemy Table metadata,
         so create_schema() on any handle for these tables emits them
         from now on. Nothing else touches the database until
-        migrate_vectors().
+        migrate_vectors() runs -- which `migrate=True` does for you:
+
+            graph.define_vectors(nodes=[Vector("summary", 1536)], migrate=True)
+
+        is exactly
 
             graph.define_vectors(nodes=[Vector("summary", 1536)])
             graph.migrate_vectors()
 
-        Returns the normalized registry; hopai/vectors.py explains the
-        storage model and every refusal."""
+        with `migrate_vectors()`'s own return value passed back, so the
+        DDL it ran stays visible rather than happening invisibly. Reach
+        for `migrate=True` in a start-up path that already carries
+        schema-changing credentials, the same as create_schema().
+
+        `migrate=False` (the default, unchanged) declares only and
+        returns the normalized registry; hopai/vectors.py explains the
+        storage model and every refusal. This is the shape to keep when
+        migrations run separately from application code -- e.g. a
+        process with read-only credentials that must not risk issuing
+        DDL -- pairing this call with an explicit migrate_vectors()
+        elsewhere."""
         from .vectors import attach_columns, build_registry
         self._vectors = build_registry(nodes, edges)
         attach_columns(self)
+        if migrate:
+            return self.migrate_vectors()
         return self._vectors
 
     @property
