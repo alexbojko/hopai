@@ -411,7 +411,16 @@ class GraphSchema:
 
         Always GENERATED from the canonical form, never the class the
         caller passed in -- the representation must not depend on which
-        notation defined the schema."""
+        notation defined the schema.
+
+        A model whose type declares a vector field carries that
+        field's {dimensions, source, embedder} as a plain class
+        attribute, `hopai_vectors` -- never a pydantic FIELD, since a
+        vector belongs to the whole target (every node of that type
+        shares the same vec_* column), not to one type's instances the
+        way `email` or `age` do, and it is never stored in the JSONB
+        `properties` bag Person(...)'s other fields validate. Read it
+        off the model class itself: `Person.hopai_vectors`."""
         try:
             import pydantic
         except ImportError as exc:
@@ -784,6 +793,18 @@ def _vector_field_json(v: VectorFieldSchema) -> dict:
     if v.populated is not None:
         spec["populated"] = v.populated
     return spec
+
+
+def vector_field_json(name: str, entry) -> dict:
+    """One declared vector field -> the same {dimensions, source,
+    embedder[, populated]} shape to_json()'s "vectors" section uses --
+    the single place that answers "what does this field look like from
+    the outside," for GraphSchema and mcp.py's describe_graph alike
+    (issue #51's review: describe_graph had grown its own, thinner
+    {name: dimensions} shape for the identical concept). Accepts a live
+    Vector or an already-normalized VectorFieldSchema, same as
+    GraphSchema(vectors=...) does."""
+    return _vector_field_json(_as_vector_field_schema(name, entry))
 
 
 def _vectors_json(vectors: dict) -> dict:

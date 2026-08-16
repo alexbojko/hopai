@@ -641,7 +641,8 @@ def _describe_tool(served: Served, read_only: bool, allow_ddl: bool, allow_mutat
     def describe_graph(graph: Optional[str] = None, counts: bool = False) -> dict:
         graph = served.pick(graph, "describe_graph")
         schema = graph.schema
-        vectors = {target: {name: field.dimensions
+        from .schema import vector_field_json
+        vectors = {target: {name: vector_field_json(name, field)
                             for name, field in _vector_fields(graph, target).items()}
                    for target in ("nodes", "edges")}
         result = {

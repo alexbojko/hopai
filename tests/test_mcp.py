@@ -1089,7 +1089,14 @@ class TestDescribeGraph:
         assert described["ddl_allowed"] is False
         assert described["search_by_meaning"] is True
         assert described["seed_traversal_by_meaning"] is True
-        assert described["vector_fields"] == {"nodes": {"summary": 3}, "edges": {"rel": 3}}
+        # Same {dimensions, source, embedder[, populated]} shape
+        # GraphSchema.to_json()'s "vectors" section uses -- issue #51's
+        # review unified describe_graph onto it instead of a second,
+        # thinner {name: dimensions} shape for the same concept.
+        assert described["vector_fields"] == {
+            "nodes": {"summary": {"dimensions": 3, "source": "summary", "embedder": False}},
+            "edges": {"rel": {"dimensions": 3, "source": "rel", "embedder": False}},
+        }
 
     def test_searching_and_seeding_are_reported_as_the_two_things_they_are(self):
         """Edge-only vectors can be SEARCHED but cannot SEED a
