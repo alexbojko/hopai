@@ -1384,6 +1384,60 @@ class TestServeArguments:
         with pytest.raises(ValueError, match="'stdio' or 'http'"):
             serve(offline(), transport="grpc")
 
+    @staticmethod
+    def _stub(monkeypatch) -> dict:
+        """serve() without an SDK or a socket: record what it would have
+        built and run, and return instead of blocking on a transport."""
+        seen = {}
+
+        class FakeServer:
+            def run(self, transport, **kwargs):
+                seen["ran"] = (transport, kwargs)
+
+        def build(graph, **options):
+            seen["options"] = options
+            return FakeServer()
+
+        monkeypatch.setattr("hopai.mcp._sdk", lambda: (None, None, 2))
+        monkeypatch.setattr("hopai.mcp.build_server", build)
+        return seen
+
+    def test_the_bind_defaults_reach_the_server_that_is_built(self, monkeypatch):
+        """The defaults are asserted through the CALL, not through
+        inspect.signature(serve): mutmut wraps every function in a
+        `trampoline(*args, **kwargs)`, so a signature assertion reads the
+        wrapper and is blind to a mutated default by construction. Six
+        mutants moving the port off 8000, the path off /mcp and the host
+        off 127.0.0.1 all survived a test that checked the signature.
+
+        The host one is the reason this matters rather than being
+        tidiness: serve()'s own docstring says a graph an agent may
+        write to is not a thing to put on 0.0.0.0 by accident, and
+        nothing was checking that it did not."""
+        from hopai.mcp import serve
+
+        seen = self._stub(monkeypatch)
+        serve(offline())
+        assert seen["options"]["http"] == {"host": "127.0.0.1", "port": 8000,
+                                           "streamable_http_path": "/mcp"}
+        assert seen["ran"] == ("stdio", {})
+
+    @pytest.mark.parametrize("transport, expected", [("stdio", "stdio"),
+                                                     ("http", "streamable-http")])
+    def test_both_transports_pass_the_gate_and_reach_their_own_runner(
+            self, monkeypatch, transport, expected):
+        """The half the refusal test cannot see. `transport not in
+        ("stdio", "http")` still rejects "grpc" when either literal is
+        misspelled, so four mutants broke a working transport while the
+        refusal went on passing -- the same shape as the CLI `choices`
+        pair one class up."""
+        from hopai.mcp import serve
+
+        seen = self._stub(monkeypatch)
+        serve(offline(), transport=transport, host="0.0.0.0", port=9001, path="/x")
+        assert seen["ran"][0] == expected
+        assert seen["options"]["http"]["port"] == 9001
+
 
 # ---------------------------------------------------------------------
 # Registration against the real SDK
