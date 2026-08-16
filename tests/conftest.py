@@ -26,6 +26,12 @@ DSN = os.environ.get(
 )
 SCHEMA = "hopai_test"
 
+# AsyncGraph (hopai/asyncio.py) needs an async DBAPI -- psycopg2 has none.
+# Same server, same credentials, just the driver swapped: psycopg3 (the
+# `asyncio` extra) speaks both sync and async, so one DSN's worth of
+# connection info serves both engines.
+ASYNC_DSN = DSN.replace("+psycopg2", "+psycopg")
+
 SETUP_SQL = f"""
 DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;
 CREATE SCHEMA {SCHEMA};
@@ -98,6 +104,15 @@ def _engine(schema: str):
                                        "gssencmode": "disable"})
 
 
+def _async_engine(schema: str):
+    """The async counterpart of _engine() -- same NullPool/gssencmode
+    reasoning, psycopg3 instead of psycopg2."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+    return create_async_engine(ASYNC_DSN, poolclass=NullPool,
+                               connect_args={"options": f"-c search_path={schema}",
+                                             "gssencmode": "disable"})
+
+
 @pytest.fixture(scope="session")
 def engine():
     eng = _engine(SCHEMA)
@@ -137,7 +152,34 @@ def graph(engine):
     return Graph(engine)
 
 
+def _require_async_driver():
+    """AsyncGraph needs psycopg3 (the `asyncio` extra); a contributor
+    running the plain `dev` extra install from before it was added
+    should get a skip naming the fix, not an ImportError with no
+    context -- same courtesy the `engine` fixture extends for a missing
+    database, and same HOPAI_REQUIRE_DB escape hatch so CI still fails
+    loudly if the driver is ever missing there."""
+    try:
+        import psycopg  # noqa: F401
+    except ImportError:
+        if os.environ.get("HOPAI_REQUIRE_DB"):
+            raise
+        pytest.skip("no psycopg3 driver installed -- pip install hopai[asyncio] "
+                    "(or HOPAI_REQUIRE_DB=1 to make this an error)")
+
+
+@pytest.fixture()
+def async_graph(engine):
+    """An AsyncGraph over the SAME seeded, read-only schema `graph`
+    reads -- for traverse/aggregate/vector_search tests that need no
+    write isolation of their own."""
+    _require_async_driver()
+    from hopai.asyncio import AsyncGraph
+    return AsyncGraph(_async_engine(SCHEMA))
+
+
 WRITE_SCHEMA = "hopai_write"
+ASYNC_WRITE_SCHEMA = "hopai_async_write"
 
 
 @pytest.fixture(scope="session")
@@ -163,6 +205,87 @@ def fresh_graph(write_engine):
     graph = Graph(write_engine)
     graph.create_schema()
     return graph
+
+
+@pytest.fixture()
+def async_fresh_graph():
+    """An empty AsyncGraph, schema owned outright, rebuilt for every
+    test -- the async counterpart of fresh_graph().
+
+    Schema setup stays on a plain sync Graph even here: AsyncGraph
+    deliberately does not implement create_schema() (see the "WHAT THIS
+    DOES NOT COVER" section of hopai/asyncio.py's module docstring) --
+    it is a one-time admin call, not a traversal/mutation the design is
+    for. The returned handle is what the test actually exercises."""
+    _require_async_driver()
+    from hopai import Graph
+    from hopai.asyncio import AsyncGraph
+
+    setup_engine = _engine(ASYNC_WRITE_SCHEMA)
+    with setup_engine.begin() as conn:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {ASYNC_WRITE_SCHEMA} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {ASYNC_WRITE_SCHEMA}"))
+    Graph(setup_engine).create_schema()
+    setup_engine.dispose()
+    return AsyncGraph(_async_engine(ASYNC_WRITE_SCHEMA))
+
+
+@pytest.fixture()
+def async_admin_graph(async_fresh_graph):
+    """A plain sync Graph on the SAME schema async_fresh_graph owns --
+    the documented escape hatch for the admin/schema-DDL calls
+    AsyncGraph deliberately does not implement (define_constraints(),
+    create_schema(), ...). Depends on async_fresh_graph purely for
+    ordering (so the schema already exists); it adds nothing schema-wise
+    of its own."""
+    from hopai import Graph
+    return Graph(_engine(ASYNC_WRITE_SCHEMA))
+
+
+POOL1_SCHEMA = "hopai_async_pool1"
+
+
+@pytest.fixture()
+def async_fresh_graph_pool1():
+    """Same shape as async_fresh_graph, but the async engine's pool is
+    capped at exactly ONE connection (pool_size=1, max_overflow=0, a
+    short pool_timeout) -- NullPool, which every other async fixture
+    uses, has no capacity limit at all and cannot tell "opened a second
+    connection" from "reused the first".
+
+    This is the general test for "does an AsyncGraph write method
+    actually pass connection=c through to the sync Mutator/Ingestor/
+    vectors function it wraps". Wired correctly, a call only ever needs
+    the ONE connection AsyncGraph already checked out via
+    engine.begin()/.connect(). If connection= is silently dropped (as
+    several mutation-testing survivors on hopai/asyncio.py turned out
+    to be), the sync function opens its own transaction, which means
+    checking out a SECOND connection while the first is still held --
+    on a one-slot pool, that blocks until pool_timeout and raises,
+    rather than quietly costing an extra round trip the way it would on
+    an unbounded pool.
+
+    Also declares Unique(email) on nodes and Unique(tag) on edges
+    up front, so tests that exercise merge_nodes()/merge_edges() need
+    no per-test admin ceremony of their own."""
+    _require_async_driver()
+    from hopai import Graph, Unique
+    from hopai.asyncio import AsyncGraph
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    setup_engine = _engine(POOL1_SCHEMA)
+    with setup_engine.begin() as conn:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {POOL1_SCHEMA} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {POOL1_SCHEMA}"))
+    admin = Graph(setup_engine)
+    admin.create_schema()
+    admin.define_constraints(nodes=[Unique("email")], edges=[Unique("tag")])
+    setup_engine.dispose()
+
+    async_engine = create_async_engine(
+        ASYNC_DSN, pool_size=1, max_overflow=0, pool_timeout=2,
+        connect_args={"options": f"-c search_path={POOL1_SCHEMA}", "gssencmode": "disable"})
+    return AsyncGraph(async_engine)
 
 
 @pytest.fixture(scope="session")

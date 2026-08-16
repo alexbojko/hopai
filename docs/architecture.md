@@ -144,6 +144,40 @@ asymmetry is Cypher's own — `MATCH (a:person) SET a.x = 1` updates every perso
 edge has to attach to exactly one row — and `_MutateTranslator`'s docstring is where it is
 written down.
 
+## Async
+
+`hopai/asyncio.py`'s `AsyncGraph` is not a second traversal/mutation/ingestion
+implementation — it is SQLAlchemy's own sync/async bridge, `AsyncSession`/
+`AsyncConnection.run_sync()`, aimed at the exact sync functions `Graph` already calls:
+`core.py`'s `_traverse_with_session()`/`_aggregate_with_session()`, `Mutator`'s and
+`Ingestor`'s methods (already `connection=`-taking, for `mutate()`/`ingest()`'s
+one-transaction-per-document guarantee — the same seam the greenlet bridge needs, so
+most of it existed before `AsyncGraph` did), and `vectors.py`'s functions (which picked
+up the same `connection=` parameter for this). `run_sync(fn)` hands `fn` a plain sync
+`Session`/`Connection`, bridged through a greenlet — the function bodies on the other
+side are unaware anything async is happening.
+
+Schema and constraint declaration — `create_schema()`, `enforce_schema()`,
+`define_constraints()`, `save_schema()`/`load_schema()`, `infer_schema()`,
+`schema_violations()`, `add_networkx()` — has no async override. These are one-time
+setup calls with no concurrency to gain, and `AsyncGraph`'s wrapped `Graph` runs on
+`AsyncEngine.sync_engine`, a facade only safe to execute against *inside* a greenlet
+`run_sync()` spawns. `AsyncGraph.__getattr__` refuses these by name, pointing at a plain
+`Graph` on the same database, rather than letting the facade fail with SQLAlchemy's own
+`MissingGreenlet` outside the context that explains it.
+
+A throwaway benchmark (not committed) compared this design against `asyncio.to_thread()`
+— the shape a naive async wrapper defaults to, and the same one `LangChain`'s `ainvoke`
+falls back to when a `Runnable` has no native async implementation. Both delivered real
+concurrency; the greenlet bridge did it on a **constant one OS thread** regardless of
+concurrency, while the thread-pool version held one thread per in-flight call, climbing
+with load. Wall-clock did **not** consistently favor the greenlet path — sometimes the
+thread pool was faster, and the gap widened at higher concurrency, most likely because
+each `AsyncSession.run_sync()` call's own setup (session open/close, greenlet spawn) is
+paid serially on the one event-loop thread. The case for this design is the resource
+ceiling a thread-pool wrapper eventually hits in a real server, not a guaranteed speed
+win — see `hopai/asyncio.py`'s module docstring for the numbers.
+
 ## Multi-graph
 
 One pair of tables holds every graph, discriminated by `graph_id`.
@@ -260,6 +294,7 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/vectors.py` | Why no pgvector, the storage and cost model, cosine-only, multivector semantics, and why vectors never pass through a tool schema |
 | `hopai/schema.py` | The graph-schema notations, the annotation mapping, what enforcement compiles to and the endpoint-type limit, and why inference is an observation rather than a `.schema` fallback |
 | `hopai/cypher.py` | The translatable subset — read, write and aggregate — and why each refusal is a refusal |
+| `hopai/asyncio.py` | Why `AsyncGraph` is a bridge, not a second implementation, what it deliberately does not cover, and the benchmark numbers behind the design |
 | `hopai/mcp.py` | The tool inventory, the four permission levels, why similarity takes text, and the 1.x/2.x SDK adapter |
 | `tests/conftest.py` | The fixture graph's shape |
 | `benchmarks/README.md` | Measured numbers, including where raw CTEs beat this library 2-5x |

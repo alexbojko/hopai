@@ -455,7 +455,7 @@ class Ingestor:
     # -- documents ------------------------------------------------------
 
     def ingest(self, document: dict, merge_nodes_on: Optional[list] = None,
-               merge_edges_on: Optional[list] = None) -> IngestResult:
+               merge_edges_on: Optional[list] = None, connection=None) -> IngestResult:
         if not isinstance(document, dict):
             raise TypeError(f"ingest() takes a dict with 'nodes' and/or 'edges', "
                             f"got {type(document).__name__}")
@@ -474,7 +474,7 @@ class Ingestor:
         # constraint, the nodes roll back with them. Committing half a
         # document would leave a retry hitting unique violations on rows
         # the caller was told had failed.
-        with self._transaction() as connection:
+        with self._transaction(connection) as connection:
             written_nodes = (self.merge_nodes(nodes, on=merge_nodes_on, connection=connection)
                              if merge_nodes_on
                              else self.add_nodes(nodes, connection=connection))

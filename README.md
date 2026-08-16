@@ -981,11 +981,37 @@ setup, every tool, every flag, and troubleshooting.
   spells out the cost model and why each refusal is a refusal. Cosine
   is the only metric — on the unit-normalized vectors every current
   embedding API ships, dot and euclidean rank identically anyway.
-- Synchronous only — every call blocks; no `AsyncSession` support yet.
 - A cycle-protection path array is carried on every recursive row. Cheap
   at moderate depth, measurably not-cheap on single-segment traversals
   past roughly 10 hops — see `benchmarks/` for the actual numbers rather
   than a guess.
+
+## ⏱️ Async
+
+`AsyncGraph` covers traversal, aggregation, ingestion, mutation and vector
+search/storage for an async app — not a second implementation, but the
+same query builders and execute-and-hydrate functions `Graph` already
+runs, reached through SQLAlchemy's own sync/async bridge:
+
+```python
+from hopai.asyncio import AsyncGraph
+
+graph = AsyncGraph("postgresql+psycopg://user:pass@host/db")   # pip install hopai[asyncio]
+result = await graph.traverse(
+    Start(where={"type": "person"}),
+    Hop(via={"kind": "friend"}, hops=(1, 4)),
+)
+await graph.mutate({"operations": [
+    {"op": "update_nodes", "where": {"type": "draft"}, "set": {"status": "archived"}},
+]})
+```
+
+Schema and constraint declaration (`create_schema()`, `enforce_schema()`,
+`define_constraints()`, ...) stay on the sync `Graph` — one-time setup
+calls with no concurrency to gain — and `AsyncGraph` refuses them by name
+if called, pointing at the fix. See `hopai/asyncio.py` for the design
+(and the benchmark that checked it isn't `asyncio.to_thread()` wearing a
+different name before it was written).
 
 ## 📓 Runnable documentation
 

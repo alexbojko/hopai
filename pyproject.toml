@@ -62,7 +62,14 @@ mcp = ["mcp>=1.10"]
 # schema_pydantic generates v2 models; this extra pins the MAJOR version
 # so v1, tolerated by some resolutions, is never silently what lands.
 pydantic = ["pydantic>=2.0"]
+# AsyncGraph (hopai/asyncio.py) needs an async-capable DBAPI -- psycopg2
+# (the base dependency) has none. greenlet itself is not listed: SQLAlchemy
+# 2.0's own wheel already pulls it in on every platform hopai supports, so
+# naming it again would be a second, redundant declaration of the same
+# dependency rather than a new one.
+asyncio = ["psycopg[binary]>=3.1"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "networkx>=3.0", "pydantic>=2.0", "ruff>=0.6",
+       "psycopg[binary]>=3.1",
        # In `dev` so CI actually registers the tools against a real SDK.
        # tests/test_mcp.py skips the SDK-backed classes without it, and
        # a suite that silently stops testing the server is how the
