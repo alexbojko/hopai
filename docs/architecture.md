@@ -88,6 +88,16 @@ set plugs into the walk.
   which is what keeps the invariant true even when a boost carries no signal.
   `scale="raw"` is the unscaled, unbounded escape hatch: today's only behavior
   before this normalization existed.
+- `vector_search()`/`vector_search_many()` report each Near's own similarity and each
+  Boost's own value alongside the combined score, keyed by name (`similarities`,
+  `boosts`) rather than by the `sim_i`/`boost_j` SQL alias. `_report_columns()` reads
+  each LATERAL's `s` column a SECOND time in the outward SELECT rather than the `sim_i`
+  `_combined()`/`_thresholds()` use — `sim_i` is coalesced to 0 for `missing="zero"`,
+  and the report has to keep saying "missing" (`None`) even where the combined score
+  scores it 0. Nothing is computed twice: both are ordinary column projections off the
+  one LATERAL join. `_format_hit()` is the single place both `search()` and
+  `search_many()` turn the flat row into that shape, so `json_api.py`'s
+  `vector_search_json()` inherits it with no code of its own.
 - `Hop(via_near=)` compiles to `edge_beam()`: a LATERAL, per anchor row, yielding the
   `(edge_id, move_id)` pair the plain join produced — so depth, the local path and edge
   reconstruction are untouched. The cycle guard goes *inside* the beam, or a top-`via_keep`

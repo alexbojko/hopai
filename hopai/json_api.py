@@ -259,7 +259,8 @@ def vector_search_json(graph: Graph, spec: dict, allow_vectors: bool = False) ->
             "target": "nodes",
             "where": {"type": "person"},
         })
-        # -> {"results": [{"id": "1", "similarity": 0.93, ...}, ...]}
+        # -> {"results": [{"id": "1", "similarity": 0.93, "properties": {...},
+        #                  "similarities": {"summary": 0.93}, "boosts": {}}, ...]}
 
     Same gate as traverse_json(): a literal "vector" is refused unless
     allow_vectors=True, while "text" is embedded by the field itself

@@ -712,7 +712,8 @@ graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
 
 graph.vector_search(Near("summary", query_embedding), k=10,
                     where={"type": "person"})
-# [{"id": "1", "similarity": 0.93, "properties": {...}}, ...]
+# [{"id": "1", "similarity": 0.93, "properties": {...},
+#   "similarities": {"summary": 0.93}, "boosts": {}}, ...]
 ```
 
 `migrate=True` runs `migrate_vectors()` for you and hands back what it
@@ -736,6 +737,19 @@ graph.vector_search(
     Near("title",   q_title,   weight=0.3, missing="zero"),  # title optional
     k=10,
 )
+```
+
+Tuning `weight=` is only useful if you can see what it did: every hit
+carries `similarities`, keyed by field name (never `sim_0` — that's a SQL
+alias), with `None` for a field the row is missing even under
+`missing="zero"` — the combined score still scores it 0, but the
+per-field report keeps saying "missing" honestly rather than looking
+like a poor match:
+
+```python
+hits = graph.vector_search(Near("summary", q_summary, weight=0.7),
+                           Near("title", q_title, weight=0.3, missing="zero"), k=10)
+hits[0]["similarities"]      # {"summary": 0.91, "title": None}
 ```
 
 And similarity composes with traversal — seed a walk with the most
@@ -792,6 +806,15 @@ the ranking instead of nudging it. `Boost("importance", 0.2,
 scale="raw")` opts back into the unscaled coefficient — for a property
 you already normalized, or when you want the per-query window function
 off the query path.
+
+Like `similarities`, every hit also carries `boosts`, keyed by the
+boosted property (empty when no `boost=` was given), so a boost that's
+quietly dominating the ranking is visible instead of discovered by
+squinting at scores that don't line up with similarity:
+
+```python
+hits[0]["boosts"]            # {"importance": 4.2} -- the property's own value
+```
 
 Two things worth knowing about the traversal forms. A traversal returns
 a **subgraph, not a ranking** — the scores and their order don't survive
