@@ -110,10 +110,10 @@ A boost cannot push a row past a min_similarity floor (thresholds
 read each field's own similarity, not the combined score) -- but it
 DOES reorder, so with k it changes which rows come back, and the
 `similarity` in each result is then the combined score, which can
-exceed 1. By default each boost is rescaled into similarity's own
-[-1, 1] range with a min-max window function over the candidate set
-before it is weighted, so `weight` means what it says regardless of
-the property's own scale -- a raw view count would otherwise not
+exceed 1. By default each boost is rescaled into [0, 1] -- similarity's
+own scale, not its sign -- with a min-max window function over the
+candidate set before it is weighted, so `weight` means what it says
+regardless of the property's own scale -- a raw view count would otherwise not
 boost a cosine ranking, it would replace it. `Boost(..., scale="raw")`
 is the unbounded, unscaled escape hatch. See Boost.
 
@@ -487,7 +487,7 @@ class Boost:
         if scale not in self._SCALES:
             raise ValueError(
                 f"Boost scale must be one of {self._SCALES}, got {scale!r} -- "
-                f"'normalized' rescales the property into similarity's [-1, 1] range "
+                f"'normalized' rescales the property into [0, 1] "
                 f"over the candidate set (the new default), 'raw' is today's unbounded "
                 f"behavior"
             )

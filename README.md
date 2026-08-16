@@ -772,8 +772,8 @@ combined score, no longer a cosine in `[-1, 1]`:
 graph.vector_search(Near("summary", q), boost=Boost("importance", 0.2), k=10)
 ```
 
-By default the property is rescaled into similarity's own `[-1, 1]`
-range with a min-max window function over the candidate rows — the ones
+By default the property is rescaled into `[0, 1]` — similarity's own
+scale, not its sign — with a min-max window function over the candidate rows — the ones
 still in play after `where=` — before `weight` is applied, so
 `Boost("importance", 0.2)` means "20% weight" whatever raw range
 `importance` holds: a raw view count in the thousands would otherwise
