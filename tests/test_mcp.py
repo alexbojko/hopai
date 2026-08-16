@@ -569,14 +569,24 @@ class TestToolSchemas:
         assert "not both" in seeded
 
     def test_a_seed_set_still_has_to_come_from_somewhere(self, vector_graph):
-        """The static schema requires `where` on start. Search is a
-        second way in, not a way to ask for every node in the graph, so
-        the requirement becomes a choice between the two rather than
-        disappearing."""
-        start = named(vector_graph,
-                      embed=embedder())["traverse_graph"].parameters["properties"]["start"]
-        assert "required" not in start
-        assert start["anyOf"] == [{"required": ["where"]}, {"required": ["search"]}]
+        """`where` or `near` in the static schema, plus `search` on a
+        server that has an embedder. None of the three is a way to ask
+        for every node in the graph, which is what an empty `start`
+        would mean -- so the constraint is a choice between the ways in,
+        never its absence.
+
+        Asserted on BOTH configurations: `search` is appended to the
+        static pair rather than replacing it, and a mutant overwriting
+        the list drops `near` on exactly the servers that can search by
+        meaning."""
+        plain = named(vector_graph)["traverse_graph"].parameters["properties"]["start"]
+        assert plain["anyOf"] == [{"required": ["where"]}, {"required": ["near"]}]
+
+        seeded = named(vector_graph,
+                       embed=embedder())["traverse_graph"].parameters["properties"]["start"]
+        assert "required" not in seeded
+        assert seeded["anyOf"] == [{"required": ["where"]}, {"required": ["near"]},
+                                   {"required": ["search"]}]
 
     def test_edge_only_vectors_offer_search_but_not_a_seed(self):
         """A seed ranks NODE vectors. A graph with only edge vector

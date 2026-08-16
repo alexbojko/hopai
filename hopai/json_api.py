@@ -398,6 +398,13 @@ TRAVERSE_TOOL_SCHEMA: dict = {
                     },
                     "boost": {"$ref": "#/$defs/boost"},
                 },
+                # A seed set has to come from SOMEWHERE. Before `near`
+                # existed this was `required: ["where"]`; dropping it to
+                # let a purely semantic seed through advertised `{}` as
+                # a valid start, which is "every node in the graph" --
+                # the unbounded result of #47, handed to a model as a
+                # legal call. Either way in is fine; neither is not.
+                "anyOf": [{"required": ["where"]}, {"required": ["near"]}],
             },
             "hops": {
                 "type": "array",
@@ -510,6 +517,13 @@ AGGREGATE_TOOL_SCHEMA: dict = {
                     },
                     "boost": {"$ref": "#/$defs/boost"},
                 },
+                # A seed set has to come from SOMEWHERE. Before `near`
+                # existed this was `required: ["where"]`; dropping it to
+                # let a purely semantic seed through advertised `{}` as
+                # a valid start, which is "every node in the graph" --
+                # the unbounded result of #47, handed to a model as a
+                # legal call. Either way in is fine; neither is not.
+                "anyOf": [{"required": ["where"]}, {"required": ["near"]}],
             },
             "hops": {
                 "type": "array",

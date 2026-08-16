@@ -582,12 +582,12 @@ def _with_search(schema: dict, served: Served, sentence: str) -> dict:
     schema["description"] = schema["description"].replace(sentence, _WITH_MEANING)
     start = schema["parameters"]["properties"]["start"]
     start["properties"].update(_search_keys(served))
-    # `where` alone is required on start in the static schema. With
-    # `search` as a second way in, keeping that would forbid a purely
-    # semantic seed -- and dropping it without a replacement would stop
-    # saying that a seed set has to come from SOMEWHERE.
-    start.pop("required", None)
-    start["anyOf"] = [{"required": ["where"]}, {"required": ["search"]}]
+    # A seed set has to come from SOMEWHERE, and `search` is a third way
+    # in beside the static schema's `where` and `near`. EXTENDED, not
+    # replaced: overwriting the pair would drop `near` from the list of
+    # legal starts on exactly the servers that can search by meaning --
+    # advertising the fallback while un-advertising the better route.
+    start["anyOf"] = [*start.get("anyOf", []), {"required": ["search"]}]
     return schema
 
 
