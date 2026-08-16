@@ -126,14 +126,16 @@ four permission levels -- read, write, delete/update, DDL -- each of
 which is a separate flag because they are separate sentences.
 
 FOR TOOL-CALLING MODELS: TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
-INGEST_TOOL_SCHEMA and MUTATE_TOOL_SCHEMA are JSON Schemas ready to hand
-to a function-calling definition, covering reading, aggregating,
-writing, and changing or deleting what is already there -- and
-`graph.tool_schemas()` returns the same four with THIS graph's declared
-schema summarized into each description, so the model knows what exists
-instead of guessing labels. (Vector search has no tool schema on
-purpose, in either form -- a model asked for an embedding invents one;
-vectors.py explains.)
+INGEST_TOOL_SCHEMA, MUTATE_TOOL_SCHEMA and VECTOR_SEARCH_TOOL_SCHEMA are
+JSON Schemas ready to hand to a function-calling definition, covering
+reading, aggregating, writing, changing or deleting what is already
+there, and searching by meaning -- and `graph.tool_schemas()` returns
+the same four with THIS graph's declared schema summarized into each
+description, plus VECTOR_SEARCH_TOOL_SCHEMA (with `field` narrowed to
+an enum of this graph's own vector fields) when define_vectors() has
+declared any, so the model knows what exists instead of guessing labels
+or fields. (A vector itself never reaches any of these schemas -- a
+model asked for an embedding invents one; vectors.py explains.)
 
 SCHEMA -- declare the shape of the graph (node types, edge kinds, typed
 properties) as plain dataclasses or NodeType/EdgeType primitives, read

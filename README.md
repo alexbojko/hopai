@@ -1036,11 +1036,14 @@ this into an LLM function-calling definition directly, alongside
 [graph schema](#-graph-schema) defined, `graph.tool_schemas()` returns
 the four traversal/write definitions with *your* node types, edge kinds
 and properties summarized into the descriptions, so the model stops
-hallucinating labels:
+hallucinating labels — plus `VECTOR_SEARCH_TOOL_SCHEMA`, its `field`
+narrowed to an enum of *your* declared vector fields, whenever
+`define_vectors()` has declared any:
 
 ```python
 tools = graph.tool_schemas()   # traverse / aggregate / ingest / mutate,
-                               # each describing what this graph holds
+                               # plus vector search if this graph
+                               # declares any vector fields
 ```
 
 That is every front end, `mutate_graph` included — hand over the subset
