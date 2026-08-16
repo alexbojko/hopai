@@ -2702,10 +2702,18 @@ class TestEmbedStaleLive:
     def test_rows_with_nothing_to_embed_are_reported_not_raised(self, fresh_graph):
         """A node with no abstract legitimately has no abstract vector.
         Silence would leave the caller re-running a backfill that can
-        never finish, and an exception would stop the other 999 rows."""
+        never finish, and an exception would stop the other 999 rows.
+
+        Row 4 is written directly rather than through add_nodes(): a
+        non-string value at a declared vector field's name is refused
+        at ingestion (#50), so this represents a row that arrived some
+        other way -- raw SQL, a migration, data from before the field
+        was declared -- which embed_stale() still has to survive."""
         g = _embedding_graph(fresh_graph)
         g.add_nodes([{"id": 1, "docvec": "apple"}, {"id": 2},
-                     {"id": 3, "docvec": "  "}, {"id": 4, "docvec": 5}])
+                     {"id": 3, "docvec": "  "}])
+        with g.engine.begin() as conn:
+            conn.execute(text('INSERT INTO nodes (id, properties) VALUES (4, \'{"docvec": 5}\')'))
         result = g.embed_stale(node_fields=["docvec"])["nodes"]["docvec"]
         assert result == {"embedded": ["1"], "skipped": ["2", "3", "4"]}
 
