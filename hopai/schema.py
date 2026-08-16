@@ -267,6 +267,60 @@ class EdgeType:
             )
 
 
+@dataclass(frozen=True)
+class VectorFieldSchema:
+    """One declared vector field, as GraphSchema reports it (issue #51)
+    -- NEVER the Vector itself, so the embed= client can never leak into
+    a serialized document (the same rule embed=None-or-not already
+    follows for `embedder`, see below).
+
+    dimensions/source come straight from the Vector registry
+    (Graph.vectors); embedder is a BOOL -- whether Vector(embed=...) is
+    set, never the client -- the same "shape, not the object" rule
+    to_json() applies to every other flag. populated is optional and
+    None unless a caller asked for it (infer_schema(vector_populated=True)):
+    stale_vectors()'s missing+wrong_dimensions count for this field,
+    turned into a fraction of the target's total rows -- "is this field
+    worth searching yet," for a model and an operator alike."""
+    dimensions: int
+    source: str
+    embedder: bool = False
+    populated: Optional[float] = None
+
+
+def _as_vector_field_schema(name: str, entry) -> VectorFieldSchema:
+    """A GraphSchema(vectors=...) entry -> VectorFieldSchema. Accepts a
+    live Vector (what Graph.vectors/graph._vectors holds -- the normal
+    case, infer_schema() attaching this Graph's own registry) or an
+    already-normalized VectorFieldSchema (schema_from_document() parsing
+    a saved document, or copy-constructing from another GraphSchema),
+    so normalization is idempotent either way."""
+    if isinstance(entry, VectorFieldSchema):
+        return entry
+    from .vectors import Vector
+    if isinstance(entry, Vector):
+        return VectorFieldSchema(dimensions=entry.dimensions, source=entry.source,
+                                 embedder=entry.embed is not None)
+    raise TypeError(
+        f"vector field {name!r}: expected a Vector or VectorFieldSchema, got {entry!r}")
+
+
+def _normalize_vector_fields(vectors) -> dict:
+    """vectors= input -> canonical {"nodes": {...}, "edges": {...}},
+    every entry a VectorFieldSchema. None (no vectors declared, or a
+    caller who never mentions the parameter) normalizes to the empty
+    shape rather than raising -- vectors are additive and optional
+    everywhere GraphSchema is built, matching how node_types=()/
+    edge_types=() already default."""
+    if vectors is None:
+        return {"nodes": {}, "edges": {}}
+    return {
+        target: {name: _as_vector_field_schema(name, entry)
+                 for name, entry in (vectors.get(target) or {}).items()}
+        for target in ("nodes", "edges")
+    }
+
+
 @dataclass
 class GraphSchema:
     """The canonical schema: what .schema returns regardless of which
@@ -274,10 +328,12 @@ class GraphSchema:
     exists is a GraphSchema that is internally consistent."""
     node_types: tuple
     edge_types: tuple
+    vectors: dict
 
-    def __init__(self, node_types=(), edge_types=()):
+    def __init__(self, node_types=(), edge_types=(), vectors=None):
         self.node_types = tuple(node_types)
         self.edge_types = tuple(edge_types)
+        self.vectors = _normalize_vector_fields(vectors)
         names = [nt.name for nt in self.node_types]
         duplicate_names = sorted({n for n in names if names.count(n) > 1})
         if duplicate_names:
@@ -306,8 +362,15 @@ class GraphSchema:
         """JSON Schema vocabulary, json.dumps-clean -- the form that gets
         pasted into a system prompt or returned from a tool call. Nodes
         are keyed by name; edges are a list, because a kind alone is not
-        an identity."""
-        return {
+        an identity.
+
+        A "vectors" key appears ONLY when at least one field is declared
+        (issue #51) -- omitted rather than an empty {"nodes": {},
+        "edges": {}}, so this is byte-identical to its pre-#51 shape for
+        every graph that never touches define_vectors(), the same
+        contract test_defining_vectors_changes_no_near_less_query()
+        already holds the query builder to."""
+        doc = {
             "nodes": {nt.name: _properties_json(nt.properties) for nt in self.node_types},
             "edges": [
                 {"kind": et.kind, "source": et.source, "target": et.target,
@@ -315,6 +378,10 @@ class GraphSchema:
                 for et in self.edge_types
             ],
         }
+        vectors = _vectors_json(self.vectors)
+        if vectors:
+            doc["vectors"] = vectors
+        return doc
 
     def to_networkx(self):
         """The schema as a meta-graph: node types as nodes, edge types as
@@ -370,6 +437,10 @@ class GraphSchema:
                     f"cannot hold both; rename one of them"
                 )
             models[kind] = _pydantic_model(kind, properties, pydantic.create_model)
+        _attach_vector_metadata(models, (nt.name for nt in self.node_types),
+                                self.vectors.get("nodes", {}))
+        _attach_vector_metadata(models, _properties_per_kind(self.edge_types),
+                                self.vectors.get("edges", {}))
         return models
 
     def to_mermaid(self) -> str:
@@ -380,7 +451,16 @@ class GraphSchema:
         property bag as tool_summary() (* required, ! unique, capped
         with +N more); one arrow per (kind, source, target) triple, so
         parallel kinds stay parallel arrows -- the same
-        no-silent-collapse rule to_networkx() documents."""
+        no-silent-collapse rule to_networkx() documents.
+
+        A declared vector field is not owned by one node type or edge
+        kind -- it applies to the whole target -- so it cannot become a
+        new box or arrow of its own without inventing one; instead every
+        box (or arrow label) for that target gets the same `{vec: ...}`
+        suffix _vector_suffix() builds, an annotation on an EXISTING
+        diagram element rather than a new kind of one. Absent for any
+        graph with no declared vectors, so the picture is unchanged from
+        before issue #51 until define_vectors() is actually used."""
         ids: dict = {}
         for index, nt in enumerate(self.node_types):
             # _slug can collide ("works-at" and "works_at") or come back
@@ -388,14 +468,18 @@ class GraphSchema:
             # label keeps the real name
             base = _slug(nt.name) or "node"
             ids[nt.name] = base if base not in ids.values() else f"{base}_{index}"
+        node_vectors = _vector_suffix(self.vectors.get("nodes", {}))
+        edge_vectors = _vector_suffix(self.vectors.get("edges", {}))
         lines = ["flowchart LR"]
         for nt in self.node_types:
             bag = _property_bag(nt.properties)
-            label = _mermaid_text(f"{nt.name} {bag}" if bag else nt.name)
+            text = f"{nt.name} {bag}" if bag else nt.name
+            label = _mermaid_text(text + node_vectors)
             lines.append(f'    {ids[nt.name]}["{label}"]')
         for et in self.edge_types:
-            kind = (et.kind if re.fullmatch(r"[A-Za-z0-9_]+", et.kind)
-                    else f'"{_mermaid_text(et.kind)}"')
+            kind_text = et.kind + edge_vectors
+            kind = (kind_text if re.fullmatch(r"[A-Za-z0-9_]+", kind_text)
+                    else f'"{_mermaid_text(kind_text)}"')
             lines.append(f"    {ids[et.source]} -- {kind} --> {ids[et.target]}")
         return "\n".join(lines)
 
@@ -688,6 +772,90 @@ def _properties_json(properties: tuple) -> dict:
     if required:
         spec["required"] = required
     return spec
+
+
+def _vector_field_json(v: VectorFieldSchema) -> dict:
+    """One VectorFieldSchema, JSON-clean. `populated` is included only
+    when it was actually computed (infer_schema(vector_populated=True))
+    -- an absent key reads as "not measured", never as "0% populated",
+    the same reason `required`/`unique`/etc. are omitted rather than
+    written false throughout this module."""
+    spec = {"dimensions": v.dimensions, "source": v.source, "embedder": v.embedder}
+    if v.populated is not None:
+        spec["populated"] = v.populated
+    return spec
+
+
+def _vectors_json(vectors: dict) -> dict:
+    """GraphSchema.vectors -> the to_json() "vectors" section, or {}
+    when nothing is declared for either target -- the caller (to_json())
+    treats an empty dict as "omit the key entirely", which is what keeps
+    a vector-free schema's document byte-identical to before issue #51."""
+    if not vectors.get("nodes") and not vectors.get("edges"):
+        return {}
+    return {target: {name: _vector_field_json(v) for name, v in fields.items()}
+            for target, fields in vectors.items()}
+
+
+def _vector_field_from_json(name: str, spec, owner: str) -> VectorFieldSchema:
+    if not isinstance(spec, dict) or "dimensions" not in spec or "source" not in spec:
+        raise ValueError(
+            f"{owner} vector field {name!r}: expected a spec with 'dimensions' and "
+            f"'source', got {spec!r}")
+    return VectorFieldSchema(
+        dimensions=spec["dimensions"], source=spec["source"],
+        embedder=bool(spec.get("embedder", False)), populated=spec.get("populated"),
+    )
+
+
+def _vectors_from_json(document: dict) -> dict:
+    """The to_json() "vectors" section (or its absence) -> a vectors=
+    GraphSchema() can take -- the exact inverse of _vectors_json(),
+    same contract schema_from_document() holds for everything else in
+    the document: a corrupted section raises naming the path rather
+    than half-loading."""
+    raw = document.get("vectors") or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"schema document 'vectors' must be an object, got {raw!r}")
+    result: dict = {"nodes": {}, "edges": {}}
+    for target in ("nodes", "edges"):
+        entries = raw.get(target) or {}
+        if not isinstance(entries, dict):
+            raise ValueError(
+                f"schema document vectors[{target!r}] must be an object, got {entries!r}")
+        for name, spec in entries.items():
+            result[target][name] = _vector_field_from_json(
+                name, spec, owner=f"vector field {name!r}")
+    return result
+
+
+def _vector_suffix(fields: dict) -> str:
+    """' {vec: name[dims], ...}' for a to_mermaid() label, or '' when
+    `fields` (one target's slice of GraphSchema.vectors) is empty --
+    the empty case is what keeps a vector-free diagram unchanged."""
+    if not fields:
+        return ""
+    parts = [f"{name}[{v.dimensions}]" for name, v in sorted(fields.items())]
+    return " {vec: " + ", ".join(parts) + "}"
+
+
+def _attach_vector_metadata(models: dict, names, fields: dict) -> None:
+    """Stamp a plain `hopai_vectors` class attribute -- never a pydantic
+    FIELD -- onto every model in `names` that to_pydantic() generated.
+
+    A real field would be wrong twice over: a vector never lives in the
+    `properties` JSONB bag it validates (vec_* columns are real columns,
+    per hopai/vectors.py), and it belongs to the whole TARGET (nodes or
+    edges), not to any one node type or edge kind -- so there is no
+    single type for a `summary: list[float]` field to attach to that
+    would not misrepresent every OTHER type sharing the same model dict.
+    A class attribute set after creation says "this target carries these
+    vectors" without claiming a row-shape it does not have."""
+    if not fields:
+        return
+    info = {name: _vector_field_json(v) for name, v in fields.items()}
+    for name in names:
+        models[name].hopai_vectors = info
 
 
 def _mermaid_text(value: str) -> str:
@@ -1366,7 +1534,57 @@ def _derive_properties(counts: dict, key_rows: list, discriminator: str,
     return properties
 
 
-def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
+def _infer_vectors(graph, connection, total_nodes: int, total_edges: int,
+                   vector_populated: bool) -> Optional[dict]:
+    """This Graph handle's OWN declared vector fields (Graph._vectors),
+    as a vectors= GraphSchema() can take -- or None when none are
+    declared, so a graph that never touched define_vectors() gets no
+    "vectors" section at all (GraphSchema normalizes None the same as
+    the plain {"nodes": {}, "edges": {}} the property-inference side
+    already defaults to).
+
+    Vectors are not observable from `properties` the way node/edge
+    types are -- there is nothing in the rows to infer a field's
+    dimensions FROM -- so this reads the registry Graph.define_vectors()
+    already declared, rather than scanning for one.
+
+    vector_populated=True adds one more read: stale_vectors() on the
+    SAME open connection infer_schema() is already using, so declaring
+    the option costs no extra round trip beyond the query it runs.
+    total_nodes/total_edges are infer_schema()'s own row counts (the
+    node_counts/edge_counts dicts summed, BEFORE they are filtered to
+    typed rows only) -- a vector field is not scoped to one node type,
+    so its denominator is every row of the target, typed or not, and
+    reusing that count is free: infer_schema() already paid for it."""
+    registry = graph._vectors
+    if not registry or not (registry.get("nodes") or registry.get("edges")):
+        return None
+    stale = None
+    if vector_populated:
+        from .vectors import stale_vectors
+        stale = stale_vectors(
+            graph,
+            node_fields=sorted(registry.get("nodes") or {}),
+            edge_fields=sorted(registry.get("edges") or {}),
+            connection=connection,
+        )
+    totals = {"nodes": total_nodes, "edges": total_edges}
+    result: dict = {"nodes": {}, "edges": {}}
+    for target in ("nodes", "edges"):
+        for name, field in (registry.get(target) or {}).items():
+            populated = None
+            if stale is not None and totals[target]:
+                per_field = stale[target][name]
+                stale_rows = len(per_field["missing"]) + len(per_field["wrong_dimensions"])
+                populated = 1 - stale_rows / totals[target]
+            result[target][name] = VectorFieldSchema(
+                dimensions=field.dimensions, source=field.source,
+                embedder=field.embed is not None, populated=populated)
+    return result
+
+
+def infer_schema(graph, sample_percent: Optional[float] = None,
+                 vector_populated: bool = False) -> tuple:
     """Derive (GraphSchema, InferenceReport) from the rows this graph
     already holds. Read-only, never registers itself as the handle's
     schema -- see the module docstring for why observation and contract
@@ -1379,7 +1597,16 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
     `sampled` and says estimates. The endpoint-triple join samples the
     edges side only: sampling the node side too would count edges whose
     node fell outside the sample as endpoint-less, manufacturing
-    skipped-edge noise the data does not contain."""
+    skipped-edge noise the data does not contain.
+
+    The returned schema's `vectors` section (issue #51) reflects THIS
+    Graph handle's OWN define_vectors() declaration -- dimensions,
+    source and whether a field embeds -- with no extra query. Passing
+    vector_populated=True adds one: stale_vectors() on every declared
+    field, on the SAME connection, turned into a fraction of that
+    target's rows -- off by default so a caller who only wants the
+    declared shape does not pay for a scan of the real vec_* columns on
+    top of the one this function already runs."""
     from sqlalchemy import and_, func, select
 
     if sample_percent is not None and not 0 < sample_percent <= 100:
@@ -1416,6 +1643,14 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
                       target.c.properties["type"].astext)
         ).all()
 
+        # Free: node_counts/edge_counts already hold every observed row
+        # of this SOURCE (sampled or not), keyed by discriminator value
+        # including None for the untyped bucket -- the sum is the total
+        # row count infer_schema() already paid to compute, reused as
+        # the "populated" fraction's denominator instead of a new query.
+        vectors = _infer_vectors(graph, connection, sum(node_counts.values()),
+                                 sum(edge_counts.values()), vector_populated)
+
     node_types = [NodeType(name, properties=props)
                   for name, props in sorted(node_props.items())]
     # The endpoint join above reads the WHOLE nodes table, while
@@ -1448,7 +1683,7 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
         conflicts=tuple(conflicts),
         sampled=sample_percent,
     )
-    return GraphSchema(node_types, edge_types), report
+    return GraphSchema(node_types, edge_types, vectors=vectors), report
 
 
 # ---------------------------------------------------------------------
@@ -1496,7 +1731,12 @@ def schema_from_document(document) -> GraphSchema:
     The stored document is data, not trusted state: every piece routes
     through the same Property/NodeType/EdgeType/GraphSchema constructors
     define_schema() uses, so a hand-corrupted row raises the real
-    validation error and never half-loads."""
+    validation error and never half-loads.
+
+    A document with no "vectors" key (everything saved before issue
+    #51, or a graph that never declared any) loads back with none --
+    _vectors_from_json() treats an absent key exactly like an empty
+    one."""
     if (not isinstance(document, dict)
             or not isinstance(document.get("nodes"), dict)
             or not isinstance(document.get("edges"), list)):
@@ -1517,4 +1757,4 @@ def schema_from_document(document) -> GraphSchema:
                 entry.get("properties", {"type": "object", "properties": {}}),
                 owner=f"edge kind {entry.get('kind')!r}"),
         ))
-    return GraphSchema(node_types, edge_types)
+    return GraphSchema(node_types, edge_types, vectors=_vectors_from_json(document))

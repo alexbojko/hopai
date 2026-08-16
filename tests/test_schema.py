@@ -29,7 +29,7 @@ import pydantic
 import pytest
 from sqlalchemy import text
 
-from hopai import ConstraintViolation, EdgeType, Graph, GraphSchema, NodeType, Property
+from hopai import ConstraintViolation, EdgeType, Graph, GraphSchema, NodeType, Property, Vector
 from hopai.constraints import JSON_TYPES
 
 OFFLINE_DSN = "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline"
@@ -582,6 +582,108 @@ class TestSchemaRepresentations:
 
 
 # ---------------------------------------------------------------------
+# GraphSchema.vectors -- declared vector fields as part of the document
+# (issue #51). define_vectors() is pure in-memory, like define_schema(),
+# so this stays in the no-database half of the file.
+# ---------------------------------------------------------------------
+
+class TestSchemaVectors:
+    @staticmethod
+    def with_vectors(offgraph) -> GraphSchema:
+        """A GraphSchema built the way infer_schema() builds one: node/
+        edge types from a declaration, vectors= from Graph._vectors --
+        no database, since define_vectors() only builds the registry
+        and attaches SQLAlchemy metadata."""
+        offgraph.define_vectors(
+            nodes=[Vector("summary", 3, source="abstract",
+                          embed=lambda texts: [[0.0, 0.0, 0.0] for _ in texts])],
+            edges=[Vector("rel", 5)],
+        )
+        return GraphSchema(
+            node_types=[NodeType("doc", properties=[Property("title", "string")])],
+            edge_types=[EdgeType("cites", source="doc", target="doc")],
+            vectors=offgraph._vectors,
+        )
+
+    def test_to_json_names_dimensions_source_and_embedder(self, offgraph):
+        doc = self.with_vectors(offgraph).to_json()
+        assert doc["vectors"] == {
+            "nodes": {"summary": {"dimensions": 3, "source": "abstract", "embedder": True}},
+            "edges": {"rel": {"dimensions": 5, "source": "rel", "embedder": False}},
+        }
+        json.dumps(doc)   # the tool-call-result contract every other representation holds
+
+    def test_to_pydantic_attaches_vector_metadata_not_a_field(self, offgraph):
+        """A vector belongs to the whole TARGET, not to `doc` or `cites`
+        alone, and never lives in the JSONB `properties` bag a generated
+        model validates -- so it must not become a model FIELD (which
+        would claim a row shape no stored row has), only a plain class
+        attribute every model of that target carries."""
+        models = self.with_vectors(offgraph).to_pydantic()
+        assert models["doc"].hopai_vectors == {
+            "summary": {"dimensions": 3, "source": "abstract", "embedder": True}}
+        assert models["cites"].hopai_vectors == {
+            "rel": {"dimensions": 5, "source": "rel", "embedder": False}}
+        # still a real, working model -- the metadata is additive
+        assert models["doc"](title="x").title == "x"
+        assert "summary" not in models["doc"].model_fields
+
+    def test_to_mermaid_annotates_the_existing_boxes_and_arrows(self, offgraph):
+        """A vector field is not one more node/edge type, so it must not
+        become a new box or a new kind of arrow -- it decorates every
+        EXISTING box/arrow of its target instead."""
+        picture = self.with_vectors(offgraph).to_mermaid()
+        assert 'doc["doc (title) {vec: summary[3]}"]' in picture
+        assert "cites {vec: rel[5]}" in picture
+        assert picture.count("{vec:") == 2   # one box, one arrow -- no third element
+
+    def test_vectors_round_trip_through_to_json_and_back(self, offgraph):
+        """schema_from_document() is to_json()'s exact inverse for
+        everything else in the document; this is the same contract for
+        the new section."""
+        from hopai.schema import schema_from_document
+        schema = self.with_vectors(offgraph)
+        doc = schema.to_json()
+        back = schema_from_document(doc)
+        assert back.vectors == schema.vectors
+        assert back.to_json() == doc
+
+    def test_no_declared_vectors_is_byte_identical_to_before_issue_51(self, offgraph):
+        """The additive promise itself: a graph that never calls
+        define_vectors() must get exactly the pre-#51 document, model
+        set and picture -- no "vectors" key, no hopai_vectors attribute,
+        no extra mermaid text. Compared against a schema declared the
+        identical way but through the OLD two-argument GraphSchema call,
+        so a default that silently changed shape would show up here."""
+        offgraph.define_schema(
+            nodes=[NodeType("doc", properties=[Property("title", "string")])],
+            edges=[EdgeType("cites", source="doc", target="doc")],
+        )
+        schema = offgraph.schema
+        old_shape = GraphSchema(schema.node_types, schema.edge_types)
+        assert schema.to_json() == old_shape.to_json()
+        assert "vectors" not in schema.to_json()
+        assert not hasattr(schema.to_pydantic()["doc"], "hopai_vectors")
+        assert "{vec:" not in schema.to_mermaid()
+        assert schema.to_mermaid() == old_shape.to_mermaid()
+
+    def test_defining_vectors_does_not_reach_the_declared_schema(self, offgraph):
+        """Scope boundary, stated as a test rather than left implicit:
+        Graph.schema_json/schema_pydantic/schema_mermaid read
+        self._schema, which define_schema() builds with no vectors=
+        argument at all. Only infer_schema()'s returned GraphSchema
+        attaches Graph._vectors (it already has both the graph handle
+        and, optionally, an open connection for `populated` -- the
+        declared-schema path has neither reason to). A future PR MAY
+        thread self._vectors through define_schema() too; until then
+        this pins the current, deliberate asymmetry so it fails loudly
+        instead of silently if something starts assuming otherwise."""
+        offgraph.define_schema(nodes=[NodeType("doc")])
+        offgraph.define_vectors(nodes=[Vector("summary", 3)])
+        assert "vectors" not in offgraph.schema_json
+
+
+# ---------------------------------------------------------------------
 # Enforcement -- against real PostgreSQL
 # ---------------------------------------------------------------------
 
@@ -942,6 +1044,59 @@ class TestSchemaInference:
         from sqlalchemy.exc import OperationalError
         with pytest.raises(OperationalError):
             offgraph.infer_schema()
+
+    def test_infer_schema_reports_this_handles_declared_vector_fields(self, fresh_graph):
+        """infer_schema() cannot observe a vector field FROM the rows --
+        there is nothing in `properties` to derive dimensions from -- so
+        it reads Graph._vectors, the declaration this same handle
+        already made with define_vectors(). Plain infer_schema() (no
+        vector_populated=) must not carry a `populated` key at all: the
+        contract is "not measured", not "0%"."""
+        fresh_graph.define_vectors(nodes=[Vector("summary", 3, source="abstract")])
+        fresh_graph.migrate_vectors()
+        fresh_graph.add_nodes([{"id": 1, "type": "person", "email": "a@x.com"}])
+        inferred, _ = fresh_graph.infer_schema()
+        assert inferred.to_json()["vectors"] == {
+            "nodes": {"summary": {"dimensions": 3, "source": "abstract", "embedder": False}},
+            "edges": {},
+        }
+
+    def test_infer_schema_without_declared_vectors_omits_the_section(self, fresh_graph):
+        """The byte-identical promise, on the connected path this time:
+        a handle that never called define_vectors() gets no "vectors"
+        key from infer_schema() either, chaotic data and all."""
+        seed_chaotic(fresh_graph)
+        inferred, _ = fresh_graph.infer_schema()
+        assert "vectors" not in inferred.to_json()
+
+    def test_vector_populated_is_opt_in_and_reports_a_fraction(self, fresh_graph):
+        """Off by default: plain infer_schema() must not pay for a
+        second scan of the vec_* columns it was not asked about. Passing
+        vector_populated=True adds exactly that -- stale_vectors()'s
+        missing+wrong_dimensions count for each declared field, turned
+        into a fraction of the target's rows."""
+        fresh_graph.define_vectors(nodes=[Vector("summary", 3)])
+        fresh_graph.migrate_vectors()
+        fresh_graph.add_nodes([
+            {"id": 1, "type": "person", "email": "a@x.com"},
+            {"id": 2, "type": "person", "email": "b@x.com"},
+        ])
+        fresh_graph.set_vectors(nodes=[{"id": 1, "summary": [1.0, 0.0, 0.0]}])
+
+        plain, _ = fresh_graph.infer_schema()
+        assert "populated" not in plain.to_json()["vectors"]["nodes"]["summary"]
+
+        measured, _ = fresh_graph.infer_schema(vector_populated=True)
+        assert measured.to_json()["vectors"]["nodes"]["summary"]["populated"] == 0.5
+
+    def test_vector_populated_needs_no_extra_query_when_nothing_is_declared(self, fresh_graph):
+        """vector_populated=True on a handle with no declared vectors has
+        nothing to measure -- it must not raise stale_vectors()'s own
+        "call define_vectors() first" refusal, since the caller did not
+        ask for a specific field, only for whatever is there."""
+        seed_chaotic(fresh_graph)
+        inferred, _ = fresh_graph.infer_schema(vector_populated=True)
+        assert "vectors" not in inferred.to_json()
 
 
 class TestEndpointEnforcement:

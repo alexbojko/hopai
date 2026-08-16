@@ -823,16 +823,38 @@ class TestToolSchemasStayVectorFree:
         could reach a model -- and it is generated, not hand-written,
         which is exactly how a leak would arrive. Vector FIELD names
         are not graph-schema properties: a model given "summary" as a
-        property would filter on it and get nothing."""
+        property on traverse_graph/aggregate_graph/ingest_graph/
+        mutate_graph would filter on it and get nothing.
+
+        Since issue #51 a field name IS legitimate in exactly one
+        place: the appended vector search tool's own `field` enum,
+        which exists so a model picks among real fields instead of
+        guessing one (the whole point of narrowing it from a bare
+        string) -- so this checks the enum names them correctly and
+        checks the OTHER four tools stay exactly as vector-free as
+        before. The raw column name and the literal word "embedding"
+        stay forbidden everywhere, enum included: `vec_*` is a storage
+        detail no schema anywhere should name, and "embedding" would
+        invite a model to send floats under a different word than
+        "vector" -- the same invariant test_vectors.py pins for the
+        static schemas, just no longer blind to a name appearing
+        on purpose."""
         from hopai import NodeType, Property
 
         g = offline()
         g.define_schema(nodes=[NodeType("doc", properties=[Property("title", "string")])])
         g.define_vectors(nodes=[Vector("summary", 1536)], edges=[Vector("rel", 8)])
-        dumped = json.dumps(g.tool_schemas())
-        assert "title" in dumped                      # declared properties DO appear
-        for leaked in ("summary", "vec_summary", "embedding"):
-            assert leaked not in dumped, leaked
+        tools = g.tool_schemas()
+        search = next(t for t in tools if t["name"] == "search_graph_by_meaning")
+        assert search["parameters"]["$defs"]["near"]["properties"]["field"]["enum"] \
+            == ["rel", "summary"]
+
+        others = json.dumps([t for t in tools if t is not search])
+        assert "title" in others                      # declared properties DO appear
+        for leaked in ("summary", "rel"):
+            assert leaked not in others, leaked
+        for leaked in ("vec_summary", "vec_rel", "embedding"):
+            assert leaked not in json.dumps(tools), leaked
 
     #: The three that advertise a near spec. INGEST_TOOL_SCHEMA writes
     #: rows and has no similarity surface at all, which is why it is in

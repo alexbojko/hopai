@@ -954,6 +954,67 @@ class TestToolSchema:
         assert "+1 more" in summary
         assert summary.endswith("bare.")
 
+    def test_no_declared_vectors_leaves_the_four_tools_unchanged(self):
+        """Issue #51's other half of the same contract this class already
+        pins for a schema: appending VECTOR_SEARCH_TOOL_SCHEMA must not
+        become unconditional. A graph with a declared SCHEMA but no
+        declared VECTORS is the case a schema-only check would miss --
+        so this graph is not offgraph()'s bare handle, it is one with a
+        real schema, and the count still has to stay four."""
+        from hopai import INGEST_TOOL_SCHEMA, MUTATE_TOOL_SCHEMA
+        graph = self.offgraph()
+        self.declare(graph)
+        tools = graph.tool_schemas()
+        assert [t["name"] for t in tools] == [
+            TRAVERSE_TOOL_SCHEMA["name"], AGGREGATE_TOOL_SCHEMA["name"],
+            INGEST_TOOL_SCHEMA["name"], MUTATE_TOOL_SCHEMA["name"],
+        ]
+
+    def test_one_declared_vector_field_narrows_the_enum_to_it(self):
+        """VECTOR_SEARCH_TOOL_SCHEMA's static `field` is a bare string --
+        a model would have to guess a name only the application knows.
+        Appended by tool_schemas(), it must narrow to exactly this
+        graph's one declared field, the same treatment `search_field`
+        already gets in hopai.mcp (issue #51's point: one shared answer
+        to "what can be searched here")."""
+        from hopai import Vector
+        graph = self.offgraph()
+        graph.define_vectors(nodes=[Vector("summary", 3)])
+        tools = graph.tool_schemas()
+        search = next(t for t in tools if t["name"] == "search_graph_by_meaning")
+        assert len(tools) == 5
+        field = search["parameters"]["$defs"]["near"]["properties"]["field"]
+        assert field["enum"] == ["summary"]
+
+    def test_several_fields_across_nodes_and_edges_are_all_enumerated(self):
+        """One `near` $def is shared by every `target`, so the enum
+        cannot be scoped per target inside the schema -- it has to be
+        the union, and this pins that a node field and an edge field
+        both make it in."""
+        from hopai import Vector
+        graph = self.offgraph()
+        graph.define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)],
+                             edges=[Vector("rel", 3)])
+        search = next(t for t in graph.tool_schemas()
+                      if t["name"] == "search_graph_by_meaning")
+        field = search["parameters"]["$defs"]["near"]["properties"]["field"]
+        assert field["enum"] == ["rel", "summary", "title"]
+
+    def test_the_search_tool_is_a_fresh_copy_not_the_module_constant(self):
+        """The same non-negotiable test_tool_schemas_without_a_schema_
+        are_the_constants_uncoupled() holds the other four to: mutating
+        what tool_schemas() hands back must never corrupt
+        VECTOR_SEARCH_TOOL_SCHEMA for every OTHER integration in the
+        process."""
+        from hopai import VECTOR_SEARCH_TOOL_SCHEMA, Vector
+        before = json.dumps(VECTOR_SEARCH_TOOL_SCHEMA, sort_keys=True)
+        graph = self.offgraph()
+        graph.define_vectors(nodes=[Vector("summary", 3)])
+        search = next(t for t in graph.tool_schemas()
+                      if t["name"] == "search_graph_by_meaning")
+        search["parameters"]["$defs"]["near"]["properties"]["field"]["enum"].clear()
+        assert json.dumps(VECTOR_SEARCH_TOOL_SCHEMA, sort_keys=True) == before
+
 
 # ---------------------------------------------------------------------
 # Result object
