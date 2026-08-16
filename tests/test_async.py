@@ -26,7 +26,7 @@ import asyncio
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from hopai import Count, Hop, Near, Start, Vector
+from hopai import Count, CypherError, Hop, Near, Start, Unique, Vector
 from hopai.asyncio import AsyncGraph
 
 
@@ -290,3 +290,165 @@ class TestInGraph:
 class TestDispose:
     def test_dispose_closes_the_pool(self, async_fresh_graph):
         run(async_fresh_graph.dispose())
+
+
+class TestColumnOverridesPropagate:
+    """Every keyword AsyncGraph.__init__() takes must reach the wrapped
+    sync Graph unchanged -- __init__() and in_graph() each had an
+    argument mutation testing could drop with nothing noticing, since
+    every other test in this file leaves every override at its default.
+    No database needed: construction never connects, on Graph or
+    AsyncGraph alike."""
+
+    OVERRIDES = {
+        "node_id_col": "pk", "edge_id_col": "eid", "edge_start_col": "src",
+        "edge_end_col": "dst", "graph_col": "tenant",
+    }
+    OFFLINE_DSN = "postgresql+psycopg://offline:offline@127.0.0.1:1/offline"
+
+    def _custom_tables(self):
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+        meta = MetaData()
+        nodes = Table("t_nodes", meta, Column("pk", BigInteger, primary_key=True),
+                      Column("tenant", Text), Column("properties", JSONB))
+        edges = Table("t_edges", meta, Column("eid", BigInteger, primary_key=True),
+                      Column("tenant", Text), Column("src", BigInteger),
+                      Column("dst", BigInteger), Column("properties", JSONB))
+        return nodes, edges
+
+    def _assert_overrides(self, graph, nodes, edges):
+        assert graph.nodes_tbl is nodes
+        assert graph.edges_tbl is edges
+        for key, value in self.OVERRIDES.items():
+            assert getattr(graph, key) == value
+
+    def test_constructor_propagates_every_override(self):
+        nodes, edges = self._custom_tables()
+        graph = AsyncGraph(self.OFFLINE_DSN, node_table=nodes, edge_table=edges,
+                           **self.OVERRIDES)
+        self._assert_overrides(graph, nodes, edges)
+
+    def test_in_graph_propagates_every_override(self):
+        nodes, edges = self._custom_tables()
+        graph = AsyncGraph(self.OFFLINE_DSN, node_table=nodes, edge_table=edges,
+                           **self.OVERRIDES)
+        other = graph.in_graph("other")
+        assert other.graph == "other"
+        self._assert_overrides(other, nodes, edges)
+
+
+class TestConnectionIsShared:
+    """Every AsyncGraph write method must pass its already-checked-out
+    connection through to the sync Mutator/Ingestor/vectors function it
+    wraps -- several mutation-testing survivors on hopai/asyncio.py were
+    exactly that connection=c keyword being silently dropped, which
+    opens a SECOND connection instead of reusing the first. See
+    conftest.py's async_fresh_graph_pool1 for the mechanism: a
+    one-connection pool turns "opened an extra connection" into a pool
+    timeout instead of a difference nothing observes."""
+
+    def test_writes_never_need_a_second_connection(self, async_fresh_graph_pool1):
+        g = async_fresh_graph_pool1
+
+        async def body():
+            g.define_vectors(nodes=[Vector("summary", 2)])
+            await g.migrate_vectors()
+            await g.add_nodes([{"id": 1, "email": "a@x.com"}, {"id": 2, "email": "b@x.com"}])
+            await g.merge_nodes([{"email": "a@x.com", "age": 31}], on=["email"])
+            await g.add_edges([{"start_id": 1, "end_id": 2, "tag": "e1"}])
+            await g.merge_edges([{"start_id": 1, "end_id": 2, "tag": "e1", "weight": 2}],
+                                on=["tag"])
+            await g.set_vectors(nodes=[{"id": 1, "summary": [1.0, 0.0]}])
+            await g.drop_vectors(node_fields=["summary"])
+            await g.mutate_cypher("MATCH (a {email: 'a@x.com'}) SET a.active = true")
+
+        run(body())   # a pool timeout (TimeoutError) means some call above needed a 2nd connection
+
+
+class TestArgumentsReachTheSyncCall:
+    """Each of these caught an argument mutation testing found could be
+    replaced with a hardcoded value (None, or the default) with nothing
+    noticing -- every prior test only ever exercised the default."""
+
+    def test_merge_nodes_replace_true_reaches_the_call(self, async_fresh_graph, async_admin_graph):
+        async_admin_graph.define_constraints(nodes=[Unique("email")])
+
+        async def body():
+            await async_fresh_graph.merge_nodes([{"email": "a@x.com", "age": 20}], on=["email"])
+            await async_fresh_graph.merge_nodes(
+                [{"email": "a@x.com", "name": "Alice"}], on=["email"], replace=True)
+            return await async_fresh_graph.traverse(Start())
+
+        result = run(body())
+        # replace=True means the second write IS the whole properties bag --
+        # "age" from the first write must be gone, not merged alongside "name".
+        assert result.nodes[0]["properties"] == {"email": "a@x.com", "name": "Alice"}
+
+    def test_ingest_with_merge_nodes_on(self, async_fresh_graph, async_admin_graph):
+        async_admin_graph.define_constraints(nodes=[Unique("email")])
+
+        async def body():
+            await async_fresh_graph.ingest({"nodes": [{"email": "a@x.com", "age": 20}]})
+            await async_fresh_graph.ingest(
+                {"nodes": [{"email": "a@x.com", "age": 31}]}, merge_nodes_on=["email"])
+            return await async_fresh_graph.traverse(Start())
+
+        result = run(body())
+        assert len(result.nodes) == 1
+        assert result.nodes[0]["properties"]["age"] == 31
+
+    def test_delete_nodes_with_a_real_filter(self, async_fresh_graph):
+        async def body():
+            await async_fresh_graph.add_nodes([{"id": 1, "type": "draft"},
+                                               {"id": 2, "type": "keep"}])
+            deleted = await async_fresh_graph.delete_nodes(where={"type": "draft"})
+            remaining = await async_fresh_graph.traverse(Start())
+            return deleted, remaining
+
+        deleted, remaining = run(body())
+        assert deleted.deleted_nodes == 1
+        assert len(remaining.nodes) == 1
+        assert remaining.nodes[0]["properties"]["type"] == "keep"
+
+    def test_delete_nodes_detach_true_removes_edges_too(self, async_fresh_graph):
+        async def body():
+            await async_fresh_graph.add_nodes([{"id": 1, "type": "person"},
+                                               {"id": 2, "type": "person"}])
+            await async_fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}])
+            return await async_fresh_graph.delete_nodes(where={"type": "person"}, detach=True)
+
+        result = run(body())
+        # Without detach=True actually reaching Mutator.delete_nodes(), the foreign
+        # key refuses (edges still point at these nodes) and this raises instead.
+        assert result.deleted_nodes == 2
+        assert result.deleted_edges == 1
+
+
+class TestStrictSchemaOptionReachesTheGraph:
+    """strict_schema=True needs the real AsyncGraph passed to
+    resolve_strict() -- resolve_strict(None, ...) raises AttributeError
+    reaching for None.schema instead of the CypherError this refusal is
+    supposed to be. Cheap to prove with no schema defined at all:
+    strict_schema=True always raises, but only raises the RIGHT
+    exception when the wiring is intact -- so these fail on the wrong
+    exception type under a broken mutant rather than needing a whole
+    declared schema to set up."""
+
+    def test_mutate_cypher(self, async_fresh_graph):
+        with pytest.raises(CypherError, match="strict_schema"):
+            run(async_fresh_graph.mutate_cypher(
+                "MATCH (a:person) SET a.active = true", strict_schema=True))
+
+    def test_cypher_dispatches_write_with_options(self, async_fresh_graph):
+        with pytest.raises(CypherError, match="strict_schema"):
+            run(async_fresh_graph.cypher(
+                "CREATE (a:person {email: 'a@x.com'})", strict_schema=True))
+
+    def test_cypher_dispatches_aggregate_with_options(self, async_fresh_graph):
+        with pytest.raises(CypherError, match="strict_schema"):
+            run(async_fresh_graph.cypher("MATCH (a:person) RETURN count(a)", strict_schema=True))
+
+    def test_cypher_dispatches_traverse_with_options(self, async_fresh_graph):
+        with pytest.raises(CypherError, match="strict_schema"):
+            run(async_fresh_graph.cypher("MATCH (a:person) RETURN a", strict_schema=True))
