@@ -1387,6 +1387,31 @@ class TestInferenceSampling:
             with pytest.raises(ValueError, match=r"0 < sample_percent <= 100"):
                 offgraph.infer_schema(sample_percent=bad)
 
+    def test_the_edge_table_is_sampled_too_not_just_nodes(self, fresh_graph, monkeypatch):
+        """node_source and edge_source are built the same way one line
+        apart, and nothing downstream tells them apart by name -- easy
+        for a future edit to sample one and forget the other, and
+        test_full_sample_equals_the_exact_scan can't catch it (100%
+        sampling and no sampling read every page either way). Spy on
+        _source() directly rather than inferring sampling from row
+        counts, which TABLESAMPLE's own randomness would make flaky."""
+        import hopai.schema as schema_module
+
+        real_source = schema_module._source
+        calls = []
+
+        def spying_source(table, sample_percent):
+            calls.append((table, sample_percent))
+            return real_source(table, sample_percent)
+
+        monkeypatch.setattr(schema_module, "_source", spying_source)
+        seed_chaotic(fresh_graph)
+        fresh_graph.infer_schema(sample_percent=5)
+
+        tables_sampled = dict(calls)
+        assert tables_sampled[fresh_graph.nodes_tbl] == 5
+        assert tables_sampled[fresh_graph.edges_tbl] == 5
+
 
 # ---------------------------------------------------------------------
 # Persistence -- save_schema()/load_schema(), against real PostgreSQL

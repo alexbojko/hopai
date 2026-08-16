@@ -1433,6 +1433,10 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
             connection, graph, edge_source, "kind"), "kind", "edges", conflicts)
 
         edges = edge_source
+        # "src"/"dst" are SQLAlchemy alias labels that only ever appear
+        # inside generated SQL text -- nothing in this module or its
+        # tests reads them back by name, so any other spelling is
+        # observably identical (mutmut x_infer_schema__mutmut_100).
         source, target = nt.alias("src"), nt.alias("dst")
         kind = edges.c.properties["kind"].astext
         node_id = graph.node_id_col
