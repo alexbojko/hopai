@@ -240,6 +240,36 @@ class TestVectors:
         assert got["nodes"]["1"]["summary"] == pytest.approx([1.0, 0.0, 0.0])
         assert dropped == ["nodes.vec_summary"]
 
+    def test_vector_search_default_k_is_ten(self, async_fresh_graph):
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 2)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": i} for i in range(1, 13)])
+            await async_fresh_graph.set_vectors(
+                nodes=[{"id": i, "summary": [1.0, 0.0]} for i in range(1, 13)])
+            # No k= -- relies entirely on the method's own default.
+            return await async_fresh_graph.vector_search(Near("summary", [1.0, 0.0]))
+
+        results = run(body())
+        assert len(results) == 10
+
+    def test_get_vectors_with_both_node_and_edge_ids(self, async_fresh_graph):
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 2)],
+                                             edges=[Vector("summary", 2)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+            await async_fresh_graph.add_edges([{"id": 9, "start_id": 1, "end_id": 2}])
+            await async_fresh_graph.set_vectors(
+                nodes=[{"id": 1, "summary": [1.0, 0.0]}],
+                edges=[{"id": 9, "summary": [0.0, 1.0]}])
+            return await async_fresh_graph.get_vectors(node_ids=[1], edge_ids=[9])
+
+        result = run(body())
+        assert result["nodes"]["1"]["summary"] == pytest.approx([1.0, 0.0])
+        # Without edge_ids reaching the call, this would come back empty.
+        assert result["edges"]["9"]["summary"] == pytest.approx([0.0, 1.0])
+
     def test_vector_search_many_ranks_each_query_independently(self, async_fresh_graph):
         async def body():
             async_fresh_graph.define_vectors(nodes=[Vector("summary", 2)])
@@ -377,6 +407,9 @@ class TestConnectionIsShared:
             await g.merge_edges([{"start_id": 1, "end_id": 2, "tag": "e1", "weight": 2}],
                                 on=["tag"])
             await g.set_vectors(nodes=[{"id": 1, "summary": [1.0, 0.0]}])
+            await g.vector_search(Near("summary", [1.0, 0.0]), k=1)
+            await g.vector_search_many([Near("summary", [1.0, 0.0])], k=1)
+            await g.get_vectors(node_ids=[1])
             await g.drop_vectors(node_fields=["summary"])
             await g.mutate_cypher("MATCH (a {email: 'a@x.com'}) SET a.active = true")
             await g.write_cypher("CREATE (c:person {email: 'c@x.com'})")
@@ -385,6 +418,7 @@ class TestConnectionIsShared:
             await g.mutate({"operations": [
                 {"op": "update_nodes", "where": {"email": "b@x.com"}, "set": {"checked": True}},
             ]})
+            await g.clear()
 
         run(body())   # a pool timeout (TimeoutError) means some call above needed a 2nd connection
 
@@ -421,6 +455,27 @@ class TestArgumentsReachTheSyncCall:
 
         result = run(body())
         assert result.nodes[0]["properties"] == {"email": "a@x.com", "age": 20, "name": "Alice"}
+
+    def test_update_nodes_remove_reaches_the_call(self, async_fresh_graph):
+        async def body():
+            await async_fresh_graph.add_nodes([{"id": 1, "type": "person", "nickname": "Al"}])
+            await async_fresh_graph.update_nodes(where={"type": "person"}, remove=["nickname"])
+            return await async_fresh_graph.traverse(Start())
+
+        result = run(body())
+        # Without remove= reaching Mutator.update_nodes(), set= and remove= are
+        # both None -- "nothing to change" -- and this raises instead of succeeding.
+        assert result.nodes[0]["properties"] == {"type": "person"}
+
+    def test_update_edges_all_true_reaches_the_call(self, async_fresh_graph):
+        async def body():
+            await async_fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+            await async_fresh_graph.add_edges([{"start_id": 1, "end_id": 2}])
+            # No where/start/end -- only all=True makes this a legal call.
+            return await async_fresh_graph.update_edges(all=True, set={"seen": True})
+
+        result = run(body())
+        assert result.updated_edges == 1
 
     def test_delete_edges_end_filter_narrows_the_delete(self, async_fresh_graph):
         async def body():
