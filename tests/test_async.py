@@ -384,6 +384,23 @@ class TestVectors:
         # Without where= reaching the call, both same-vector nodes would match.
         assert [hit["id"] for hit in results[0]] == ["1"]
 
+    def test_define_vectors_migrate_true_is_refused_with_the_fix_named(
+            self, async_fresh_graph):
+        """define_vectors(migrate=True) (issue #57) is a Graph-only
+        shortcut: on AsyncGraph it would run migrate_vectors() straight
+        against the async engine's sync facade outside the greenlet
+        bridge -- the same MissingGreenlet trap TestOutOfScope pins for
+        the admin methods -- so it must refuse loud instead, naming both
+        the two-call replacement and the plain-Graph escape hatch."""
+        with pytest.raises(AttributeError, match="migrate=True"):
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3)], migrate=True)
+        # The refusal fires before any declaration -- nothing half-applied.
+        assert async_fresh_graph.vectors is None
+
+    def test_define_vectors_without_migrate_still_passes_through(self, async_fresh_graph):
+        result = async_fresh_graph.define_vectors(nodes=[Vector("summary", 3)])
+        assert set(result["nodes"]) == {"summary"}
+
 
 class TestOutOfScope:
     """Schema/constraint DDL has no async override -- see hopai/asyncio.py's
