@@ -42,17 +42,12 @@ from sqlalchemy import String, and_, cast, create_engine, distinct, func, litera
 from sqlalchemy import union as sa_union
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
+from sqlalchemy.schema import CreateIndex
 
 from .filters import resolve
 from .hop import Hop, Start
 from .models import DEFAULT_GRAPH, EDGE_IDENTITY_KEYS, NODE_IDENTITY_KEYS, Edge, Node
 from .vectors import VECTOR_COLUMN_PREFIX
-
-
-def _qualify(table) -> str:
-    if table.schema:
-        return f'"{table.schema}"."{table.name}"'
-    return f'"{table.name}"'
 
 
 def _extra_columns(table, reserved: set, graph_col: Optional[str]) -> tuple:
@@ -575,30 +570,43 @@ class Graph:
 
         The baseline indexes are not optional decoration. Without the
         btree indexes on the edge endpoints every hop is a sequential
-        scan, and without the GIN indexes every property filter is."""
-        self.nodes_tbl.create(self.engine, checkfirst=True)
-        self.edges_tbl.create(self.engine, checkfirst=True)
+        scan, and without the GIN indexes every property filter is.
 
-        nodes, edges = _qualify(self.nodes_tbl), _qualify(self.edges_tbl)
-        g = self.graph_col
+        Each is a real sqlalchemy.Index attached to nodes_tbl/edges_tbl
+        (see hopai.constraints), so a project's own Alembic
+        --autogenerate sees them as declared schema rather than drift to
+        propose dropping. suspended_declarations() is what keeps that
+        attachment from backfiring here: Table.create() renders EVERY
+        index/constraint currently attached, and if this process already
+        called define_constraints()/enforce_schema()/migrate_vectors()
+        on this table before create_schema() ever ran, those would
+        otherwise get baked into the CREATE TABLE this issues instead of
+        being applied on their own terms."""
+        from .constraints import _attach_index, suspended_declarations
+
+        with suspended_declarations(self.nodes_tbl, self.edges_tbl):
+            self.nodes_tbl.create(self.engine, checkfirst=True)
+            self.edges_tbl.create(self.engine, checkfirst=True)
+
+        nt, et, g = self.nodes_tbl, self.edges_tbl, self.graph_col
         # graph_id LEADS both endpoint indexes. Every hop filters on it,
         # so a trailing position would make the index useless the moment
         # a second graph exists -- and the cost of the discriminator is
         # only acceptable because it is indexed away.
-        statements = [
-            f'CREATE INDEX IF NOT EXISTS "ix_{self.edges_tbl.name}_graph_{self.edge_start_col}" '
-            f'ON {edges} ("{g}", "{self.edge_start_col}")',
-            f'CREATE INDEX IF NOT EXISTS "ix_{self.edges_tbl.name}_graph_{self.edge_end_col}" '
-            f'ON {edges} ("{g}", "{self.edge_end_col}")',
-            f'CREATE INDEX IF NOT EXISTS "ix_{self.nodes_tbl.name}_graph" ON {nodes} ("{g}")',
-            f'CREATE INDEX IF NOT EXISTS "ix_{self.nodes_tbl.name}_properties" '
-            f'ON {nodes} USING GIN (properties)',
-            f'CREATE INDEX IF NOT EXISTS "ix_{self.edges_tbl.name}_properties" '
-            f'ON {edges} USING GIN (properties)',
+        indexes = [
+            _attach_index(et, f"ix_{et.name}_graph_{self.edge_start_col}",
+                         [et.c[g], et.c[self.edge_start_col]]),
+            _attach_index(et, f"ix_{et.name}_graph_{self.edge_end_col}",
+                         [et.c[g], et.c[self.edge_end_col]]),
+            _attach_index(nt, f"ix_{nt.name}_graph", [nt.c[g]]),
+            _attach_index(nt, f"ix_{nt.name}_properties", [nt.c.properties],
+                         postgresql_using="gin"),
+            _attach_index(et, f"ix_{et.name}_properties", [et.c.properties],
+                         postgresql_using="gin"),
         ]
         with self.engine.begin() as connection:
-            for statement in statements:
-                connection.execute(text(statement))
+            for idx in indexes:
+                connection.execute(CreateIndex(idx, if_not_exists=True))
 
     def drop_schema(self) -> None:
         """Drop both tables and everything on them. Edges first, for the
@@ -649,8 +657,13 @@ class Graph:
     def drop_constraints(self, nodes: Optional[list] = None,
                          edges: Optional[list] = None) -> list:
         """Drop the constraints these declarations describe. Missing ones
-        are ignored, so this is the exact inverse of define_constraints()."""
-        from .constraints import compile_constraint
+        are ignored, so this is the exact inverse of define_constraints().
+
+        Also detaches the matching Index/CheckConstraint from the
+        table's SQLAlchemy metadata (compile_constraint() attached it),
+        so a dropped constraint does not linger as a phantom object a
+        later constraint_ddl()/Alembic autogenerate would still see."""
+        from .constraints import compile_constraint, detach_constraint
 
         dropped = []
         with self.engine.begin() as connection:
@@ -662,6 +675,7 @@ class Graph:
                     else:
                         connection.execute(text(
                             f'ALTER TABLE {target.qualified} DROP CONSTRAINT IF EXISTS "{name}"'))
+                    detach_constraint(target.table, kind, name)
                     dropped.append(name)
         return dropped
 
@@ -860,6 +874,7 @@ class Graph:
         named (ck_schema_*) are ever touched; define_constraints()
         declarations are not its to drop. Returns the names now in
         force, in order."""
+        from .constraints import detach_constraint
         from .schema import (
             ENDPOINT_TRIGGER_EXISTS, SCHEMA_CHECKS, SCHEMA_UNIQUES, _graph_token,
             compile_edge_constraints, compile_edge_uniques, compile_endpoint_ddl,
@@ -883,6 +898,7 @@ class Graph:
                                     if n.startswith(prefixes) and n not in current):
                     connection.execute(text(
                         f'ALTER TABLE {target.qualified} DROP CONSTRAINT "{stale}"'))
+                    detach_constraint(target.table, "check", stale)
                 for name, ddl in pairs:
                     if name not in existing:
                         connection.execute(text(ddl))
@@ -897,6 +913,7 @@ class Graph:
                 for stale in sorted(n for n in existing_uniques
                                     if n.startswith(index_prefix) and n not in wanted_uniques):
                     connection.execute(text(f'DROP INDEX IF EXISTS "{stale}"'))
+                    detach_constraint(target.table, "index", stale)
                 for name, ddl in uniques:
                     connection.execute(text(ddl))   # IF NOT EXISTS makes this idempotent
                     applied.append(name)

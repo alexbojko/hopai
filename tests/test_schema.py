@@ -553,7 +553,7 @@ class TestSchemaRepresentations:
         # the DEFAULT dialect instead (mutant x__literal__mutmut_4) emits
         # `properties -> 'age'` here and nothing else in the DDL differs
         assert any("jsonb_typeof(properties['age'])" in statement for statement in ddl)
-        assert any('ALTER TABLE "edges"' in statement
+        assert any("ALTER TABLE edges" in statement
                    and "IS DISTINCT FROM 'works_at'" in statement for statement in ddl)
 
     def test_conflicting_property_schemas_for_one_kind_refused(self, offgraph):

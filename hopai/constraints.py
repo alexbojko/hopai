@@ -64,17 +64,33 @@ does not exist. This is checked wherever a bare string could compile to
 `properties->>'...'` -- Unique/Index/Required/PropertyType, and
 merge_nodes()/merge_edges()'s `on=`, since key_sql() is what both the
 index and the ON CONFLICT target are rendered through.
+
+EVERY CONSTRAINT DECLARED HERE IS REAL SQLALCHEMY METADATA, not a hand-
+built DDL string kept off to the side: compile_constraint() attaches an
+actual `sqlalchemy.Index`/`CheckConstraint` to `graph.nodes_tbl`/
+`edges_tbl` and derives its returned DDL from that same object. That is
+what lets a project's own Alembic `--autogenerate` -- run against
+`target_metadata` that includes these tables -- see hopai's indexes and
+checks as declared schema instead of drift to propose dropping. It costs
+nothing extra to call: `constraint_ddl()`'s preview and
+`define_constraints()`'s apply both attach, so either one run once is
+enough for the shape to be visible.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
+from sqlalchemy import CheckConstraint as SACheckConstraint
+from sqlalchemy import Index as SAIndex
 from sqlalchemy import column as sa_column
 from sqlalchemy import func, or_, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.schema import AddConstraint, CreateIndex
+from sqlalchemy.sql.elements import quoted_name
 
 from .filters import resolve
 
@@ -196,23 +212,27 @@ CONSTRAINT_TYPES = (Unique, Index, Required, PropertyType, Check)
 
 @dataclass
 class _Target:
-    """The table a set of constraints applies to, and the graph within it.
-
-    `properties_col` is deliberately an UNBOUND column rather than
-    table.c.properties: an unbound one renders as `properties`, a bound
-    one as `nodes.properties`. Both work in DDL, but a qualified name is
-    not accepted in an ON CONFLICT target -- and index inference only
-    works when the conflict target is spelled exactly as the index was.
-    Generating both from this one column is what keeps merge_nodes() and
-    Unique() in step."""
+    """The table a set of constraints applies to, and the graph within it."""
     table: Any
     label: str
     graph: Optional[str] = None
     graph_col: str = "graph_id"
-    properties_col: Any = field(init=False)
 
-    def __post_init__(self):
-        self.properties_col = sa_column("properties", JSONB)
+    @property
+    def properties_col(self):
+        """The properties column, BOUND to this target's table.
+
+        Building it from table.c.properties -- rather than an unbound
+        sa_column("properties", JSONB), which is what this used to be --
+        is what lets compile_constraint() hand it to sqlalchemy.Index/
+        CheckConstraint: both infer which table they belong to from a
+        bound column inside their expression, and an unbound one carries
+        no table to infer. The one place that still needs the UNBOUND
+        rendering -- merge()'s ON CONFLICT target -- builds it directly
+        in key_sql() rather than through this property, since a bound
+        column renders table-qualified when compiled standalone and
+        Postgres rejects a qualified conflict target."""
+        return self.table.c.properties
 
     def scope_index(self, keys: tuple) -> tuple:
         """Put graph_id in front of an index's columns.
@@ -231,7 +251,7 @@ class _Target:
         guard makes it vacuously true elsewhere."""
         if self.graph is None:
             return expression
-        return or_(sa_column(self.graph_col) != self.graph, expression)
+        return or_(self.table.c[self.graph_col] != self.graph, expression)
 
     def scope_name(self, name: str) -> str:
         """Two graphs declaring the same check need two constraints, so
@@ -277,27 +297,45 @@ def _reject_column_collision(target: _Target, key: str) -> None:
         )
 
 
-def _key_expression(target: _Target, key: Key):
+def _validate_key(target: _Target, key: Key) -> None:
     if isinstance(key, Col):
         if key.name not in target.table.c:
             raise ValueError(
                 f"{target.label} has no column {key.name!r} -- "
                 f"columns are {sorted(c.name for c in target.table.c)}"
             )
-        return sa_column(key.name)
+        return
     if not isinstance(key, str):
         raise TypeError(f"a constraint key must be a property name or Col(...), got {key!r}")
     _reject_column_collision(target, key)
+
+
+def _key_expression(target: _Target, key: Key):
+    """This key as a BOUND expression, for building the actual
+    sqlalchemy.Index/CheckConstraint objects compile_constraint()
+    attaches to target.table. See key_sql() for the unbound counterpart
+    ON CONFLICT needs."""
+    _validate_key(target, key)
+    if isinstance(key, Col):
+        return target.table.c[key.name]
     return target.properties_col[key].astext
 
 
 def key_sql(target: _Target, key: Key) -> str:
-    """One key as index-ready SQL: `start_id`, or `(properties ->> 'k')`.
+    """One key as UNQUALIFIED index-ready SQL: `start_id`, or
+    `(properties ->> 'k')`.
 
-    Both CREATE INDEX and ON CONFLICT go through here, so a conflict
-    target can never drift from the index it needs to infer."""
-    rendered = _literal(_key_expression(target, key))
-    return rendered if isinstance(key, Col) else f"({rendered})"
+    Both CREATE INDEX (through compile_constraint()) and ON CONFLICT go
+    through here, so a conflict target can never drift from the index it
+    needs to infer -- which is also why this builds its own unbound
+    expression rather than reusing _key_expression()'s bound one: a bound
+    column renders table-qualified (`nodes.properties`) when compiled
+    standalone outside a DDL-construct context, and Postgres rejects a
+    qualified ON CONFLICT target."""
+    _validate_key(target, key)
+    if isinstance(key, Col):
+        return _literal(sa_column(key.name))
+    return f"({_literal(sa_column('properties', JSONB)[key].astext)})"
 
 
 def _slug(key: Key) -> str:
@@ -313,8 +351,127 @@ def _auto_name(prefix: str, target: _Target, parts) -> str:
     return name[:63]
 
 
+def detach_constraint(table: Any, kind: str, name: str) -> None:
+    """Remove a same-named Index/CheckConstraint from `table`'s own
+    SQLAlchemy metadata.
+
+    _attach_index()/_attach_check() call this before constructing a
+    replacement: SQLAlchemy does not dedupe two same-named objects
+    attached to one table, so constructing without detaching first
+    leaves both sitting in `table.indexes`/`table.constraints` -- and a
+    tool reading that metadata (Alembic included) then sees two
+    competing definitions for one name. drop_constraints() and
+    enforce_schema()'s reconciliation call it too, so an object dropped
+    from the database does not linger as a phantom in Python metadata.
+
+    Takes the table directly, not a _Target: nothing here needs a
+    graph's scoping rules, only which table's metadata to touch --
+    create_schema()'s baseline indexes and vectors.py's dimension checks
+    use it too, and neither one has a constraint _Target of its own."""
+    container = table.indexes if kind == "index" else table.constraints
+    match = next((obj for obj in container if getattr(obj, "name", None) == name), None)
+    if match is not None:
+        container.discard(match)
+
+
+#: Marks an Index/CheckConstraint as attached by THIS module, in
+#: `.info` -- the SchemaItem-standard place for a library to stash its
+#: own bookkeeping without colliding with SQLAlchemy's own attributes.
+#: suspended_declarations() reads it to tell "something define_constraints()/
+#: enforce_schema()/migrate_vectors() declared" apart from a table's own
+#: structural constraints (its primary key, foreign keys, and any
+#: UniqueConstraint or CheckConstraint a project wrote directly into a
+#: custom node_table=/edge_table=), which must NOT be hidden.
+_DECLARED = "hopai_declared"
+
+
+def _attach_index(table: Any, name: str, expressions, *, unique: bool = False,
+                  where=None, **options) -> SAIndex:
+    """A real sqlalchemy.Index, attached to `table`.
+
+    Built from BOUND expressions (see _key_expression), which is what
+    lets Index infer `table` and self-register on construction -- the
+    same mechanism that makes it visible to Alembic --autogenerate.
+    `**options` passes through dialect-specific kwargs like
+    postgresql_using="gin"."""
+    detach_constraint(table, "index", name)
+    if where is not None:
+        options["postgresql_where"] = where
+    idx = SAIndex(quoted_name(name, True), *expressions, unique=unique, **options)
+    idx.info[_DECLARED] = True
+    return idx
+
+
+def _attach_check(table: Any, name: str, expression) -> SACheckConstraint:
+    """A real sqlalchemy.CheckConstraint, attached to `table`."""
+    detach_constraint(table, "check", name)
+    ck = SACheckConstraint(expression, name=quoted_name(name, True))
+    ck.info[_DECLARED] = True
+    table.append_constraint(ck)
+    return ck
+
+
+@contextmanager
+def suspended_declarations(*tables: Any):
+    """Temporarily detach every Index/CheckConstraint _attach_index()/
+    _attach_check() put on `tables`, restoring them on exit.
+
+    Table.create() (and the CreateTable DDL it emits) renders EVERY
+    index/constraint currently attached to a table, not just the ones
+    native to its own definition. create_schema()'s contract is "the
+    table's own structure, plus its five baseline indexes" -- so if
+    this process already called define_constraints()/enforce_schema()/
+    migrate_vectors() on this table (on this Graph, or on another one
+    sharing the default Node/Edge table) before create_schema() ever
+    ran, those declarations must not get baked into the CREATE TABLE/
+    CREATE INDEX statements create_schema() is about to issue. A
+    table's own structural constraints -- its primary key, foreign
+    keys, and anything a project wrote directly into a custom
+    node_table=/edge_table= -- are untouched, since only objects
+    carrying _DECLARED in `.info` (see _attach_index/_attach_check) are
+    ever hidden."""
+    hidden = [
+        ([ix for ix in table.indexes if ix.info.get(_DECLARED)],
+         [c for c in table.constraints if getattr(c, "info", {}).get(_DECLARED)])
+        for table in tables
+    ]
+    for table, (indexes, checks) in zip(tables, hidden, strict=True):
+        for ix in indexes:
+            table.indexes.discard(ix)
+        for ck in checks:
+            table.constraints.discard(ck)
+    try:
+        yield
+    finally:
+        for table, (indexes, checks) in zip(tables, hidden, strict=True):
+            table.indexes.update(indexes)
+            table.constraints.update(checks)
+
+
+def _compile_check(table: Any, name: str, expression) -> str:
+    """Attach `expression` (already scoped) as a CheckConstraint named
+    `name`, and return its ADD CONSTRAINT DDL.
+
+    The one seam every CHECK this library emits goes through --
+    compile_constraint()'s Required/PropertyType/Check branches, and
+    schema.py's per-type presence/type/value rules -- so a CHECK is never
+    hand-built DDL invisible to SQLAlchemy's own metadata."""
+    ck = _attach_check(table, name, expression)
+    return str(AddConstraint(ck).compile(
+        dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+
+
 def compile_constraint(constraint: Any, target: _Target) -> tuple:
-    """Return (kind, name, ddl) for one constraint.
+    """Return (kind, name, ddl) for one constraint -- attaching it to
+    target.table's SQLAlchemy metadata as a real Index/CheckConstraint
+    along the way, so a tool reading target_metadata (Alembic's
+    --autogenerate, first and foremost) sees exactly what this call
+    declares rather than proposing to drop it. Re-declaring under the
+    same name replaces the prior object rather than accumulating a
+    duplicate (see detach_constraint), which is also why calling this
+    more than once -- constraint_ddl() previewing, then
+    define_constraints() applying -- always reflects the CURRENT
+    declaration rather than whichever one ran first.
 
     kind is 'index' or 'check' -- they are created and dropped by
     different statements. Exposed so `graph.constraint_ddl()` can show a
@@ -323,11 +480,12 @@ def compile_constraint(constraint: Any, target: _Target) -> tuple:
         unique = isinstance(constraint, Unique)
         keys = target.scope_index(constraint.keys)
         name = constraint.name or _auto_name("uq" if unique else "ix", target, constraint.keys)
-        columns = ", ".join(key_sql(target, k) for k in keys)
-        ddl = (f'CREATE {"UNIQUE " if unique else ""}INDEX IF NOT EXISTS "{name}" '
-               f'ON {target.qualified} ({columns})')
-        if constraint.where is not None:
-            ddl += f" WHERE ({_literal(resolve(target.properties_col, constraint.where))})"
+        expressions = [_key_expression(target, key) for key in keys]
+        where = (resolve(target.properties_col, constraint.where)
+                 if constraint.where is not None else None)
+        idx = _attach_index(target.table, name, expressions, unique=unique, where=where)
+        ddl = str(CreateIndex(idx, if_not_exists=True).compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
         return "index", name, ddl
 
     if isinstance(constraint, Required):
@@ -335,16 +493,17 @@ def compile_constraint(constraint: Any, target: _Target) -> tuple:
             _reject_column_collision(target, key)
         name = constraint.name or target.scope_name(
             _auto_name("ck_required", target, constraint.keys))
-        body = _literal(target.scope_check(
-            target.properties_col.has_all(postgresql.array(constraint.keys))))
-        return "check", name, _add_check(target, name, body)
+        expression = target.scope_check(
+            target.properties_col.has_all(postgresql.array(constraint.keys)))
+        return "check", name, _compile_check(target.table, name, expression)
 
     if isinstance(constraint, PropertyType):
         _reject_column_collision(target, constraint.key)
         name = constraint.name or target.scope_name(
             _auto_name(f"ck_{constraint.json_type}", target, [constraint.key]))
-        expression = func.jsonb_typeof(target.properties_col[constraint.key]) == constraint.json_type
-        return "check", name, _add_check(target, name, _literal(target.scope_check(expression)))
+        expression = target.scope_check(
+            func.jsonb_typeof(target.properties_col[constraint.key]) == constraint.json_type)
+        return "check", name, _compile_check(target.table, name, expression)
 
     if isinstance(constraint, Check):
         # No _reject_column_collision here: unlike Required/PropertyType,
@@ -360,17 +519,13 @@ def compile_constraint(constraint: Any, target: _Target) -> tuple:
                 "dropped or made idempotent"
             )
         name = target.scope_name(constraint.name)
-        body = _literal(target.scope_check(resolve(target.properties_col, constraint.filter)))
-        return "check", name, _add_check(target, name, body)
+        expression = target.scope_check(resolve(target.properties_col, constraint.filter))
+        return "check", name, _compile_check(target.table, name, expression)
 
     raise TypeError(
         f"expected one of {', '.join(t.__name__ for t in CONSTRAINT_TYPES)}, "
         f"got {type(constraint).__name__}"
     )
-
-
-def _add_check(target: _Target, name: str, body: str) -> str:
-    return f'ALTER TABLE {target.qualified} ADD CONSTRAINT "{name}" CHECK ({body})'
 
 
 _CHECK_EXISTS = text("""

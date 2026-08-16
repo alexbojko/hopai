@@ -162,7 +162,7 @@ from typing import Optional, Union
 from sqlalchemy import func, or_, text
 from sqlalchemy.dialects import postgresql
 
-from .constraints import JSON_TYPES, _add_check, _literal, _slug, _Target
+from .constraints import JSON_TYPES, _compile_check, _slug, _Target
 
 _ENDPOINTS = ("source", "target")
 
@@ -852,7 +852,7 @@ SCHEMA_UNIQUES = text("""
 
 def _type_constraints(target: _Target, discriminator: str, type_name: str,
                       properties: tuple) -> list:
-    return [(name, _add_check(target, name, _literal(target.scope_check(expression))))
+    return [(name, _compile_check(target.table, name, target.scope_check(expression)))
             for name, expression in _type_rules(target, discriminator, type_name, properties)]
 
 

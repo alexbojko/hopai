@@ -301,8 +301,9 @@ class TestLifecycle:
 
     def test_constraint_ddl_does_not_execute(self, fresh_graph):
         ddl = fresh_graph.constraint_ddl(nodes=[Unique("email")])
+        table = f"{fresh_graph.nodes_tbl.schema}.nodes" if fresh_graph.nodes_tbl.schema else "nodes"
         assert ddl == ['CREATE UNIQUE INDEX IF NOT EXISTS "uq_nodes_email" '
-                       'ON "nodes" (graph_id, (properties ->> \'email\'))'], ddl
+                       f'ON {table} (graph_id, (properties ->> \'email\'))'], ddl
         assert "uq_nodes_email" not in indexes(fresh_graph)
 
     def test_create_schema_is_idempotent(self, fresh_graph):
@@ -375,6 +376,59 @@ class TestNaming:
         ddl = graph.constraint_ddl(**{target: [Unique("email")]})[0]
         assert "tenant" in ddl
         assert "graph_id" not in ddl
+
+
+class TestSQLAlchemyMetadata:
+    """define_constraints() attaches real sqlalchemy.Index/CheckConstraint
+    objects to graph.nodes_tbl/edges_tbl -- not just hand-built DDL kept
+    off to the side -- so a tool reading that metadata (Alembic's
+    --autogenerate, chiefly) sees hopai's declared shape natively."""
+
+    def test_unique_attaches_a_real_index(self, fresh_graph):
+        from sqlalchemy import Index as SAIndex
+
+        fresh_graph.define_constraints(nodes=[Unique("email")])
+        match = [ix for ix in fresh_graph.nodes_tbl.indexes if ix.name == "uq_nodes_email"]
+        assert len(match) == 1
+        assert isinstance(match[0], SAIndex)
+        assert match[0].unique is True
+
+    def test_required_attaches_a_real_check_constraint(self, fresh_graph):
+        from sqlalchemy import CheckConstraint as SACheckConstraint
+
+        fresh_graph.define_constraints(nodes=[Required("type")])
+        match = [c for c in fresh_graph.nodes_tbl.constraints
+                 if getattr(c, "name", None) == "ck_required_nodes_type"]
+        assert len(match) == 1
+        assert isinstance(match[0], SACheckConstraint)
+
+    def test_defining_twice_does_not_duplicate_metadata(self, fresh_graph):
+        """SQLAlchemy does not dedupe two same-named Index/CheckConstraint
+        objects attached to one table -- attach the same declaration twice
+        without replacing and Alembic would see two competing definitions
+        for one name."""
+        declarations = {"nodes": [Unique("email"), Required("type")]}
+        fresh_graph.define_constraints(**declarations)
+        fresh_graph.define_constraints(**declarations)
+        assert sum(1 for ix in fresh_graph.nodes_tbl.indexes
+                   if ix.name == "uq_nodes_email") == 1
+        assert sum(1 for c in fresh_graph.nodes_tbl.constraints
+                   if getattr(c, "name", None) == "ck_required_nodes_type") == 1
+
+    def test_previewing_still_attaches(self, fresh_graph):
+        """constraint_ddl() never executes anything, but it still has to
+        attach: a project calling it to preview a migration should see
+        the same metadata a caller of define_constraints() would."""
+        fresh_graph.constraint_ddl(nodes=[Unique("email")])
+        assert any(ix.name == "uq_nodes_email" for ix in fresh_graph.nodes_tbl.indexes)
+
+    def test_drop_constraints_detaches(self, fresh_graph):
+        declarations = {"nodes": [Unique("email"), Required("type")]}
+        fresh_graph.define_constraints(**declarations)
+        fresh_graph.drop_constraints(**declarations)
+        assert not any(ix.name == "uq_nodes_email" for ix in fresh_graph.nodes_tbl.indexes)
+        assert not any(getattr(c, "name", None) == "ck_required_nodes_type"
+                       for c in fresh_graph.nodes_tbl.constraints)
 
 
 class TestViolationErrors:

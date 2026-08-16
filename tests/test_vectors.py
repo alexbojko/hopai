@@ -273,7 +273,7 @@ class TestVectorDDL:
         g.define_vectors(nodes=[Vector("summary", 3)])
         check = [s for s in g.vector_ddl() if "ADD CONSTRAINT" in s][0]
         assert "graph_id" not in check
-        assert '"vertex"' in check
+        assert "vertex" in check
 
     def test_migrate_without_define_names_the_fix_before_connecting(self):
         with pytest.raises(ValueError, match=r"call define_vectors\(...\) first"):

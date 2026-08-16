@@ -366,6 +366,16 @@ Idempotent, so it belongs next to `create_schema()`. A violation raises
 than a driver error. `graph.constraint_ddl(...)` returns the exact SQL
 without running it; `graph.drop_constraints(...)` is the inverse.
 
+Every constraint here is a real `sqlalchemy.Index`/`CheckConstraint`
+attached to `graph.nodes_tbl`/`edges_tbl`, not DDL kept off to the side
+-- so if your project points its own Alembic `target_metadata` at those
+tables (or a custom `node_table=`/`edge_table=` you pass to `Graph()`),
+`alembic revision --autogenerate` sees hopai's constraints as declared
+schema instead of drift to propose dropping. Call `create_schema()` and
+`define_constraints(...)` (or their `_ddl` previews, which attach
+without running anything) from `env.py` before autogenerate runs, the
+same way you would import your own models.
+
 `PropertyType` is worth the line when a model writes your data: an LLM
 emitting `"42"` where you expected `42` breaks every numeric comparison
 downstream, silently and much later.
@@ -454,6 +464,11 @@ graph.enforce_schema()  # idempotent; re-running after a schema change
                         # drops the rules the schema no longer has
 graph.add_nodes([{"type": "person"}])   # ConstraintViolation: email required
 ```
+
+Same SQLAlchemy-metadata attachment as [Constraints](#-constraints)
+above: `enforce_schema()`'s CHECK constraints land as real
+`CheckConstraint` objects on `graph.nodes_tbl`/`edges_tbl`, visible to
+Alembic `--autogenerate` the same way.
 
 Enforcing on a graph that grew **before** the schema did? `ADD
 CONSTRAINT` validates every existing row and fails opaquely on the
@@ -688,6 +703,7 @@ from hopai import Vector, Near
 graph.define_vectors(nodes=[Vector("summary", 1536), Vector("title", 384)],
                      edges=[Vector("relation", 384)])
 graph.migrate_vectors()      # ALTER TABLE, idempotent; vector_ddl() previews it
+                              # (the dimension CHECK it adds is real SA metadata too)
 
 graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
 
