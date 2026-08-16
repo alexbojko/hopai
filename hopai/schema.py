@@ -1344,6 +1344,12 @@ def _observed_keys(connection, graph, source, discriminator: str) -> list:
     """(type name, key, json type, row count) per distinct combination
     -- one lateral jsonb_each scan, Postgres doing all the work."""
     from sqlalchemy import func, select
+    # joins_implicitly=True only tells the compiler's cartesian-product
+    # linter to trust a correlation it can't otherwise see -- and it can
+    # already see this one, since the function call embeds a direct
+    # reference to source.c.properties. Verified equivalent to False:
+    # byte-identical compiled SQL, identical query results, no linter
+    # warning either way (mutmut survivor x__observed_keys__mutmut_13).
     kv = func.jsonb_each(source.c.properties).table_valued(
         "key", "value", joins_implicitly=True)
     name = source.c.properties[discriminator].astext
