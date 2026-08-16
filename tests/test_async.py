@@ -27,7 +27,7 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from hopai import Count, CypherError, Hop, Near, Start, Unique, Vector
+from hopai import Boost, Count, CypherError, Hop, Near, Start, Unique, Vector
 from hopai.asyncio import AsyncGraph
 
 
@@ -549,6 +549,48 @@ class TestArgumentsReachTheSyncCall:
 
         result = run(body())
         assert result.updated_edges == 1
+
+    def test_delete_edges_all_true_reaches_the_call(self, async_fresh_graph):
+        async def body():
+            await async_fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+            await async_fresh_graph.add_edges([{"start_id": 1, "end_id": 2}])
+            # No where/start/end -- only all=True makes this legal, so a
+            # dropped `all` turns a delete into a refusal.
+            return await async_fresh_graph.delete_edges(all=True)
+
+        assert run(body()).deleted_edges == 1
+
+    def test_update_edges_replace_true_reaches_the_call(self, async_fresh_graph):
+        async def body():
+            await async_fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+            await async_fresh_graph.add_edges([{"start_id": 1, "end_id": 2,
+                                                "kind": "knows", "weight": 3}])
+            await async_fresh_graph.update_edges(where={"kind": "knows"},
+                                                 set={"kind": "knows", "seen": True},
+                                                 replace=True)
+            return await async_fresh_graph.traverse(Start(), Hop(hops=(1, 1)))
+
+        result = run(body())
+        # replace=True means the map IS the properties bag: a dropped
+        # `replace` merges instead, and "weight" survives.
+        assert result.edges[0]["properties"] == {"kind": "knows", "seen": True}
+
+    def test_vector_search_many_boost_reaches_the_call(self, async_fresh_graph):
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 2)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1, "rank": 0}, {"id": 2, "rank": 100}])
+            await async_fresh_graph.set_vectors(nodes=[
+                {"id": 1, "summary": [1.0, 0.0]},
+                {"id": 2, "summary": [0.0, 1.0]},
+            ])
+            # Node 1 is the better cosine match; node 2's `rank` is large
+            # enough that the boost has to reorder them. A dropped boost=
+            # leaves node 1 first and says nothing.
+            return await async_fresh_graph.vector_search_many(
+                [Near("summary", [1.0, 0.0])], k=2, boost=Boost("rank"))
+
+        assert [hit["id"] for hit in run(body())[0]] == ["2", "1"]
 
     def test_delete_edges_end_filter_narrows_the_delete(self, async_fresh_graph):
         async def body():

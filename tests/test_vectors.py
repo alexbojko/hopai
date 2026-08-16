@@ -1542,6 +1542,29 @@ class TestTraversalNearLive:
 # ---------------------------------------------------------------------
 
 class TestDropVectorsLive:
+    def test_edge_fields_reach_the_drop_too(self, fresh_graph):
+        """Every other case here passes only node_fields, so blanking
+        the edge_fields argument on the way through Graph.drop_vectors()
+        survived the whole class -- drop_vectors(edges=...) would have
+        silently dropped nothing and reported success, which is the same
+        shape as the drop_constraints(edges=[...]) gap this branch
+        already fixed."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1}, {"id": 2}])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}])
+        with g.engine.connect() as conn:
+            edge_id = conn.execute(text("SELECT id FROM edges")).scalar()
+        g.set_vectors(edges=[{"id": edge_id, "relvec": [1.0, 0.0, 0.0]}])
+
+        # `for entry in names or ()` -- a blanked edge_fields drops
+        # NOTHING and still returns, so both halves are asserted: the
+        # report, and the values it claims to have cleared.
+        assert g.drop_vectors(edge_fields=["relvec"]) == ["edges.vec_relvec"]
+        with g.engine.connect() as conn:
+            remaining = conn.execute(text(
+                "SELECT count(*) FROM edges WHERE vec_relvec IS NOT NULL")).scalar()
+        assert remaining == 0
+
     def test_drop_nulls_this_graph_and_removes_its_constraint(self, fresh_graph):
         g = _corpus(fresh_graph)
         dropped = g.drop_vectors(node_fields=["docvec"])
