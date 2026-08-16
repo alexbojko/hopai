@@ -165,6 +165,59 @@ class TestVectorDeclaration:
         with pytest.raises(TypeError, match=r"takes Vector\(name, dimensions\) entries"):
             offline().define_vectors(nodes=["summary"])
 
+    def test_no_migrate_kwarg_is_byte_identical_to_today(self, monkeypatch):
+        """The default (issue #57): no `migrate=` at all, and `migrate=False`
+        explicitly, must both be exactly today's behavior -- no DDL, the
+        registry returned -- for every existing caller that never heard of
+        the kwarg."""
+        called = []
+        monkeypatch.setattr(Graph, "migrate_vectors", lambda self: called.append(True))
+
+        g = offline()
+        result = g.define_vectors(nodes=[Vector("summary", 3)])
+        assert result == g.vectors
+        assert isinstance(result, dict) and set(result) == {"nodes", "edges"}
+
+        g2 = offline()
+        result2 = g2.define_vectors(nodes=[Vector("summary", 3)], migrate=False)
+        assert result2 == g2.vectors
+
+        assert called == []  # migrate_vectors() never ran in either call
+
+    def test_migrate_true_creates_the_column_and_returns_migrate_vectors_result(
+            self, fresh_graph):
+        """The one-call form (issue #57): define_vectors(migrate=True) must
+        have the same effect on the database as the two-call
+        define_vectors()+migrate_vectors() sequence, and must hand back
+        migrate_vectors()'s own return value -- not the registry -- so the
+        DDL result stays visible instead of happening invisibly."""
+        result = fresh_graph.define_vectors(nodes=[Vector("docvec", 3)], migrate=True)
+
+        assert result == ["nodes.vec_docvec"]  # migrate_vectors()'s own return, verbatim
+        assert result != fresh_graph.vectors  # NOT the registry
+
+        with fresh_graph.engine.connect() as conn:
+            udt = conn.execute(text(
+                "SELECT udt_name FROM information_schema.columns "
+                "WHERE table_name = 'nodes' AND column_name = 'vec_docvec'"
+            )).scalar()
+            names = {row[0] for row in conn.execute(text(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid = CAST('nodes' AS regclass) AND contype = 'c'"))}
+        assert udt == "_float4"
+        assert "ck_vec_dims_default_nodes_docvec" in names
+
+    def test_migrate_true_matches_calling_migrate_vectors_separately(self, fresh_graph):
+        """Equivalence check against the existing two-call path: same
+        column, same constraint, on an equally fresh graph."""
+        one_call = fresh_graph.define_vectors(nodes=[Vector("docvec", 3)], migrate=True)
+
+        two_call_graph = fresh_graph.in_graph("two_call")
+        two_call_graph.define_vectors(nodes=[Vector("docvec", 3)])
+        two_call = two_call_graph.migrate_vectors()
+
+        assert one_call == two_call == ["nodes.vec_docvec"]
+
 
 # ---------------------------------------------------------------------
 # The migration's DDL
