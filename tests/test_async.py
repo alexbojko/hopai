@@ -692,3 +692,100 @@ class TestStrictSchemaOptionReachesTheGraph:
     def test_cypher_dispatches_traverse_with_options(self, async_fresh_graph):
         with pytest.raises(CypherError, match="strict_schema"):
             run(async_fresh_graph.cypher("MATCH (a:person) RETURN a", strict_schema=True))
+
+
+def _consume(passed: list, expected: dict, name: str) -> None:
+    """Match each expected value against a DISTINCT recorded argument.
+
+    A multiset, not membership: delete_nodes passes detach=True and
+    all=True, so `True in passed` still succeeds after one of them is
+    dropped -- the other one answers for it. The first version of this
+    test used `in` and missed exactly that mutant."""
+    remaining = list(passed)
+    for keyword, value in expected.items():
+        for i, item in enumerate(remaining):
+            if item is value or item == value:
+                del remaining[i]
+                break
+        else:
+            raise AssertionError(
+                f"{name}() did not pass {keyword}={value!r} -- recorded {passed!r}")
+
+
+class TestEveryWrapperForwardsEveryArgument:
+    """AsyncGraph is ~25 one-line delegations, and the mutation runs have
+    now picked six different ones apiece: boost off vector_search_many,
+    all off delete_edges, replace off update_edges, merge_edges_on off
+    ingest, hops off cypher's aggregate branch, all off update_nodes,
+    and merge_edges' `replace` default flipped outright. Every prior
+    test called each wrapper with the defaults for whatever it was not
+    itself about, so each was invisible in turn.
+
+    tests/test_vectors.py has the same table for Graph's vector methods;
+    this is the write half, and between them the family is closed rather
+    than its members picked off one run at a time.
+
+    Both directions are covered, because they fail differently: passing
+    a NON-DEFAULT value catches an argument dropped on the way through,
+    and passing NOTHING catches a default rewritten in the signature --
+    the shape that flipped merge_edges to replace=True."""
+
+    #: {AsyncGraph method: (delegate to record, required args, optional args)}
+    #: The delegate is patched on the class it lives on, so `self`
+    #: arrives first and is ignored -- only the values matter.
+    CALLS = {
+        "merge_nodes": ("hopai.ingest.Ingestor.merge_nodes",
+                        {"rows": [{"a": 1}], "on": ["a"]}, {"replace": True}),
+        "merge_edges": ("hopai.ingest.Ingestor.merge_edges",
+                        {"rows": [{"a": 1}], "on": ["a"]}, {"replace": True}),
+        "ingest": ("hopai.ingest.Ingestor.ingest", {"document": {"nodes": []}},
+                   {"merge_nodes_on": ["mn"], "merge_edges_on": ["me"]}),
+        "delete_nodes": ("hopai.mutate.Mutator.delete_nodes", {"where": {"w": 1}},
+                         {"detach": True, "all": True}),
+        "delete_edges": ("hopai.mutate.Mutator.delete_edges", {"where": {"w": 1}},
+                         {"start": {"s": 1}, "end": {"e": 1}, "all": True}),
+        "update_nodes": ("hopai.mutate.Mutator.update_nodes", {"where": {"w": 1}},
+                         {"set": {"s": 1}, "remove": ["r"], "replace": True, "all": True}),
+        "update_edges": ("hopai.mutate.Mutator.update_edges", {"where": {"w": 1}},
+                         {"start": {"s": 1}, "end": {"e": 1}, "set": {"v": 1},
+                          "remove": ["r"], "replace": True, "all": True}),
+    }
+
+    #: What each optional argument is when the caller says nothing. A
+    #: signature default rewritten in place changes behaviour for every
+    #: caller who trusted it, and no test that passes the value can see it.
+    DEFAULTS = {
+        "merge_nodes": {"replace": False},
+        "merge_edges": {"replace": False},
+        "ingest": {"merge_nodes_on": None, "merge_edges_on": None},
+        "delete_nodes": {"detach": False, "all": False},
+        "delete_edges": {"start": None, "end": None, "all": False},
+        "update_nodes": {"set": None, "remove": None, "replace": False, "all": False},
+        "update_edges": {"start": None, "end": None, "set": None, "remove": None,
+                         "replace": False, "all": False},
+    }
+
+    @staticmethod
+    def _record(monkeypatch, target: str) -> dict:
+        seen: dict = {}
+
+        def recorder(self, *args, **kwargs):
+            seen["passed"] = [*args, *kwargs.values()]
+            return "recorded"
+
+        monkeypatch.setattr(target, recorder)
+        return seen
+
+    @pytest.mark.parametrize("name", sorted(CALLS))
+    def test_non_default_values_reach_the_sync_call(self, async_graph, monkeypatch, name):
+        target, required, optional = self.CALLS[name]
+        seen = self._record(monkeypatch, target)
+        run(getattr(async_graph, name)(**required, **optional))
+        _consume(seen["passed"], optional, name)
+
+    @pytest.mark.parametrize("name", sorted(CALLS))
+    def test_the_documented_defaults_are_what_arrive(self, async_graph, monkeypatch, name):
+        target, required, _ = self.CALLS[name]
+        seen = self._record(monkeypatch, target)
+        run(getattr(async_graph, name)(**required))
+        _consume(seen["passed"], self.DEFAULTS[name], name)
