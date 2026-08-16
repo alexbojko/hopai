@@ -85,6 +85,8 @@ from typing import Any, Optional, Union
 
 from sqlalchemy import CheckConstraint as SACheckConstraint
 from sqlalchemy import Index as SAIndex
+from sqlalchemy import PrimaryKeyConstraint as SAPrimaryKeyConstraint
+from sqlalchemy import UniqueConstraint as SAUniqueConstraint
 from sqlalchemy import column as sa_column
 from sqlalchemy import func, or_, text
 from sqlalchemy.dialects import postgresql
@@ -351,9 +353,90 @@ def _auto_name(prefix: str, target: _Target, parts) -> str:
     return name[:63]
 
 
+#: Marks an Index/CheckConstraint as attached by THIS module, in
+#: `.info` -- the SchemaItem-standard place for a library to stash its
+#: own bookkeeping without colliding with SQLAlchemy's own attributes.
+#: Everything that hides, replaces or removes an object reads it first,
+#: so a table's own structural constraints (its primary key, foreign
+#: keys, and any Index/UniqueConstraint/CheckConstraint a project wrote
+#: directly into a custom node_table=/edge_table=) are never touched.
+_DECLARED = "hopai_declared"
+
+
+def _container(table: Any, kind: str):
+    return table.indexes if kind == "index" else table.constraints
+
+
+def _declared(table: Any, kind: str, name: str):
+    """The hopai-declared Index/CheckConstraint of this name, or None.
+
+    OWNERSHIP IS CHECKED, NOT JUST THE NAME, and that is the whole point
+    of this function. `table.constraints` also holds the table's primary
+    key, its foreign keys, and anything a project put in its own
+    node_table=/edge_table= -- and models.py names the composite foreign
+    keys `fk_edges_start_same_graph`/`fk_edges_end_same_graph` in
+    cleartext. Matching on name alone let
+    `Check(..., name="fk_edges_start_same_graph")` silently REPLACE that
+    foreign key with an ordinary CheckConstraint, on the module-level
+    Edge singleton every default Graph() shares -- so a later
+    create_schema() anywhere in the same process built `edges` without
+    the constraint that makes a cross-graph edge impossible. It was
+    reachable through constraint_ddl() alone, which is documented as
+    showing the SQL without running anything.
+    (test_a_declaration_cannot_replace_the_composite_foreign_key)"""
+    wanted = SAIndex if kind == "index" else SACheckConstraint
+    return next((obj for obj in _container(table, kind)
+                 if getattr(obj, "name", None) == name
+                 and isinstance(obj, wanted)
+                 and getattr(obj, "info", {}).get(_DECLARED)), None)
+
+
+def _foreign_holders(table: Any, kind: str):
+    """Every object on `table` this library did not declare whose name
+    an object of `kind` would collide with.
+
+    An index collides with more than the other indexes: a PRIMARY KEY or
+    UNIQUE constraint owns a backing index of its own name, so they share
+    one namespace in Postgres. `models.py` names one -- uq_nodes_id_graph,
+    the composite key the edges foreign key points at -- and
+    `Unique(..., name="uq_nodes_id_graph")` therefore compiled a
+    CREATE UNIQUE INDEX IF NOT EXISTS that Postgres skipped as
+    already-present, leaving the declared rule silently unenforced.
+    A CHECK owns no index, so it is not part of that namespace and is not
+    listed here."""
+    yield from (obj for obj in _container(table, kind)
+                if not getattr(obj, "info", {}).get(_DECLARED))
+    if kind == "index":
+        yield from (obj for obj in table.constraints
+                    if isinstance(obj, (SAPrimaryKeyConstraint, SAUniqueConstraint))
+                    and not getattr(obj, "info", {}).get(_DECLARED))
+
+
+def _reject_foreign_name(table: Any, kind: str, name: str) -> None:
+    """Refuse a name already taken by an object this library did not
+    declare, rather than shadowing it with a second one of the same name.
+
+    The alternative to refusing is two same-named objects on one table --
+    SQLAlchemy permits it, Alembic then sees competing definitions, and
+    Postgres either rejects the second CREATE or, with the IF NOT EXISTS
+    this library emits, skips it and leaves the rule unenforced. Naming
+    the collision beats any of those. Silently REPLACING it is what
+    _declared()'s docstring describes and is worse still."""
+    clash = next((obj for obj in _foreign_holders(table, kind)
+                  if getattr(obj, "name", None) == name), None)
+    if clash is not None:
+        raise ValueError(
+            f"{name!r} is already the name of a {type(clash).__name__} on "
+            f"{table.name!r} that hopai did not declare -- naming a constraint "
+            f"after one of the table's own would shadow it. Pass a different "
+            f"name= (every constraint takes one)"
+        )
+
+
 def detach_constraint(table: Any, kind: str, name: str) -> None:
-    """Remove a same-named Index/CheckConstraint from `table`'s own
-    SQLAlchemy metadata.
+    """Remove the hopai-declared Index/CheckConstraint of this name from
+    `table`'s own SQLAlchemy metadata. A name this library did not
+    declare is left alone (see _declared).
 
     _attach_index()/_attach_check() call this before constructing a
     replacement: SQLAlchemy does not dedupe two same-named objects
@@ -368,21 +451,9 @@ def detach_constraint(table: Any, kind: str, name: str) -> None:
     graph's scoping rules, only which table's metadata to touch --
     create_schema()'s baseline indexes and vectors.py's dimension checks
     use it too, and neither one has a constraint _Target of its own."""
-    container = table.indexes if kind == "index" else table.constraints
-    match = next((obj for obj in container if getattr(obj, "name", None) == name), None)
+    match = _declared(table, kind, name)
     if match is not None:
-        container.discard(match)
-
-
-#: Marks an Index/CheckConstraint as attached by THIS module, in
-#: `.info` -- the SchemaItem-standard place for a library to stash its
-#: own bookkeeping without colliding with SQLAlchemy's own attributes.
-#: suspended_declarations() reads it to tell "something define_constraints()/
-#: enforce_schema()/migrate_vectors() declared" apart from a table's own
-#: structural constraints (its primary key, foreign keys, and any
-#: UniqueConstraint or CheckConstraint a project wrote directly into a
-#: custom node_table=/edge_table=), which must NOT be hidden.
-_DECLARED = "hopai_declared"
+        _container(table, kind).discard(match)
 
 
 def _attach_index(table: Any, name: str, expressions, *, unique: bool = False,
@@ -394,6 +465,7 @@ def _attach_index(table: Any, name: str, expressions, *, unique: bool = False,
     same mechanism that makes it visible to Alembic --autogenerate.
     `**options` passes through dialect-specific kwargs like
     postgresql_using="gin"."""
+    _reject_foreign_name(table, "index", name)
     detach_constraint(table, "index", name)
     if where is not None:
         options["postgresql_where"] = where
@@ -404,6 +476,7 @@ def _attach_index(table: Any, name: str, expressions, *, unique: bool = False,
 
 def _attach_check(table: Any, name: str, expression) -> SACheckConstraint:
     """A real sqlalchemy.CheckConstraint, attached to `table`."""
+    _reject_foreign_name(table, "check", name)
     detach_constraint(table, "check", name)
     ck = SACheckConstraint(expression, name=quoted_name(name, True))
     ck.info[_DECLARED] = True
@@ -431,7 +504,7 @@ def suspended_declarations(*tables: Any):
     carrying _DECLARED in `.info` (see _attach_index/_attach_check) are
     ever hidden."""
     hidden = [
-        ([ix for ix in table.indexes if ix.info.get(_DECLARED)],
+        ([ix for ix in table.indexes if getattr(ix, "info", {}).get(_DECLARED)],
          [c for c in table.constraints if getattr(c, "info", {}).get(_DECLARED)])
         for table in tables
     ]

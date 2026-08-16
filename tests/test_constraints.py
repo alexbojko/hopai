@@ -422,6 +422,90 @@ class TestSQLAlchemyMetadata:
         fresh_graph.constraint_ddl(nodes=[Unique("email")])
         assert any(ix.name == "uq_nodes_email" for ix in fresh_graph.nodes_tbl.indexes)
 
+    def test_a_declaration_cannot_replace_the_composite_foreign_key(self):
+        """The attach machinery matched a same-named object by NAME
+        alone, and `table.constraints` holds the table's own primary key
+        and foreign keys too -- so a constraint named after one of them
+        REPLACED it, on the module-level Edge every default Graph()
+        shares. `edges` then got created without the composite FK that
+        makes a cross-graph edge impossible.
+
+        Uses the real hopai.models.Edge deliberately: the shared
+        singleton is what made this global, and models.py names these
+        two foreign keys in cleartext for anyone to collide with. It is
+        reachable through constraint_ddl(), which runs nothing."""
+        from sqlalchemy.schema import CreateTable
+
+        from hopai.models import Edge
+
+        with pytest.raises(ValueError, match="hopai did not declare"):
+            compile_constraint(
+                Check(GT("weight", 0), name="fk_edges_start_same_graph"),
+                _Target(Edge, "edges", None, "graph_id"))
+
+        kinds = {c.name: type(c).__name__ for c in Edge.constraints if c.name}
+        assert kinds["fk_edges_start_same_graph"] == "ForeignKeyConstraint"
+        assert "fk_edges_start_same_graph" in str(CreateTable(Edge).compile())
+
+    def test_a_unique_cannot_shadow_an_index_backed_constraint(self):
+        """A PRIMARY KEY / UNIQUE constraint owns a backing index of its
+        own name, so it shares one namespace with the indexes Unique()
+        emits. Without the refusal, Unique(name="uq_nodes_id_graph")
+        compiled a CREATE UNIQUE INDEX IF NOT EXISTS that Postgres
+        skipped as already-present -- the declared rule silently never
+        enforced, which is the worst answer this library can give."""
+        from hopai.models import Node
+
+        with pytest.raises(ValueError, match="hopai did not declare"):
+            compile_constraint(Unique("email", name="uq_nodes_id_graph"),
+                               _Target(Node, "nodes", None, "graph_id"))
+        assert not any(i.name == "uq_nodes_id_graph" for i in Node.indexes)
+
+    def test_a_check_may_reuse_a_name_no_index_owns(self, fresh_graph):
+        """The mirror of the two above: a CHECK owns no index, so it is
+        NOT in the index namespace and a check named after one of this
+        graph's own indexes has to keep working -- a refusal widened to
+        every container would break it."""
+        fresh_graph.define_constraints(nodes=[Index("type", name="shared_name")])
+        assert fresh_graph.define_constraints(
+            nodes=[Check(GT("age", 0), name="shared_name")]) == ["shared_name"]
+
+    def test_suspending_restores_on_an_exception(self):
+        """create_schema() hides hopai's declarations while it issues
+        CREATE TABLE, so they are not baked into it. If the CREATE
+        raises -- an unreachable database, a permissions error -- the
+        `finally` has to put them back, or the process is left with a
+        Graph whose declared constraints have silently vanished from its
+        own metadata. Coverage cannot see this: the try/finally is one
+        statement either way."""
+        from hopai.constraints import _attach_index, suspended_declarations
+        from hopai.models import Node
+
+        _attach_index(Node, "ix_suspend_probe", [Node.c.graph_id])
+        try:
+            with suspended_declarations(Node):
+                assert not any(i.name == "ix_suspend_probe" for i in Node.indexes)
+                raise RuntimeError("whatever CREATE TABLE would have raised")
+        except RuntimeError:
+            pass
+        try:
+            assert any(i.name == "ix_suspend_probe" for i in Node.indexes)
+        finally:
+            # Node is a module-level singleton shared by every default
+            # Graph(); leaving a probe on it would follow the whole session.
+            Node.indexes.discard(
+                next(i for i in Node.indexes if i.name == "ix_suspend_probe"))
+
+    def test_drop_constraints_leaves_a_foreign_object_alone(self, fresh_graph):
+        """detach_constraint() is ownership-aware on the way out too --
+        dropping must not evict a table's own constraint that happens to
+        share the name."""
+        from hopai.constraints import detach_constraint
+        from hopai.models import Edge
+
+        detach_constraint(Edge, "check", "fk_edges_start_same_graph")
+        assert any(c.name == "fk_edges_start_same_graph" for c in Edge.constraints)
+
     def test_drop_constraints_detaches(self, fresh_graph):
         declarations = {"nodes": [Unique("email"), Required("type")]}
         fresh_graph.define_constraints(**declarations)
