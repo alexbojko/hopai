@@ -14,6 +14,14 @@ read.** When a design question comes up, these decide it, in order:
 
 1. **No new dependency, ever.** Postgres and SQLAlchemy are the whole stack. A feature
    needing an extension, sidecar or worker is the wrong feature. Extras stay optional.
+   `embeddings.py` is the one place hopai makes a **network call**, and it holds the
+   line rather than breaking it: no provider package is imported, the client is the
+   caller's to construct and configure, and the extras (`hopai[openai]` and friends)
+   name what you were installing anyway. It retries transient failures because a
+   network call that gives up on one 429 is not finished work — but the policy is
+   `retries=`/`backoff=` on the Embedder, defaults documented against the client's
+   own, since the two multiply. A cache belongs to the application; a rate limiter
+   belongs to the client.
 2. **An LLM must get it right with no custom instructions.** Prefer a protocol a model
    has already seen ten thousand times — Cypher, JSON node/edge lists, JSON Schema tool
    definitions, SQLAlchemy idioms — over anything invented here, even when the invention
@@ -83,16 +91,33 @@ read.** When a design question comes up, these decide it, in order:
 - **A similarity is NULL — "missing" — when the stored vector is NULL, all zeros, or the
   wrong length.** `unnest(a, b)` pads the shorter side, so a mis-sized vector would
   otherwise score a confident cosine over the shared prefix.
-- **Vectors live in `vec_*` real columns, never in `properties`, and never pass
-  through an LLM tool schema.** JSONB storage would bloat the GIN index and every
-  result; a tool-schema `"vector"` parameter invites a model to invent an embedding,
-  and an invented embedding finds confidently wrong neighbors. Similarity is exact
-  (unnest+sum cosine, float8 accumulation); a traversal without `near=` must emit
-  byte-identical SQL to the pre-vector engine. (`test_defining_vectors_changes_no_near_less_query`,
-  `TestToolSchemasStayVectorFree`) The MCP server is the sanctioned shape for reaching
-  similarity from a model and does not weaken this: it takes the model's **text** and
-  embeds it with the operator's own callable, so still nowhere does a schema offer a
-  place to put floats. (`test_no_tool_advertises_a_vector_parameter`)
+- **Vectors live in `vec_*` real columns, never in `properties`.** JSONB storage would
+  bloat the GIN index and every result. Similarity is exact (unnest+sum cosine, float8
+  accumulation); a traversal without `near=` must emit byte-identical SQL to the
+  pre-vector engine. (`test_defining_vectors_changes_no_near_less_query`)
+- **A model may send `"text"`; a `"vector"` never reaches a tool schema.** Floats asked
+  of a model are invented, and an invented embedding finds confidently wrong neighbors,
+  so `"vector"` is the single key parsed and never advertised, refused without
+  `allow_vectors=True` — nowhere does a schema offer a place to put floats.
+  (`TestToolSchemasStayVectorFree`, `test_no_tool_advertises_a_vector_parameter`)
+  Text is the model's way IN and is meant to be advertised: the field embeds it with
+  the application's own client, so the query embedding comes from the model that wrote
+  the stored ones. Widening the refusal back over `text`/`keep`/`boost` puts semantic
+  search out of a tool call's reach entirely, which is what it was. **There are two
+  sanctioned embedders and they are not interchangeable**: the field's own `embed=`
+  (`Vector(..., embed=client)`, per field, matches the stored vectors' model) and the
+  MCP server's operator-supplied `serve(graph, embed=…)` (one callable for the whole
+  server, used for `start.search`). A field-level embedder is the better answer where
+  both apply, since a server-wide one cannot know which model wrote which field.
+- **Embedding happens outside the transaction, batched per field.** `set_vectors()`
+  resolves every string before it takes a connection: an HTTP call inside an open
+  transaction holds row locks for a network round trip, and a provider dying halfway
+  leaves a half-written batch for a retry to collide with.
+  (`test_the_provider_is_called_before_the_transaction_opens`)
+- **`embeddings.py` imports no provider package, ever** — not even to recognize one.
+  Clients are matched by `type(client).__module__` and attribute shape; `isinstance`
+  would need the import and would make `hopai[openai]` a coupling instead of a
+  convenience. (`TestNoProviderIsImported`)
 - **Writes are one transaction**, batching included. A half-committed write makes a
   retry collide with rows that landed.
 
@@ -117,15 +142,19 @@ read.** When a design question comes up, these decide it, in order:
   `{"type": "object"}` and leave a model guessing. A tool that offers a parameter no
   handler accepts, or a permission enforced inside a handler instead of by not registering
   the tool, is the defect. The tool schemas (`TRAVERSE_TOOL_SCHEMA` /
-  `AGGREGATE_TOOL_SCHEMA` / `INGEST_TOOL_SCHEMA` / `MUTATE_TOOL_SCHEMA`) must stay in
-  step with what the parsers accept — with one pinned exception: the vector keys
-  (`near`/`keep`/`via_near`/`via_keep`/`boost`) are parsed but deliberately never
-  advertised to a model, and `traverse_json`/`aggregate_json` refuse them without
-  `allow_vectors=True` (see `vectors.py`). `cypher.py` has no vector spelling and is not
-  expected to grow one — Cypher has no portable similarity syntax to translate, so there
-  is nothing to refuse by name. `mcp.py` calls `json_api.refuse_vectors()` on what the
-  model sent *before* injecting the embedding of its text; that function is the single
-  enforcement site and must not be copied into a front end.
+  `AGGREGATE_TOOL_SCHEMA` / `INGEST_TOOL_SCHEMA` / `MUTATE_TOOL_SCHEMA` /
+  `VECTOR_SEARCH_TOOL_SCHEMA`) must stay in step with what the parsers accept — with
+  exactly two pinned exceptions, and no third without a reason of the same kind. A near
+  spec's **`"vector"`** is parsed and never advertised (the invariant above); **`label`**
+  is not advertised because it names result groups for the caller's own bookkeeping and
+  builds no SQL, so there is nothing for a model to decide.
+  `test_advertises_the_keys_the_parser_reads` derives both sides from
+  `_HOP_KEYS`/`_START_KEYS`, so a widened parser and a widened schema fail apart.
+  `cypher.py` has no vector spelling and is not expected to grow one — Cypher has no
+  portable similarity syntax to translate, so there is nothing to refuse by name.
+  `mcp.py` calls `json_api.refuse_vectors()` on what the model sent *before* injecting
+  the embedding of its text; that function is the single enforcement site and must not
+  be copied into a front end.
 - `notebooks/` is documentation that **runs**, executed by CI on every PR
   (`python scripts/run_notebooks.py`). A change to a public API means re-running
   them with `--save` and reading the output diff — a stale notebook is a broken

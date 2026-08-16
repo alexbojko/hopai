@@ -151,9 +151,24 @@ path:
                              # re-declares it
 
 See hopai/schema.py for both notations and the annotation mapping.
+
+ASYNC -- traverse, aggregate, ingestion, mutation and vector search/
+storage, all reachable from an async app through the SAME query
+builders and execute-and-hydrate code Graph runs, via SQLAlchemy's own
+sync/async bridge rather than a second implementation:
+
+    from hopai.asyncio import AsyncGraph
+
+    graph = AsyncGraph("postgresql+psycopg://user:pass@host/db")   # needs
+    result = await graph.traverse(Start(where={"type": "person"}))  # hopai[asyncio]
+
+Schema and constraint declaration (create_schema(), enforce_schema(),
+define_constraints(), ...) stay on the sync Graph -- one-time setup
+calls with no concurrency to gain. See hopai/asyncio.py.
 """
 
 from .aggregates import Avg, Count, Max, Min, Sum, parse_aggregate
+from .asyncio import AsyncGraph
 from .constraints import (
     Check, Col, ConstraintViolation, Index, PropertyType, Required, Unique,
 )
@@ -166,9 +181,11 @@ from .filters import AND, BETWEEN, GT, GTE, LT, LTE, NOT, OR, parse_filter
 from .hop import Hop, Start
 from .ingest import INGEST_TOOL_SCHEMA, IngestResult
 from .json_api import (
-    AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, aggregate_json, spec_to_aggregation,
-    spec_to_traversal, traverse_json, vector_search_json,
+    AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, VECTOR_SEARCH_TOOL_SCHEMA,
+    aggregate_json, spec_to_aggregation, spec_to_traversal, traverse_json,
+    vector_search_json,
 )
+from .embeddings import Embedder, EmbeddingError
 from .models import Edge, Node
 from .mutate import MUTATE_TOOL_SCHEMA, MutationResult, spec_to_mutations
 from .schema import (
@@ -185,7 +202,7 @@ from .vectors import Boost, Near, Vector, parse_boost, parse_near
 __version__ = "0.0.1"  # x-release-please-version
 
 __all__ = [
-    "Graph", "Subgraph", "Start", "Hop",
+    "Graph", "AsyncGraph", "Subgraph", "Start", "Hop",
     "OR", "AND", "NOT", "GT", "GTE", "LT", "LTE", "BETWEEN", "parse_filter",
     "Count", "Sum", "Avg", "Min", "Max", "parse_aggregate",
     "traverse_json", "spec_to_traversal", "TRAVERSE_TOOL_SCHEMA",
@@ -198,6 +215,8 @@ __all__ = [
     "GraphSchema", "NodeType", "EdgeType", "Property", "InferenceReport", "TypeConflict",
     "SchemaViolations",
     "Vector", "Near", "Boost", "parse_near", "parse_boost", "vector_search_json",
+    "VECTOR_SEARCH_TOOL_SCHEMA",
+    "Embedder", "EmbeddingError",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",
 ]

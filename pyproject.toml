@@ -62,7 +62,14 @@ mcp = ["mcp>=1.10"]
 # schema_pydantic generates v2 models; this extra pins the MAJOR version
 # so v1, tolerated by some resolutions, is never silently what lands.
 pydantic = ["pydantic>=2.0"]
+# AsyncGraph (hopai/asyncio.py) needs an async-capable DBAPI -- psycopg2
+# (the base dependency) has none. greenlet itself is not listed: SQLAlchemy
+# 2.0's own wheel already pulls it in on every platform hopai supports, so
+# naming it again would be a second, redundant declaration of the same
+# dependency rather than a new one.
+asyncio = ["psycopg[binary]>=3.1"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "networkx>=3.0", "pydantic>=2.0", "ruff>=0.6",
+       "psycopg[binary]>=3.1",
        # In `dev` so CI actually registers the tools against a real SDK.
        # tests/test_mcp.py skips the SDK-backed classes without it, and
        # a suite that silently stops testing the server is how the
@@ -84,6 +91,26 @@ docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocs-jupyter>=0.25"]
 # `export-cicd-stats` JSON the PR comment parses) is the documented 3.x
 # contract, and a major bump could change any of it. See setup.cfg.
 mutation = ["mutmut>=3.6.0,<4"]
+
+# Embedding providers. hopai imports NONE of these -- see
+# hopai/embeddings.py, which matches clients by module name and duck
+# typing precisely so the import never happens. They are here so
+# `pip install hopai[openai]` gets you a working setup in one line, and
+# so the supported set is written down somewhere a reader can find it.
+#
+# Floors, not ceilings, and only where a floor means something:
+# openai>=1.0 is the v1 client rewrite (`client.embeddings.create`),
+# cohere>=5.0 is the v2 client (`embed(..., embedding_types=)`). The
+# rest have kept one shape.
+openai = ["openai>=1.0"]
+cohere = ["cohere>=5.0"]
+voyageai = ["voyageai>=0.2"]
+google = ["google-genai>=0.3"]
+sentence-transformers = ["sentence-transformers>=3.0"]
+# Everything at once, for a project that has not chosen yet. A real
+# deployment installs the one provider it uses.
+embeddings = ["openai>=1.0", "cohere>=5.0", "voyageai>=0.2",
+              "google-genai>=0.3", "sentence-transformers>=3.0"]
 
 [build-system]
 requires = ["setuptools>=68"]

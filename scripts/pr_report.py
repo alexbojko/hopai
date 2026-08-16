@@ -199,7 +199,7 @@ def render_coverage(percent: float, threshold: float, by_file: list) -> str:
 
 
 def render_mutation(stats: dict, found: list, note: str, attempted: bool = False,
-                    changes: dict = None) -> str:
+                    changes: dict = None, timed_out: str = "") -> str:
     """Mutation half of the comment. `note` explains the scope, or why
     there was nothing to run.
 
@@ -207,16 +207,33 @@ def render_mutation(stats: dict, found: list, note: str, attempted: bool = False
     must never read alike: nothing to mutate (fine) versus mutmut ran and
     produced nothing (a broken harness). The second is the case the
     triage rule calls out -- it looks like a clean sweep and is the
-    opposite."""
+    opposite.
+
+    `timed_out` splits that second case again, because the two halves
+    need OPPOSITE fixes and the message used to assert one of them. A
+    budget spent before the first mutant means the run needs longer (or
+    a cheaper baseline); a mutants tree that cannot run the suite means
+    a file is missing from `also_copy`. Guessing sends the reader to
+    the wrong one, which is how a broken harness stays broken."""
     if stats is None:
+        if attempted and timed_out:
+            return "\n".join([
+                "### ⚠️ Mutation testing — BUDGET SPENT BEFORE ANY MUTANT", "",
+                f"{note}  mutmut was stopped by its {timed_out}s wall-clock budget "
+                f"having checked **nothing**. This is not a clean sweep, and it is "
+                f"not a broken mutants tree either: before the first mutant, mutmut "
+                f"runs the suite to establish a baseline and again under tracing to "
+                f"map tests to lines, and that fixed cost grows with the suite. "
+                f"Raise `MUTATION_BUDGET_SECONDS`, or make the baseline cheaper.",
+            ])
         if attempted:
             return "\n".join([
                 "### ⚠️ Mutation testing — HARNESS FAILED", "",
-                f"{note}  mutmut ran but produced no results, so **nothing was "
-                f"checked**. This is not a clean sweep: the usual cause is a file "
-                f"the suite reads that `also_copy` does not put in the mutants "
-                f"tree, which fails the baseline run before any mutant is tried. "
-                f"See the job log.",
+                f"{note}  mutmut ran, was not stopped by its budget, and still "
+                f"produced no results, so **nothing was checked**. This is not a "
+                f"clean sweep: the usual cause is a file the suite reads that "
+                f"`also_copy` does not put in the mutants tree, which fails the "
+                f"baseline run before any mutant is tried. See the job log.",
             ])
         return "\n".join(["### 🧬 Mutation testing — not run", "", note])
 
@@ -253,10 +270,11 @@ def render_mutation(stats: dict, found: list, note: str, attempted: bool = False
 
 
 def render(percent, threshold, by_file, stats, found, note, run_url,
-           attempted: bool = False, changes: dict = None) -> str:
+           attempted: bool = False, changes: dict = None,
+           timed_out: str = "") -> str:
     parts = [MARKER, "## Test quality report", "",
              render_coverage(percent, threshold, by_file), "",
-             render_mutation(stats, found, note, attempted, changes)]
+             render_mutation(stats, found, note, attempted, changes, timed_out)]
     if run_url:
         parts += ["", f"<sub>[CI run]({run_url})</sub>"]
     return "\n".join(parts) + "\n"
@@ -278,6 +296,10 @@ def main() -> None:
     parser.add_argument("--mutation-attempted", action="store_true",
                         help="mutmut was run; missing results therefore mean a broken "
                              "harness rather than an empty scope")
+    parser.add_argument("--mutation-timed-out", default="", metavar="SECONDS",
+                        help="the wall-clock budget, when timeout(1) killed the run -- "
+                             "a spent budget and a broken mutants tree both report zero "
+                             "checked and need opposite fixes")
     parser.add_argument("--run-url", default="")
     args = parser.parse_args()
 
@@ -295,7 +317,7 @@ def main() -> None:
     print(render(coverage_percent(args.coverage_xml), args.threshold,
                  coverage_by_file(args.coverage_xml), stats, found,
                  args.mutation_note, args.run_url, args.mutation_attempted,
-                 changes), end="")
+                 changes, args.mutation_timed_out), end="")
 
 
 if __name__ == "__main__":
