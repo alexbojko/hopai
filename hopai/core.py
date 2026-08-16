@@ -1202,7 +1202,8 @@ class Graph:
 
             graph.vector_search(Near("summary", embedding), k=10,
                                 where={"type": "person"})
-            # -> [{"id": "1", "similarity": 0.93, "properties": {...}}, ...]
+            # -> [{"id": "1", "similarity": 0.93, "properties": {...},
+            #      "similarities": {"summary": 0.93}, "boosts": {}}, ...]
 
         Several Near specs combine into one weighted score
         (multivector search); `where` is the same filter language as
@@ -1212,8 +1213,13 @@ class Graph:
         ids are strings, like every other result. `boost` adds
         property terms to the score for hybrid retrieval; a boosted
         `similarity` is the combined score and can exceed 1, and
-        reordering with `k` changes which rows come back. The cost
-        model and every design refusal live in hopai/vectors.py."""
+        reordering with `k` changes which rows come back. Every hit
+        also reports `similarities` (per Near field, keyed by name --
+        `None` where that field's vector is missing, even if
+        missing="zero" scored it 0 in the combined total) and `boosts`
+        (per Boost, keyed by property), so a caller tuning weights can
+        see what actually drove a result rather than only the sum. The
+        cost model and every design refusal live in hopai/vectors.py."""
         from .vectors import search
         return search(self, list(near), target=target, k=k, where=where, boost=boost)
 

@@ -13,7 +13,8 @@ run -- no pgvector, no extension, no approximate index.
 
     graph.vector_search(Near("summary", query_embedding), k=10,
                         where={"type": "person"})
-    # -> [{"id": "1", "similarity": 0.93, "properties": {...}}, ...]
+    # -> [{"id": "1", "similarity": 0.93, "properties": {...},
+    #      "similarities": {"summary": 0.93}, "boosts": {}}, ...]
 
     graph.traverse(                  # similarity as a traversal seed
         Start(near=Near("summary", query_embedding), keep=25),
@@ -91,6 +92,23 @@ interaction / ColBERT, many vectors per row with a maxsim -- is
 refused, not approximated: pure SQL would make it O(rows x tokens^2 x
 dims) per query, which is not a feature, it is a timeout.
 
+Tuning `weight=` per field is only as good as your ability to see
+which field actually drove a result, so every hit also carries
+`similarities`, keyed by FIELD NAME (never `sim_0` -- that is a SQL
+alias, an implementation detail no caller should have to read):
+
+    hits = graph.vector_search(Near("summary", q1, weight=0.7),
+                               Near("title", q2, weight=0.3), k=10)
+    hits[0]["similarities"]     # {"summary": 0.91, "title": 0.64}
+
+A field a row is missing reports `None` there, even under
+`missing="zero"` -- the COMBINED `similarity` still scores that field 0
+(that is what `missing="zero"` means), but the per-field report keeps
+saying "missing" honestly rather than making a skipped field look like
+a poor match. `similarities` is always a dict, even for one Near, so
+`hit["similarities"][field]` never needs to branch on how many Near
+clauses a search used.
+
 BATCH SEARCH ranks many queries in ONE statement -- the shape
 retrieval actually has, since a question is usually expanded into
 several sub-queries:
@@ -113,6 +131,20 @@ DOES reorder, so with k it changes which rows come back, and the
 exceed 1. The library will NOT normalize a property for you, because
 a raw view count would not boost a cosine ranking, it would replace
 it. See Boost.
+
+A boost that dominates the ranking should be visible, not discovered
+by staring at scores that don't line up with similarity -- so each hit
+also carries `boosts`, keyed by the boosted property (a callable
+Boost, having no property name, falls back to its own `boost_j`
+slot):
+
+    hits = graph.vector_search(Near("summary", q), k=10,
+                               boost=Boost("importance", 0.2))
+    hits[0]["boosts"]           # {"importance": 0.18}
+
+Like `similarities`, `boosts` is always a dict -- empty when no
+boost= was given -- so a caller never has to check whether one was
+passed before reading it.
 
 EDGE SIMILARITY is the `via` of ranking: Hop(via_near=...,
 via_keep=N) follows the N most similar EDGES out of each node reached
@@ -1024,10 +1056,84 @@ def edge_beam(graph, edge_alias, join_expr, anchor_expr, move_col, id_col, via,
     return beam.lateral(name)
 
 
-def build_search_query(graph, near, target: str = "nodes", k: Optional[int] = 10,
-                       where: Any = None, boost=None):
-    """The single statement vector_search() runs. Exposed so the SQL
-    can be inspected with no database, like build_query()."""
+#: Prefix for the per-field similarity report columns build_search_query()
+#: and build_search_many_query() add outward, alongside boost_j -- both
+#: named distinctly from `sim_i` (which stays the coalesced value
+#: _combined()/_thresholds() use) so a mutation on one prefix cannot
+#: silently satisfy the other's tests. See _report_columns().
+_SIM_REPORT_PREFIX = "sim_report_"
+
+
+def _report_columns(laterals: list) -> list:
+    """Each field's RAW similarity, never coalesced -- read again off the
+    same LATERAL `sim_i` already reads, so nothing is computed twice.
+
+    This is what makes `similarities` in the result honest for
+    missing="zero": `sim_i` (used for the combined score and
+    min_similarity) coalesces a missing field to 0.0 so it does not NULL
+    the row's total, but the PER-FIELD report must keep saying "missing"
+    -- None, not a score -- or a field with no vector would look
+    identical to one that matched poorly (issue #54)."""
+    return [lateral.c.s.label(f"{_SIM_REPORT_PREFIX}{i}")
+            for i, lateral in enumerate(laterals)]
+
+
+def _search_result_columns(inner, target: str, similarity, n_near: int, n_boost: int) -> list:
+    """The outward SELECT list vector_search() and vector_search_many()
+    share: identity + properties + the combined score, plus each near's
+    own similarity and each boost's own term so a caller can see what
+    actually drove the combined number, not just the sum (issue #54)."""
+    return (
+        _result_columns(inner, target) + [inner.c.properties, similarity]
+        + [inner.c[f"{_SIM_REPORT_PREFIX}{i}"] for i in range(n_near)]
+        + [inner.c[f"boost_{j}"] for j in range(n_boost)]
+    )
+
+
+def _format_hit(row, nears: list, boosts: list) -> dict:
+    """One search()/search_many() row, reshaped from the flat SQL row
+    (id/properties/similarity plus the private sim_report_i/boost_j
+    columns) into the public shape: `similarities` keyed by the field
+    NAME the caller passed to Near, never by the `sim_i` SQL alias,
+    which is an implementation detail (issue #54). Always present, even
+    for a single Near, so `row["similarities"][field]` never needs to
+    branch on how many Near clauses a search used.
+
+    `boosts` is keyed by Boost.key the same way; a callable boost has no
+    property name, so it falls back to its own `boost_j` slot. Two
+    Boosts naming the same property is unusual but legal -- the combined
+    score already adds both terms, so the report SUMS them under one key
+    rather than the second silently overwriting the first, which would
+    under-report the exact thing this feature exists to surface."""
+    hit = {key: value for key, value in row.items()
+           if not key.startswith(_SIM_REPORT_PREFIX) and not key.startswith("boost_")}
+    hit["similarity"] = float(hit["similarity"])
+    hit["similarities"] = {
+        near.field: (None if row[f"{_SIM_REPORT_PREFIX}{i}"] is None
+                    else float(row[f"{_SIM_REPORT_PREFIX}{i}"]))
+        for i, near in enumerate(nears)
+    }
+    per_boost: dict = {}
+    for j, boost in enumerate(boosts):
+        key = boost.key if isinstance(boost.key, str) else f"boost_{j}"
+        per_boost[key] = per_boost.get(key, 0.0) + float(row[f"boost_{j}"])
+    hit["boosts"] = per_boost
+    return hit
+
+
+def _prepare_search_query(graph, near, target: str, k: Optional[int], where: Any,
+                          boost) -> tuple:
+    """(nears, boosts, query) for vector_search()'s single statement --
+    build_search_query() is the public, query-only view of this;
+    search() needs the resolved nears/boosts too, to key `similarities`/
+    `boosts` by name rather than by their SQL column position.
+
+    The caller label stays a literal "vector_search()" at each call
+    below, not a parameter -- TestVectorCallerNamesArePinned reads
+    every caller label straight out of the source AST, and a `caller`
+    variable at the call site would make this function's two labels
+    invisible to it (a wrapped-and-forwarded label is a bug this
+    library refuses to reproduce silently)."""
     _check_k(k, "vector_search()")
     nears = validate_nears(graph, target, near, k, "vector_search()")
     boosts = validate_boosts(boost, "vector_search()")
@@ -1037,28 +1143,37 @@ def build_search_query(graph, near, target: str = "nodes", k: Optional[int] = 10
     inner = (
         select(*_identity_columns(graph, table, target),
                table.c.properties.label("properties"),
-               *sim_columns, *_boost_columns(table, boosts))
+               *sim_columns, *_report_columns(laterals), *_boost_columns(table, boosts))
         .select_from(_with_laterals(table, laterals))
         .where(and_(graph._scoped(table), resolve(table.c.properties, where), *guards))
         .subquery()
     )
     combined = _combined(inner, nears, boosts)
     similarity = combined.label("similarity")
-    columns = _result_columns(inner, target) + [inner.c.properties, similarity]
+    columns = _search_result_columns(inner, target, similarity, len(nears), len(boosts))
     query = (
         select(*columns)
         .where(combined.isnot(None), *_thresholds(inner, nears))
         .order_by(similarity.desc(), inner.c._id)
     )
-    return query if k is None else query.limit(k)
+    return nears, boosts, (query if k is None else query.limit(k))
+
+
+def build_search_query(graph, near, target: str = "nodes", k: Optional[int] = 10,
+                       where: Any = None, boost=None):
+    """The single statement vector_search() runs. Exposed so the SQL
+    can be inspected with no database, like build_query()."""
+    _, _, query = _prepare_search_query(graph, near, target=target, k=k, where=where, boost=boost)
+    return query
 
 
 def search(graph, near, target: str = "nodes", k: Optional[int] = 10, where: Any = None,
            boost=None, connection=None) -> list:
-    query = build_search_query(graph, near, target=target, k=k, where=where, boost=boost)
+    nears, boosts, query = _prepare_search_query(graph, near, target=target, k=k, where=where,
+                                                 boost=boost)
     with _read_connection(graph, connection) as conn:
         rows = conn.execute(query).mappings().all()
-    return [{**row, "similarity": float(row["similarity"])} for row in rows]
+    return [_format_hit(row, nears, boosts) for row in rows]
 
 
 # ---------------------------------------------------------------------
@@ -1092,10 +1207,16 @@ def _as_query_list(queries, caller: str) -> list:
     return [list(one) if isinstance(one, (list, tuple)) else [one] for one in queries]
 
 
-def build_search_many_query(graph, queries, target: str = "nodes", k: Optional[int] = 10,
-                            where: Any = None, boost=None):
-    """The single statement search_many() runs: every query ranked in
-    one round trip.
+def _prepare_search_many_query(graph, queries, target: str, k: Optional[int], where: Any,
+                               boost) -> tuple:
+    """(parsed, template, boosts, query) for vector_search_many()'s
+    single statement -- build_search_many_query() is the public,
+    query-only view of this; search_many() needs `template`/`boosts`
+    too, to key each hit's `similarities`/`boosts` by name.
+
+    The caller label stays a literal "vector_search_many()" at each
+    call below, like _prepare_search_query() -- see its docstring for
+    why a `caller` parameter would defeat the AST-based pin.
 
     The queries become a VALUES list -- (index, vector, norm) per
     query -- and the per-query top-k hangs off it as a LATERAL.
@@ -1172,7 +1293,7 @@ def build_search_many_query(graph, queries, target: str = "nodes", k: Optional[i
     inner = (
         select(*_identity_columns(graph, table, target),
                table.c.properties.label("properties"),
-               *sim_columns, *_boost_columns(table, boosts))
+               *sim_columns, *_report_columns(laterals), *_boost_columns(table, boosts))
         .select_from(_with_laterals(table, laterals))
         .where(and_(graph._scoped(table), resolve(table.c.properties, where), *guards))
         .subquery()
@@ -1180,14 +1301,40 @@ def build_search_many_query(graph, queries, target: str = "nodes", k: Optional[i
     combined = _combined(inner, template, boosts)
     similarity = combined.label("similarity")
     per_query = (
-        select(*_result_columns(inner, target), inner.c.properties, similarity)
+        select(*_search_result_columns(inner, target, similarity, len(template), len(boosts)))
         .where(combined.isnot(None), *_thresholds(inner, template))
         .order_by(similarity.desc(), inner.c._id)
     )
     per_query = (per_query if k is None else per_query.limit(k)).lateral("hits")
-    return select(queries_values.c.q.label("q"), *per_query.c).select_from(
+    query = select(queries_values.c.q.label("q"), *per_query.c).select_from(
         queries_values.join(per_query, literal(True))
     )
+    return parsed, template, boosts, query
+
+
+def build_search_many_query(graph, queries, target: str = "nodes", k: Optional[int] = 10,
+                            where: Any = None, boost=None):
+    """The single statement search_many() runs: every query ranked in
+    one round trip.
+
+    WHAT THIS BUYS, measured rather than assumed: one round trip
+    instead of N. It does NOT reduce the arithmetic -- every query
+    still scores every candidate, so 8 queries over 4k x 384-dim
+    measured 1.08x against a Python loop on a local database, where a
+    round trip is nearly free. The win scales with LATENCY, not with
+    N: at a realistic 5-20ms each, N-1 saved round trips is the whole
+    benefit, and it is worth having for exactly that reason. If the
+    arithmetic is what hurts, fewer candidates (`where=`) is the lever,
+    not batching.
+
+    Each query keeps its own field set, weights, thresholds and
+    missing-modes; only the vectors vary per row. Queries must
+    therefore agree on the SHAPE -- same fields in the same order --
+    or they would need different SQL, which one statement cannot be.
+    """
+    _, _, _, query = _prepare_search_many_query(graph, queries, target=target, k=k, where=where,
+                                                boost=boost)
+    return query
 
 
 def search_many(graph, queries, target: str = "nodes", k: Optional[int] = 10,
@@ -1195,13 +1342,14 @@ def search_many(graph, queries, target: str = "nodes", k: Optional[int] = 10,
     """Results per query, in the order the queries were given -- an
     empty list for a query nothing matched, so index i always answers
     query i."""
-    parsed = _as_query_list(queries, "vector_search_many()")
-    query = build_search_many_query(graph, queries, target=target, k=k, where=where, boost=boost)
+    parsed, template, boosts, query = _prepare_search_many_query(
+        graph, queries, target=target, k=k, where=where, boost=boost)
     grouped: dict = {str(i): [] for i in range(len(parsed))}
     with _read_connection(graph, connection) as conn:
         for row in conn.execute(query).mappings():
-            hit = {key: value for key, value in row.items() if key != "q"}
-            grouped[row["q"]].append({**hit, "similarity": float(hit["similarity"])})
+            hit = _format_hit({key: value for key, value in row.items() if key != "q"},
+                              template, boosts)
+            grouped[row["q"]].append(hit)
     return [grouped[str(i)] for i in range(len(parsed))]
 
 

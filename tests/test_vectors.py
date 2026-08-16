@@ -543,6 +543,27 @@ class TestSearchQueryShape:
         assert sql.count("unnest") == 2
         assert "* 0.7" in sql and "* 0.3" in sql
 
+    def test_per_field_report_columns_read_the_lateral_not_a_new_evaluation(self, vg):
+        """The per-field `similarities` report (issue #54) has to expose
+        each LATERAL's raw value outward -- but CLAUDE.md is emphatic
+        that similarity is never a correlated scalar subquery, so
+        reading it again must not add a second `unnest`/`sqrt` per
+        field: it is one more column projected off the SAME LATERAL
+        join, not a second computation."""
+        sql = self.sql(vg, Near("summary", [1.0, 0.0, 0.0]),
+                       Near("title", [0.0, 1.0, 0.0]))
+        assert sql.count("unnest") == 2       # one per field, not one per field per use
+        assert sql.count("sqrt") == 2
+        assert "sim_report_0" in sql and "sim_report_1" in sql
+
+    def test_boost_report_column_reaches_the_outer_select(self, vg):
+        sql = self.sql(vg, Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.5))
+        # boost_0 is computed inside the inner subquery either way; the
+        # OUTER select is what search() reads to build `boosts`, so its
+        # presence there specifically is the thing worth pinning.
+        outer, _, _ = sql.partition(" FROM (SELECT")
+        assert "boost_0" in outer
+
     def test_exclude_mode_guards_every_field(self, vg):
         sql = self.sql(vg, Near("summary", [1.0, 0.0, 0.0]), Near("title", [0.0, 1.0, 0.0]))
         assert "vec_summary IS NOT NULL" in sql
@@ -1399,6 +1420,23 @@ class TestVectorSearchLive:
                                Near("titlevec", QUERY, weight=0.3), k=10)
         assert [h["id"] for h in hits] == ["1", "2"]
         assert [h["similarity"] for h in hits] == pytest.approx([0.7, 0.3], abs=1e-6)
+        # similarities is keyed by FIELD NAME, not by sim_0/sim_1 -- and
+        # each field's OWN cosine, not its weighted contribution to the
+        # combined score (issue #54).
+        assert hits[0]["similarities"] == pytest.approx({"docvec": 1.0, "titlevec": 0.0}, abs=1e-6)
+        assert hits[1]["similarities"] == pytest.approx({"docvec": 0.0, "titlevec": 1.0}, abs=1e-6)
+        # No boost= was passed -- the key is still present, empty, so a
+        # caller never has to check whether one was given before reading it.
+        assert hits[0]["boosts"] == {}
+
+    def test_single_near_search_still_returns_a_similarities_dict(self, fresh_graph):
+        """Shape stability (issue #54): a caller writing
+        `hit["similarities"][field]` should never have to branch on how
+        many Near clauses a search used."""
+        g = _corpus(fresh_graph)
+        hits = g.vector_search(Near("docvec", QUERY), k=1, where={"type": "doc"})
+        assert hits[0]["similarities"] == pytest.approx({"docvec": 1.0}, abs=1e-6)
+        assert hits[0]["similarities"]["docvec"] == hits[0]["similarity"]
 
     def test_missing_exclude_versus_zero(self, fresh_graph):
         g = _migrated(fresh_graph)
@@ -1416,6 +1454,17 @@ class TestVectorSearchLive:
         assert [h["id"] for h in lenient] == ["1", "2"]
         # full: 0.5*0.6 + 0.5*1.0 = 0.8; doc-only: 0.5*1.0 + 0 = 0.5
         assert [h["similarity"] for h in lenient] == pytest.approx([0.8, 0.5], abs=1e-6)
+        # The COMBINED score above treats doc-only's missing titlevec as
+        # 0 (missing="zero"'s whole point). The PER-FIELD report must
+        # keep saying "missing" honestly -- None, not 0.0 -- or a field
+        # with no vector would look identical to one that matched
+        # poorly, which is exactly the ambiguity issue #54 exists to
+        # remove.
+        by_id = {h["id"]: h for h in lenient}
+        assert by_id["2"]["similarities"]["titlevec"] is None
+        assert by_id["2"]["similarities"]["docvec"] == pytest.approx(1.0, abs=1e-6)
+        assert by_id["1"]["similarities"] == pytest.approx(
+            {"docvec": 0.6, "titlevec": 1.0}, abs=1e-6)
 
     def test_edges_search_reports_endpoints(self, fresh_graph):
         g = _migrated(fresh_graph)
@@ -1451,6 +1500,31 @@ class TestVectorSearchLive:
         }, allow_vectors=True)
         assert json.loads(json.dumps(result)) == result
         assert [h["id"] for h in result["results"]] == ["1", "3"]
+        # json_api.py is a thin front end with no query logic of its
+        # own (CLAUDE.md) -- it calls graph.vector_search() directly, so
+        # similarities/boosts (issue #54) should already be here with no
+        # extra plumbing. A None similarity (had min_similarity excluded
+        # a missing field here) has to survive the JSON round trip too,
+        # which the assertion above already covers structurally.
+        assert result["results"][0]["similarities"] == {"docvec": pytest.approx(1.0, abs=1e-6)}
+        assert result["results"][0]["boosts"] == {}
+
+    def test_vector_search_json_reports_a_missing_field_as_json_null(self, fresh_graph):
+        """None -> JSON null -> None has to survive round-tripping
+        through an actual HTTP-shaped call, not just Python equality --
+        the earlier test's corpus never exercises missing="zero"."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "n": "doc-only"}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]}])
+        result = vector_search_json(g, {
+            "near": [{"field": "docvec", "vector": QUERY},
+                    {"field": "titlevec", "vector": QUERY, "missing": "zero"}],
+            "k": 1,
+        }, allow_vectors=True)
+        dumped = json.loads(json.dumps(result))
+        assert dumped == result
+        assert dumped["results"][0]["similarities"]["titlevec"] is None
+        assert dumped["results"][0]["similarity"] == pytest.approx(1.0, abs=1e-6)
 
     def test_vector_search_json_k_actually_truncates(self, fresh_graph):
         """`k` in the spec has to REACH the search. Pairing it with a
@@ -1711,6 +1785,18 @@ class TestSearchManyShape:
         assert "AS start_id" in sql and "AS end_id" in sql
         assert "hits.start_id" in sql and "hits.end_id" in sql
 
+    def test_report_columns_reach_the_hits_lateral(self, vg):
+        """The batch path builds its per-query select separately from
+        the single-query path's -- `similarities`/`boosts` (issue #54)
+        need their own SQL-shape proof that sim_report_i/boost_j reach
+        the `hits` LATERAL the outer query reads, not just the inner
+        subquery search_many() never surfaces on its own."""
+        sql = norm(vg.build_vector_search_many_query(
+            [[Near("summary", [1.0, 0.0, 0.0]), Near("title", [0.0, 1.0, 0.0])]],
+            k=1, boost=Boost("score", 0.5)))
+        assert "hits.sim_report_0" in sql and "hits.sim_report_1" in sql
+        assert "hits.boost_0" in sql
+
     def test_rows_without_a_vector_are_filtered_before_the_cosine(self, vg):
         """The single-query path has this guard pinned; the batch path
         did not, and dropping it changes no ANSWER -- the outer
@@ -1787,6 +1873,21 @@ class TestSearchManyLive:
         g = _corpus(fresh_graph)
         (one,) = g.vector_search_many([Near("docvec", QUERY)], k=1)
         assert one[0]["properties"]["name"] == "exact"
+
+    def test_hits_carry_similarities_too(self, fresh_graph):
+        """The batch path builds its per-query SELECT separately from
+        vector_search()'s -- nothing shares column lists automatically,
+        so `similarities`/`boosts` need their own proof here (issue
+        #54), matching the single-query path's."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "n": "both"}])
+        g.set_vectors(nodes=[
+            {"id": 1, "docvec": [1.0, 0.0, 0.0], "titlevec": [0.0, 1.0, 0.0]}])
+        (one,) = g.vector_search_many(
+            [[Near("docvec", QUERY, weight=0.5), Near("titlevec", QUERY, weight=0.5)]], k=1)
+        assert one[0]["similarities"] == pytest.approx(
+            {"docvec": 1.0, "titlevec": 0.0}, abs=1e-6)
+        assert one[0]["boosts"] == {}
 
     def test_edge_hits_carry_their_endpoints(self, fresh_graph):
         """The single-query path has had this since it was written; the
@@ -1942,6 +2043,47 @@ class TestBoostLive:
         # not a dropped row.
         assert {h["id"] for h in boosted} == set(plain)
         assert boosted[0]["similarity"] == pytest.approx(0.8 + 0.9, abs=1e-6)
+        # boosts is keyed by the boosted PROPERTY, so a caller can see
+        # the boost's own contribution and not just the combined total
+        # (issue #54) -- node 2's boost alone (0.9) is what actually
+        # pushed it past node 1 despite a lower raw similarity.
+        by_id = {h["id"]: h for h in boosted}
+        assert by_id["2"]["boosts"] == pytest.approx({"score": 0.9}, abs=1e-6)
+        assert by_id["3"]["boosts"] == pytest.approx({"score": 0.0}, abs=1e-6)
+
+    def test_callable_boost_falls_back_to_its_slot_name(self, fresh_graph):
+        """A callable Boost has no property name to key the report by --
+        it gets a stable positional fallback instead of vanishing from
+        `boosts` or crashing the formatter. `boosts` reports the boost's
+        OWN value (what `_boost_columns()` already computes, reused
+        outward per the task's minimal-change design), not
+        weight-multiplied -- the same choice `similarities` makes for
+        min_similarity/weight: the raw signal, not its contribution."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "title": "abc"}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]}])
+        hits = g.vector_search(
+            Near("docvec", QUERY),
+            boost=Boost(lambda p: func.length(p["title"].astext), 0.1), k=10)
+        assert hits[0]["boosts"] == pytest.approx({"boost_0": 3.0}, abs=1e-6)
+        assert hits[0]["similarity"] == pytest.approx(1.0 + 3.0 * 0.1, abs=1e-6)
+
+    def test_two_boosts_on_the_same_property_sum_in_the_report(self, fresh_graph):
+        """Two Boosts naming the same property is unusual but legal --
+        the COMBINED score already adds both terms weighted, so the
+        per-property report sums their RAW values too (0.4 + 0.4)
+        rather than the second silently overwriting the first, which
+        would under-report the very thing this feature exists to
+        surface. Weights of 0.5 and 2.0 (not equal, and not summing to
+        the boost count) keep this from passing by the coincidence a
+        matched pair of weights could hide."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "score": 0.4}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]}])
+        hits = g.vector_search(Near("docvec", QUERY),
+                               boost=[Boost("score", 0.5), Boost("score", 2.0)], k=10)
+        assert hits[0]["boosts"] == pytest.approx({"score": 0.4 + 0.4}, abs=1e-6)
+        assert hits[0]["similarity"] == pytest.approx(1.0 + 0.4 * 0.5 + 0.4 * 2.0, abs=1e-6)
 
     def test_non_numeric_property_contributes_missing_not_an_error(self, fresh_graph):
         """One row carrying "high" where a number was expected must not
