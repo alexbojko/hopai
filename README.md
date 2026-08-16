@@ -96,34 +96,44 @@ CREATE INDEX ON nodes USING GIN (properties);
 CREATE INDEX ON edges USING GIN (properties);
 ```
 
-Custom table/column names, extra real columns alongside the JSONB bag, and
-multi-graph isolation on one connection pool are covered in
+Custom table/column names, and extra real columns alongside the JSONB bag
+(a foreign key to your own `users` table, with the collision refusals that
+keep it distinct from a JSONB property) are covered in full in
+[Schema](https://hopai.readthedocs.io/en/latest/reference/schema/); multi-graph
+isolation on one connection pool in
 [`07_many_graphs`](notebooks/07_many_graphs.ipynb) and
-[`08_under_the_hood`](notebooks/08_under_the_hood.ipynb).
+[Many graphs](https://hopai.readthedocs.io/en/latest/reference/multi-graph/).
 
 ## 📚 Learn more
 
-Everything above — and everything below — is documented as **nine runnable
-notebooks**, executed in CI on every PR so they can't drift from the API:
+Nothing below is summarized away — every section the README used to spell
+out inline now has a full, standalone write-up under **Reference**, plus a
+**runnable notebook** for the topics that have one, executed in CI on every
+PR so neither can drift from the API:
 
-| Topic | Where |
-| --- | --- |
-| Traversal: direction, hop count, `OPTIONAL` | [`02_traversal`](notebooks/02_traversal.ipynb) |
-| Aggregation | [`03_aggregation`](notebooks/03_aggregation.ipynb) |
-| The JSON interface and Cypher as input syntax | [`04_json_and_cypher`](notebooks/04_json_and_cypher.ipynb) |
-| Constraints | [`05_constraints`](notebooks/05_constraints.ipynb) |
-| Declaring, inferring and enforcing a graph schema | [`06_graph_schema`](notebooks/06_graph_schema.ipynb) |
-| Many graphs, one database | [`07_many_graphs`](notebooks/07_many_graphs.ipynb) |
-| The SQL underneath | [`08_under_the_hood`](notebooks/08_under_the_hood.ipynb) |
-| Vector search, hybrid ranking, text-to-vector embedding | [`09_vector_search`](notebooks/09_vector_search.ipynb) |
-| MCP server — client setup, every tool, every flag | [Full guide](https://hopai.readthedocs.io/en/latest/mcp/) |
-| Read/write pipelines, multi-graph internals, gotchas | [architecture.md](https://hopai.readthedocs.io/en/latest/architecture/) |
-| Fixtures, coverage gate, mutation testing | [testing.md](https://hopai.readthedocs.io/en/latest/testing/) |
-| release-please, PyPI trusted publishing | [releasing.md](https://hopai.readthedocs.io/en/latest/releasing/) |
-| Measured traversal and vector-search costs | `benchmarks/README.md` |
+| Topic | Notebook | Full reference |
+| --- | --- | --- |
+| Schema — two tables, extending the model with real columns | [`08_under_the_hood`](notebooks/08_under_the_hood.ipynb) | [Schema](https://hopai.readthedocs.io/en/latest/reference/schema/) |
+| Many graphs, one database | [`07_many_graphs`](notebooks/07_many_graphs.ipynb) | [Many graphs](https://hopai.readthedocs.io/en/latest/reference/multi-graph/) |
+| Getting data in — `add_nodes`/`add_edges`/`merge_*`/`ingest` | — | [Getting data in](https://hopai.readthedocs.io/en/latest/reference/ingestion/) |
+| Changing and deleting — `update_*`/`delete_*`/`clear`/`mutate` | — | [Changing and deleting](https://hopai.readthedocs.io/en/latest/reference/mutations/) |
+| Constraints — unique, composite, partial, existence, type, CHECK | [`05_constraints`](notebooks/05_constraints.ipynb) | [Constraints](https://hopai.readthedocs.io/en/latest/reference/constraints/) |
+| Declaring, inferring and enforcing a graph schema | [`06_graph_schema`](notebooks/06_graph_schema.ipynb) | [Graph schema](https://hopai.readthedocs.io/en/latest/reference/graph-schema/) |
+| Filters — `AND`/`OR`/`NOT`/`GT`/`BETWEEN`, the escape hatch | — | [Filters](https://hopai.readthedocs.io/en/latest/reference/filters/) |
+| Traversal: direction, hop count, `OPTIONAL` | [`02_traversal`](notebooks/02_traversal.ipynb) | [Traversal](https://hopai.readthedocs.io/en/latest/reference/traversal/) |
+| Aggregation | [`03_aggregation`](notebooks/03_aggregation.ipynb) | [Aggregation](https://hopai.readthedocs.io/en/latest/reference/aggregation/) |
+| Vector search, hybrid ranking, text-to-vector embedding | [`09_vector_search`](notebooks/09_vector_search.ipynb) | [Vector search](https://hopai.readthedocs.io/en/latest/reference/vector-search/) |
+| The JSON interface | [`04_json_and_cypher`](notebooks/04_json_and_cypher.ipynb) | [JSON interface](https://hopai.readthedocs.io/en/latest/reference/json-interface/) |
+| Cypher as input syntax | [`04_json_and_cypher`](notebooks/04_json_and_cypher.ipynb) | [Cypher](https://hopai.readthedocs.io/en/latest/reference/cypher/) |
+| What this doesn't do (yet), and why each refusal is a refusal | — | [Limits](https://hopai.readthedocs.io/en/latest/reference/limits/) |
+| MCP server — client setup, every tool, every flag | — | [Full guide](https://hopai.readthedocs.io/en/latest/mcp/) |
+| Read/write pipelines, multi-graph internals, gotchas | — | [architecture.md](https://hopai.readthedocs.io/en/latest/architecture/) |
+| Fixtures, coverage gate, mutation testing | — | [testing.md](https://hopai.readthedocs.io/en/latest/testing/) |
+| release-please, PyPI trusted publishing | — | [releasing.md](https://hopai.readthedocs.io/en/latest/releasing/) |
+| Measured traversal and vector-search costs | — | `benchmarks/README.md` |
 
-See [`notebooks/README.md`](notebooks/README.md) for how to run them
-yourself against a throwaway database.
+See [`notebooks/README.md`](notebooks/README.md) for how to run the
+notebooks yourself against a throwaway database.
 
 ## 🔌 MCP server
 
@@ -148,7 +158,9 @@ writing, `--allow-mutations` adds deleting, `--allow-ddl` adds
 ingestion, mutation and vector search for an async app — the same query
 builders `Graph` runs, reached through SQLAlchemy's sync/async bridge.
 Schema and constraint declaration stay on the sync `Graph` — one-time setup
-calls with no concurrency to gain. See `hopai/asyncio.py`.
+calls with no concurrency to gain. See `hopai/asyncio.py` and the
+[Async](https://hopai.readthedocs.io/en/latest/architecture/#async) section
+of architecture.md for the bridge design and the benchmark behind it.
 
 ## 🚧 What this doesn't do (yet)
 
@@ -166,8 +178,10 @@ calls with no concurrency to gain. See `hopai/asyncio.py`.
   not-cheap past roughly 10 hops on a single-segment traversal.
 
 Each refusal names the rewrite rather than approximating — see
-[architecture.md](https://hopai.readthedocs.io/en/latest/architecture/) and
-`hopai/vectors.py`/`hopai/cypher.py` for the full detail behind each one.
+[the full list](https://hopai.readthedocs.io/en/latest/reference/limits/)
+for the reasoning behind each one, and
+[architecture.md](https://hopai.readthedocs.io/en/latest/architecture/) /
+`hopai/vectors.py`/`hopai/cypher.py` for the implementation.
 
 ## 🛠️ Development
 

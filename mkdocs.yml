@@ -93,6 +93,20 @@ nav:
       - 07 · Many graphs: notebooks/07_many_graphs.ipynb
       - 08 · Under the hood: notebooks/08_under_the_hood.ipynb
       - 09 · Vector search: notebooks/09_vector_search.ipynb
+  - Reference:
+      - Schema: reference/schema.md
+      - Many graphs, one database: reference/multi-graph.md
+      - Getting data in: reference/ingestion.md
+      - Changing and deleting: reference/mutations.md
+      - Constraints: reference/constraints.md
+      - Graph schema: reference/graph-schema.md
+      - Filters: reference/filters.md
+      - Traversal, direction and OPTIONAL: reference/traversal.md
+      - Aggregation: reference/aggregation.md
+      - Vector search: reference/vector-search.md
+      - The JSON interface: reference/json-interface.md
+      - Cypher as input syntax: reference/cypher.md
+      - What this doesn't do (yet): reference/limits.md
   - Guides:
       - MCP server: mcp.md
   - Internals:
