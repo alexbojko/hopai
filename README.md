@@ -51,8 +51,9 @@ is [`01_quickstart`](notebooks/01_quickstart.ipynb).
 
 ## 🔭 Every way to ask
 
-One engine, five ways to reach it — the same "Alice's friends" question as
-above, and what else it answers:
+One engine underneath all of it — the same "Alice's friends" question as
+above, other front ends that ask it, and the other things this engine
+answers:
 
 ```python
 # JSON -- for an LLM tool call, an HTTP handler, or config-driven traversal
@@ -67,17 +68,32 @@ graph.aggregate(Start(where={"name": "Alice"}),
                 Hop(via={"kind": "friend"}, hops=(1, 4)),
                 aggregates={"count": Count()})               # {"count": 12}
 
-# Vector search -- exact cosine similarity, no pgvector, no extension
-graph.vector_search(Near("summary", query_embedding), k=10,
-                    where={"type": "person"})
-
-# ...or seed a traversal from similarity instead of a property match
-graph.traverse(Start(near=Near("summary", query_embedding), keep=25),
-               Hop(via={"kind": "cites"}, hops=(1, 3)))
-
 # Change and delete -- the same filters, selecting rows to update or remove
 graph.update_nodes(where={"name": "Alice"}, set={"active": False})
 ```
+
+**Similarity and traversal compose** — find the nodes closest in meaning to
+some text, then walk the graph from there. No separate vector database, no
+gluing two systems together with application code:
+
+```python
+# Vector search on its own -- exact cosine similarity, no pgvector, no extension
+graph.vector_search(Near("summary", "distributed consensus"), k=10,
+                    where={"type": "paper"})
+
+# Start a traversal from similarity instead of a property match: the 5 papers
+# most similar to the text, then everything they cite, up to 3 hops out.
+graph.traverse(
+    Start(near=Near("summary", "distributed consensus"), keep=5),
+    Hop(via={"kind": "cites"}, hops=(1, 3)),
+)
+```
+
+`Hop(near=, keep=)` and `Hop(via_near=, via_keep=)` do the same thing
+mid-chain — rank what a hop reaches, or beam over each node's edges, by
+similarity instead of only filtering by property. See
+[Vector search](https://hopai.readthedocs.io/en/latest/reference/vector-search/)
+in the table below.
 
 Every one of these compiles through the same query builder, so the SQL, the
 semantics and the invariants are identical no matter which front end wrote
@@ -102,9 +118,10 @@ full reference lives.
   schema and similarity tools, with permissions deciding which tools exist.
 - 🔐 **Constraints Neo4j puts behind an enterprise licence** — unique,
   composite, partial, existence, type and CHECK constraints on JSONB.
-- 🧲 **Vector search without pgvector** — exact cosine similarity on plain
-  `real[]` columns, multivector queries, similarity-seeded traversals, and a
-  field-level `embed=` so you can hand it text instead of floats.
+- 🧲 **Similarity-seeded traversal** — find the nodes closest in meaning to
+  some text, then walk the graph from there, in one call. Exact cosine
+  similarity on plain `real[]` columns, no pgvector, multivector queries,
+  and a field-level `embed=` so you can hand it text instead of floats.
 - 🧪 **Tested like it matters** — an 85% coverage gate and mutation testing
   in CI, and real benchmark numbers in `benchmarks/`.
 
