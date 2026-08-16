@@ -91,5 +91,24 @@ because of bugs, not taste:
   immediately. Treat this class as a harness artifact, and verify by hand rather than
   writing a test that cannot run.
 
+- **`hopai/mcp.py`'s tool/parameter description LITERALS are knowingly not chased one
+  by one (issue #58).** A run once reported ~120 survivors there, almost all the same
+  shape: a description string uppercased or XX-wrapped
+  (`"Which vector field search ranks against."` → `"WHICH VECTOR FIELD SEARCH RANKS
+  AGAINST."`), with no test objecting. Pinning every one verbatim would freeze wording
+  CLAUDE.md wants to stay editable (design rule 2: an LLM must get it right with no
+  custom instructions, and that means the prose stays free to improve) — so a skim that
+  reads "~120 survivors, all prose" and moves on is the wrong triage here, and so is
+  chasing each one by exact string. `tests/test_mcp.py`'s `TestDescriptionsAreStructurallyComplete`
+  catches the STRUCTURAL failure mode instead — a description missing, truncated to a
+  stub, or drifted from its own `enum` — generically over whatever `tools()` registers,
+  with nothing hand-named; `TestPinnedPermissionClaims` pins the small subset that
+  *are* load-bearing by meaning (what a `read_only`/restricted server refuses, and the
+  "never invent a vector" line CLAUDE.md's vector invariant depends on), each by
+  substring via the same idiom `_with_search()` already uses, not by exact string. A
+  survivor inside those two classes' scope is a real gap; a survivor that is a bare
+  case-flip of a sentence neither class pins is the accepted remainder, not an
+  oversight — check which of the two before re-opening this.
+
 CI scopes mutation to the files a PR changed and caps it with a wall-clock budget; a
 full run over `hopai/` is thousands of mutants.
