@@ -1375,17 +1375,8 @@ class TestCommandLine:
 
 
 class TestServeArguments:
-    def test_an_unknown_transport_is_refused_before_anything_starts(self):
-        """Named here rather than left to the SDK: 'sse' and 'grpc' are
-        both plausible guesses, and the SDK's own error arrives after a
-        server has been built."""
-        from hopai.mcp import serve
-
-        with pytest.raises(ValueError, match="'stdio' or 'http'"):
-            serve(offline(), transport="grpc")
-
     @staticmethod
-    def _stub(monkeypatch) -> dict:
+    def _stub(monkeypatch, era: int = 2) -> dict:
         """serve() without an SDK or a socket: record what it would have
         built and run, and return instead of blocking on a transport."""
         seen = {}
@@ -1395,12 +1386,45 @@ class TestServeArguments:
                 seen["ran"] = (transport, kwargs)
 
         def build(graph, **options):
+            seen["graph"] = graph
             seen["options"] = options
             return FakeServer()
 
-        monkeypatch.setattr("hopai.mcp._sdk", lambda: (None, None, 2))
+        monkeypatch.setattr("hopai.mcp._sdk", lambda: (None, None, era))
         monkeypatch.setattr("hopai.mcp.build_server", build)
         return seen
+
+    def test_an_unknown_transport_is_refused_before_anything_starts(self, monkeypatch):
+        """Named here rather than left to the SDK: 'sse' and 'grpc' are
+        both plausible guesses, and the SDK's own error arrives after a
+        server has been built.
+
+        Stubbed even though it is a refusal test: unstubbed, a mutant
+        inverting the guard falls through to running a REAL stdio server
+        and the test hangs until the harness kills it -- which is how
+        `serve__mutmut_7` came back as a timeout rather than a verdict.
+        With the stub, falling through returns instead of blocking, so
+        the missing raise is reported as a failure."""
+        from hopai.mcp import serve
+
+        self._stub(monkeypatch)
+        with pytest.raises(ValueError, match="'stdio' or 'http'"):
+            serve(offline(), transport="grpc")
+
+    def test_the_graph_and_the_options_reach_the_server(self, monkeypatch):
+        """`read_only` is the reason this is not bookkeeping: an option
+        dropped between serve() and build_server() is a server that was
+        asked to be read-only and registers the write tools anyway.
+        Mutants blanking the graph argument and dropping **options both
+        survived the bind-defaults test, which asserts neither."""
+        from hopai.mcp import serve
+
+        graph = offline()
+        seen = self._stub(monkeypatch)
+        serve(graph, read_only=True, name="pinned")
+        assert seen["graph"] is graph
+        assert seen["options"]["read_only"] is True
+        assert seen["options"]["name"] == "pinned"
 
     def test_the_bind_defaults_reach_the_server_that_is_built(self, monkeypatch):
         """The defaults are asserted through the CALL, not through
@@ -1437,6 +1461,27 @@ class TestServeArguments:
         serve(offline(), transport=transport, host="0.0.0.0", port=9001, path="/x")
         assert seen["ran"][0] == expected
         assert seen["options"]["http"]["port"] == 9001
+
+    @pytest.mark.parametrize("era, forwarded", [
+        (2, {"host": "0.0.0.0", "port": 9001, "streamable_http_path": "/x"}),
+        (1, {}),
+    ])
+    def test_http_bind_settings_go_where_the_sdk_era_wants_them(self, monkeypatch, era,
+                                                                forwarded):
+        """1.x took the bind settings at construction, 2.0 takes them on
+        run() -- so the same dict has to reach a different place per era,
+        and passing it to both (or neither) is a server on the wrong
+        port. Three mutants lived here: dropping the kwargs entirely,
+        and flipping `era == 2` to `!= 2` and to `== 3`, each of which
+        swaps the two eras' behavior silently.
+
+        Both eras are asserted because either one alone passes for a
+        mutant that always chooses the other."""
+        from hopai.mcp import serve
+
+        seen = self._stub(monkeypatch, era=era)
+        serve(offline(), transport="http", host="0.0.0.0", port=9001, path="/x")
+        assert seen["ran"] == ("streamable-http", forwarded)
 
 
 # ---------------------------------------------------------------------
