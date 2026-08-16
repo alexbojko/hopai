@@ -181,9 +181,11 @@ from .filters import AND, BETWEEN, GT, GTE, LT, LTE, NOT, OR, parse_filter
 from .hop import Hop, Start
 from .ingest import INGEST_TOOL_SCHEMA, IngestResult
 from .json_api import (
-    AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, aggregate_json, spec_to_aggregation,
-    spec_to_traversal, traverse_json, vector_search_json,
+    AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, VECTOR_SEARCH_TOOL_SCHEMA,
+    aggregate_json, spec_to_aggregation, spec_to_traversal, traverse_json,
+    vector_search_json,
 )
+from .embeddings import Embedder, EmbeddingError
 from .models import Edge, Node
 from .mutate import MUTATE_TOOL_SCHEMA, MutationResult, spec_to_mutations
 from .schema import (
@@ -213,6 +215,8 @@ __all__ = [
     "GraphSchema", "NodeType", "EdgeType", "Property", "InferenceReport", "TypeConflict",
     "SchemaViolations",
     "Vector", "Near", "Boost", "parse_near", "parse_boost", "vector_search_json",
+    "VECTOR_SEARCH_TOOL_SCHEMA",
+    "Embedder", "EmbeddingError",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",
 ]

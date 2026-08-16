@@ -92,6 +92,26 @@ docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocs-jupyter>=0.25"]
 # contract, and a major bump could change any of it. See setup.cfg.
 mutation = ["mutmut>=3.6.0,<4"]
 
+# Embedding providers. hopai imports NONE of these -- see
+# hopai/embeddings.py, which matches clients by module name and duck
+# typing precisely so the import never happens. They are here so
+# `pip install hopai[openai]` gets you a working setup in one line, and
+# so the supported set is written down somewhere a reader can find it.
+#
+# Floors, not ceilings, and only where a floor means something:
+# openai>=1.0 is the v1 client rewrite (`client.embeddings.create`),
+# cohere>=5.0 is the v2 client (`embed(..., embedding_types=)`). The
+# rest have kept one shape.
+openai = ["openai>=1.0"]
+cohere = ["cohere>=5.0"]
+voyageai = ["voyageai>=0.2"]
+google = ["google-genai>=0.3"]
+sentence-transformers = ["sentence-transformers>=3.0"]
+# Everything at once, for a project that has not chosen yet. A real
+# deployment installs the one provider it uses.
+embeddings = ["openai>=1.0", "cohere>=5.0", "voyageai>=0.2",
+              "google-genai>=0.3", "sentence-transformers>=3.0"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

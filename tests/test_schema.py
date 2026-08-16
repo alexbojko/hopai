@@ -1243,6 +1243,10 @@ class TestInferenceSampling:
         assert report.edge_counts == {"works_at": 2, "likes": 2, "dangles": 1}
         assert report.skipped_endpoint_edges == 5
         assert "not one of the above" in str(report)
+        # The point of dropping rather than raising: what comes back is
+        # still something define_schema() accepts. An inferred schema
+        # its own library refuses is not a usable answer.
+        fresh_graph.define_schema(schema=schema)
 
     def test_out_of_range_percent_is_refused_offline(self, offgraph):
         """Validation names the range and runs BEFORE anything connects

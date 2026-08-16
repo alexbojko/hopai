@@ -67,7 +67,27 @@ def _plain(value):
 @dataclass
 class Subgraph:
     """The result of a traversal: every node and edge that is part of at
-    least one complete, filter-satisfying chain."""
+    least one complete, filter-satisfying chain.
+
+        nodes -> [{"id": "1", "properties": {...}}]
+        edges -> [{"id": "7", "start_id": "1", "end_id": "2",
+                   "properties": {...}}]
+
+    Ids are strings everywhere, matching vector_search() and every
+    *_vectors() call, so an edge found by traversal feeds straight into
+    set_vectors(edges=[...]) -- which used to need a hand-written
+    `SELECT id FROM edges`, since the edge id was the one identity this
+    result dropped. It also tells parallel edges apart: two `friend`
+    edges between one pair with identical properties were otherwise two
+    identical dicts.
+
+    Both lists therefore carry ids that already exist, so writing a
+    result back with add_nodes/add_edges asks for those ids again and
+    the primary key refuses. Drop them to copy a subgraph elsewhere:
+    `add_edges([{k: v for k, v in e.items() if k != "id"} for e in
+    result.edges])`. That has always been true of `nodes`; `edges` now
+    says the same thing rather than being the one shape you could feed
+    back by accident."""
     nodes: list = field(default_factory=list)
     edges: list = field(default_factory=list)
     elapsed_ms: float = 0.0
@@ -457,6 +477,11 @@ class Graph:
         ]
         edge_selects = [select(literal("edge").label("kind"), cast(edge_rows.c.eid, String).label("id"))]
 
+        # The `is not None` half never decides anything, and the sentinel
+        # above is therefore unobservable: `optional` is rejected anywhere
+        # but the last hop, and `pairs` has one entry per hop, so
+        # hops[-1].optional being true means the loop already assigned
+        # this. Kept as a statement of that coupling, not as a guard.
         if hops[-1].optional and pre_optional_match is not None:
             node_selects.append(
                 select(literal("node").label("kind"), cast(pre_optional_match.c.node_id, String).label("id"))
@@ -973,9 +998,16 @@ class Graph:
 
     def set_vectors(self, nodes: Optional[list] = None, edges: Optional[list] = None) -> int:
         """Store vectors on existing rows, one transaction for the
-        whole call. Each row is {"id": ..., <field>: <vector or None>}:
+        whole call. Each row is {"id": ..., <field>: <vector, text or
+        None>}:
 
             graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
+            graph.set_vectors(nodes=[{"id": 1, "summary": "a paper on Raft"}])
+
+        A string is embedded with the field's declared embed= -- every
+        string in the call batched into one provider request per field,
+        before the transaction opens. A field with no embedder refuses
+        text by name rather than guessing.
 
         This is the ONLY write path for vectors -- add_nodes/merge
         rows never carry them (hopai/vectors.py says why). Returns the
@@ -1002,7 +1034,8 @@ class Graph:
         from .vectors import get_vectors
         return get_vectors(self, node_ids, edge_ids, node_fields, edge_fields)
 
-    def stale_vectors(self, node_fields=None, edge_fields=None, limit=None) -> dict:
+    def stale_vectors(self, node_fields=None, edge_fields=None, limit=None,
+                      after=None) -> dict:
         """Which rows need (re-)embedding, per field: those with no
         vector, and those whose stored vector no longer matches the
         declared dimensions.
@@ -1013,9 +1046,40 @@ class Graph:
         The second category is the window a dimension change opens --
         migrate_vectors() refuses to reinterpret stored vectors and
         set_vectors() refuses to write the wrong size, so this is what
-        closes it without hand-writing the catalog query."""
+        closes it without hand-writing the catalog query.
+
+        embed_stale() runs that whole loop for fields that declare an
+        embed=; this is the report for the ones you fill in yourself.
+
+        To walk a large field, page with `limit` AND `after=<the
+        largest id you saw>`. `limit` alone repeats itself: a row with
+        nothing to embed stays stale forever and holds the window."""
         from .vectors import stale_vectors
-        return stale_vectors(self, node_fields, edge_fields, limit)
+        return stale_vectors(self, node_fields, edge_fields, limit, after)
+
+    def embed_stale(self, node_fields=None, edge_fields=None, limit=None,
+                    batch: int = 1000) -> dict:
+        """Fill in every stale vector from its source property, for the
+        fields that declare an embed=. The backfill loop stale_vectors()
+        leaves you to write:
+
+            graph.define_vectors(nodes=[Vector("summary", 1536,
+                                               source="abstract",
+                                               embed=openai.OpenAI())])
+            graph.embed_stale()
+            # -> {"nodes": {"summary": {"embedded": ["1"], "skipped": []}},
+            #     "edges": {}}
+
+        `skipped` is the rows whose source property is absent or blank
+        -- reported rather than raised, since there is nothing to embed,
+        but never silent.
+
+        Walks each field in pages of `batch`, one embed call and one
+        transaction each, so any size of backfill costs bounded memory
+        and a re-run resumes rather than restarting. `limit` caps the
+        rows one call takes on per field; the default is all of them."""
+        from .vectors import embed_stale
+        return embed_stale(self, node_fields, edge_fields, limit, batch)
 
     def pgvector_exit_ddl(self, index: Optional[str] = "hnsw") -> list:
         """The migration off this library's exact search and onto
@@ -1283,6 +1347,10 @@ class Graph:
         answers."""
         query = self.build_aggregate_query(start, hops, aggregates)
         row = session.execute(query).one()
+        # strict= is unobservable here and that is on purpose:
+        # build_aggregate_query() emits exactly one labeled column per
+        # entry in `aggregates`, so the two lengths are equal by
+        # construction. Kept as a claim about that, not as a guard.
         return {name: _plain(value) for name, value in zip(aggregates, row, strict=True)}
 
     def aggregate(self, start: Start, *hops: Hop, aggregates: dict) -> dict:
@@ -1328,12 +1396,14 @@ class Graph:
         edges = []
         if edge_ids:
             q = select(
+                cast(edge_id_col, String).label("id"),
                 cast(getattr(et.c, self.edge_start_col), String).label("start_id"),
                 cast(getattr(et.c, self.edge_end_col), String).label("end_id"),
                 et.c.properties,
             ).where(and_(self._scoped(et), cast(edge_id_col, String).in_(edge_ids)))
             edges = [
-                {"start_id": r.start_id, "end_id": r.end_id, "properties": r.properties}
+                {"id": r.id, "start_id": r.start_id, "end_id": r.end_id,
+                 "properties": r.properties}
                 for r in session.execute(q).all()
             ]
 

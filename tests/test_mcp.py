@@ -123,6 +123,28 @@ def vector_graph() -> Graph:
     return g
 
 
+def field_embedder(dimensions: int = 3):
+    """A field-level `embed=` client, which is NOT the same contract as
+    serve(embed=): Vector(..., embed=) hands its client a LIST of texts
+    and expects a list of vectors, because it batches. serve(embed=)
+    takes one string. Passing one where the other is wanted is the
+    mistake this separate helper exists to keep visible."""
+    def embed(texts):
+        return [[float(len(t) % 7 + 1), 0.5, -0.25][:dimensions] for t in texts]
+    return embed
+
+
+@pytest.fixture
+def embedded_graph() -> Graph:
+    """A graph whose FIELDS can embed, so `near`/`via_near` text needs
+    nothing from the server -- the configuration where the two ways in
+    are genuinely independent."""
+    g = offline()
+    g.define_vectors(nodes=[Vector("summary", 3, embed=field_embedder())],
+                     edges=[Vector("rel", 3, embed=field_embedder())])
+    return g
+
+
 # ---------------------------------------------------------------------
 # What gets registered
 # ---------------------------------------------------------------------
@@ -451,15 +473,33 @@ class TestToolSchemas:
         an embedder configured, which is the only configuration where a
         similarity parameter could plausibly appear.
 
-        `search` and `keep` are the deliberate exception and are not in
-        this set: `search` takes the model's TEXT, which the server
-        embeds itself, and `keep` is a count. What must never appear is
-        a place to PUT floats -- a model asked for an embedding invents
-        one, and an invented embedding finds confidently wrong
-        neighbors."""
-        forbidden = {"near", "via_near", "via_keep", "boost", "vector", "embedding"}
+        What must never appear is a place to PUT FLOATS: a model asked
+        for an embedding invents one, and an invented embedding finds
+        confidently wrong neighbors. Everything else in the similarity
+        family is advertised on purpose -- `near` and `via_near` carry
+        the model's TEXT, `keep`/`via_keep` are counts, `boost` names a
+        property. A model supplies those as truthfully as it supplies a
+        filter, and refusing them put semantic search out of a tool
+        call's reach entirely.
+
+        So the forbidden set is two names, not seven, and the test still
+        walks $defs/anyOf -- `vector` hiding one level down inside the
+        near definition is exactly the regression this catches."""
+        forbidden = {"vector", "embedding"}
         for spec in tools(vector_graph, embed=embedder(), allow_ddl=True, allow_mutations=True):
             assert not parameter_names(spec.parameters) & forbidden, spec.name
+
+    def test_the_near_definition_offers_text_and_no_vector(self, vector_graph):
+        """The other half of the same rule: `near` being advertised is
+        only safe while the thing it advertises has no float-shaped
+        slot. A near spec a model can fill in must offer `text` and
+        must not offer `vector`."""
+        for spec in tools(vector_graph, embed=embedder()):
+            near = spec.parameters.get("$defs", {}).get("near")
+            if near is None:
+                continue
+            assert "text" in near["properties"], spec.name
+            assert "vector" not in near["properties"], spec.name
 
     @pytest.mark.parametrize("tool, method, arguments, forwarded", [
         ("ingest_graph", "ingest",
@@ -512,28 +552,41 @@ class TestToolSchemas:
         tools(vector_graph, embed=embedder())
         assert json.dumps(TRAVERSE_TOOL_SCHEMA, sort_keys=True) == before
 
-    def test_the_cannot_search_by_meaning_sentence_is_replaced_not_kept(self, vector_graph):
-        """The static schema tells a model this tool cannot find nodes
-        by meaning, which stops it guessing property values for a
-        semantic question. With an embedder that sentence is false, and
-        a description carrying both instructions is worse than either:
-        a model reading the refusal will not use the feature next to
-        it."""
+    def test_the_one_way_in_sentence_is_replaced_by_the_two_way_one(self, vector_graph):
+        """The static schema points a model at `near` -- the field
+        embeds the text, and that needs nothing from this server. An
+        `embed` callable adds a SECOND way in, so the sentence is
+        replaced rather than appended to: a description naming one route
+        while the parameters offer two is how a model picks neither.
+
+        This used to assert the static sentence said meaning-based
+        lookup was impossible. It is not impossible any more; what the
+        server adds is the fallback for fields carrying no embedder."""
         plain = named(vector_graph)["traverse_graph"].description
         seeded = named(vector_graph, embed=embedder())["traverse_graph"].description
-        assert "cannot find nodes by meaning" in plain
-        assert "cannot find nodes by meaning" not in seeded
-        assert "start.search" in seeded
+        assert "`near`" in plain and "start.search" not in plain
+        assert "`near`" in seeded and "start.search" in seeded
+        assert "not both" in seeded
 
     def test_a_seed_set_still_has_to_come_from_somewhere(self, vector_graph):
-        """The static schema requires `where` on start. Search is a
-        second way in, not a way to ask for every node in the graph, so
-        the requirement becomes a choice between the two rather than
-        disappearing."""
-        start = named(vector_graph,
-                      embed=embedder())["traverse_graph"].parameters["properties"]["start"]
-        assert "required" not in start
-        assert start["anyOf"] == [{"required": ["where"]}, {"required": ["search"]}]
+        """`where` or `near` in the static schema, plus `search` on a
+        server that has an embedder. None of the three is a way to ask
+        for every node in the graph, which is what an empty `start`
+        would mean -- so the constraint is a choice between the ways in,
+        never its absence.
+
+        Asserted on BOTH configurations: `search` is appended to the
+        static pair rather than replacing it, and a mutant overwriting
+        the list drops `near` on exactly the servers that can search by
+        meaning."""
+        plain = named(vector_graph)["traverse_graph"].parameters["properties"]["start"]
+        assert plain["anyOf"] == [{"required": ["where"]}, {"required": ["near"]}]
+
+        seeded = named(vector_graph,
+                       embed=embedder())["traverse_graph"].parameters["properties"]["start"]
+        assert "required" not in seeded
+        assert seeded["anyOf"] == [{"required": ["where"]}, {"required": ["near"]},
+                                   {"required": ["search"]}]
 
     def test_edge_only_vectors_offer_search_but_not_a_seed(self):
         """A seed ranks NODE vectors. A graph with only edge vector
@@ -546,7 +599,7 @@ class TestToolSchemas:
         assert "search_similar" in specs
         start = specs["traverse_graph"].parameters["properties"]["start"]
         assert "search" not in start["properties"]
-        assert "cannot find nodes by meaning" in specs["traverse_graph"].description
+        assert "start.search" not in specs["traverse_graph"].description
 
     def test_aggregation_can_be_seeded_by_meaning_too(self):
         """"How many papers cite anything about retrieval" is the same
@@ -764,11 +817,11 @@ class TestVectorsNeverComeFromTheModel:
         # to answer, and a mutation blanking the caller survived. Both
         # tools, because they pass their own name to _seed and a mutant
         # mangled aggregate_graph's while traverse_graph's was pinned.
-        with pytest.raises(ValueError, match=rf"{tool}: \['near'\] cannot come from"):
+        with pytest.raises(ValueError, match=rf"{tool}: near=.*cannot come from"):
             spec.call(start={"near": {"field": "summary", "vector": [0.1, 0.2, 0.3]}},
                       **arguments)
 
-    @pytest.mark.parametrize("key", ["near", "keep", "via_near", "via_keep", "boost"])
+    @pytest.mark.parametrize("key", ["near", "via_near"])
     @pytest.mark.parametrize("tool, arguments", [
         ("traverse_graph", {}),
         ("aggregate_graph", {"aggregates": {"n": {"fn": "count"}}}),
@@ -778,14 +831,49 @@ class TestVectorsNeverComeFromTheModel:
         path calls it with allow_vectors=True -- so the hops have to be
         refused here or the invariant would hold only for `start`.
 
+        Only the two keys that CARRY a near spec can smuggle floats in;
+        `keep`/`via_keep`/`boost` hold an integer or a property name and
+        are pinned to the opposite behavior just below.
+
         Both tools name themselves in the refusal, and both are checked:
         a mutant that mangled aggregate_graph's caller name survived
         while traverse_graph's was pinned. "Which of my calls was this?"
         is the first thing a model has to answer, and the answer being
         right for one of two tools is how it stops being reliable."""
         spec = named(offline())[tool]
-        with pytest.raises(ValueError, match=rf"{tool}: \['{key}'\] cannot come from"):
-            spec.call(start={"where": {"type": "person"}}, hops=[{key: 3}], **arguments)
+        with pytest.raises(ValueError, match=rf"{tool}: {key}=.*cannot come from"):
+            spec.call(start={"where": {"type": "person"}},
+                      hops=[{key: {"field": "summary", "vector": [1.0, 2.0, 3.0]}}],
+                      **arguments)
+
+    @pytest.mark.parametrize("hop", [
+        {"near": {"field": "summary", "text": "raft"}, "keep": 3},
+        {"via_near": {"field": "rel", "text": "cites"}, "via_keep": 3},
+        {"near": {"field": "summary", "text": "raft"}, "keep": 3,
+         "boost": {"property": "rank"}},
+    ])
+    def test_the_countable_similarity_keys_are_not_refused(self, embedded_graph, hop):
+        """The half that stops the refusal creeping back outwards.
+        `keep`, `via_keep` and `boost` were refused as a family with
+        `near`, which put semantic search out of a tool call's reach
+        entirely -- they hold an integer and a property name, which a
+        model supplies as truthfully as it supplies a filter.
+
+        Each is paired with the near it ranks, because `keep` alone is
+        "keep the top 3 of WHAT" and hopai refuses it on its own -- the
+        first draft of this test asserted the opposite and was wrong
+        about the code rather than the other way round.
+
+        The server has no embedder here on purpose: the FIELDS do, so
+        this pins that `near` text needs nothing from serve(embed=).
+
+        OperationalError is the assertion, and it has to be that
+        specific: reaching the connection that is not there proves the
+        spec was accepted and compiled, where pytest.raises(Exception)
+        would pass for the refusal this test exists to rule out."""
+        spec = named(embedded_graph)["traverse_graph"]
+        with pytest.raises(OperationalError):
+            spec.call(start={"where": {"type": "person"}}, hops=[hop])
 
     def test_a_seeded_server_still_refuses_an_invented_near(self, vector_graph):
         spec = named(vector_graph, embed=embedder())["traverse_graph"]
@@ -816,10 +904,29 @@ class TestVectorsNeverComeFromTheModel:
         with pytest.raises(OperationalError):
             spec.call(start={"search": "graph databases"}, **arguments)
 
-    def test_keep_without_search_is_refused(self):
+    def test_search_field_without_search_is_refused(self):
+        """`search_field` says which vector field the SEARCH TEXT ranks
+        against, so without `search` it configures nothing. `keep` used
+        to be refused here beside it and must not be: it is how many of
+        `near`'s ranked nodes to keep, and that is a spec traverse_json()
+        has always accepted."""
         spec = named(offline())["traverse_graph"]
-        with pytest.raises(ValueError, match="start.keep"):
-            spec.call(start={"where": {"type": "person"}, "keep": 10})
+        with pytest.raises(ValueError, match="start.search_field"):
+            spec.call(start={"where": {"type": "person"}, "search_field": "summary"})
+
+    def test_keep_without_search_is_now_a_near_spec_not_a_refusal(self, embedded_graph):
+        spec = named(embedded_graph)["traverse_graph"]
+        with pytest.raises(OperationalError):
+            spec.call(start={"near": {"field": "summary", "text": "raft"}, "keep": 10})
+
+    def test_search_and_near_together_are_refused_rather_than_one_dropped(self, vector_graph):
+        """Both rank the seed set, and _seed() writes `near` -- so
+        accepting both would silently discard whichever it overwrote.
+        Rule 4: refuse and name the rewrite."""
+        spec = named(vector_graph, embed=embedder())["traverse_graph"]
+        with pytest.raises(ValueError, match="only one of them can"):
+            spec.call(start={"search": "graph databases",
+                             "near": {"field": "summary", "text": "raft"}})
 
     def test_search_without_an_embedder_names_the_fix(self):
         spec = named(offline())["traverse_graph"]
@@ -1278,14 +1385,113 @@ class TestCommandLine:
 
 
 class TestServeArguments:
-    def test_an_unknown_transport_is_refused_before_anything_starts(self):
+    @staticmethod
+    def _stub(monkeypatch, era: int = 2) -> dict:
+        """serve() without an SDK or a socket: record what it would have
+        built and run, and return instead of blocking on a transport."""
+        seen = {}
+
+        class FakeServer:
+            def run(self, transport, **kwargs):
+                seen["ran"] = (transport, kwargs)
+
+        def build(graph, **options):
+            seen["graph"] = graph
+            seen["options"] = options
+            return FakeServer()
+
+        monkeypatch.setattr("hopai.mcp._sdk", lambda: (None, None, era))
+        monkeypatch.setattr("hopai.mcp.build_server", build)
+        return seen
+
+    def test_an_unknown_transport_is_refused_before_anything_starts(self, monkeypatch):
         """Named here rather than left to the SDK: 'sse' and 'grpc' are
         both plausible guesses, and the SDK's own error arrives after a
-        server has been built."""
+        server has been built.
+
+        Stubbed even though it is a refusal test: unstubbed, a mutant
+        inverting the guard falls through to running a REAL stdio server
+        and the test hangs until the harness kills it -- which is how
+        `serve__mutmut_7` came back as a timeout rather than a verdict.
+        With the stub, falling through returns instead of blocking, so
+        the missing raise is reported as a failure."""
         from hopai.mcp import serve
 
+        self._stub(monkeypatch)
         with pytest.raises(ValueError, match="'stdio' or 'http'"):
             serve(offline(), transport="grpc")
+
+    def test_the_graph_and_the_options_reach_the_server(self, monkeypatch):
+        """`read_only` is the reason this is not bookkeeping: an option
+        dropped between serve() and build_server() is a server that was
+        asked to be read-only and registers the write tools anyway.
+        Mutants blanking the graph argument and dropping **options both
+        survived the bind-defaults test, which asserts neither."""
+        from hopai.mcp import serve
+
+        graph = offline()
+        seen = self._stub(monkeypatch)
+        serve(graph, read_only=True, name="pinned")
+        assert seen["graph"] is graph
+        assert seen["options"]["read_only"] is True
+        assert seen["options"]["name"] == "pinned"
+
+    def test_the_bind_defaults_reach_the_server_that_is_built(self, monkeypatch):
+        """The defaults are asserted through the CALL, not through
+        inspect.signature(serve): mutmut wraps every function in a
+        `trampoline(*args, **kwargs)`, so a signature assertion reads the
+        wrapper and is blind to a mutated default by construction. Six
+        mutants moving the port off 8000, the path off /mcp and the host
+        off 127.0.0.1 all survived a test that checked the signature.
+
+        The host one is the reason this matters rather than being
+        tidiness: serve()'s own docstring says a graph an agent may
+        write to is not a thing to put on 0.0.0.0 by accident, and
+        nothing was checking that it did not."""
+        from hopai.mcp import serve
+
+        seen = self._stub(monkeypatch)
+        serve(offline())
+        assert seen["options"]["http"] == {"host": "127.0.0.1", "port": 8000,
+                                           "streamable_http_path": "/mcp"}
+        assert seen["ran"] == ("stdio", {})
+
+    @pytest.mark.parametrize("transport, expected", [("stdio", "stdio"),
+                                                     ("http", "streamable-http")])
+    def test_both_transports_pass_the_gate_and_reach_their_own_runner(
+            self, monkeypatch, transport, expected):
+        """The half the refusal test cannot see. `transport not in
+        ("stdio", "http")` still rejects "grpc" when either literal is
+        misspelled, so four mutants broke a working transport while the
+        refusal went on passing -- the same shape as the CLI `choices`
+        pair one class up."""
+        from hopai.mcp import serve
+
+        seen = self._stub(monkeypatch)
+        serve(offline(), transport=transport, host="0.0.0.0", port=9001, path="/x")
+        assert seen["ran"][0] == expected
+        assert seen["options"]["http"]["port"] == 9001
+
+    @pytest.mark.parametrize("era, forwarded", [
+        (2, {"host": "0.0.0.0", "port": 9001, "streamable_http_path": "/x"}),
+        (1, {}),
+    ])
+    def test_http_bind_settings_go_where_the_sdk_era_wants_them(self, monkeypatch, era,
+                                                                forwarded):
+        """1.x took the bind settings at construction, 2.0 takes them on
+        run() -- so the same dict has to reach a different place per era,
+        and passing it to both (or neither) is a server on the wrong
+        port. Three mutants lived here: dropping the kwargs entirely,
+        and flipping `era == 2` to `!= 2` and to `== 3`, each of which
+        swaps the two eras' behavior silently.
+
+        Both eras are asserted because either one alone passes for a
+        mutant that always chooses the other."""
+        from hopai.mcp import serve
+
+        seen = self._stub(monkeypatch, era=era)
+        serve(offline(), transport="http", host="0.0.0.0", port=9001, path="/x")
+        assert seen["ran"] == ("streamable-http", forwarded)
 
 
 # ---------------------------------------------------------------------

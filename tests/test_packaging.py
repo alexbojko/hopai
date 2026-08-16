@@ -144,6 +144,35 @@ class TestDistributionMetadata:
         required = pyproject.split("[project.optional-dependencies]")[0]
         assert "pydantic" not in required
 
+    def test_every_provider_hopai_recognizes_has_an_extra(self, pyproject):
+        """The extras are the only written-down list of what
+        `Embedder(client)` accepts natively. A provider added to
+        embeddings.py without one installs fine and is simply
+        undiscoverable -- and the reverse, an extra for a provider
+        nothing dispatches on, promises support that is not there."""
+        from hopai.embeddings import _BATCH_CAPS, _INPUT_TYPES
+
+        extras = pyproject.split("[project.optional-dependencies]")[1]
+        declared = {line.split("=")[0].strip()
+                    for line in extras.splitlines() if "=" in line and not line.startswith(" ")}
+        for provider in set(_BATCH_CAPS) | set(_INPUT_TYPES):
+            assert provider in declared, f"no hopai[{provider}] extra"
+        # The bundle installs every one of them, so "install them all"
+        # cannot quietly fall behind the list above.
+        bundle = extras.split("embeddings = ")[1]
+        for provider in set(_BATCH_CAPS) | set(_INPUT_TYPES):
+            assert provider in bundle.split("]")[0], f"{provider} missing from hopai[embeddings]"
+
+    def test_no_provider_is_a_required_dependency(self, pyproject):
+        """hopai imports no provider package, ever -- embeddings.py
+        matches clients by module name for exactly that reason. An
+        extra that drifted above the optional-dependencies line would
+        put an API client in the install path of a project that only
+        traverses."""
+        required = pyproject.split("[project.optional-dependencies]")[0]
+        for provider in ("openai", "cohere", "voyageai", "sentence-transformers"):
+            assert provider not in required
+
     def test_requires_python_matches_the_tested_versions(self, pyproject):
         assert 'requires-python = ">=3.10"' in pyproject
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()

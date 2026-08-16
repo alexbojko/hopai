@@ -123,8 +123,27 @@ all. One server cannot give two graphs different permissions — that is two ser
 
 Similarity takes **text**, never vectors. A model asked to fill in an embedding invents
 one, and an invented embedding finds confidently wrong neighbours — so no tool here has
-anywhere to put floats. You supply the embedding function; the server embeds the model's
-words with it.
+anywhere to put floats. Text is the opposite: a model says what it is looking for as
+truthfully as it writes a filter, so text is advertised and only the floats are refused.
+
+There are two ways in, and which one applies depends on where the embedder lives.
+
+**1. `near`, embedded by the field.** The same spelling `traverse_json()` takes, available
+whether or not this server has an embedder of its own:
+
+```jsonc
+{"start": {"near": {"field": "summary", "text": "retrieval augmented generation"},
+           "keep": 25},
+ "hops":  [{"via": {"kind": "wrote"}, "direction": "backward"}]}
+```
+
+The **field** embeds that text, using the client declared in
+`Vector("summary", 1536, embed=…)`, so the query embedding comes from the same model that
+wrote the stored ones. This is the better answer wherever it is available. `keep`,
+`via_near`, `via_keep` and `boost` come with it — none of them is a place to put floats.
+
+**2. `start.search`, embedded by the server.** The fallback for graphs whose fields carry
+no embedder of their own:
 
 ```bash
 hopai-mcp --dsn ... --vector nodes:summary:1536 --embed myapp.embeddings:embed
@@ -143,8 +162,12 @@ With both set, `search_similar` is registered and the traversal tools grow a
  "hops":  [{"via": {"kind": "wrote"}, "direction": "backward"}]}
 ```
 
-Without `--embed` there is no search by meaning, and the tool descriptions say so rather
-than leaving a model to guess property values for a semantic question.
+One callable serves every field here, which is why it is the fallback: it cannot know
+which model wrote which field. Send `search` **or** `start.near`, never both — they both
+rank the seed set, so accepting both would mean silently dropping one.
+
+Without `--embed`, `search_similar` is not registered and `start.search` is not
+advertised; `near` still works for any field that can embed its own text.
 
 ## All flags
 

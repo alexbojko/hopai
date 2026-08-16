@@ -105,21 +105,38 @@ The one exception is `cypher`, which is one tool covering all four
 kinds -- it classifies the query first (cypher.classify_cypher) and
 refuses by permission before opening a connection.
 
-SIMILARITY, and the rule it must not break. Vectors never pass through
-a tool schema -- a model asked for an embedding invents one, and an
-invented embedding finds confidently wrong neighbors (hopai/vectors.py
-argues this at length). So the model here sends TEXT, and this server
-embeds it with the `embed` callable the operator wired up:
+SIMILARITY, and the rule it must not break. A VECTOR never passes
+through a tool schema -- a model asked for an embedding invents one, and
+an invented embedding finds confidently wrong neighbors (hopai/vectors.py
+argues this at length). TEXT is the opposite: a model says what it is
+looking for as truthfully as it writes a filter, so text is advertised
+and only the floats are refused. json_api.refuse_vectors() is the one
+place that is enforced, and it runs on every spec BEFORE anything is
+injected.
 
-    serve(graph, embed=lambda text: openai_embedding(text))
+There are two ways in, and which applies depends on where the embedder
+lives:
 
-That is the whole of it: `search_similar` appears only when `embed` is
-configured, `traverse_graph`/`aggregate_graph` grow a `start.search`
-string that seeds the walk from the most similar nodes, and no tool
-anywhere accepts a list of floats. json_api.refuse_vectors() -- the one
-place that invariant is enforced -- still runs on every spec BEFORE the
-embedding is injected, so a model that invents a `near` is refused by
-the same code that refuses it in traverse_json().
+  - `near: {"field": ..., "text": ...}` on start or any hop, the same
+    spelling traverse_json() takes. The FIELD embeds it, with the client
+    the application declared in Vector(name, dims, embed=...), so the
+    query embedding comes from the same model that wrote the stored
+    ones. This is the better answer wherever it is available, and it
+    needs nothing from this server.
+  - `start.search`, a bare string, for graphs whose fields carry no
+    embedder of their own. This server embeds it with the operator's
+    callable:
+
+        serve(graph, embed=lambda text: openai_embedding(text))
+
+    One callable for every field, which is why it is the fallback: it
+    cannot know which model wrote which field.
+
+`search_similar` appears only when `embed` is configured. `near` needs
+no such gate -- it is advertised whenever the underlying schema
+advertises it, and a field with no embedder refuses by name when the
+text is resolved. Sending both `search` and a `start.near` is refused
+rather than resolved: one of the two would have to be silently dropped.
 
 NO AUTHENTICATION. Over stdio the client is the process that spawned
 this one, which is the trust boundary. Over HTTP it binds 127.0.0.1 by
@@ -169,24 +186,25 @@ call rather than retrying it unchanged.\
 """
 SERVER_INSTRUCTIONS = f"{_ONE_GRAPH}\n\n{_ADVICE}"
 
-#: The sentence TRAVERSE_TOOL_SCHEMA/AGGREGATE_TOOL_SCHEMA use to tell a
-#: model that meaning-based lookup is not available. It stops being true
-#: the moment an `embed` callable is wired up, so it is REPLACED (not
-#: appended to) rather than leaving the description arguing with itself.
+#: The sentence TRAVERSE_TOOL_SCHEMA/AGGREGATE_TOOL_SCHEMA use to point a
+#: model at `near` for meaning-based lookup. `near` is always available;
+#: what an `embed` callable adds is the SECOND way in -- start.search,
+#: for graphs whose fields carry no embedder of their own. So the
+#: sentence is REPLACED (not appended to) rather than leaving the
+#: description listing one way and the parameters offering two.
 _NO_MEANING = (
-    "Filters are EXACT property matches: this tool cannot find nodes by meaning "
-    "or semantic closeness. If the question needs that, say so rather than guessing "
-    "property values -- the application must run the search and give you node ids "
-    "to start from."
+    "`where`/`via` are EXACT property matches; to select nodes by MEANING instead, "
+    "give `near` a field and the text to look for, with `keep` to say how many to keep."
 )
 _NO_MEANING_AGGREGATE = (
-    "Filters are EXACT property matches: this tool cannot select nodes by meaning."
+    "`where`/`via` are EXACT property matches; `near` selects by meaning."
 )
 _WITH_MEANING = (
-    "Filters are EXACT property matches. To select nodes by MEANING instead, put the "
-    "question's own text in start.search: this server embeds it and seeds the "
-    "traversal with the most similar nodes. Never invent a vector; there is nowhere "
-    "to put one."
+    "`where`/`via` are EXACT property matches. To select nodes by MEANING instead, "
+    "either give `near` a field and the text to look for (the field embeds it), or "
+    "put the question's own text in start.search and this server will embed it and "
+    "seed the traversal with the most similar nodes. Use one or the other, not both. "
+    "Never invent a vector; there is nowhere to put one."
 )
 
 #: Default seed size for start.search. Big enough that a real answer is
@@ -454,37 +472,51 @@ def _seed(graph: Graph, embed: Optional[Callable], start: Any, caller: str) -> d
     `near` seed.
 
     The order matters and is the point: the caller's keys are refused by
-    json_api.refuse_vectors() BEFORE anything is injected, so `search`
-    is the only route from a model to a similarity search, and an
-    invented `near` is rejected by the same function that rejects it in
-    traverse_json()."""
+    json_api.refuse_vectors() BEFORE anything is injected, so a model
+    that invents floats is rejected by the same function that rejects
+    them in traverse_json(). What it may legitimately send is `near`
+    with TEXT -- that needs no help from this server, because the field
+    embeds it -- so this function only has to handle `search`, the
+    fallback for fields carrying no embedder of their own.
+
+    `keep` is NOT this function's to claim: it belongs to whichever of
+    the two produced the ranking. Popping it was right when `search` was
+    the only way in and is a bug now, since `{"near": ..., "keep": 3}`
+    is an ordinary spec traverse_json() has always accepted."""
     if not isinstance(start, dict):
         raise TypeError(f"{caller}: `start` must be an object, got {type(start).__name__}")
     start = dict(start)
     search = start.pop("search", None)
     field = start.pop("search_field", None)
-    keep = start.pop("keep", None)
     refuse_vectors({"start": start}, caller)
 
+    if search is not None and "near" in start:
+        raise ValueError(
+            f"{caller}: start.search and start.near both rank the seed set, and only "
+            f"one of them can -- drop start.search to let the field embed your "
+            f"`near` text, or drop start.near to have this server embed the search "
+            f"string"
+        )
     if search is None:
-        if keep is not None or field is not None:
+        if field is not None:
             raise ValueError(
-                f"{caller}: start.keep/start.search_field only mean something with "
-                f"start.search -- they say how many of the most similar nodes to seed "
-                f"from, and how to rank them"
+                f"{caller}: start.search_field only means something with start.search "
+                f"-- it says which vector field to rank the search text against. Name "
+                f"the field in `near` instead: {{\"field\": ..., \"text\": ...}}"
             )
         return start
     if embed is None:
         raise ValueError(
             f"{caller}: start.search needs an embedding function and this server has "
-            f"none -- start it with serve(graph, embed=...) to search by meaning, or "
-            f"filter on properties with start.where"
+            f"none -- start it with serve(graph, embed=...), give `near` a field and "
+            f"text so the field embeds it itself, or filter on properties with "
+            f"start.where"
         )
     if not isinstance(search, str) or not search.strip():
         raise ValueError(f"{caller}: start.search must be a non-empty string, got {search!r}")
     name = _resolve_field(graph, "nodes", field, caller)
     start["near"] = {"field": name, "vector": embed(search)}
-    start["keep"] = DEFAULT_KEEP if keep is None else keep
+    start.setdefault("keep", DEFAULT_KEEP)
     return start
 
 
@@ -550,12 +582,12 @@ def _with_search(schema: dict, served: Served, sentence: str) -> dict:
     schema["description"] = schema["description"].replace(sentence, _WITH_MEANING)
     start = schema["parameters"]["properties"]["start"]
     start["properties"].update(_search_keys(served))
-    # `where` alone is required on start in the static schema. With
-    # `search` as a second way in, keeping that would forbid a purely
-    # semantic seed -- and dropping it without a replacement would stop
-    # saying that a seed set has to come from SOMEWHERE.
-    start.pop("required", None)
-    start["anyOf"] = [{"required": ["where"]}, {"required": ["search"]}]
+    # A seed set has to come from SOMEWHERE, and `search` is a third way
+    # in beside the static schema's `where` and `near`. EXTENDED, not
+    # replaced: overwriting the pair would drop `near` from the list of
+    # legal starts on exactly the servers that can search by meaning --
+    # advertising the fallback while un-advertising the better route.
+    start["anyOf"] = [*start.get("anyOf", []), {"required": ["search"]}]
     return schema
 
 
@@ -723,12 +755,17 @@ def _search_tool(served: Served, embed: Callable) -> ToolSpec:
             raise ValueError(f"search_similar: query must be a non-empty string, got {query!r}")
         chosen = served.pick(graph, "search_similar")
         name = _resolve_field(chosen, target, field, "search_similar")
+        # allow_vectors, for the same reason traverse_graph passes it:
+        # this `near` is the server's own, built from the model's TEXT a
+        # line above. Without it refuse_vectors() rejects the embedding
+        # this tool exists to make -- a vector_search_json() spec carries
+        # its near at the TOP level, which is a scope the refusal walks.
         return vector_search_json(chosen, {
             "near": {"field": name, "vector": embed(query)},
             "target": target,
             "k": k,
             "where": where,
-        })
+        }, allow_vectors=True)
 
     properties = {
         "query": {

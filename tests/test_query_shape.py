@@ -760,8 +760,20 @@ class TestToolSchema:
         assert json.loads(json.dumps(TRAVERSE_TOOL_SCHEMA)) == TRAVERSE_TOOL_SCHEMA
 
     def test_advertises_the_keys_the_parser_reads(self):
-        hop_props = TRAVERSE_TOOL_SCHEMA["parameters"]["properties"]["hops"]["items"]["properties"]
-        assert set(hop_props) == {"where", "via", "hops", "direction", "optional"}
+        """Derived from the parser's own key sets rather than listed
+        here, so widening one without the other fails in both
+        directions -- an unadvertised key is documentation a model
+        never sees, and an advertised one the parser rejects is a tool
+        call that errors.
+
+        `label` is the single omission: it names result groups for the
+        caller's own bookkeeping and builds no SQL, so there is nothing
+        for a model to decide. The near-level omission -- "vector" --
+        is pinned separately in tests/test_vectors.py."""
+        from hopai.json_api import _HOP_KEYS, _START_KEYS
+        properties = TRAVERSE_TOOL_SCHEMA["parameters"]["properties"]
+        assert set(properties["hops"]["items"]["properties"]) == _HOP_KEYS - {"label"}
+        assert set(properties["start"]["properties"]) == _START_KEYS - {"label"}
 
     def test_direction_enum_matches_what_hop_accepts(self):
         for direction in TRAVERSE_TOOL_SCHEMA["parameters"]["properties"]["hops"]["items"] \

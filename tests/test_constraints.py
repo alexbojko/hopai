@@ -234,6 +234,24 @@ class TestLifecycle:
         assert "uq_nodes_email" not in indexes(fresh_graph)
         assert fresh_graph.add_nodes([{"email": "a@x.com"}, {"email": "a@x.com"}]) == 2
 
+    def test_drop_constraints_reaches_the_edges_too(self, fresh_graph):
+        """Every drop_constraints test passed `nodes=` only, so the
+        edges half of `_targets(nodes, edges)` could be dropped
+        entirely -- `drop_constraints(edges=[...])` silently doing
+        nothing, returning [], and leaving the constraint enforcing.
+
+        Asserted by the write, not by the return value: a name in the
+        list proves the DDL was composed, not that it ran."""
+        fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+        declarations = {"edges": [Unique(Col("start_id"), Col("end_id"), "kind")]}
+        fresh_graph.define_constraints(**declarations)
+        fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}])
+        with pytest.raises(ConstraintViolation):
+            fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}])
+
+        assert fresh_graph.drop_constraints(**declarations) == ["uq_edges_start_id_end_id_kind"]
+        assert fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}]) == 1
+
     def test_dropping_what_was_never_created_is_fine(self, fresh_graph):
         fresh_graph.drop_constraints(nodes=[Unique("nothing_here")])
 
@@ -279,6 +297,40 @@ class TestNaming:
     def test_unknown_constraint_object_is_rejected(self, offline_graph):
         with pytest.raises(TypeError, match="expected one of"):
             offline_graph.constraint_ddl(nodes=["Unique('email')"])
+
+    @pytest.mark.parametrize("target", ["nodes", "edges"])
+    def test_a_renamed_graph_column_reaches_both_targets(self, target):
+        """Table and column names are configurable, and every constraint
+        is scoped by the graph column -- so a graph discriminator named
+        anything but `graph_id` has to reach the DDL, or the constraint
+        is scoped by a column that does not exist.
+
+        Parametrized because `_targets()` builds the node and edge sides
+        on two separate lines: dropping graph_col from the EDGES line
+        alone left the whole suite green, which is the same
+        node-works/edge-twin-untested shape as every other edge defect
+        this feature has had."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        from hopai import Graph
+
+        metadata = MetaData()
+        nodes = Table("nodes", metadata,
+                      Column("id", BigInteger, primary_key=True),
+                      Column("tenant", Text),
+                      Column("properties", JSONB))
+        edges = Table("edges", metadata,
+                      Column("id", BigInteger, primary_key=True),
+                      Column("tenant", Text),
+                      Column("start_id", BigInteger),
+                      Column("end_id", BigInteger),
+                      Column("properties", JSONB))
+        graph = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+                      node_table=nodes, edge_table=edges, graph_col="tenant")
+        ddl = graph.constraint_ddl(**{target: [Unique("email")]})[0]
+        assert "tenant" in ddl
+        assert "graph_id" not in ddl
 
 
 class TestViolationErrors:

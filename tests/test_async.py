@@ -24,9 +24,10 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from hopai import Count, CypherError, Hop, Near, Start, Unique, Vector
+from hopai import Boost, Count, CypherError, Hop, Near, Start, Unique, Vector
 from hopai.asyncio import AsyncGraph
 
 
@@ -79,6 +80,20 @@ class TestSameAnswerAsSync:
         async_result = run(async_graph.cypher(query))
         assert async_result == sync_result
 
+    def test_cypher_aggregate_carries_its_hops(self, graph, async_graph):
+        """The case above has no hops, so it cannot see cypher()'s
+        dispatch dropping `*hops` on the way to aggregate() -- with none
+        to drop, both spellings count the same set. With a hop, dropping
+        it counts the SEED set instead: a different number, from a query
+        that still succeeds and says nothing."""
+        walked = "MATCH (a {type: 'leaf'})-[:knows]->(b) RETURN count(DISTINCT b)"
+        seeds = "MATCH (a {type: 'leaf'}) RETURN count(a)"
+        sync_result = graph.cypher(walked)
+        assert run(async_graph.cypher(walked)) == sync_result
+        # Without this the assertion above is vacuous: it only means
+        # something while the hop actually changes the answer.
+        assert sync_result != graph.cypher(seeds)
+
 
 class TestIngestAndMutate:
     def test_add_nodes_edges_and_traverse(self, async_fresh_graph):
@@ -121,6 +136,35 @@ class TestIngestAndMutate:
         result = run(body())
         assert result.nodes == 2
         assert result.edges == 1
+
+    def test_ingest_forwards_merge_edges_on(self, async_fresh_graph, async_admin_graph):
+        """Both merge keys have to reach the sync ingestor. A mutant
+        blanking `merge_edges_on` survived every ingest test here,
+        because the only one that existed passed neither -- so an
+        ingest asked to merge edges would have inserted duplicates
+        instead, and nothing would have said so.
+
+        Asserted through the OUTCOME rather than the call: re-ingesting
+        the same edge is one edge with the new weight if the key
+        arrived, and two edges if it did not."""
+        from hopai import Unique
+
+        async_admin_graph.define_constraints(edges=[Unique("tag")])
+        document = {"nodes": [{"id": 1}, {"id": 2}],
+                    "edges": [{"start_id": 1, "end_id": 2, "tag": "e1", "weight": 5}]}
+
+        async def body():
+            await async_fresh_graph.ingest(document, merge_edges_on=["tag"])
+            # Edges only the second time: the nodes already exist, and
+            # re-sending them would test merge_nodes_on instead.
+            await async_fresh_graph.ingest(
+                {"edges": [{"start_id": 1, "end_id": 2, "tag": "e1", "weight": 9}]},
+                merge_edges_on=["tag"])
+            return await async_fresh_graph.traverse(Start(), Hop(hops=(1, 1)))
+
+        result = run(body())
+        assert len(result.edges) == 1
+        assert result.edges[0]["properties"]["weight"] == 9
 
     def test_delete_nodes_with_no_filter_refuses(self, async_fresh_graph):
         async def body():
@@ -239,6 +283,44 @@ class TestVectors:
         assert hits[0]["id"] == "1"
         assert got["nodes"]["1"]["summary"] == pytest.approx([1.0, 0.0, 0.0])
         assert dropped == ["nodes.vec_summary"]
+
+    def test_text_is_embedded_before_the_transaction_opens(self, async_fresh_graph):
+        """The sync set_vectors() plans and then opens a transaction, so
+        the provider call is outside it by construction. This one cannot
+        get that for free: the transaction is already open by the time
+        run_sync() reaches vectors.py, so planning inside would hold row
+        locks for a network round trip -- the invariant set_vectors()'
+        docstring states and tests/test_vectors.py pins for the sync
+        side. Here the plan is built before `begin()`, and this is what
+        says so."""
+        embedded, opened = [], []
+
+        def watching(texts):
+            embedded.extend(texts)
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        def on_begin(conn):
+            opened.append(len(embedded))
+
+        async def body():
+            async_fresh_graph.define_vectors(
+                nodes=[Vector("summary", 3, embed=watching)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1, "summary": "a paper about Raft"}])
+
+            engine = async_fresh_graph.engine.sync_engine
+            event.listen(engine, "begin", on_begin)
+            try:
+                await async_fresh_graph.set_vectors(
+                    nodes=[{"id": 1, "summary": "a paper about Raft"}])
+            finally:
+                event.remove(engine, "begin", on_begin)
+
+        run(body())
+        assert embedded == ["a paper about Raft"]
+        # Every transaction this call opened already had the embedding in
+        # hand. A zero here is a provider round trip holding row locks.
+        assert opened and all(count == 1 for count in opened)
 
     def test_vector_search_default_k_is_ten(self, async_fresh_graph):
         async def body():
@@ -482,6 +564,48 @@ class TestArgumentsReachTheSyncCall:
         result = run(body())
         assert result.updated_edges == 1
 
+    def test_delete_edges_all_true_reaches_the_call(self, async_fresh_graph):
+        async def body():
+            await async_fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+            await async_fresh_graph.add_edges([{"start_id": 1, "end_id": 2}])
+            # No where/start/end -- only all=True makes this legal, so a
+            # dropped `all` turns a delete into a refusal.
+            return await async_fresh_graph.delete_edges(all=True)
+
+        assert run(body()).deleted_edges == 1
+
+    def test_update_edges_replace_true_reaches_the_call(self, async_fresh_graph):
+        async def body():
+            await async_fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+            await async_fresh_graph.add_edges([{"start_id": 1, "end_id": 2,
+                                                "kind": "knows", "weight": 3}])
+            await async_fresh_graph.update_edges(where={"kind": "knows"},
+                                                 set={"kind": "knows", "seen": True},
+                                                 replace=True)
+            return await async_fresh_graph.traverse(Start(), Hop(hops=(1, 1)))
+
+        result = run(body())
+        # replace=True means the map IS the properties bag: a dropped
+        # `replace` merges instead, and "weight" survives.
+        assert result.edges[0]["properties"] == {"kind": "knows", "seen": True}
+
+    def test_vector_search_many_boost_reaches_the_call(self, async_fresh_graph):
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 2)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1, "rank": 0}, {"id": 2, "rank": 100}])
+            await async_fresh_graph.set_vectors(nodes=[
+                {"id": 1, "summary": [1.0, 0.0]},
+                {"id": 2, "summary": [0.0, 1.0]},
+            ])
+            # Node 1 is the better cosine match; node 2's `rank` is large
+            # enough that the boost has to reorder them. A dropped boost=
+            # leaves node 1 first and says nothing.
+            return await async_fresh_graph.vector_search_many(
+                [Near("summary", [1.0, 0.0])], k=2, boost=Boost("rank"))
+
+        assert [hit["id"] for hit in run(body())[0]] == ["2", "1"]
+
     def test_delete_edges_end_filter_narrows_the_delete(self, async_fresh_graph):
         async def body():
             await async_fresh_graph.add_nodes([{"id": 1}, {"id": 2, "role": "target"},
@@ -568,3 +692,100 @@ class TestStrictSchemaOptionReachesTheGraph:
     def test_cypher_dispatches_traverse_with_options(self, async_fresh_graph):
         with pytest.raises(CypherError, match="strict_schema"):
             run(async_fresh_graph.cypher("MATCH (a:person) RETURN a", strict_schema=True))
+
+
+def _consume(passed: list, expected: dict, name: str) -> None:
+    """Match each expected value against a DISTINCT recorded argument.
+
+    A multiset, not membership: delete_nodes passes detach=True and
+    all=True, so `True in passed` still succeeds after one of them is
+    dropped -- the other one answers for it. The first version of this
+    test used `in` and missed exactly that mutant."""
+    remaining = list(passed)
+    for keyword, value in expected.items():
+        for i, item in enumerate(remaining):
+            if item is value or item == value:
+                del remaining[i]
+                break
+        else:
+            raise AssertionError(
+                f"{name}() did not pass {keyword}={value!r} -- recorded {passed!r}")
+
+
+class TestEveryWrapperForwardsEveryArgument:
+    """AsyncGraph is ~25 one-line delegations, and the mutation runs have
+    now picked six different ones apiece: boost off vector_search_many,
+    all off delete_edges, replace off update_edges, merge_edges_on off
+    ingest, hops off cypher's aggregate branch, all off update_nodes,
+    and merge_edges' `replace` default flipped outright. Every prior
+    test called each wrapper with the defaults for whatever it was not
+    itself about, so each was invisible in turn.
+
+    tests/test_vectors.py has the same table for Graph's vector methods;
+    this is the write half, and between them the family is closed rather
+    than its members picked off one run at a time.
+
+    Both directions are covered, because they fail differently: passing
+    a NON-DEFAULT value catches an argument dropped on the way through,
+    and passing NOTHING catches a default rewritten in the signature --
+    the shape that flipped merge_edges to replace=True."""
+
+    #: {AsyncGraph method: (delegate to record, required args, optional args)}
+    #: The delegate is patched on the class it lives on, so `self`
+    #: arrives first and is ignored -- only the values matter.
+    CALLS = {
+        "merge_nodes": ("hopai.ingest.Ingestor.merge_nodes",
+                        {"rows": [{"a": 1}], "on": ["a"]}, {"replace": True}),
+        "merge_edges": ("hopai.ingest.Ingestor.merge_edges",
+                        {"rows": [{"a": 1}], "on": ["a"]}, {"replace": True}),
+        "ingest": ("hopai.ingest.Ingestor.ingest", {"document": {"nodes": []}},
+                   {"merge_nodes_on": ["mn"], "merge_edges_on": ["me"]}),
+        "delete_nodes": ("hopai.mutate.Mutator.delete_nodes", {"where": {"w": 1}},
+                         {"detach": True, "all": True}),
+        "delete_edges": ("hopai.mutate.Mutator.delete_edges", {"where": {"w": 1}},
+                         {"start": {"s": 1}, "end": {"e": 1}, "all": True}),
+        "update_nodes": ("hopai.mutate.Mutator.update_nodes", {"where": {"w": 1}},
+                         {"set": {"s": 1}, "remove": ["r"], "replace": True, "all": True}),
+        "update_edges": ("hopai.mutate.Mutator.update_edges", {"where": {"w": 1}},
+                         {"start": {"s": 1}, "end": {"e": 1}, "set": {"v": 1},
+                          "remove": ["r"], "replace": True, "all": True}),
+    }
+
+    #: What each optional argument is when the caller says nothing. A
+    #: signature default rewritten in place changes behaviour for every
+    #: caller who trusted it, and no test that passes the value can see it.
+    DEFAULTS = {
+        "merge_nodes": {"replace": False},
+        "merge_edges": {"replace": False},
+        "ingest": {"merge_nodes_on": None, "merge_edges_on": None},
+        "delete_nodes": {"detach": False, "all": False},
+        "delete_edges": {"start": None, "end": None, "all": False},
+        "update_nodes": {"set": None, "remove": None, "replace": False, "all": False},
+        "update_edges": {"start": None, "end": None, "set": None, "remove": None,
+                         "replace": False, "all": False},
+    }
+
+    @staticmethod
+    def _record(monkeypatch, target: str) -> dict:
+        seen: dict = {}
+
+        def recorder(self, *args, **kwargs):
+            seen["passed"] = [*args, *kwargs.values()]
+            return "recorded"
+
+        monkeypatch.setattr(target, recorder)
+        return seen
+
+    @pytest.mark.parametrize("name", sorted(CALLS))
+    def test_non_default_values_reach_the_sync_call(self, async_graph, monkeypatch, name):
+        target, required, optional = self.CALLS[name]
+        seen = self._record(monkeypatch, target)
+        run(getattr(async_graph, name)(**required, **optional))
+        _consume(seen["passed"], optional, name)
+
+    @pytest.mark.parametrize("name", sorted(CALLS))
+    def test_the_documented_defaults_are_what_arrive(self, async_graph, monkeypatch, name):
+        target, required, _ = self.CALLS[name]
+        seen = self._record(monkeypatch, target)
+        run(getattr(async_graph, name)(**required))
+        _consume(seen["passed"], self.DEFAULTS[name], name)

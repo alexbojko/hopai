@@ -10,21 +10,78 @@ and run on the write schema, since migration is DDL.
 
 from __future__ import annotations
 
+import ast
 import json
+import pathlib
 import re
 
 import pytest
 from sqlalchemy import event, func, text
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateTable
 
 from hopai import (
     AGGREGATE_TOOL_SCHEMA, Count, Graph, Hop, INGEST_TOOL_SCHEMA, Near, Start, aggregate_json,
     traverse_json,
-    TRAVERSE_TOOL_SCHEMA, Vector, parse_near, spec_to_traversal, vector_search_json,
+    TRAVERSE_TOOL_SCHEMA, VECTOR_SEARCH_TOOL_SCHEMA, Vector, parse_near,
+    spec_to_traversal, vector_search_json,
 )
-from hopai import Boost
-from hopai.vectors import parse_boost
+from hopai import Boost, Embedder
+from hopai.vectors import (
+    build_search_many_query, build_search_query, parse_boost, pgvector_exit_ddl,
+)
 from hopai.constraints import ConstraintViolation
+
+
+#: Helpers that take their CALLER's name as an argument, mapped to the
+#: position that argument sits in. Several refusals are shared by many
+#: entry points, and the label is the only thing telling a caller which
+#: one they reached -- so each call site needs its own assertion, and
+#: four separate mutation rounds each surfaced one more that had none.
+#: Reading the sites out of the source is what stops the fifth.
+_LABEL_ARG = {"_check_k": 1, "validate_nears": 4, "validate_boosts": 1,
+              "_field": 3, "_defined": 2, "_check_keys": 2, "refuse_vectors": 1,
+              "_embedder": 2, "_resolve_query_texts": 3}
+
+
+#: mutmut copies every function once per mutant into the tree it runs
+#: from, so the source this reads THERE also contains the mutated labels
+#: -- "XXvector_search()XX", "VECTOR_SEARCH()". Counting those would fail
+#: this test under every mutant, which fails the BASELINE, which mutmut
+#: reports as "0 checked": a broken harness that reads like a clean
+#: sweep. The `_orig` copy carries the real labels, so skipping the
+#: numbered ones is both correct and sufficient.
+_MUTANT_COPY = re.compile(r"__mutmut_\d+$")
+
+
+def _calls(node):
+    """Every Call below `node`, not descending into mutmut's copies."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and _MUTANT_COPY.search(child.name):
+            continue
+        if isinstance(child, ast.Call):
+            yield child
+        yield from _calls(child)
+
+
+def declared_caller_labels() -> set:
+    """Every literal caller label passed to one of those helpers."""
+    from hopai import json_api, vectors
+
+    found = set()
+    for module in (vectors, json_api):
+        tree = ast.parse(pathlib.Path(module.__file__).read_text())
+        for node in _calls(tree):
+            if not isinstance(node.func, ast.Name):
+                continue
+            index = _LABEL_ARG.get(node.func.id)
+            if index is None or len(node.args) <= index:
+                continue
+            argument = node.args[index]
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                found.add(argument.value)
+    return found
 
 
 def norm(statement, literal_binds: bool = False) -> str:
@@ -125,6 +182,30 @@ class TestVectorDDL:
         assert "array_ndims(vec_summary) = 1" in checks[0]
         assert "array_length(vec_summary, 1) = 3" in checks[0]
 
+    def test_create_schema_emits_a_nullable_real_array_column(self, vg):
+        """define_vectors() attaches the vec_* columns to the shared
+        Table metadata, so create_schema() emits them -- and a NOT NULL
+        there would make the tables unusable outright. Vectors are
+        written only by set_vectors(), which UPDATEs rows that already
+        exist, so a row has to be insertable without one first.
+
+        The type is asserted against a FRESH table rather than the
+        fixture's, because Table metadata is shared between handles:
+        _attach() only appends when the column is absent, so whether
+        this graph's call is the one that set the type depends on which
+        test ran first. Against a table nobody has touched it does not."""
+        ddl = str(CreateTable(vg.nodes_tbl).compile(dialect=postgresql.dialect()))
+        assert re.search(r"vec_summary REAL\[\](?!\s+NOT NULL)", ddl), ddl
+
+        from sqlalchemy import BigInteger, Column, MetaData, Table
+        from sqlalchemy.dialects.postgresql import ARRAY, REAL
+        from hopai.vectors import _attach
+
+        fresh = Table("t", MetaData(), Column("id", BigInteger))
+        column = _attach(fresh, "vec_x")
+        assert isinstance(column.type, ARRAY) and isinstance(column.type.item_type, REAL)
+        assert column.nullable is True
+
     def test_check_is_graph_scoped(self, vg):
         """A CHECK binds the whole table; without the guard one graph's
         3-dim rule would reject another graph's 1536-dim vectors."""
@@ -211,13 +292,15 @@ class TestVectorDDL:
 # ---------------------------------------------------------------------
 
 class TestNearValidation:
-    @pytest.mark.parametrize("bad", ["x", 42, [], (), {}, None])
+    # None and "x" are absent on purpose: None means "no query was
+    # given" (the neither-of-them refusal) and a str is TEXT to embed,
+    # not a malformed vector -- both live in TestNearText.
+    @pytest.mark.parametrize("bad", [42, [], (), {}])
     def test_vector_must_be_a_non_empty_sequence(self, bad):
         with pytest.raises(TypeError, match="non-empty list of numbers"):
             Near("summary", bad)
 
-    @pytest.mark.parametrize("bad,name", [("x", "str"), (42, "int"), ({}, "dict"),
-                                          (None, "NoneType")])
+    @pytest.mark.parametrize("bad,name", [(42, "int"), ({}, "dict")])
     def test_the_refusal_names_the_type_actually_passed(self, bad, name):
         """`got {type(vector).__name__}` is the whole diagnostic -- every
         case above matches only the shared sentence, so the type name
@@ -636,8 +719,10 @@ class TestNearJsonPythonEquivalence:
             == norm(python, literal_binds=True)
 
     @pytest.mark.parametrize("bad,message", [
-        ({"field": "s"}, r"needs \['vector'\]"),
-        ({"vector": [1.0]}, r"needs \['field'\]"),
+        ({"field": "s"}, r'needs "text" to embed OR "vector".*not neither'),
+        ({"field": "s", "text": "a", "vector": [1.0]},
+         r'needs "text" to embed OR "vector".*not both'),
+        ({"vector": [1.0]}, r'^a near spec needs "field" -- '),
         ({"field": "s", "vector": [1.0], "top_k": 3}, "unknown"),
         # Anchored: an unanchored "empty list" kept matching after a
         # mutant mangled the message's edges.
@@ -655,6 +740,32 @@ class TestNearJsonPythonEquivalence:
         with pytest.raises(ValueError, match='"near" key'):
             vector_search_json(vg, {"k": 5})
 
+    def test_the_text_form_carries_every_optional_key_across(self, vg):
+        """The JSON half of the same resolution the Python half does --
+        and the keys travel through parse_near, Near, and _with_vector
+        before reaching SQL, so any of the three could drop one."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder()),
+                                 Vector("title", 3, embed=counting_embedder())])
+        start, hops = spec_to_traversal({
+            "start": {"near": [{"field": "summary", "text": "apple", "weight": 0.25,
+                                "min_similarity": 0.75, "missing": "zero"},
+                               {"field": "title", "text": "banana"}],
+                      "keep": 4},
+        })
+        sql = norm(vg.build_query(start, hops), literal_binds=True)
+        assert "0.25" in sql and "0.75" in sql and "coalesce" in sql.lower()
+        assert "97" in sql and "98" in sql       # both texts reached the embedder
+
+    def test_a_json_text_query_and_the_python_one_compile_alike(self, vg):
+        """The JSON front end holds no query logic -- text= is parsed
+        into exactly the Near the Python caller would have written."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder())])
+        start, hops = spec_to_traversal(
+            {"start": {"near": {"field": "summary", "text": "apple"}, "keep": 4}})
+        python = vg.build_query(Start(near=Near("summary", text="apple"), keep=4), [])
+        assert norm(vg.build_query(start, hops), literal_binds=True) \
+            == norm(python, literal_binds=True)
+
 
 class TestToolSchemasStayVectorFree:
     @staticmethod
@@ -666,8 +777,14 @@ class TestToolSchemasStayVectorFree:
                 for name, child in (node.get("properties") or {}).items():
                     found.add(name)
                     walk(child)
-                for key in ("items", "additionalProperties"):
+                # $defs and the combinators too: a near spec lives in
+                # $defs and is reached by $ref, so a walker that stopped
+                # at properties/items would have seen neither `text` nor
+                # a `vector` someone put back beside it.
+                for key in ("items", "additionalProperties", "anyOf", "oneOf", "allOf"):
                     walk(node.get(key))
+                for child in (node.get("$defs") or {}).values():
+                    walk(child)
             elif isinstance(node, list):
                 for child in node:
                     walk(child)
@@ -676,26 +793,37 @@ class TestToolSchemasStayVectorFree:
         return found
 
     @pytest.mark.parametrize("schema", [TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
-                                        INGEST_TOOL_SCHEMA])
+                                        VECTOR_SEARCH_TOOL_SCHEMA, INGEST_TOOL_SCHEMA])
     def test_no_schema_advertises_a_vector_parameter(self, schema):
-        """DELIBERATE asymmetry with the parsers, pinned: a tool-calling
-        model asked to fill a "vector" invents plausible floats, and an
-        invented embedding finds confidently wrong neighbors. If this
-        fails, someone widened a schema -- vectors.py explains why not.
+        """The DELIBERATE asymmetry with the parsers, pinned, and now
+        down to exactly one key: a tool-calling model asked to fill a
+        "vector" invents plausible floats, and an invented embedding
+        finds confidently wrong neighbors. `text` is the way in -- the
+        field embeds it with the application's own client -- so it is
+        advertised and this must not creep back to cover it.
 
         Asserted on PARAMETER NAMES, not by grepping the serialized
-        schema: the descriptions must stay free to say the tool cannot
-        search by meaning, which is what stops a model guessing
-        property values for a semantic question."""
-        assert not self._parameter_names(schema) & {
-            "near", "keep", "via_near", "via_keep", "boost", "vector", "embedding"}
+        schema: the descriptions must stay free to talk about vectors
+        and embeddings in prose."""
+        assert not self._parameter_names(schema) & {"vector", "embedding"}
+
+    @pytest.mark.parametrize("schema", [TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
+                                        VECTOR_SEARCH_TOOL_SCHEMA])
+    def test_the_text_half_is_advertised(self, schema):
+        """The other side of the same rule. A schema that omitted `text`
+        along with `vector` would leave a model no way to search by
+        meaning at all -- which is what it did before, and why it was
+        told to say it could not."""
+        names = self._parameter_names(schema)
+        assert "text" in names and "near" in names
 
     def test_per_graph_tool_schemas_stay_vector_free_too(self):
         """tool_schemas() summarizes THIS graph's declared schema into
         each description, so it is the second place a vector field
         could reach a model -- and it is generated, not hand-written,
-        which is exactly how the omission would be lost. Vector fields
-        are not graph-schema properties and must not appear."""
+        which is exactly how a leak would arrive. Vector FIELD names
+        are not graph-schema properties: a model given "summary" as a
+        property would filter on it and get nothing."""
         from hopai import NodeType, Property
 
         g = offline()
@@ -703,14 +831,76 @@ class TestToolSchemasStayVectorFree:
         g.define_vectors(nodes=[Vector("summary", 1536)], edges=[Vector("rel", 8)])
         dumped = json.dumps(g.tool_schemas())
         assert "title" in dumped                      # declared properties DO appear
-        for leaked in ("summary", "vec_summary", "rel", "vector", "embedding", "near"):
+        for leaked in ("summary", "vec_summary", "embedding"):
             assert leaked not in dumped, leaked
 
-    def test_descriptions_tell_the_model_what_it_cannot_do(self):
-        """A model holding only the schema sees no hint that meaning-based
-        search exists, so it guesses property values and gets zero rows."""
+    #: The three that advertise a near spec. INGEST_TOOL_SCHEMA writes
+    #: rows and has no similarity surface at all, which is why it is in
+    #: the vector-free check above and not in these two.
+    NEAR_SCHEMAS = [TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, VECTOR_SEARCH_TOOL_SCHEMA]
+
+    @staticmethod
+    def _nodes(node):
+        """Every dict in the schema, wherever it sits."""
+        if isinstance(node, dict):
+            yield node
+            for child in node.values():
+                yield from TestToolSchemasStayVectorFree._nodes(child)
+        elif isinstance(node, list):
+            for child in node:
+                yield from TestToolSchemasStayVectorFree._nodes(child)
+
+    @pytest.mark.parametrize("schema", NEAR_SCHEMAS)
+    def test_every_ref_resolves(self, schema):
+        """A $ref naming no $def is a parameter that describes nothing.
+        Providers validate these before the model ever sees them, and
+        nothing here would have noticed -- the schema stays a dict
+        either way, and json.dumps() is just as happy."""
+        defs = schema["parameters"].get("$defs", {})
+        refs = [node["$ref"] for node in self._nodes(schema) if "$ref" in node]
+        assert refs, "no $ref at all -- did the near spec stop being shared?"
+        for ref in refs:
+            assert ref.startswith("#/$defs/"), ref
+            assert ref.split("/")[-1] in defs, f"{ref} resolves to nothing"
+
+    @pytest.mark.parametrize("schema", NEAR_SCHEMAS)
+    def test_a_near_parameter_takes_one_spec_or_a_list(self, schema):
+        """parse_near() accepts both forms, so the schema has to offer
+        both -- under `anyOf`, the key a validator actually knows. A
+        misspelled combinator leaves the parameter unconstrained, which
+        is the one failure mode a "does it serialize" test cannot see.
+
+        _near_schema() is CALLED here as well as read off the schema.
+        The schemas are module-level constants built once at import, so
+        a test that only reads them cannot exercise the builder under a
+        harness that imports the module once and varies behavior per
+        test -- which is how the mutation runner works, and how three
+        mutants in this exact function came back "survived" while
+        failing this assertion on a fresh interpreter."""
+        from hopai.json_api import _near_schema
+        built = _near_schema("anything")
+        assert set(built) == {"description", "anyOf"}
+        assert built["anyOf"] == [{"$ref": "#/$defs/near"},
+                                  {"type": "array", "items": {"$ref": "#/$defs/near"}}]
+
+        found = 0
+        for node in self._nodes(schema):
+            for name in ("near", "via_near"):
+                spec = (node.get("properties") or {}).get(name)
+                if spec is None:
+                    continue
+                found += 1
+                assert spec["anyOf"] == built["anyOf"]     # same shared shape
+        assert found, "no near parameter advertised at all"
+
+    def test_descriptions_point_the_model_at_the_right_tool(self):
+        """A model holding only the schema has to be told which half of
+        the surface answers which question -- it used to be told that
+        searching by meaning was impossible, which is no longer true."""
         for schema in (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA):
             assert "EXACT property matches" in schema["description"]
+            assert "near" in schema["description"]
+        assert "not an exact property match" in VECTOR_SEARCH_TOOL_SCHEMA["description"]
 
 
 class TestJsonFrontEndRefusesInventedVectors:
@@ -728,8 +918,52 @@ class TestJsonFrontEndRefusesInventedVectors:
         spec = {"start": {"where": {"type": "doc"}},
                 "hops": [{"via_near": {"field": "rel", "vector": [1.0, 0.0, 0.0]},
                           "via_keep": 1}]}
-        with pytest.raises(ValueError, match=r"\['via_keep', 'via_near'\]"):
+        with pytest.raises(ValueError, match="via_near=.*cannot come from a tool call"):
             traverse_json(vg, spec)
+
+    def test_a_vector_inside_a_list_of_near_specs_is_found(self, vg):
+        """near= takes a list, and checking only the object form would
+        leave the list the way through."""
+        spec = {"start": {"near": [{"field": "title", "text": "a"},
+                                   {"field": "summary", "vector": [1.0, 0.0, 0.0]}],
+                          "keep": 2}}
+        with pytest.raises(ValueError, match="cannot come from a tool call"):
+            traverse_json(vg, spec)
+
+    def test_the_refusal_shows_the_rewrite_for_the_field_asked_for(self, vg):
+        """The message's whole job is to be copy-pasteable, so it names
+        the caller's own field -- and falls back to a placeholder rather
+        than an invented field name when the spec gave none, which reads
+        as "you asked for summary" to someone who did not."""
+        with pytest.raises(ValueError, match=r'\{"field": \'title\', "text": "\.\.\."\}'):
+            traverse_json(vg, {"start": {"near": {"field": "title", "vector": [1.0]}}})
+        with pytest.raises(ValueError, match=r'\{"field": \'<your field>\''):
+            traverse_json(vg, {"start": {"near": {"vector": [1.0]}}})
+
+    def test_text_is_not_refused(self, fresh_graph):
+        """The whole point of the narrowing: a model CAN say what it is
+        looking for, because the field embeds it with the application's
+        own client. Refusing this left semantic search unreachable from
+        a tool call at all."""
+        g = _corpus(fresh_graph)
+        g.define_vectors(nodes=[Vector("docvec", 3, embed=lambda t: [QUERY for _ in t])])
+        result = traverse_json(g, {
+            "start": {"where": {"type": "doc"},
+                      "near": {"field": "docvec", "text": "graph databases"}, "keep": 2},
+        })
+        assert {n["id"] for n in result["nodes"]} == {"1", "3"}
+
+    def test_keep_and_boost_alone_are_not_refused(self, vg):
+        """They hold an integer and a property name -- nothing a model
+        could invent an embedding into. Refusing them was collateral
+        damage from the coarser rule, and it took `keep` with it, so a
+        text query had no way to say how many to keep."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=lambda t: [[1.0, 0.0, 0.0]])])
+        spec = {"start": {"near": {"field": "summary", "text": "a"}, "keep": 2,
+                          "boost": {"property": "rank", "weight": 0.5}}}
+        spec_to_traversal(spec)                        # parses
+        from hopai.json_api import refuse_vectors
+        refuse_vectors(spec, "traverse_json()")       # and is not refused
 
     def test_application_code_opts_in(self, fresh_graph):
         """A caller holding a REAL embedding says so, and it runs."""
@@ -863,6 +1097,43 @@ class TestVectorMigrationLive:
                     fresh_graph.engine.begin() as conn:
                 conn.execute(text(
                     f"UPDATE nodes SET vec_docvec = '{bad}' WHERE id = {row_id}"))
+
+    def test_two_graphs_may_give_one_EDGE_field_different_dimensions(self, fresh_graph):
+        """The same rule on the other table, which had no test at all.
+
+        `edges` is not the node path with a different string: it has its
+        own _target_for(), its own id column, and its own pass through
+        migrate_vectors(). Every edge-side defect this feature has had
+        was of exactly this shape -- a node path that worked and an edge
+        twin nobody exercised -- so the per-graph rule is asserted here
+        against the edges table directly rather than assumed by
+        symmetry."""
+        a = _migrated(fresh_graph)                      # edges relvec = 3
+        b = fresh_graph.in_graph("other")
+        b.define_vectors(edges=[Vector("relvec", 2)])
+        b.migrate_vectors()
+
+        for graph, ids in ((a, (1, 2)), (b, (3, 4))):
+            graph.add_nodes([{"id": ids[0], "t": "x"}, {"id": ids[1], "t": "y"}])
+            graph.add_edges([{"start_id": ids[0], "end_id": ids[1], "kind": "k"}])
+        with fresh_graph.engine.connect() as conn:
+            edges = dict(conn.execute(text("SELECT graph_id, id FROM edges")).all())
+
+        assert a.set_vectors(edges=[{"id": edges[a.graph], "relvec": [1.0, 2.0, 3.0]}]) == 1
+        assert b.set_vectors(edges=[{"id": edges[b.graph], "relvec": [1.0, 2.0]}]) == 1
+
+        with fresh_graph.engine.connect() as conn:
+            names = sorted(row[0] for row in conn.execute(text(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid = CAST('edges' AS regclass) AND contype = 'c' "
+                "AND conname LIKE 'ck\\_vec\\_dims\\_%relvec' ESCAPE '\\'")))
+        assert len(names) == 2, f"one constraint is serving both graphs: {names}"
+
+        for edge_id, bad in ((edges[b.graph], "{1,2,3}"), (edges[a.graph], "{1,2}")):
+            with pytest.raises(Exception, match="ck_vec_dims_"), \
+                    fresh_graph.engine.begin() as conn:
+                conn.execute(text(
+                    f"UPDATE edges SET vec_relvec = '{bad}' WHERE id = {edge_id}"))
 
 
 # ---------------------------------------------------------------------
@@ -1177,7 +1448,7 @@ class TestVectorSearchLive:
         result = vector_search_json(g, {
             "near": {"field": "docvec", "vector": QUERY, "min_similarity": 0.7},
             "k": 2, "where": {"type": "doc"},
-        })
+        }, allow_vectors=True)
         assert json.loads(json.dumps(result)) == result
         assert [h["id"] for h in result["results"]] == ["1", "3"]
 
@@ -1188,10 +1459,31 @@ class TestVectorSearchLive:
         "K" survived exactly that way."""
         g = _corpus(fresh_graph)
         spec = {"near": {"field": "docvec", "vector": QUERY}, "where": {"type": "doc"}}
-        assert len(vector_search_json(g, {**spec, "k": 1})["results"]) == 1
-        assert len(vector_search_json(g, {**spec, "k": 3})["results"]) == 3
+        run = lambda s: vector_search_json(g, s, allow_vectors=True)  # noqa: E731
+        assert len(run({**spec, "k": 1})["results"]) == 1
+        assert len(run({**spec, "k": 3})["results"]) == 3
         # ...and the documented default when the key is absent.
-        assert len(vector_search_json(g, spec)["results"]) == 5
+        assert len(run(spec)["results"]) == 5
+
+    def test_a_model_can_search_by_meaning_with_no_floats_at_all(self, fresh_graph):
+        """VECTOR_SEARCH_TOOL_SCHEMA's whole promise, end to end: the
+        spec a tool-calling model can actually produce -- a field name
+        and words -- runs and ranks. Nothing here opts into vectors."""
+        g = _corpus(fresh_graph)
+        g.define_vectors(nodes=[Vector("docvec", 3, embed=lambda t: [QUERY for _ in t])])
+        result = vector_search_json(g, {
+            "near": {"field": "docvec", "text": "how do nodes agree?"},
+            "k": 2, "where": {"type": "doc"},
+        })
+        assert json.loads(json.dumps(result)) == result
+        assert [h["id"] for h in result["results"]] == ["1", "3"]
+
+    def test_a_field_that_cannot_embed_says_so_through_json_too(self, fresh_graph):
+        """A model that sends text to a field with no embedder gets the
+        declaration to change, not an empty result set."""
+        g = _corpus(fresh_graph)
+        with pytest.raises(ValueError, match="declares no embedder"):
+            vector_search_json(g, {"near": {"field": "docvec", "text": "anything"}})
 
 
 # ---------------------------------------------------------------------
@@ -1250,6 +1542,29 @@ class TestTraversalNearLive:
 # ---------------------------------------------------------------------
 
 class TestDropVectorsLive:
+    def test_edge_fields_reach_the_drop_too(self, fresh_graph):
+        """Every other case here passes only node_fields, so blanking
+        the edge_fields argument on the way through Graph.drop_vectors()
+        survived the whole class -- drop_vectors(edges=...) would have
+        silently dropped nothing and reported success, which is the same
+        shape as the drop_constraints(edges=[...]) gap this branch
+        already fixed."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1}, {"id": 2}])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}])
+        with g.engine.connect() as conn:
+            edge_id = conn.execute(text("SELECT id FROM edges")).scalar()
+        g.set_vectors(edges=[{"id": edge_id, "relvec": [1.0, 0.0, 0.0]}])
+
+        # `for entry in names or ()` -- a blanked edge_fields drops
+        # NOTHING and still returns, so both halves are asserted: the
+        # report, and the values it claims to have cleared.
+        assert g.drop_vectors(edge_fields=["relvec"]) == ["edges.vec_relvec"]
+        with g.engine.connect() as conn:
+            remaining = conn.execute(text(
+                "SELECT count(*) FROM edges WHERE vec_relvec IS NOT NULL")).scalar()
+        assert remaining == 0
+
     def test_drop_nulls_this_graph_and_removes_its_constraint(self, fresh_graph):
         g = _corpus(fresh_graph)
         dropped = g.drop_vectors(node_fields=["docvec"])
@@ -1412,7 +1727,12 @@ class TestSearchManyShape:
         """One statement can only express one shape. Ranking the second
         query with the first one's weights would answer a question
         nobody asked."""
-        with pytest.raises(ValueError, match="must share a shape"):
+        # Anchored on the whole opening clause: "must share a shape"
+        # alone survives the message losing the emphasis that explains
+        # WHY -- one statement, not one per query.
+        with pytest.raises(ValueError,
+                           match=r"^vector_search_many\(\) ranks every query with ONE "
+                                 r"statement, so the queries must share a shape"):
             vg.build_vector_search_many_query(
                 [Near("summary", [1.0, 0.0, 0.0]),
                  Near("summary", [0.0, 1.0, 0.0], weight=0.5)], k=2)
@@ -1756,6 +2076,31 @@ class TestEdgeBeamLive:
         assert len(result.edges) == 1
         assert result.edges[0]["properties"]["kind"] == "aligned"
 
+    def test_the_beam_ranks_by_similarity_not_by_edge_id(self, fresh_graph):
+        """Every other case in this class inserts the most similar edge
+        FIRST, so it also carries the lowest id -- and `ORDER BY
+        similarity DESC, edge_id` and a bare `ORDER BY edge_id` then
+        pick the same winner. Dropping the similarity term survived the
+        entire class for exactly that reason, which is the whole feature
+        silently becoming "follow the oldest edge".
+
+        Here the similar edge is inserted LAST, so the two orderings
+        disagree and only one of them is right. edge_id stays in the
+        ORDER BY as the tie-break that keeps equal scores deterministic;
+        what must not go is the term in front of it."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "seed": True}, {"id": 2}, {"id": 3}])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "older_but_wrong"},
+                     {"start_id": 1, "end_id": 3, "kind": "newer_but_right"}])
+        ids = self._edges(g)
+        assert ids["older_but_wrong"] < ids["newer_but_right"]
+        g.set_vectors(edges=[{"id": ids["older_but_wrong"], "relvec": [0.0, 1.0, 0.0]},
+                             {"id": ids["newer_but_right"], "relvec": [1.0, 0.0, 0.0]}])
+        result = g.traverse(Start(where={"seed": True}),
+                            Hop(via_near=Near("relvec", QUERY), via_keep=1))
+        assert [e["properties"]["kind"] for e in result.edges] == ["newer_but_right"]
+        assert {n["id"] for n in result.nodes} == {"1", "3"}
+
     def test_threshold_filters_which_edges_are_worth_walking(self, fresh_graph):
         g = self._fixture(fresh_graph)
         kept = g.traverse(Start(where={"seed": True}),
@@ -1801,6 +2146,27 @@ class TestEdgeBeamLive:
         assert {n["id"] for n in result.nodes} == {"1", "2", "3"}
         assert len(result.edges) == 2
 
+    def test_cycle_guard_runs_inside_the_beam_not_after_it(self, fresh_graph):
+        """The back edge is the MOST similar one, so a beam that ranks
+        before excluding it spends its only slot walking home and never
+        reaches node 3. Filtering after the beam cannot recover that:
+        the slot is already gone, and how many were wasted is invisible
+        from the outside."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": i, "n": str(i), "seed": i == 1} for i in (1, 2, 3)])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "out"},
+                     {"start_id": 2, "end_id": 1, "kind": "back"},
+                     {"start_id": 2, "end_id": 3, "kind": "onward"}])
+        ids = self._edges(g)
+        g.set_vectors(edges=[{"id": ids["out"], "relvec": [1.0, 0.0, 0.0]},
+                             {"id": ids["back"], "relvec": [1.0, 0.0, 0.0]},
+                             {"id": ids["onward"], "relvec": [0.8, 0.6, 0.0]}])
+        result = g.traverse(Start(where={"seed": True}),
+                            Hop(via_near=Near("relvec", QUERY), via_keep=1,
+                                hops=(1, 2)))
+        assert {n["id"] for n in result.nodes} == {"1", "2", "3"}
+        assert sorted(e["properties"]["kind"] for e in result.edges) == ["onward", "out"]
+
     def test_beam_does_not_leak_across_graphs(self, fresh_graph):
         g = self._fixture(fresh_graph)
         other = g.in_graph("other")
@@ -1810,6 +2176,69 @@ class TestEdgeBeamLive:
         result = g.traverse(Start(where={"seed": True}),
                             Hop(via_near=Near("relvec", QUERY, min_similarity=-1.0)))
         assert "101" not in {n["id"] for n in result.nodes}
+
+    def test_beam_scopes_by_graph_where_ids_actually_collide(self, fresh_graph):
+        """The default schema makes node ids globally unique and ties
+        both endpoints to the edge's own graph, so no foreign edge can
+        even join this graph's seeds -- which is why the test above
+        proves nothing about the discriminator. On CALLER-SUPPLIED
+        tables keyed by (id, graph_id) the ids do collide, and an
+        unscoped beam spends its only slot on the foreign edge because
+        that one is more similar. The walk then carries an edge id this
+        graph does not own, the scoped edge-report step drops it, and
+        the traversal returns NOTHING -- silence standing in for the
+        neighbor that was there all along."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        engine = fresh_graph.engine
+        meta = MetaData(schema="hopai_beam_scope")
+        nodes = Table("nodes", meta,
+                      Column("id", BigInteger, primary_key=True),
+                      Column("graph_id", Text, primary_key=True),
+                      Column("properties", JSONB, nullable=False))
+        edges = Table("edges", meta,
+                      Column("id", BigInteger, primary_key=True),
+                      Column("graph_id", Text, primary_key=True),
+                      Column("start_id", BigInteger, nullable=False),
+                      Column("end_id", BigInteger, nullable=False),
+                      Column("properties", JSONB, nullable=False))
+        with engine.begin() as conn:
+            conn.execute(text("DROP SCHEMA IF EXISTS hopai_beam_scope CASCADE"))
+            conn.execute(text("CREATE SCHEMA hopai_beam_scope"))
+        meta.create_all(engine)
+        with engine.begin() as conn:
+            conn.execute(nodes.insert(), [
+                {"id": 1, "graph_id": "g1", "properties": {"seed": True}},
+                {"id": 2, "graph_id": "g1", "properties": {"m": "mine"}},
+                {"id": 3, "graph_id": "g1", "properties": {"m": "ours"}},
+                {"id": 1, "graph_id": "g2", "properties": {"seed": True}},
+                {"id": 3, "graph_id": "g2", "properties": {"m": "theirs"}},
+            ])
+            conn.execute(edges.insert(), [
+                {"id": 1, "graph_id": "g1", "start_id": 1, "end_id": 2,
+                 "properties": {"kind": "mine"}},
+                # A DIFFERENT edge id on purpose: reuse g1's and the
+                # scoped edge-report step resolves the stolen id back to
+                # g1's own edge, hiding the leak behind a right answer.
+                {"id": 99, "graph_id": "g2", "start_id": 1, "end_id": 3,
+                 "properties": {"kind": "theirs"}},
+            ])
+
+        g1 = Graph(engine, graph="g1", node_table=nodes, edge_table=edges)
+        g1.define_vectors(edges=[Vector("relvec", 3)])
+        g1.migrate_vectors()
+        # The foreign edge is the MORE similar one, so an unscoped beam
+        # prefers it over this graph's own.
+        g1.set_vectors(edges=[{"id": 1, "relvec": [0.8, 0.6, 0.0]}])
+        g2 = g1.in_graph("g2")
+        g2.define_vectors(edges=[Vector("relvec", 3)])
+        g2.set_vectors(edges=[{"id": 99, "relvec": [1.0, 0.0, 0.0]}])
+
+        result = g1.traverse(Start(where={"seed": True}),
+                             Hop(via_near=Near("relvec", QUERY), via_keep=1))
+        assert {n["id"] for n in result.nodes} == {"1", "2"}
+        assert [e["properties"]["kind"] for e in result.edges] == ["mine"]
 
 
 # ---------------------------------------------------------------------
@@ -1856,6 +2285,318 @@ class TestStaleVectorsLive:
         g = _migrated(fresh_graph)
         with pytest.raises(ValueError, match="no vector field 'ghost'"):
             g.stale_vectors(node_fields=["ghost"])
+
+    def test_after_walks_past_the_ids_already_seen(self, fresh_graph):
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": i} for i in range(1, 6)])
+        assert g.stale_vectors(node_fields=["docvec"], limit=2,
+                               after=None)["nodes"]["docvec"]["missing"] == ["1", "2"]
+        assert g.stale_vectors(node_fields=["docvec"], limit=2,
+                               after="2")["nodes"]["docvec"]["missing"] == ["3", "4"]
+        assert g.stale_vectors(node_fields=["docvec"],
+                               after="5")["nodes"]["docvec"]["missing"] == []
+
+    def test_the_cursor_compares_ids_the_way_it_orders_them(self, fresh_graph):
+        """Ids come back as strings but the walk is ordered by the raw
+        column, where 9 < 10. A cursor comparing the TEXT would put
+        '10' before '9', so paging past '9' would skip every id from 10
+        up -- rows silently never returned, which is how a backfill
+        finishes while leaving work behind."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": i} for i in (8, 9, 10, 11)])
+        assert g.stale_vectors(node_fields=["docvec"],
+                               after="9")["nodes"]["docvec"]["missing"] == ["10", "11"]
+
+
+def _embedding_graph(fresh_graph, log=None, source=None, dimensions=3):
+    """A migrated graph whose `docvec` field knows how to embed itself."""
+    fresh_graph.define_vectors(
+        nodes=[Vector("docvec", dimensions, source=source,
+                      embed=counting_embedder(dimensions, log)),
+               Vector("titlevec", 3)],
+        edges=[Vector("relvec", 3, embed=counting_embedder(3, log))])
+    fresh_graph.migrate_vectors()
+    return fresh_graph
+
+
+class TestSetVectorsFromTextLive:
+    def test_a_string_is_embedded_and_stored(self, fresh_graph):
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}])
+        assert g.set_vectors(nodes=[{"id": 1, "docvec": "apple"}]) == 1
+        # ord('a') == 97: the stored vector is the embedder's answer, so
+        # this covers the whole path rather than "something was written".
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] == [97.0, 0.0, 0.0]
+
+    def test_text_and_vectors_mix_in_one_call(self, fresh_graph):
+        """Nothing forces a caller to pick one form for a whole batch,
+        and a half-migrated codebase will have both."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}, {"id": 2}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": "apple"},
+                             {"id": 2, "docvec": [1.0, 2.0, 3.0]}])
+        stored = g.get_vectors(node_ids=[1, 2])["nodes"]
+        assert stored["1"]["docvec"] == [97.0, 0.0, 0.0]
+        assert stored["2"]["docvec"] == [1.0, 2.0, 3.0]
+
+    def test_edges_take_text_too(self, fresh_graph):
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}, {"id": 2}])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "cites"}])
+        with g.engine.connect() as connection:
+            edge_id = connection.execute(text("SELECT id FROM edges")).scalar()
+        g.set_vectors(edges=[{"id": edge_id, "relvec": "banana"}])
+        assert g.get_vectors(edge_ids=[edge_id])["edges"][str(edge_id)]["relvec"] \
+            == [98.0, 0.0, 0.0]
+
+    def test_every_row_is_embedded_in_one_provider_call(self, fresh_graph):
+        """Per row would be 500 HTTP round trips for 500 rows. The
+        Embedder chunks to the provider's cap on top of this; what
+        matters here is that set_vectors() does not defeat it."""
+        log = []
+        g = _embedding_graph(fresh_graph, log=log)
+        g.add_nodes([{"id": i} for i in range(1, 6)])
+        g.set_vectors(nodes=[{"id": i, "docvec": f"text-{i}"} for i in range(1, 6)])
+        assert log == [[f"text-{i}" for i in range(1, 6)]]
+
+    def test_a_field_with_no_embedder_refuses_text(self, fresh_graph):
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}])
+        with pytest.raises(ValueError, match=r"set_vectors\(\): field 'titlevec' on nodes "
+                                             r"was given text, but declares no embedder"):
+            g.set_vectors(nodes=[{"id": 1, "titlevec": "apple"}])
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\n"])
+    def test_blank_text_is_refused_rather_than_embedded(self, fresh_graph, blank):
+        """Whitespace has no meaning to embed; every provider either
+        errors or returns a vector for nothing. Refusing here names
+        None as the way to actually clear the field."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}])
+        with pytest.raises(ValueError, match="the text to embed is empty"):
+            g.set_vectors(nodes=[{"id": 1, "docvec": blank}])
+
+    def test_none_still_clears_the_vector(self, fresh_graph):
+        """The one thing blank text must not become: a field with an
+        embedder still has to be clearable."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": "apple"}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": None}])
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] is None
+
+    def test_a_provider_failure_writes_nothing(self, fresh_graph):
+        """The reason embedding happens before the transaction opens:
+        a provider that dies halfway must not leave half a batch
+        written, and a retry must not collide with rows that landed."""
+        def dies(texts):
+            raise RuntimeError("provider is down")
+
+        g = _embedding_graph(fresh_graph)
+        g.define_vectors(nodes=[Vector("docvec", 3, embed=dies)])
+        g.add_nodes([{"id": 1}, {"id": 2}])
+        with pytest.raises(Exception, match="provider is down"):
+            g.set_vectors(nodes=[{"id": 1, "docvec": "a"}, {"id": 2, "docvec": "b"}])
+        assert g.get_vectors(node_ids=[1, 2])["nodes"]["1"]["docvec"] is None
+
+    def test_an_embedder_of_the_wrong_width_writes_nothing(self, fresh_graph):
+        g = _embedding_graph(fresh_graph)
+        g.define_vectors(nodes=[Vector("docvec", 3, embed=lambda texts: [[1.0, 2.0]])])
+        g.add_nodes([{"id": 1}])
+        with pytest.raises(ValueError, match="returned 2 dimensions, the field is defined "
+                                             "with 3 -- nothing was written"):
+            g.set_vectors(nodes=[{"id": 1, "docvec": "apple"}])
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] is None
+
+    def test_the_provider_is_called_before_the_transaction_opens(self, fresh_graph):
+        """Stated as an invariant in set_vectors()' docstring and
+        untestable by inspection: an HTTP call inside an open
+        transaction holds row locks for a network round trip."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}])
+        seen_texts, opened = [], []
+
+        def watching(texts):
+            seen_texts.extend(texts)
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        def on_begin(conn):
+            opened.append(len(seen_texts))
+
+        g.define_vectors(nodes=[Vector("docvec", 3, embed=watching)])
+        event.listen(g.engine, "begin", on_begin)
+        try:
+            g.set_vectors(nodes=[{"id": 1, "docvec": "apple"}])
+        finally:
+            event.remove(g.engine, "begin", on_begin)
+        # Every transaction this call opened already had the embedding
+        # in hand; a zero here is a provider call holding row locks.
+        assert opened and all(count == 1 for count in opened)
+
+
+class TestEmbedStaleLive:
+    def test_it_reads_the_property_of_the_fields_own_name(self, fresh_graph):
+        """The naming gap, closed: Vector("docvec") embeds the "docvec"
+        property. Before this the field name named a column and nothing
+        else, and which property fed it was simply unanswerable."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple"}])
+        assert g.embed_stale()["nodes"]["docvec"] == {"embedded": ["1"], "skipped": []}
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] == [97.0, 0.0, 0.0]
+
+    def test_source_points_it_at_another_property(self, fresh_graph):
+        g = _embedding_graph(fresh_graph, source="abstract")
+        g.add_nodes([{"id": 1, "abstract": "banana", "docvec": "apple"}])
+        g.embed_stale()
+        # 'b' for the abstract, not 'a' for the same-named property.
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] == [98.0, 0.0, 0.0]
+
+    def test_rows_with_nothing_to_embed_are_reported_not_raised(self, fresh_graph):
+        """A node with no abstract legitimately has no abstract vector.
+        Silence would leave the caller re-running a backfill that can
+        never finish, and an exception would stop the other 999 rows."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple"}, {"id": 2},
+                     {"id": 3, "docvec": "  "}, {"id": 4, "docvec": 5}])
+        result = g.embed_stale(node_fields=["docvec"])["nodes"]["docvec"]
+        assert result == {"embedded": ["1"], "skipped": ["2", "3", "4"]}
+
+    def test_it_refills_the_graph_after_a_dimension_change(self, fresh_graph):
+        """Changing a model means changing a width, and the whole
+        re-embed used to be the caller's loop to write. The source text
+        is already in the properties, so it is three calls now."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple"}])
+        g.embed_stale()
+        g.define_vectors(nodes=[Vector("docvec", 4, embed=counting_embedder(4))])
+        g.drop_vectors(node_fields=["docvec"])       # refuses to reinterpret
+        g.migrate_vectors()
+        assert g.embed_stale()["nodes"]["docvec"]["embedded"] == ["1"]
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] == [97.0, 0.0, 0.0, 0.0]
+
+    def test_wrong_dimension_rows_are_in_the_work_set(self, fresh_graph):
+        """stale_vectors() reports two categories and this fills in
+        both. Taking only `missing` would leave every row a widened
+        declaration outgrew sitting there, reported forever.
+
+        The state is built with raw SQL because the API refuses to
+        create it: set_vectors() checks the width on the way in."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple"}])
+        g.drop_vectors(node_fields=["docvec"])       # take the CHECK away
+        with g.engine.begin() as connection:
+            connection.execute(text(
+                "UPDATE nodes SET vec_docvec = ARRAY[1.0, 2.0]::real[] WHERE id = 1"))
+        stale = g.stale_vectors(node_fields=["docvec"])["nodes"]["docvec"]
+        assert stale == {"missing": [], "wrong_dimensions": ["1"]}
+        assert g.embed_stale()["nodes"]["docvec"]["embedded"] == ["1"]
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["docvec"] == [97.0, 0.0, 0.0]
+
+    def test_a_second_run_finds_nothing_left(self, fresh_graph):
+        """The loop has to terminate: a call that re-embeds rows it
+        already filled would never come back empty, and a caller
+        looping until it does would loop forever."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple"}])
+        g.embed_stale()
+        assert g.embed_stale()["nodes"]["docvec"] == {"embedded": [], "skipped": []}
+
+    def test_fields_without_an_embedder_are_left_alone(self, fresh_graph):
+        """titlevec declares no embed=, so this call has nothing to say
+        about it -- and must not report a zero that reads as "done"."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple", "titlevec": "apple"}])
+        assert set(g.embed_stale()["nodes"]) == {"docvec"}
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"]["titlevec"] is None
+
+    def test_naming_a_field_that_cannot_embed_itself_raises(self, fresh_graph):
+        """Skipped from the default sweep, refused when asked for by
+        name: a caller who typed the field meant something by it."""
+        g = _embedding_graph(fresh_graph)
+        with pytest.raises(ValueError, match=r"embed_stale\(\): field 'titlevec' on nodes "
+                                             r"was given text, but declares no embedder"):
+            g.embed_stale(node_fields=["titlevec"])
+
+    def test_a_graph_where_nothing_can_embed_says_so(self, fresh_graph):
+        """An empty result here would read as "nothing was stale",
+        which is the opposite of what happened."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "docvec": "apple"}])
+        with pytest.raises(ValueError, match="no vector field on this graph declares an "
+                                             "embedder"):
+            g.embed_stale()
+
+    def test_limit_caps_the_rows_per_field(self, fresh_graph):
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": i, "docvec": f"text-{i}"} for i in range(1, 6)])
+        assert len(g.embed_stale(limit=2)["nodes"]["docvec"]["embedded"]) == 2
+
+    def test_it_reaches_work_behind_rows_that_can_never_be_filled(self, fresh_graph):
+        """The bug a plain LIMIT window has, and the reason paging is a
+        keyset cursor: a row with no source text is stale FOREVER, so
+        the same leading rows fill the window on every pass and the
+        work behind them is never reached. It reported success and
+        embedded nothing -- silent, permanent incompleteness."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": 1}, {"id": 2}, {"id": 3},          # nothing to embed
+                     {"id": 4, "docvec": "apple"}, {"id": 5, "docvec": "banana"}])
+        result = g.embed_stale(node_fields=["docvec"], batch=2)["nodes"]["docvec"]
+        assert result == {"embedded": ["4", "5"], "skipped": ["1", "2", "3"]}
+        assert g.get_vectors(node_ids=[4])["nodes"]["4"]["docvec"] == [97.0, 0.0, 0.0]
+
+    def test_a_page_smaller_than_the_field_still_finishes_it(self, fresh_graph):
+        """batch= bounds memory and transaction size, not how much gets
+        done: one call still walks the whole field."""
+        g = _embedding_graph(fresh_graph)
+        g.add_nodes([{"id": i, "docvec": f"text-{i}"} for i in range(1, 8)])
+        result = g.embed_stale(node_fields=["docvec"], batch=2)["nodes"]["docvec"]
+        assert result["embedded"] == [str(i) for i in range(1, 8)]
+        assert g.embed_stale(node_fields=["docvec"], batch=2)["nodes"]["docvec"]["embedded"] == []
+
+    def test_each_page_is_its_own_provider_call_and_transaction(self, fresh_graph):
+        """What bounds the memory: 500k rows must not become one embed
+        call holding 500k vectors, nor one transaction holding every
+        row lock until the last provider round trip returns."""
+        log, opened = [], []
+        g = _embedding_graph(fresh_graph, log=log)
+        g.add_nodes([{"id": i, "docvec": f"text-{i}"} for i in range(1, 7)])
+
+        def on_begin(conn):
+            opened.append(len(log))
+
+        event.listen(g.engine, "begin", on_begin)
+        try:
+            g.embed_stale(node_fields=["docvec"], batch=2)
+        finally:
+            event.remove(g.engine, "begin", on_begin)
+        assert log == [["text-1", "text-2"], ["text-3", "text-4"], ["text-5", "text-6"]]
+        # Read as: one transaction opened before any embedding (the
+        # first stale query), then more after each page. Embedding
+        # everything first and writing once would put every `begin` at
+        # the same count instead of walking 0, 1, 2, 3.
+        assert sorted(set(opened)) == [0, 1, 2, 3]
+
+    @pytest.mark.parametrize("bad", [0, -1, 1.5, True, "10"])
+    def test_a_meaningless_batch_is_refused(self, fresh_graph, bad):
+        """batch=0 would spin forever asking for zero rows."""
+        g = _embedding_graph(fresh_graph)
+        with pytest.raises(ValueError, match="batch must be a positive integer"):
+            g.embed_stale(node_fields=["docvec"], batch=bad)
+
+    def test_it_stays_inside_its_own_graph(self, fresh_graph):
+        """Every read and write goes through _scoped(); the property
+        read this call adds is a new place to forget it."""
+        g = _embedding_graph(fresh_graph)
+        other = g.in_graph("other")
+        other.define_vectors(nodes=[Vector("docvec", 3, embed=counting_embedder())])
+        g.add_nodes([{"id": 1, "docvec": "apple"}])
+        other.add_nodes([{"id": 2, "docvec": "banana"}])
+        assert g.embed_stale()["nodes"]["docvec"]["embedded"] == ["1"]
+        assert other.get_vectors(node_ids=[2])["nodes"]["2"]["docvec"] is None
+
+    def test_undeclared_graphs_say_to_declare_first(self, fresh_graph):
+        with pytest.raises(ValueError, match=r"call define_vectors\(...\) first"):
+            fresh_graph.embed_stale()
 
 
 class TestPgvectorDdl:
@@ -1991,6 +2732,41 @@ class TestVectorCallerNamesArePinned:
     """Every refusal leads with the CALL, so a traceback says which one
     to fix. Each name below was mutable with the suite still green."""
 
+    #: Every caller label this class asserts on. The test below reads the
+    #: real call sites out of the source and compares, so a NEW entry
+    #: point fails here until someone pins it -- rather than surfacing
+    #: two mutation rounds later, which is how the last four were found.
+    PINNED = {
+        "vector_search()", "vector_search_many()",
+        "get_vectors()", "set_vectors()", "stale_vectors()", "embed_stale()",
+        "traverse_json()", "aggregate_json()", "vector_search_json()",
+        "traversal spec", '"start"', '"hops" entry', "vector search spec",
+    }
+
+    def test_every_caller_label_in_the_source_is_pinned_here(self):
+        """The durable half of this class.
+
+        Five helpers take a caller label from eleven call sites, and the
+        per-site assertions below can only ever cover the sites that
+        existed when they were written. Comparing against the source
+        makes an unpinned twelfth site a failure, and a removed one a
+        failure too -- so this set cannot rot in either direction."""
+        declared = declared_caller_labels()
+        assert declared - self.PINNED == set(), \
+            f"caller labels with no assertion in this class: {sorted(declared - self.PINNED)}"
+        assert self.PINNED - declared == set(), \
+            f"pinned labels no longer in the source: {sorted(self.PINNED - declared)}"
+
+    def test_get_vectors_names_itself(self):
+        with pytest.raises(ValueError, match=r"^get_vectors\(\) needs vector fields"):
+            offline().get_vectors(node_ids=[1])
+
+    def test_set_vectors_names_itself(self, fresh_graph):
+        """Reached only against a live graph: set_vectors() opens its
+        transaction before it consults the registry."""
+        with pytest.raises(ValueError, match=r"^set_vectors\(\) needs vector fields"):
+            fresh_graph.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 2.0, 3.0]}])
+
     def test_search_names_itself(self, vg):
         with pytest.raises(ValueError, match=r"^vector_search\(\): boost="):
             vg.build_vector_search_query(Near("summary", [1.0, 0.0, 0.0]), boost=[])
@@ -2030,10 +2806,13 @@ class TestVectorCallerNamesArePinned:
         ("traverse_json()", lambda g, s: traverse_json(g, s)),
         ("aggregate_json()", lambda g, s: aggregate_json(
             g, {**s, "aggregates": {"n": {"fn": "count"}}})),
+        ("vector_search_json()",
+         lambda g, s: vector_search_json(g, {"near": s["start"]["near"]})),
     ])
     def test_json_refusals_name_the_call(self, vg, caller, run):
         spec = {"start": {"near": {"field": "summary", "vector": [1.0, 0.0, 0.0]}, "keep": 1}}
-        with pytest.raises(ValueError, match=rf"^{re.escape(caller)}: \['keep', 'near'\]"):
+        with pytest.raises(ValueError,
+                           match=rf"^{re.escape(caller)}: near=.*cannot come from a tool call"):
             run(vg, spec)
 
     @pytest.mark.parametrize("caller,run", [
@@ -2097,3 +2876,310 @@ class TestBuilderDelegation:
         builders document could be any number at all. It is a promise
         the README and both docstrings make."""
         assert "LIMIT 10" in norm(build(vg), literal_binds=True)
+
+    @pytest.mark.parametrize("build", [
+        lambda g: build_search_query(g, Near("summary", [1.0, 0.0, 0.0])),
+        lambda g: build_search_many_query(g, [Near("summary", [1.0, 0.0, 0.0])]),
+    ])
+    def test_the_same_default_holds_one_layer_down(self, vg, build):
+        """Each default is written TWICE -- once on the Graph method and
+        once on the function behind it -- so the tests above pin only
+        half of each pair, and the halves are free to drift apart. The
+        method always passes k explicitly, which is exactly what hides
+        a changed default underneath it."""
+        assert "LIMIT 10" in norm(build(vg), literal_binds=True)
+
+    def test_the_pgvector_index_default_holds_one_layer_down(self, vg):
+        """Same pair, same drift: Graph.pgvector_exit_ddl() passes
+        index= down, so only its own default was ever read."""
+        assert any("USING hnsw" in s for s in pgvector_exit_ddl(vg))
+
+
+# ---------------------------------------------------------------------
+# Text, embedded on the way in and on the way out
+# ---------------------------------------------------------------------
+
+def counting_embedder(dimensions: int = 3, log: list = None):
+    """A fake embedding client that records every batch it is handed.
+
+    A plain callable, so it goes down Embedder's last dispatch branch
+    and exercises no provider-specific code. The vector it returns
+    encodes the text's first character, which is enough to tell two
+    embeddings apart without pretending to be a model."""
+    log = [] if log is None else log
+
+    def embed(texts):
+        log.append(list(texts))
+        return [[float(ord(t[0])), 0.0, 0.0][:dimensions] + [0.0] * (dimensions - 3)
+                for t in texts]
+    embed.log = log
+    return embed
+
+
+class TestVectorSourceAndEmbedder:
+    def test_source_defaults_to_the_fields_own_name(self):
+        """The gap this closes: Vector("title") named a column and read
+        nothing, so "which property does it embed" had no answer at
+        all. It is the property of the same name."""
+        assert Vector("title", 3).source == "title"
+
+    def test_source_can_point_at_another_property(self):
+        assert Vector("summary", 3, source="abstract").source == "abstract"
+
+    @pytest.mark.parametrize("bad", ["", 5, []])
+    def test_source_must_be_a_non_empty_string(self, bad):
+        with pytest.raises(ValueError, match="source= is the PROPERTY name"):
+            Vector("summary", 3, source=bad)
+
+    def test_a_client_is_wrapped_once_into_an_embedder(self):
+        field = Vector("summary", 3, embed=counting_embedder())
+        assert isinstance(field.embed, Embedder)
+        # And an Embedder passed straight in is kept, not re-wrapped --
+        # double wrapping is what Embedder(Embedder(...)) refuses.
+        made = Embedder(counting_embedder())
+        assert Vector("summary", 3, embed=made).embed is made
+
+    def test_an_embedder_sized_for_another_field_is_refused(self):
+        """Two numbers, one of which would have to be ignored. Silently
+        picking either leaves half the caller's configuration inert."""
+        from hopai import Embedder
+        with pytest.raises(ValueError, match="its embedder is built with dimensions=768"):
+            Vector("summary", 3, embed=Embedder(counting_embedder(), dimensions=768))
+
+    def test_one_embedder_serves_fields_of_different_sizes(self):
+        """The flip side: an embedder with no dimensions of its own is
+        the ordinary case, and pinning it to the first field it met
+        would break the second."""
+        shared = Embedder(counting_embedder())
+        assert Vector("a", 3, embed=shared).dimensions == 3
+        assert Vector("b", 8, embed=shared).dimensions == 8
+        assert shared.dimensions is None
+
+
+class TestNearText:
+    def test_text_and_vector_are_alternatives(self):
+        for kwargs, word in (({}, "neither"),
+                             ({"query": [1.0, 0.0, 0.0], "text": "x"}, "both")):
+            with pytest.raises(TypeError, match=f"vector or text to embed, not {word}"):
+                Near("summary", **kwargs)
+
+    @pytest.mark.parametrize("bad", ["", "   ", 5])
+    def test_text_must_say_something(self, bad):
+        with pytest.raises((ValueError, TypeError),
+                           match="the text to embed must be a non-empty string"):
+            Near("summary", text=bad)
+
+    def test_a_bare_string_is_text_to_embed(self):
+        """The terse form. A str and a sequence of numbers can never be
+        confused for one another, so the second argument takes either
+        and the caller does not have to remember a keyword."""
+        assert Near("summary", "raft consensus").text == "raft consensus"
+        assert Near("summary", "raft consensus").vector == ()
+        # ...and the same spec written explicitly is the same spec.
+        assert repr(Near("summary", "raft consensus")) \
+            == repr(Near("summary", text="raft consensus"))
+
+    def test_a_sequence_in_the_same_slot_is_still_a_vector(self):
+        spec = Near("summary", [0.1, 0.4, 0.9])
+        assert spec.text is None and len(spec.vector) == 3
+
+    @pytest.mark.parametrize("looks_like", ["[0.1, 0.2]", "(1, 2)", "  [1,2]  "])
+    def test_a_serialized_vector_is_refused_rather_than_embedded(self, looks_like):
+        """The one case where the two forms could be confused, and it
+        would be silent: embedding the literal characters '[0.1, 0.2]'
+        ranks against whatever that phrase means to the model, with a
+        confident score attached and nothing to notice."""
+        with pytest.raises(ValueError, match="looks like a serialized vector"):
+            Near("summary", looks_like)
+
+    def test_text_is_the_way_to_embed_such_a_string_on_purpose(self):
+        """The guard above must not make a legitimate string
+        unreachable -- text= is unambiguous by construction."""
+        assert Near("summary", text="[0.1, 0.2]").text == "[0.1, 0.2]"
+
+    def test_ordinary_brackets_inside_a_sentence_are_not_a_vector(self):
+        """The guard is anchored at both ends, so prose that merely
+        mentions brackets still embeds."""
+        assert Near("summary", "a paper about [databases]").text is not None
+
+    def test_repr_shows_the_text_rather_than_a_dimension_count(self):
+        """An unresolved Near has no dimensions yet, and "0 dims" would
+        read as a bug in the vector rather than a spec awaiting one."""
+        assert repr(Near("summary", text="raft")) == "Near('summary', text='raft')"
+
+    def test_text_is_embedded_with_the_fields_own_embedder(self, vg):
+        log = []
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder(log=log))])
+        sql = norm(vg.build_vector_search_query(Near("summary", text="apple"), k=1),
+                   literal_binds=True)
+        assert log == [["apple"]]
+        # ord('a') == 97: the embedder's answer is what reached the SQL,
+        # so this is the whole round trip, not just the call.
+        assert "97" in sql
+
+    def test_a_field_with_no_embedder_says_which_declaration_to_change(self, vg):
+        with pytest.raises(ValueError, match=r"vector_search\(\): field 'summary' on nodes "
+                                             r"was given text, but declares no embedder"):
+            vg.build_vector_search_query(Near("summary", text="apple"), k=1)
+
+    def test_resolving_leaves_the_original_spec_alone(self, vg):
+        """A Near is a value: reusing one across two graphs whose fields
+        embed differently must not hand the second graph the first
+        graph's embedding."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder())])
+        spec = Near("summary", text="apple")
+        vg.build_vector_search_query(spec, k=1)
+        assert spec.text == "apple" and spec.vector == ()
+
+    def test_a_text_query_is_still_checked_against_the_declared_size(self, vg):
+        """An embedder answering with the wrong width is a
+        configuration mistake, not a query that should run and rank
+        nothing."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=lambda texts: [[1.0, 0.0]])])
+        with pytest.raises(ValueError, match="has 2 dimensions, the field is defined with 3"):
+            vg.build_vector_search_query(Near("summary", text="apple"), k=1)
+
+    def test_two_text_specs_on_one_field_raise_before_either_is_embedded(self, vg):
+        """The duplicate-field refusal comes first on purpose: a
+        provider call for a query that is about to be rejected is a
+        round trip and a bill for nothing."""
+        log = []
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder(log=log))])
+        with pytest.raises(ValueError, match="two Near specs both rank field 'summary'"):
+            vg.build_vector_search_query(
+                Near("summary", text="a"), Near("summary", text="b"), k=1)
+        assert log == []
+
+    def test_many_queries_cost_one_provider_call_per_field(self, vg):
+        """vector_search_many() exists to turn N round trips into one.
+        Resolving each query's text on its own would put all N back,
+        just against a different server."""
+        log = []
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder(log=log))])
+        vg.build_vector_search_many_query(
+            [Near("summary", text="apple"), Near("summary", text="banana"),
+             Near("summary", text="cherry")], k=1)
+        assert log == [["apple", "banana", "cherry"]]
+
+    def test_resolution_carries_every_knob_across(self, vg):
+        """The resolved Near is a NEW object, so weight, min_similarity
+        and missing have to be copied onto it by hand -- and dropping
+        any one of them re-ranks the results in silence. Mutation found
+        all three unasserted at once."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder()),
+                                 Vector("title", 3, embed=counting_embedder())])
+        sql = norm(vg.build_vector_search_query(
+            Near("summary", text="apple", weight=0.25, min_similarity=0.75,
+                 missing="zero"),
+            Near("title", text="banana"), k=1), literal_binds=True)
+        assert "0.25" in sql                       # weight=
+        assert "0.75" in sql                       # min_similarity=
+        assert "coalesce" in sql.lower()           # missing="zero"
+
+    def test_a_batch_may_mix_text_and_vectors(self, vg):
+        """Queries have to agree on SHAPE -- same fields, weights,
+        thresholds -- and how each one arrived is not part of that. So
+        a caller holding one embedding already and wanting another
+        embedded is a legal batch, and the resolver has to deal the one
+        answer it asked for back to the one query that asked."""
+        log = []
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder(log=log))])
+        sql = norm(vg.build_vector_search_many_query(
+            [Near("summary", text="apple"),
+             Near("summary", [5.0, 6.0, 7.0]),
+             Near("summary", text="banana")], k=1), literal_binds=True)
+        assert log == [["apple", "banana"]]        # only the texts were sent
+        assert re.search(r"'0'.*?97.*?'1'.*?5\.0.*?'2'.*?98", sql, re.S)
+
+    def test_the_batched_resolver_names_the_call_it_serves(self, vg):
+        """_resolve_query_texts() is reached only from
+        vector_search_many(), and its refusals are the first thing a
+        caller sees when a field cannot embed -- with nothing but the
+        label to say which of the search calls they were in.
+
+        It raises through TWO helpers, and each takes the label
+        separately: _field() for a name that is not declared at all,
+        _embedder() for one that is but cannot embed itself."""
+        with pytest.raises(ValueError,
+                           match=r"^vector_search_many\(\): field 'summary' on nodes "
+                                 r"was given text"):
+            vg.build_vector_search_many_query([Near("summary", text="apple")], k=1)
+        with pytest.raises(ValueError,
+                           match=r"^vector_search_many\(\): no vector field 'ghost'"):
+            vg.build_vector_search_many_query([Near("ghost", text="apple")], k=1)
+
+    def test_queries_keep_their_own_text_in_order(self, vg):
+        """One batched answer has to be dealt back to the query it came
+        from -- zipping it wrongly is a silent mis-ranking."""
+        vg.define_vectors(nodes=[Vector("summary", 3, embed=counting_embedder())])
+        sql = norm(vg.build_vector_search_many_query(
+            [Near("summary", text="apple"), Near("summary", text="banana")], k=1),
+            literal_binds=True)
+        # ord('a')=97 for query 0, ord('b')=98 for query 1.
+        assert re.search(r"'0'.*?97.*?'1'.*?98", sql, re.S)
+
+
+class TestGraphVectorWrappersForwardEveryArgument:
+    """Graph's vector methods are one-line delegations into vectors.py,
+    and the mutation runs kept picking a different one apiece: `boost`
+    dropped from vector_search_many (twice -- once on Graph, once on
+    AsyncGraph), `edge_fields` dropped from drop_vectors. Same defect,
+    different member each round, because every prior test called each
+    wrapper with the defaults for everything it was not itself about.
+
+    So this closes the FAMILY rather than its members: each wrapper is
+    called with a non-default, individually recognizable value for every
+    argument it accepts, and every one of those has to arrive at the
+    function underneath. Nothing connects -- the delegate is recorded
+    and replaced, which is also why a new wrapper joining this table
+    costs one line."""
+
+    #: {Graph method: the arguments to pass}. Every VALUE here has to
+    #: arrive at the delegate; which of them travel positionally and
+    #: which by keyword is the wrapper's business, not this test's.
+    CALLS = {
+        "drop_vectors": {"node_fields": ["nf"], "edge_fields": ["ef"]},
+        "get_vectors": {"node_ids": ["ni"], "edge_ids": ["ei"],
+                        "node_fields": ["nf"], "edge_fields": ["ef"]},
+        "stale_vectors": {"node_fields": ["nf"], "edge_fields": ["ef"],
+                          "limit": 7, "after": "cur"},
+        "embed_stale": {"node_fields": ["nf"], "edge_fields": ["ef"],
+                        "limit": 7, "batch": 3},
+        "set_vectors": {"nodes": ["N"], "edges": ["E"]},
+        "vector_search_many": {"queries": ["Q"], "target": "edges", "k": 3,
+                               "where": {"w": 1}, "boost": "B"},
+    }
+
+    #: The two names that differ: Graph says vector_*, vectors.py does
+    #: not repeat the word it is already a module about.
+    DELEGATE = {"vector_search_many": "search_many", "vector_search": "search"}
+
+    @staticmethod
+    def _record(monkeypatch, name: str) -> dict:
+        seen: dict = {}
+
+        def recorder(*args, **kwargs):
+            seen["passed"] = [*args, *kwargs.values()]
+            return "recorded"
+
+        monkeypatch.setattr(f"hopai.vectors.{name}", recorder)
+        return seen
+
+    @pytest.mark.parametrize("name", sorted(CALLS))
+    def test_every_argument_reaches_vectors_py(self, offline_graph, monkeypatch, name):
+        arguments = self.CALLS[name]
+        seen = self._record(monkeypatch, self.DELEGATE.get(name, name))
+        getattr(offline_graph, name)(**arguments)
+        for keyword, value in arguments.items():
+            assert value in seen["passed"], f"{name}() dropped {keyword}={value!r}"
+
+    def test_vector_search_forwards_its_varargs_and_options(self, offline_graph, monkeypatch):
+        """Separate because `near` is *args here and a list one layer
+        down -- the wrapper's one piece of real work, and the shape a
+        table cannot express."""
+        seen = self._record(monkeypatch, "search")
+        near = Near("summary", [1.0, 0.0, 0.0])
+        offline_graph.vector_search(near, target="edges", k=3, where={"w": 1}, boost="B")
+        assert [near] in seen["passed"]
+        for value in ("edges", 3, {"w": 1}, "B"):
+            assert value in seen["passed"]

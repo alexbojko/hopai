@@ -207,19 +207,30 @@ class AsyncGraph:
                 lambda c: get_vectors(self._sync, node_ids, edge_ids, node_fields, edge_fields,
                                       connection=c))
 
-    async def stale_vectors(self, node_fields=None, edge_fields=None, limit=None) -> dict:
+    async def stale_vectors(self, node_fields=None, edge_fields=None, limit=None,
+                            after=None) -> dict:
         from .vectors import stale_vectors
         async with self._async_engine.connect() as conn:
             return await conn.run_sync(
-                lambda c: stale_vectors(self._sync, node_fields, edge_fields, limit, connection=c))
+                lambda c: stale_vectors(self._sync, node_fields, edge_fields, limit, after,
+                                        connection=c))
 
     # -- vectors: writing ---------------------------------------------
 
     async def set_vectors(self, nodes=None, edges=None) -> int:
-        from .vectors import set_vectors
+        """Planned BEFORE the transaction opens, unlike every other write
+        here, because a row's value may be TEXT -- and turning text into
+        a vector is a network round trip. The sync set_vectors() gets
+        that ordering for free by planning and then opening; this one
+        cannot, since the transaction is already open by the time
+        run_sync() reaches into vectors.py. Planning here keeps the
+        provider call off the row locks, which is the invariant, not a
+        preference."""
+        from .vectors import plan_vector_writes, set_vectors
+        plan = plan_vector_writes(self._sync, nodes, edges)
         async with self._async_engine.begin() as conn:
             return await conn.run_sync(
-                lambda c: set_vectors(self._sync, nodes, edges, connection=c))
+                lambda c: set_vectors(self._sync, connection=c, plan=plan))
 
     async def migrate_vectors(self) -> list:
         from .vectors import migrate_vectors
