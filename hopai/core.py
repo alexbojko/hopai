@@ -178,6 +178,13 @@ class Graph:
         self.graph_col = graph_col
         self._schema = None
         self._vectors = None
+        # Set True only by in_graph() (see its docstring): lets
+        # search()/search_many() populate this handle's registry from
+        # the database, on first use, instead of leaving it blank for
+        # the handle's whole life. A plain Graph() keeps this False, so
+        # "you forgot define_vectors()" still refuses immediately and
+        # by name rather than silently trying the catalog first.
+        self._vectors_lazy = False
         if graph_col is not None:
             for table in (self.nodes_tbl, self.edges_tbl):
                 if graph_col not in table.c:
@@ -204,14 +211,37 @@ class Graph:
         `Graph` is a cheap handle, so this is how you move between graphs
         rather than building a second engine and pool for each.
 
-        The new handle starts with NO schema and NO vector fields -- a
-        different graph is allowed a different shape (different vector
+        The new handle starts with NO schema and NO vector DECLARATION --
+        a different graph is allowed a different shape (different vector
         dimensions included), so neither travels implicitly; call
-        define_schema()/define_vectors() on the new handle."""
-        return Graph(self.engine, graph=graph, node_table=self.nodes_tbl,
-                     edge_table=self.edges_tbl, node_id_col=self.node_id_col,
-                     edge_id_col=self.edge_id_col, edge_start_col=self.edge_start_col,
-                     edge_end_col=self.edge_end_col, graph_col=self.graph_col)
+        define_schema()/define_vectors() on the new handle to state one
+        up front.
+
+        Vectors are the one exception to "starts blank", and only
+        LAZILY: the vec_* columns are physical storage SHARED by every
+        graph in the table (only the dimension CHECK is per-graph), so
+        a field this new handle's own graph already had migrated by
+        some OTHER handle is not actually unknown, just not yet read
+        back. Rather than eagerly querying the catalog here -- which
+        would cost every in_graph() call a round trip even when nothing
+        that follows ever touches a vector, and would make an offline
+        Graph() (query building never connects; see the module docstring
+        and Graph.build_query()) try to connect just from being handed a
+        new graph name -- the returned handle only sets a flag
+        (`_vectors_lazy`). vector_search()/vector_search_many() check it
+        and call load_vectors() themselves, once, the first time they
+        actually need a connection anyway. Anything else that needs
+        vectors (set_vectors(), migrate_vectors(), ...) is unaffected by
+        the flag and still refuses by name until you call
+        define_vectors() or load_vectors() explicitly -- the lazy path
+        exists for the READ side this issue was filed about, not as a
+        blanket auto-declare."""
+        handle = Graph(self.engine, graph=graph, node_table=self.nodes_tbl,
+                       edge_table=self.edges_tbl, node_id_col=self.node_id_col,
+                       edge_id_col=self.edge_id_col, edge_start_col=self.edge_start_col,
+                       edge_end_col=self.edge_end_col, graph_col=self.graph_col)
+        handle._vectors_lazy = True
+        return handle
 
     def graphs(self) -> list:
         """Every graph that has rows in these tables, in name order.
@@ -1050,6 +1080,17 @@ class Graph:
         "edges": {...}}, or None when define_vectors() has not been
         called on this handle -- that is the existence check.
 
+        NEVER CONNECTS, on any handle, including one from in_graph():
+        that guarantee -- a Graph you only build queries with never
+        touches the network -- outranks this property being perfectly
+        live. A handle from in_graph() is marked to recover its vectors
+        lazily from the database (see in_graph()'s docstring), but that
+        recovery happens on first CONNECTION -- a search, or an
+        explicit load_vectors() call -- never on reading this property.
+        Until then, this answers None for such a handle even when the
+        database can prove the graph has fields; call load_vectors()
+        yourself first if you need the true answer without searching.
+
         A copy: handing out the live registry made editing the
         returned dict silently redeclare the graph."""
         if self._vectors is None:
@@ -1069,6 +1110,42 @@ class Graph:
         create_schema() in your start-up path once vectors are in use."""
         from .vectors import migrate_vectors
         return migrate_vectors(self)
+
+    def load_vectors(self, connection=None) -> dict:
+        """Recover the vector declaration FROM THE DATABASE instead of
+        from define_vectors() -- for a fresh process, a second Graph
+        handle, or any other caller that forgot to redeclare a graph
+        another handle already migrated:
+
+            g2 = Graph(engine)     # a second handle; define_vectors() never ran here
+            g2.load_vectors()      # -> {"nodes": {"summary": Vector("summary", 1536)}, ...}
+            g2.vector_search(Near("summary", q))    # now works
+
+        Every vec_* column already migrated FOR THIS GRAPH is found by
+        its per-graph dimension CHECK (the same constraint
+        migrate_vectors() creates, looked up by the exact name that
+        handle would have used) -- a column present with no such
+        constraint means some OTHER graph migrated it, and is skipped
+        rather than guessed at, since the column itself is shared
+        storage while the dimension is scoped per graph.
+
+        RECOVERING THE SHAPE IS NOT RECOVERING THE POLICY: `embed=`
+        (an application's own embedding client) and a non-default
+        `source=` are never stored in SQL, so every recovered field
+        comes back with embed=None and source=<field name>, Vector's
+        defaults -- fine for vector_search() with a vector= or for
+        reading with get_vectors(), but redeclare with
+        define_vectors(..., embed=<your client>) before using
+        Near(text=...) or set_vectors() with a string against it.
+
+        Populates and returns the registry exactly like
+        define_vectors() does (attach_columns() included), so the
+        result is usable immediately -- this is also what in_graph()
+        calls, lazily, the first time a returned handle needs vectors
+        and was never given an explicit declaration (see its
+        docstring)."""
+        from .vectors import load_vectors
+        return load_vectors(self, connection=connection)
 
     def drop_vectors(self, node_fields: Optional[list] = None,
                      edge_fields: Optional[list] = None) -> list:

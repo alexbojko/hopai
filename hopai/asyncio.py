@@ -97,6 +97,13 @@ _NEEDS_SYNC_GRAPH = frozenset({
     "create_schema", "drop_schema", "define_constraints", "drop_constraints",
     "enforce_schema", "save_schema", "load_schema", "infer_schema",
     "schema_violations", "add_networkx",
+    # load_vectors() (#53) is a database round trip, unlike
+    # define_vectors()/vectors/*_ddl(), which is why it is named here
+    # rather than left to fall through __getattr__ to the wrapped sync
+    # Graph -- that would run it straight against the async engine's
+    # sync facade outside the greenlet bridge, same MissingGreenlet trap
+    # as every other admin call in this list.
+    "load_vectors",
 })
 
 

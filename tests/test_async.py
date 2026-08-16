@@ -411,7 +411,7 @@ class TestOutOfScope:
     @pytest.mark.parametrize("name", [
         "create_schema", "drop_schema", "define_constraints", "drop_constraints",
         "enforce_schema", "save_schema", "load_schema", "infer_schema",
-        "schema_violations", "add_networkx",
+        "schema_violations", "add_networkx", "load_vectors",
     ])
     def test_admin_methods_refuse_with_the_fix_named(self, async_graph, name):
         with pytest.raises(AttributeError, match="plain Graph"):
