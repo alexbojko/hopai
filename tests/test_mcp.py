@@ -2177,8 +2177,13 @@ class TestSearchLive:
             query="graph databases", k=1)["results"]
         assert embed.calls == ["graph databases"]
         assert results[0]["id"] == "1"
-        # no vector comes back: 6KB of floats has no business in a tool result
-        assert "summary" not in json.dumps(results)
+        # The field NAME legitimately reaches the result now (issue #54:
+        # `similarities` is keyed by it), so the proxy for "no vector
+        # comes back" can no longer be "the field name never appears" --
+        # it has to be that the STORED FLOATS never do, 6KB of them
+        # having no business in a tool result.
+        assert results[0]["similarities"] == pytest.approx({"summary": 0.9630868246861536})
+        assert "1.0, 0.0, 0.0" not in json.dumps(results)
 
     def test_a_traversal_can_be_seeded_from_meaning(self, fresh_graph):
         fresh_graph.define_vectors(nodes=[Vector("summary", 3)])
