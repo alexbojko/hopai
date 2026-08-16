@@ -1316,6 +1316,18 @@ class TestInferenceSampling:
             ("likes", "target", "company"),
             ("dangles", "source", "person"),
         }
+        # 'likes' has TWO triples missing 'person' at the source end --
+        # (person,person) and (person,company) -- so this is the case
+        # that would print as two identical report lines and two
+        # DroppedEdgeType objects if they weren't aggregated by
+        # (kind, end, type_name) with rows summed. One object, one line.
+        assert len(report.dropped_edge_types) == len(dropped_kinds)
+        likes_source_person = next(d for d in report.dropped_edge_types
+                                   if (d.kind, d.end) == ("likes", "source"))
+        assert likes_source_person.rows == 2
+        assert str(report).count(
+            "edge kind 'likes' dropped: source type 'person' not present "
+            "in the sampled nodes") == 1
         assert ("edge kind 'works_at' dropped: source type 'person' not present "
                 "in the sampled nodes") in str(report)
         # The point of dropping rather than raising: what comes back is
