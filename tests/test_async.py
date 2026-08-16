@@ -255,6 +255,23 @@ class TestVectors:
         assert results[0][0]["id"] == "1"
         assert results[1][0]["id"] == "2"
 
+    def test_vector_search_many_where_filters_candidates(self, async_fresh_graph):
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 2)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([
+                {"id": 1, "type": "keep"}, {"id": 2, "type": "skip"},
+            ])
+            await async_fresh_graph.set_vectors(nodes=[
+                {"id": 1, "summary": [1.0, 0.0]}, {"id": 2, "summary": [1.0, 0.0]},
+            ])
+            return await async_fresh_graph.vector_search_many(
+                [Near("summary", [1.0, 0.0])], where={"type": "keep"}, k=5)
+
+        results = run(body())
+        # Without where= reaching the call, both same-vector nodes would match.
+        assert [hit["id"] for hit in results[0]] == ["1"]
+
 
 class TestOutOfScope:
     """Schema/constraint DDL has no async override -- see hopai/asyncio.py's
@@ -362,6 +379,12 @@ class TestConnectionIsShared:
             await g.set_vectors(nodes=[{"id": 1, "summary": [1.0, 0.0]}])
             await g.drop_vectors(node_fields=["summary"])
             await g.mutate_cypher("MATCH (a {email: 'a@x.com'}) SET a.active = true")
+            await g.write_cypher("CREATE (c:person {email: 'c@x.com'})")
+            await g.delete_nodes(where={"email": "c@x.com"})
+            await g.update_edges(where={"tag": "e1"}, set={"seen": True})
+            await g.mutate({"operations": [
+                {"op": "update_nodes", "where": {"email": "b@x.com"}, "set": {"checked": True}},
+            ]})
 
         run(body())   # a pool timeout (TimeoutError) means some call above needed a 2nd connection
 
@@ -384,6 +407,39 @@ class TestArgumentsReachTheSyncCall:
         # replace=True means the second write IS the whole properties bag --
         # "age" from the first write must be gone, not merged alongside "name".
         assert result.nodes[0]["properties"] == {"email": "a@x.com", "name": "Alice"}
+
+    def test_merge_nodes_default_is_merge_not_replace(self, async_fresh_graph, async_admin_graph):
+        async_admin_graph.define_constraints(nodes=[Unique("email")])
+
+        async def body():
+            await async_fresh_graph.merge_nodes([{"email": "a@x.com", "age": 20}], on=["email"])
+            # No replace= passed -- the default (False) must still merge, not
+            # wipe "age" the way replace=True does in the test above.
+            await async_fresh_graph.merge_nodes([{"email": "a@x.com", "name": "Alice"}],
+                                                 on=["email"])
+            return await async_fresh_graph.traverse(Start())
+
+        result = run(body())
+        assert result.nodes[0]["properties"] == {"email": "a@x.com", "age": 20, "name": "Alice"}
+
+    def test_delete_edges_end_filter_narrows_the_delete(self, async_fresh_graph):
+        async def body():
+            await async_fresh_graph.add_nodes([{"id": 1}, {"id": 2, "role": "target"},
+                                               {"id": 3, "role": "other"}])
+            await async_fresh_graph.add_edges([
+                {"start_id": 1, "end_id": 2, "kind": "knows"},
+                {"start_id": 1, "end_id": 3, "kind": "knows"},
+            ])
+            deleted = await async_fresh_graph.delete_edges(
+                where={"kind": "knows"}, end={"role": "target"})
+            remaining = await async_fresh_graph.traverse(Start(), Hop(hops=(1, 1)))
+            return deleted, remaining
+
+        deleted, remaining = run(body())
+        # Without end= reaching the call, both edges match where= alone and both go.
+        assert deleted.deleted_edges == 1
+        assert len(remaining.edges) == 1
+        assert remaining.edges[0]["end_id"] == "3"
 
     def test_ingest_with_merge_nodes_on(self, async_fresh_graph, async_admin_graph):
         async_admin_graph.define_constraints(nodes=[Unique("email")])
