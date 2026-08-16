@@ -1338,6 +1338,21 @@ class Graph:
 
     # -- execution ------------------------------------------------------
 
+    def _aggregate_with_session(self, session, start: Start, hops: list, aggregates: dict) -> dict:
+        """The aggregate work itself, given an OPEN session. aggregate()
+        opens one and calls this directly; AsyncGraph.aggregate()
+        (hopai/asyncio.py) reaches the SAME function through
+        AsyncSession.run_sync() -- one implementation, two callers, so
+        sync and async can never disagree about what an aggregate
+        answers."""
+        query = self.build_aggregate_query(start, hops, aggregates)
+        row = session.execute(query).one()
+        # strict= is unobservable here and that is on purpose:
+        # build_aggregate_query() emits exactly one labeled column per
+        # entry in `aggregates`, so the two lengths are equal by
+        # construction. Kept as a claim about that, not as a guard.
+        return {name: _plain(value) for name, value in zip(aggregates, row, strict=True)}
+
     def aggregate(self, start: Start, *hops: Hop, aggregates: dict) -> dict:
         """Aggregate over the nodes a traversal matches, without
         hydrating them. `start` and the hops mean exactly what they mean
@@ -1355,53 +1370,49 @@ class Graph:
         Returns plain JSON-serializable values: count -> int, sum -> a
         number (0 when nothing matched), avg/min/max -> a number or None
         when nothing matched. One statement, one round trip."""
-        query = self.build_aggregate_query(start, list(hops), aggregates)
         with Session(self.engine) as session:
-            row = session.execute(query).one()
-        # strict= is unobservable here and that is on purpose:
-        # build_aggregate_query() emits exactly one labeled column per
-        # entry in `aggregates`, so the two lengths are equal by
-        # construction. Kept as a claim about that, not as a guard.
-        return {name: _plain(value) for name, value in zip(aggregates, row, strict=True)}
+            return self._aggregate_with_session(session, start, list(hops), aggregates)
+
+    def _traverse_with_session(self, session, start: Start, hops: list) -> Subgraph:
+        """The traverse work itself, given an OPEN session -- see
+        _aggregate_with_session() just above for why this split exists."""
+        query = self.build_query(start, hops)
+        t0 = time.perf_counter()
+        rows = session.execute(query).all()
+        node_ids = [r.id for r in rows if r.kind == "node"]
+        edge_ids = [r.id for r in rows if r.kind == "edge"]
+
+        nt, et = self.nodes_tbl, self.edges_tbl
+        node_id_col = getattr(nt.c, self.node_id_col)
+        edge_id_col = getattr(et.c, self.edge_id_col)
+
+        nodes = []
+        if node_ids:
+            q = select(cast(node_id_col, String).label("id"), nt.c.properties).where(
+                and_(self._scoped(nt), cast(node_id_col, String).in_(node_ids))
+            )
+            nodes = [{"id": r.id, "properties": r.properties} for r in session.execute(q).all()]
+
+        edges = []
+        if edge_ids:
+            q = select(
+                cast(edge_id_col, String).label("id"),
+                cast(getattr(et.c, self.edge_start_col), String).label("start_id"),
+                cast(getattr(et.c, self.edge_end_col), String).label("end_id"),
+                et.c.properties,
+            ).where(and_(self._scoped(et), cast(edge_id_col, String).in_(edge_ids)))
+            edges = [
+                {"id": r.id, "start_id": r.start_id, "end_id": r.end_id,
+                 "properties": r.properties}
+                for r in session.execute(q).all()
+            ]
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        return Subgraph(nodes=nodes, edges=edges, elapsed_ms=elapsed_ms)
 
     def traverse(self, start: Start, *hops: Hop) -> Subgraph:
         """Run one traversal. `start` picks the seed set; each `Hop`
         after it is one step of the walk. Returns a Subgraph with every
         node and edge on at least one complete matching chain."""
-        hops = list(hops)
-        query = self.build_query(start, hops)
-
         with Session(self.engine) as session:
-            t0 = time.perf_counter()
-            rows = session.execute(query).all()
-            node_ids = [r.id for r in rows if r.kind == "node"]
-            edge_ids = [r.id for r in rows if r.kind == "edge"]
-
-            nt, et = self.nodes_tbl, self.edges_tbl
-            node_id_col = getattr(nt.c, self.node_id_col)
-            edge_id_col = getattr(et.c, self.edge_id_col)
-
-            nodes = []
-            if node_ids:
-                q = select(cast(node_id_col, String).label("id"), nt.c.properties).where(
-                    and_(self._scoped(nt), cast(node_id_col, String).in_(node_ids))
-                )
-                nodes = [{"id": r.id, "properties": r.properties} for r in session.execute(q).all()]
-
-            edges = []
-            if edge_ids:
-                q = select(
-                    cast(edge_id_col, String).label("id"),
-                    cast(getattr(et.c, self.edge_start_col), String).label("start_id"),
-                    cast(getattr(et.c, self.edge_end_col), String).label("end_id"),
-                    et.c.properties,
-                ).where(and_(self._scoped(et), cast(edge_id_col, String).in_(edge_ids)))
-                edges = [
-                    {"id": r.id, "start_id": r.start_id, "end_id": r.end_id,
-                     "properties": r.properties}
-                    for r in session.execute(q).all()
-                ]
-
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-
-        return Subgraph(nodes=nodes, edges=edges, elapsed_ms=elapsed_ms)
+            return self._traverse_with_session(session, start, list(hops))

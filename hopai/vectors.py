@@ -152,6 +152,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -694,6 +695,19 @@ def _embedder(field: Vector, target: str, caller: str):
     return field.embed
 
 
+@contextmanager
+def _read_connection(graph, connection=None):
+    """A connection for a read-only vector query: the caller's own, when
+    one is passed in (the seam AsyncGraph's greenlet bridge needs -- see
+    hopai/asyncio.py), or a fresh one otherwise. Mirrors ingest.py's
+    one_transaction(), minus the transaction: nothing here writes."""
+    if connection is not None:
+        yield connection
+    else:
+        with graph.engine.connect() as opened:
+            yield opened
+
+
 def validate_nears(graph, target: str, near, k, caller: str,
                    limit_name: str = "k") -> list:
     """Normalize near= (one Near or a list) into a validated list:
@@ -1032,10 +1046,10 @@ def build_search_query(graph, near, target: str = "nodes", k: Optional[int] = 10
 
 
 def search(graph, near, target: str = "nodes", k: Optional[int] = 10, where: Any = None,
-           boost=None) -> list:
+           boost=None, connection=None) -> list:
     query = build_search_query(graph, near, target=target, k=k, where=where, boost=boost)
-    with graph.engine.connect() as connection:
-        rows = connection.execute(query).mappings().all()
+    with _read_connection(graph, connection) as conn:
+        rows = conn.execute(query).mappings().all()
     return [{**row, "similarity": float(row["similarity"])} for row in rows]
 
 
@@ -1169,15 +1183,15 @@ def build_search_many_query(graph, queries, target: str = "nodes", k: Optional[i
 
 
 def search_many(graph, queries, target: str = "nodes", k: Optional[int] = 10,
-                where: Any = None, boost=None) -> list:
+                where: Any = None, boost=None, connection=None) -> list:
     """Results per query, in the order the queries were given -- an
     empty list for a query nothing matched, so index i always answers
     query i."""
     parsed = _as_query_list(queries, "vector_search_many()")
     query = build_search_many_query(graph, queries, target=target, k=k, where=where, boost=boost)
     grouped: dict = {str(i): [] for i in range(len(parsed))}
-    with graph.engine.connect() as connection:
-        for row in connection.execute(query).mappings():
+    with _read_connection(graph, connection) as conn:
+        for row in conn.execute(query).mappings():
             hit = {key: value for key, value in row.items() if key != "q"}
             grouped[row["q"]].append({**hit, "similarity": float(hit["similarity"])})
     return [grouped[str(i)] for i in range(len(parsed))]
@@ -1334,7 +1348,7 @@ def pgvector_exit_ddl(graph, index: Optional[str] = "hnsw") -> list:
 
 
 def stale_vectors(graph, node_fields=None, edge_fields=None,
-                  limit: Optional[int] = None, after=None) -> dict:
+                  limit: Optional[int] = None, after=None, connection=None) -> dict:
     """Which rows need (re-)embedding, per field:
 
         {"nodes": {"summary": {"missing": ["4"], "wrong_dimensions": ["7"]}},
@@ -1388,8 +1402,8 @@ def stale_vectors(graph, node_fields=None, edge_fields=None,
             if limit is not None:
                 query = query.limit(limit)
             missing, wrong = [], []
-            with graph.engine.connect() as connection:
-                for row in connection.execute(query):
+            with _read_connection(graph, connection) as conn:
+                for row in conn.execute(query):
                     (missing if row.missing else wrong).append(row.id)
             result[target_name][name] = {"missing": missing, "wrong_dimensions": wrong}
     return result
@@ -1547,7 +1561,7 @@ _CONSTRAINT_DEF = text("""
 """)
 
 
-def migrate_vectors(graph) -> list:
+def migrate_vectors(graph, connection=None) -> list:
     """Apply the declared vector fields: add each column and its
     per-graph dimension CHECK. Idempotent, one transaction, and it
     REFUSES drift instead of papering over it -- a column of the wrong
@@ -1555,16 +1569,18 @@ def migrate_vectors(graph) -> list:
     names drop_vectors() (or the conflicting column) rather than
     quietly serving two incompatible definitions. Returns
     "table.column" for every field ensured, in order."""
+    from .ingest import one_transaction
+
     if graph._vectors is None:
         raise ValueError("migrate_vectors() needs vector fields and none are defined -- "
                          "call define_vectors(...) first")
     ensured = []
-    with graph.engine.begin() as connection:
+    with one_transaction(graph, connection) as conn:
         for target_name in _TARGETS:
             table = _table(graph, target_name)
             target = _target_for(graph, target_name)
             for field in graph._vectors[target_name].values():
-                existing = connection.execute(_COLUMN_TYPE, {
+                existing = conn.execute(_COLUMN_TYPE, {
                     "table": table.name, "column": field.column_name, "schema": table.schema,
                 }).scalar()
                 if existing is not None and existing not in ("_float4", "_float8"):
@@ -1574,10 +1590,10 @@ def migrate_vectors(graph) -> list:
                         f"drop the conflicting column"
                     )
                 add_column, storage, add_check = _field_ddl(target, field)
-                connection.execute(text(add_column))
-                connection.execute(text(storage))
+                conn.execute(text(add_column))
+                conn.execute(text(storage))
                 name = _constraint_name(target, field)
-                definition = connection.execute(_CONSTRAINT_DEF, {
+                definition = conn.execute(_CONSTRAINT_DEF, {
                     "name": name, "table": target.qualified,
                 }).scalar()
                 if definition is not None:
@@ -1595,7 +1611,7 @@ def migrate_vectors(graph) -> list:
                         )
                 else:
                     try:
-                        connection.execute(text(add_check))
+                        conn.execute(text(add_check))
                     except IntegrityError as exc:
                         raise ConstraintViolation(
                             f"existing {target_name} rows in graph {graph.graph!r} carry "
@@ -1609,7 +1625,7 @@ def migrate_vectors(graph) -> list:
     return ensured
 
 
-def drop_vectors(graph, node_fields=None, edge_fields=None) -> list:
+def drop_vectors(graph, node_fields=None, edge_fields=None, connection=None) -> list:
     """The inverse of migrate_vectors() for THIS graph: drop each
     field's dimension constraint and NULL its values in this graph's
     rows. The column itself stays -- it is shared by every graph in
@@ -1630,23 +1646,25 @@ def drop_vectors(graph, node_fields=None, edge_fields=None) -> list:
     re-embed") only works if the field is still declared when you get
     to step two. Returns "table.column" per field, the vocabulary
     migrate_vectors() returns."""
+    from .ingest import one_transaction
+
     dropped = []
-    with graph.engine.begin() as connection:
+    with one_transaction(graph, connection) as conn:
         for target_name, names in (("nodes", node_fields), ("edges", edge_fields)):
             table = _table(graph, target_name)
             target = _target_for(graph, target_name)
             for entry in names or ():
                 field = entry if isinstance(entry, Vector) else Vector(entry, 1)
-                connection.execute(text(
+                conn.execute(text(
                     f'ALTER TABLE {target.qualified} DROP CONSTRAINT IF EXISTS '
                     f'"{_constraint_name(target, field)}"'
                 ))
-                exists = connection.execute(_COLUMN_TYPE, {
+                exists = conn.execute(_COLUMN_TYPE, {
                     "table": table.name, "column": field.column_name, "schema": table.schema,
                 }).scalar()
                 if exists is not None:
                     column = _attach(table, field.column_name)
-                    connection.execute(
+                    conn.execute(
                         update(table)
                         .where(graph._scoped(table), column.isnot(None))
                         .values({field.column_name: None})
@@ -1670,22 +1688,18 @@ def _coerce_id(value):
     return value
 
 
-def set_vectors(graph, nodes=None, edges=None) -> int:
-    """UPDATE existing rows' vector columns. Each row is
-    {"id": ..., <field>: <vector, text, or None>}; every non-id key
-    must be a defined field of the right dimensionality. One
-    transaction for the whole call: an id that matches no row in this
-    graph fails everything by name, so a retry never collides with
-    half a write. Returns the number of rows updated.
+def plan_vector_writes(graph, nodes=None, edges=None) -> list:
+    """Everything set_vectors() does BEFORE it takes a connection:
+    validate every row, and turn every string into a vector.
 
-    A string value is embedded with the field's declared embedder --
-    every string in the call, per field, in ONE batched provider call,
-    resolved BEFORE the transaction opens. That ordering is the point:
-    an HTTP call inside an open transaction holds row locks for the
-    length of a network round trip, and a provider failure halfway
-    through would leave the write half-done."""
-    from .ingest import BATCH_SIZE, _chunks
-
+    Separate so it can be called from outside a transaction. The
+    sync path gets that for free -- it plans, then opens one. The
+    async one cannot: AsyncGraph opens the transaction and reaches
+    this module through run_sync(), so planning inside set_vectors()
+    would put a provider round trip inside an open transaction with
+    the row locks already held. AsyncGraph.set_vectors() calls this
+    first and passes the finished plan in.
+    """
     # Validation is pure, so it all happens before a connection is
     # taken -- including the embedding, which is the slow part.
     plan = []
@@ -1762,9 +1776,30 @@ def set_vectors(graph, nodes=None, edges=None) -> int:
                     )
                 cleaned[name] = list(vector)
         plan.append((target_name, table, id_column, groups))
+    return plan
+
+
+def set_vectors(graph, nodes=None, edges=None, connection=None, plan=None) -> int:
+    """UPDATE existing rows' vector columns. Each row is
+    {"id": ..., <field>: <vector, text, or None>}; every non-id key
+    must be a defined field of the right dimensionality. One
+    transaction for the whole call: an id that matches no row in this
+    graph fails everything by name, so a retry never collides with
+    half a write. Returns the number of rows updated.
+
+    A string value is embedded with the field's declared embedder --
+    every string in the call, per field, in ONE batched provider call,
+    resolved BEFORE the transaction opens. That ordering is the point:
+    an HTTP call inside an open transaction holds row locks for the
+    length of a network round trip, and a provider failure halfway
+    through would leave the write half-done."""
+    from .ingest import BATCH_SIZE, _chunks, one_transaction
+
+    if plan is None:
+        plan = plan_vector_writes(graph, nodes, edges)
 
     total = 0
-    with graph.engine.begin() as connection:
+    with one_transaction(graph, connection) as conn:
         for target_name, table, id_column, groups in plan:
             for names, group in groups.items():
                 for chunk in _chunks(group, BATCH_SIZE):
@@ -1788,7 +1823,7 @@ def set_vectors(graph, nodes=None, edges=None) -> int:
                         })
                         .returning(id_column)
                     )
-                    updated = {row[0] for row in connection.execute(statement)}
+                    updated = {row[0] for row in conn.execute(statement)}
                     missing = [row_id for row_id, _ in chunk if row_id not in updated]
                     if missing:
                         raise ValueError(
@@ -1801,7 +1836,7 @@ def set_vectors(graph, nodes=None, edges=None) -> int:
 
 
 def get_vectors(graph, node_ids=None, edge_ids=None, node_fields=None,
-                edge_fields=None) -> dict:
+                edge_fields=None, connection=None) -> dict:
     """Read stored vectors back, since traversal results never carry
     them. Returns {"nodes": {id: {field: [floats] | None}}, "edges":
     {...}} with string ids, matching every other result. Ids that
@@ -1827,7 +1862,7 @@ def get_vectors(graph, node_ids=None, edge_ids=None, node_fields=None,
             cast(id_column, SAString).label("id"),
             *(table.c[VECTOR_COLUMN_PREFIX + name].label(name) for name in wanted),
         ).where(graph._scoped(table), id_column.in_([_coerce_id(i) for i in ids]))
-        with graph.engine.connect() as connection:
-            for row in connection.execute(query).mappings():
+        with _read_connection(graph, connection) as conn:
+            for row in conn.execute(query).mappings():
                 result[target_name][row["id"]] = {name: row[name] for name in wanted}
     return result
