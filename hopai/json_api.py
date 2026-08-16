@@ -429,7 +429,10 @@ TRAVERSE_TOOL_SCHEMA: dict = {
                             "description": "Exact hop count (integer) or [min, max] range.",
                             "anyOf": [{"type": "integer"}, {"type": "array", "items": {"type": "integer"}}],
                         },
-                        "direction": {"type": "string", "enum": ["forward", "backward"]},
+                        "direction": {"type": "string", "enum": ["forward", "backward"],
+                                     "description": "Which way to walk this hop's edges: "
+                                                    "forward follows start->end, backward "
+                                                    "follows end->start. Default forward."},
                         "optional": {
                             "type": "boolean",
                             "description": "If true, keep prior matches even if this hop finds nothing. Only valid on the last hop.",
@@ -548,7 +551,10 @@ AGGREGATE_TOOL_SCHEMA: dict = {
                             "description": "Exact hop count (integer) or [min, max] range.",
                             "anyOf": [{"type": "integer"}, {"type": "array", "items": {"type": "integer"}}],
                         },
-                        "direction": {"type": "string", "enum": ["forward", "backward"]},
+                        "direction": {"type": "string", "enum": ["forward", "backward"],
+                                     "description": "Which way to walk this hop's edges: "
+                                                    "forward follows start->end, backward "
+                                                    "follows end->start. Default forward."},
                         "near": _near_schema(
                             "Rank the nodes this hop reaches by similarity to some text. "
                             "Needs `keep`."),
@@ -577,7 +583,9 @@ AGGREGATE_TOOL_SCHEMA: dict = {
                 "additionalProperties": {
                     "type": "object",
                     "properties": {
-                        "fn": {"type": "string", "enum": ["count", "sum", "avg", "min", "max"]},
+                        "fn": {"type": "string", "enum": ["count", "sum", "avg", "min", "max"],
+                              "description": "Which aggregate to compute. count needs no "
+                                             "`property`; sum/avg/min/max do."},
                         "property": {
                             "type": "string",
                             "description": (
