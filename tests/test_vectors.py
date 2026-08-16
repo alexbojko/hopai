@@ -2053,6 +2053,31 @@ class TestEdgeBeamLive:
         assert len(result.edges) == 1
         assert result.edges[0]["properties"]["kind"] == "aligned"
 
+    def test_the_beam_ranks_by_similarity_not_by_edge_id(self, fresh_graph):
+        """Every other case in this class inserts the most similar edge
+        FIRST, so it also carries the lowest id -- and `ORDER BY
+        similarity DESC, edge_id` and a bare `ORDER BY edge_id` then
+        pick the same winner. Dropping the similarity term survived the
+        entire class for exactly that reason, which is the whole feature
+        silently becoming "follow the oldest edge".
+
+        Here the similar edge is inserted LAST, so the two orderings
+        disagree and only one of them is right. edge_id stays in the
+        ORDER BY as the tie-break that keeps equal scores deterministic;
+        what must not go is the term in front of it."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "seed": True}, {"id": 2}, {"id": 3}])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "older_but_wrong"},
+                     {"start_id": 1, "end_id": 3, "kind": "newer_but_right"}])
+        ids = self._edges(g)
+        assert ids["older_but_wrong"] < ids["newer_but_right"]
+        g.set_vectors(edges=[{"id": ids["older_but_wrong"], "relvec": [0.0, 1.0, 0.0]},
+                             {"id": ids["newer_but_right"], "relvec": [1.0, 0.0, 0.0]}])
+        result = g.traverse(Start(where={"seed": True}),
+                            Hop(via_near=Near("relvec", QUERY), via_keep=1))
+        assert [e["properties"]["kind"] for e in result.edges] == ["newer_but_right"]
+        assert {n["id"] for n in result.nodes} == {"1", "3"}
+
     def test_threshold_filters_which_edges_are_worth_walking(self, fresh_graph):
         g = self._fixture(fresh_graph)
         kept = g.traverse(Start(where={"seed": True}),

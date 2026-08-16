@@ -123,6 +123,35 @@ class TestIngestAndMutate:
         assert result.nodes == 2
         assert result.edges == 1
 
+    def test_ingest_forwards_merge_edges_on(self, async_fresh_graph, async_admin_graph):
+        """Both merge keys have to reach the sync ingestor. A mutant
+        blanking `merge_edges_on` survived every ingest test here,
+        because the only one that existed passed neither -- so an
+        ingest asked to merge edges would have inserted duplicates
+        instead, and nothing would have said so.
+
+        Asserted through the OUTCOME rather than the call: re-ingesting
+        the same edge is one edge with the new weight if the key
+        arrived, and two edges if it did not."""
+        from hopai import Unique
+
+        async_admin_graph.define_constraints(edges=[Unique("tag")])
+        document = {"nodes": [{"id": 1}, {"id": 2}],
+                    "edges": [{"start_id": 1, "end_id": 2, "tag": "e1", "weight": 5}]}
+
+        async def body():
+            await async_fresh_graph.ingest(document, merge_edges_on=["tag"])
+            # Edges only the second time: the nodes already exist, and
+            # re-sending them would test merge_nodes_on instead.
+            await async_fresh_graph.ingest(
+                {"edges": [{"start_id": 1, "end_id": 2, "tag": "e1", "weight": 9}]},
+                merge_edges_on=["tag"])
+            return await async_fresh_graph.traverse(Start(), Hop(hops=(1, 1)))
+
+        result = run(body())
+        assert len(result.edges) == 1
+        assert result.edges[0]["properties"]["weight"] == 9
+
     def test_delete_nodes_with_no_filter_refuses(self, async_fresh_graph):
         async def body():
             await async_fresh_graph.add_nodes([{"id": 1}])
