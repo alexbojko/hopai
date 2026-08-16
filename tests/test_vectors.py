@@ -273,7 +273,7 @@ class TestVectorDDL:
         g.define_vectors(nodes=[Vector("summary", 3)])
         check = [s for s in g.vector_ddl() if "ADD CONSTRAINT" in s][0]
         assert "graph_id" not in check
-        assert '"vertex"' in check
+        assert "vertex" in check
 
     def test_migrate_without_define_names_the_fix_before_connecting(self):
         with pytest.raises(ValueError, match=r"call define_vectors\(...\) first"):
@@ -1819,6 +1819,23 @@ class TestSearchManyLive:
         finally:
             event.remove(g.engine, "before_cursor_execute", record)
         assert len(statements) == 1
+
+    def test_boost_reaches_the_batched_call_too(self, fresh_graph):
+        """vector_search_many() does nothing but forward its arguments to
+        search_many() -- drop the boost= forwarding and every batched
+        call would quietly stop boosting while the single-query
+        vector_search() kept working, unnoticed unless something calls
+        it with a boost that actually reorders."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "n": "closest", "score": 0.0},
+                     {"id": 2, "n": "runner-up", "score": 0.9}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 2, "docvec": [0.8, 0.6, 0.0]}])
+        (plain,) = g.vector_search_many([Near("docvec", QUERY)], k=10)
+        (boosted,) = g.vector_search_many([Near("docvec", QUERY)], k=10,
+                                          boost=Boost("score", 1.0))
+        assert [h["id"] for h in plain] == ["1", "2"]
+        assert [h["id"] for h in boosted] == ["2", "1"]
 
 
 # ---------------------------------------------------------------------

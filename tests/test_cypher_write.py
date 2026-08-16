@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 
 from hopai import (
-    Col, ConstraintViolation, CypherError, Hop, Start, Unique,
+    Col, ConstraintViolation, CypherError, Hop, PropertyType, Start, Unique,
     cypher_to_operations,
 )
 
@@ -437,6 +437,17 @@ class TestMerge:
     def test_without_the_unique_index_it_says_what_to_declare(self, fresh_graph):
         with pytest.raises(ConstraintViolation, match="define_constraints"):
             fresh_graph.write_cypher("MERGE (a:person {email: 'a@x.com'})")
+
+    def test_a_check_violation_during_merge_names_the_node_side(self, keyed_graph):
+        """PostgreSQL evaluates CHECK constraints on the row being
+        INSERTed before it ever looks for a conflict (see ingest.py's
+        docstring), so a MERGE with a valid unique index can still hit
+        ordinary constraint enforcement -- and _merge_with_sets must
+        report it the same way add_nodes() would, naming 'node'."""
+        keyed_graph.define_constraints(nodes=[PropertyType("age", "number")])
+        with pytest.raises(ConstraintViolation, match="node rejected by constraint"):
+            keyed_graph.write_cypher(
+                "MERGE (a:person {email: 'a@x.com'}) ON CREATE SET a.age = 'not a number'")
 
     def test_merging_a_relationship_between_bound_nodes(self, keyed_graph):
         keyed_graph.write_cypher("MERGE (a {email: 'a'}) MERGE (b {email: 'b'})")

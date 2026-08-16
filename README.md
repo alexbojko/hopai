@@ -128,6 +128,59 @@ may change without a migration path — `drop_schema()` and
 
 Different table or column names? `Graph(engine, node_table=..., edge_table=..., node_id_col=..., ...)`.
 
+**Extending the model** — a field no JSONB property can give you, like a
+foreign key to a `users` table, is an ordinary `Column()` on your own
+table:
+
+```python
+nodes = Table(
+    "nodes", metadata,
+    Column("id", BigInteger, Identity(always=False), primary_key=True),
+    Column("graph_id", Text, nullable=False, server_default="default"),
+    Column("properties", JSONB, nullable=False, server_default="{}"),
+    Column("user_id", BigInteger, ForeignKey("users.id"), nullable=False),
+)
+graph = Graph(engine, node_table=nodes)
+graph.create_schema()   # emits user_id and its foreign key too
+
+graph.add_nodes([{"id": 1, "user_id": 7, "type": "task"}])   # writes the real column
+graph.traverse(Start()).nodes[0]     # {"id": "1", "properties": {"type": "task"}, "user_id": 7}
+```
+
+Graph() finds every such **extra column** on its own — nothing to
+declare — and it behaves like `id` from then on: written by
+`add_nodes`/`add_edges`/`merge_nodes`/`merge_edges` when a row names it,
+returned by `traverse()`, and `Col("user_id")` names it for
+`Unique`/`Index`/merge's `on=`, the same way `Col("start_id")` already
+does. A real `NOT NULL`/`FOREIGN KEY` validates it, for free; what does
+*not* extend to it is `update_nodes`/`update_edges` — `set=`/`remove=`
+stay JSONB-only, so change an extra column with `UPDATE` through the
+engine, or `merge_nodes`/`merge_edges`, which does refresh it on
+conflict. See `hopai/models.py`'s "EXTENDING THE MODEL" note.
+
+Naming a property, a constraint key, or a merge `on=` entry the same as
+an extra column — easy to do by accident, since `user_id` is your own
+project's name, not a universal convention like `id` — is refused, not
+guessed:
+
+```python
+graph.define_schema(nodes=[NodeType("task", properties=[Property("user_id", "number")])])
+# ValueError: NodeType('task'): ['user_id'] already name real column(s) on 'nodes' -- ...
+
+graph.define_constraints(nodes=[Required("user_id")])
+# TypeError: 'user_id' is a real column on nodes (...) -- say Col('user_id') if you meant it
+
+graph.merge_nodes([{"user_id": 7, "name": "..."}], on=["user_id"])
+# TypeError: 'user_id' is a real column on nodes -- say Col('user_id')
+```
+
+Every one of these would otherwise compile a rule against
+`properties->>'user_id'`, a JSONB key that name can never reach once
+it is an extra column — a correct row would fail forever, or worse for
+merge: `ON CONFLICT` would never match, so every "merge" silently
+inserts a duplicate instead of updating one. `Col("user_id")` is always
+the fix when the real column genuinely is what you mean.
+
 ## 🧬 Many graphs, one database
 
 ```python
@@ -313,6 +366,16 @@ Idempotent, so it belongs next to `create_schema()`. A violation raises
 than a driver error. `graph.constraint_ddl(...)` returns the exact SQL
 without running it; `graph.drop_constraints(...)` is the inverse.
 
+Every constraint here is a real `sqlalchemy.Index`/`CheckConstraint`
+attached to `graph.nodes_tbl`/`edges_tbl`, not DDL kept off to the side
+-- so if your project points its own Alembic `target_metadata` at those
+tables (or a custom `node_table=`/`edge_table=` you pass to `Graph()`),
+`alembic revision --autogenerate` sees hopai's constraints as declared
+schema instead of drift to propose dropping. Call `create_schema()` and
+`define_constraints(...)` (or their `_ddl` previews, which attach
+without running anything) from `env.py` before autogenerate runs, the
+same way you would import your own models.
+
 `PropertyType` is worth the line when a model writes your data: an LLM
 emitting `"42"` where you expected `42` breaks every numeric comparison
 downstream, silently and much later.
@@ -401,6 +464,11 @@ graph.enforce_schema()  # idempotent; re-running after a schema change
                         # drops the rules the schema no longer has
 graph.add_nodes([{"type": "person"}])   # ConstraintViolation: email required
 ```
+
+Same SQLAlchemy-metadata attachment as [Constraints](#-constraints)
+above: `enforce_schema()`'s CHECK constraints land as real
+`CheckConstraint` objects on `graph.nodes_tbl`/`edges_tbl`, visible to
+Alembic `--autogenerate` the same way.
 
 Enforcing on a graph that grew **before** the schema did? `ADD
 CONSTRAINT` validates every existing row and fails opaquely on the
@@ -635,6 +703,7 @@ from hopai import Vector, Near
 graph.define_vectors(nodes=[Vector("summary", 1536), Vector("title", 384)],
                      edges=[Vector("relation", 384)])
 graph.migrate_vectors()      # ALTER TABLE, idempotent; vector_ddl() previews it
+                              # (the dimension CHECK it adds is real SA metadata too)
 
 graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
 

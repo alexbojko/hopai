@@ -124,6 +124,50 @@ class TestUnique:
 
 
 # ---------------------------------------------------------------------
+# A bare string colliding with a real column
+# ---------------------------------------------------------------------
+
+class TestColumnCollision:
+    """A bare string that names a real column can only be a mistake --
+    that column is written and read by name already, never through
+    `properties`. Unique/Index/Required/PropertyType all refuse it
+    rather than silently compiling a rule that can never see the value
+    it is testing for; Col(...) is the documented, still-working escape
+    hatch when the real column genuinely is what's meant."""
+
+    def test_unique_refuses_it(self, fresh_graph):
+        with pytest.raises(TypeError, match="'start_id' is a real column"):
+            fresh_graph.constraint_ddl(edges=[Unique("start_id")])
+
+    def test_index_refuses_it(self, fresh_graph):
+        with pytest.raises(TypeError, match="'end_id' is a real column"):
+            fresh_graph.constraint_ddl(edges=[Index("end_id")])
+
+    def test_required_refuses_it(self, fresh_graph):
+        with pytest.raises(TypeError, match="'id' is a real column"):
+            fresh_graph.constraint_ddl(nodes=[Required("id")])
+
+    def test_property_type_refuses_it(self, fresh_graph):
+        with pytest.raises(TypeError, match="'id' is a real column"):
+            fresh_graph.constraint_ddl(nodes=[PropertyType("id", "number")])
+
+    def test_the_message_names_the_fix(self, fresh_graph):
+        with pytest.raises(TypeError, match=r"Col\('start_id'\)"):
+            fresh_graph.constraint_ddl(edges=[Unique("start_id")])
+
+    def test_col_is_the_working_escape_hatch(self, fresh_graph):
+        """The point of the refusal: the real column stays reachable,
+        it just has to say so -- Unique(Col("start_id"), "kind") is
+        exactly what TestMerge.test_merging_edges already relies on."""
+        ddl = fresh_graph.constraint_ddl(edges=[Unique(Col("start_id"), "kind")])
+        assert ddl
+
+    def test_a_non_colliding_property_is_unaffected(self, fresh_graph):
+        fresh_graph.define_constraints(nodes=[Required("email"), Unique("email")])
+        assert fresh_graph.add_nodes([{"email": "a@x.com"}]) == 1
+
+
+# ---------------------------------------------------------------------
 # Presence and type
 # ---------------------------------------------------------------------
 
@@ -257,8 +301,9 @@ class TestLifecycle:
 
     def test_constraint_ddl_does_not_execute(self, fresh_graph):
         ddl = fresh_graph.constraint_ddl(nodes=[Unique("email")])
+        table = f"{fresh_graph.nodes_tbl.schema}.nodes" if fresh_graph.nodes_tbl.schema else "nodes"
         assert ddl == ['CREATE UNIQUE INDEX IF NOT EXISTS "uq_nodes_email" '
-                       'ON "nodes" (graph_id, (properties ->> \'email\'))'], ddl
+                       f'ON {table} (graph_id, (properties ->> \'email\'))'], ddl
         assert "uq_nodes_email" not in indexes(fresh_graph)
 
     def test_create_schema_is_idempotent(self, fresh_graph):
@@ -331,6 +376,143 @@ class TestNaming:
         ddl = graph.constraint_ddl(**{target: [Unique("email")]})[0]
         assert "tenant" in ddl
         assert "graph_id" not in ddl
+
+
+class TestSQLAlchemyMetadata:
+    """define_constraints() attaches real sqlalchemy.Index/CheckConstraint
+    objects to graph.nodes_tbl/edges_tbl -- not just hand-built DDL kept
+    off to the side -- so a tool reading that metadata (Alembic's
+    --autogenerate, chiefly) sees hopai's declared shape natively."""
+
+    def test_unique_attaches_a_real_index(self, fresh_graph):
+        from sqlalchemy import Index as SAIndex
+
+        fresh_graph.define_constraints(nodes=[Unique("email")])
+        match = [ix for ix in fresh_graph.nodes_tbl.indexes if ix.name == "uq_nodes_email"]
+        assert len(match) == 1
+        assert isinstance(match[0], SAIndex)
+        assert match[0].unique is True
+
+    def test_required_attaches_a_real_check_constraint(self, fresh_graph):
+        from sqlalchemy import CheckConstraint as SACheckConstraint
+
+        fresh_graph.define_constraints(nodes=[Required("type")])
+        match = [c for c in fresh_graph.nodes_tbl.constraints
+                 if getattr(c, "name", None) == "ck_required_nodes_type"]
+        assert len(match) == 1
+        assert isinstance(match[0], SACheckConstraint)
+
+    def test_defining_twice_does_not_duplicate_metadata(self, fresh_graph):
+        """SQLAlchemy does not dedupe two same-named Index/CheckConstraint
+        objects attached to one table -- attach the same declaration twice
+        without replacing and Alembic would see two competing definitions
+        for one name."""
+        declarations = {"nodes": [Unique("email"), Required("type")]}
+        fresh_graph.define_constraints(**declarations)
+        fresh_graph.define_constraints(**declarations)
+        assert sum(1 for ix in fresh_graph.nodes_tbl.indexes
+                   if ix.name == "uq_nodes_email") == 1
+        assert sum(1 for c in fresh_graph.nodes_tbl.constraints
+                   if getattr(c, "name", None) == "ck_required_nodes_type") == 1
+
+    def test_previewing_still_attaches(self, fresh_graph):
+        """constraint_ddl() never executes anything, but it still has to
+        attach: a project calling it to preview a migration should see
+        the same metadata a caller of define_constraints() would."""
+        fresh_graph.constraint_ddl(nodes=[Unique("email")])
+        assert any(ix.name == "uq_nodes_email" for ix in fresh_graph.nodes_tbl.indexes)
+
+    def test_a_declaration_cannot_replace_the_composite_foreign_key(self):
+        """The attach machinery matched a same-named object by NAME
+        alone, and `table.constraints` holds the table's own primary key
+        and foreign keys too -- so a constraint named after one of them
+        REPLACED it, on the module-level Edge every default Graph()
+        shares. `edges` then got created without the composite FK that
+        makes a cross-graph edge impossible.
+
+        Uses the real hopai.models.Edge deliberately: the shared
+        singleton is what made this global, and models.py names these
+        two foreign keys in cleartext for anyone to collide with. It is
+        reachable through constraint_ddl(), which runs nothing."""
+        from sqlalchemy.schema import CreateTable
+
+        from hopai.models import Edge
+
+        with pytest.raises(ValueError, match="hopai did not declare"):
+            compile_constraint(
+                Check(GT("weight", 0), name="fk_edges_start_same_graph"),
+                _Target(Edge, "edges", None, "graph_id"))
+
+        kinds = {c.name: type(c).__name__ for c in Edge.constraints if c.name}
+        assert kinds["fk_edges_start_same_graph"] == "ForeignKeyConstraint"
+        assert "fk_edges_start_same_graph" in str(CreateTable(Edge).compile())
+
+    def test_a_unique_cannot_shadow_an_index_backed_constraint(self):
+        """A PRIMARY KEY / UNIQUE constraint owns a backing index of its
+        own name, so it shares one namespace with the indexes Unique()
+        emits. Without the refusal, Unique(name="uq_nodes_id_graph")
+        compiled a CREATE UNIQUE INDEX IF NOT EXISTS that Postgres
+        skipped as already-present -- the declared rule silently never
+        enforced, which is the worst answer this library can give."""
+        from hopai.models import Node
+
+        with pytest.raises(ValueError, match="hopai did not declare"):
+            compile_constraint(Unique("email", name="uq_nodes_id_graph"),
+                               _Target(Node, "nodes", None, "graph_id"))
+        assert not any(i.name == "uq_nodes_id_graph" for i in Node.indexes)
+
+    def test_a_check_may_reuse_a_name_no_index_owns(self, fresh_graph):
+        """The mirror of the two above: a CHECK owns no index, so it is
+        NOT in the index namespace and a check named after one of this
+        graph's own indexes has to keep working -- a refusal widened to
+        every container would break it."""
+        fresh_graph.define_constraints(nodes=[Index("type", name="shared_name")])
+        assert fresh_graph.define_constraints(
+            nodes=[Check(GT("age", 0), name="shared_name")]) == ["shared_name"]
+
+    def test_suspending_restores_on_an_exception(self):
+        """create_schema() hides hopai's declarations while it issues
+        CREATE TABLE, so they are not baked into it. If the CREATE
+        raises -- an unreachable database, a permissions error -- the
+        `finally` has to put them back, or the process is left with a
+        Graph whose declared constraints have silently vanished from its
+        own metadata. Coverage cannot see this: the try/finally is one
+        statement either way."""
+        from hopai.constraints import _attach_index, suspended_declarations
+        from hopai.models import Node
+
+        _attach_index(Node, "ix_suspend_probe", [Node.c.graph_id])
+        try:
+            with suspended_declarations(Node):
+                assert not any(i.name == "ix_suspend_probe" for i in Node.indexes)
+                raise RuntimeError("whatever CREATE TABLE would have raised")
+        except RuntimeError:
+            pass
+        try:
+            assert any(i.name == "ix_suspend_probe" for i in Node.indexes)
+        finally:
+            # Node is a module-level singleton shared by every default
+            # Graph(); leaving a probe on it would follow the whole session.
+            Node.indexes.discard(
+                next(i for i in Node.indexes if i.name == "ix_suspend_probe"))
+
+    def test_drop_constraints_leaves_a_foreign_object_alone(self, fresh_graph):
+        """detach_constraint() is ownership-aware on the way out too --
+        dropping must not evict a table's own constraint that happens to
+        share the name."""
+        from hopai.constraints import detach_constraint
+        from hopai.models import Edge
+
+        detach_constraint(Edge, "check", "fk_edges_start_same_graph")
+        assert any(c.name == "fk_edges_start_same_graph" for c in Edge.constraints)
+
+    def test_drop_constraints_detaches(self, fresh_graph):
+        declarations = {"nodes": [Unique("email"), Required("type")]}
+        fresh_graph.define_constraints(**declarations)
+        fresh_graph.drop_constraints(**declarations)
+        assert not any(ix.name == "uq_nodes_email" for ix in fresh_graph.nodes_tbl.indexes)
+        assert not any(getattr(c, "name", None) == "ck_required_nodes_type"
+                       for c in fresh_graph.nodes_tbl.constraints)
 
 
 class TestViolationErrors:

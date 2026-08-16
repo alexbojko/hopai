@@ -224,6 +224,17 @@ class TestMerge:
                                     on=[Col("start_id"), Col("end_id"), "kind"])
         assert count(fresh_graph, "edges") == 1
 
+    def test_on_refuses_a_bare_string_naming_a_real_column(self, fresh_graph):
+        """merge_edges(on=["start_id"]) meant Col("start_id") -- a bare
+        string always names a JSONB property, so this can only be a
+        mistake. Before the refusal, it silently compiled a conflict
+        target on properties->>'start_id', a key ingestion never
+        writes there, so the merge could never find its own inserts."""
+        fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+        with pytest.raises(TypeError, match="'start_id' is a real column"):
+            fresh_graph.merge_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}],
+                                    on=["start_id", "end_id", "kind"])
+
     def test_merge_is_idempotent(self, fresh_graph):
         """The property that makes merge the right call for an agent that
         may retry: running it twice changes nothing the second time."""

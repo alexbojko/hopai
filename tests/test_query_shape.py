@@ -180,6 +180,64 @@ class TestCustomSchema:
         for default in ("nodes.id", "edges.start_id", "edges.end_id"):
             assert default not in sql
 
+    def test_default_tables_have_no_extra_columns(self, offline_graph):
+        assert offline_graph.node_extra_cols == ()
+        assert offline_graph.edge_extra_cols == ()
+
+    def test_extra_columns_are_discovered_from_the_table(self):
+        """A custom table's columns beyond the ones this library already
+        has a use for -- a foreign key to a `users` table, say -- are
+        found with no separate declaration; see models.py's "EXTENDING
+        THE MODEL" note."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        md = MetaData()
+        v = Table("vertex", md, Column("vid", BigInteger, primary_key=True),
+                  Column("user_id", BigInteger), Column("properties", JSONB))
+        e = Table("link", md, Column("lid", BigInteger, primary_key=True),
+                  Column("src", BigInteger), Column("dst", BigInteger),
+                  Column("note", Text), Column("properties", JSONB))
+        g = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/x",
+                  node_table=v, edge_table=e, node_id_col="vid", edge_id_col="lid",
+                  edge_start_col="src", edge_end_col="dst", graph_col=None)
+        assert g.node_extra_cols == ("user_id",)
+        assert g.edge_extra_cols == ("note",)
+
+    def test_reserved_edge_keys_are_never_extra_columns(self):
+        """"start"/"end" address a node-by-property reference in
+        add_edges()/merge_edges(); a column that happens to be named one
+        of them -- even under custom start_id/end_id column names --
+        must never be treated as a plain extra column, or ingestion
+        would try to write the reference dict into it."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        md = MetaData()
+        e = Table("link", md, Column("lid", BigInteger, primary_key=True),
+                  Column("src", BigInteger), Column("dst", BigInteger),
+                  Column("start", BigInteger), Column("properties", JSONB))
+        g = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/x",
+                  node_table=Node, edge_table=e, edge_id_col="lid",
+                  edge_start_col="src", edge_end_col="dst", graph_col=None)
+        assert g.edge_extra_cols == ()
+
+    def test_vector_columns_are_never_extra_columns(self):
+        """define_vectors()/migrate_vectors() attach vec_* columns to
+        the SAME shared Table object a later Graph() may reuse; those
+        follow their own write path (set_vectors()) and must stay
+        invisible to extra-column discovery even though they are, by
+        then, ordinary columns on the table."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table
+        from sqlalchemy.dialects.postgresql import ARRAY, JSONB, REAL
+
+        md = MetaData()
+        v = Table("vertex", md, Column("vid", BigInteger, primary_key=True),
+                  Column("vec_summary", ARRAY(REAL)), Column("properties", JSONB))
+        g = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/x",
+                  node_table=v, node_id_col="vid", graph_col=None)
+        assert g.node_extra_cols == ()
+
     def test_repr_does_not_leak_the_password(self, offline_graph):
         """Graph.__repr__ turns up in logs, tracebacks and agent
         transcripts. SQLAlchemy's URL repr masks the password; this test

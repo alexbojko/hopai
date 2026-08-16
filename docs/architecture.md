@@ -143,6 +143,52 @@ of its own decisions about how: you construct the client, hopai calls one method
   (`_resolve_query_texts()`), because N round trips to the provider would undo the N-1
   round trips to Postgres that call exists to save.
 
+## Extra columns
+
+A custom `node_table=`/`edge_table=` may carry columns beyond `id`/`start_id`/`end_id`/
+`graph_id`/`properties` — a foreign key to a `users` table is the motivating case.
+`Graph.__init__` diffs the table's columns against the ones it already has a use for
+(`models.NODE_IDENTITY_KEYS`/`EDGE_IDENTITY_KEYS`, plus the configured id/start/end/
+graph columns, plus anything `vec_*` — vector fields keep their own write path and must
+never be mistaken for one of these) and calls what is left over `node_extra_cols` /
+`edge_extra_cols`, computed once and never revisited.
+
+- **Write**: `Ingestor.__init__` widens the identity-key set `split_row()` uses by these
+  names, so a flat row addressing one is pulled into `identity`, not `properties` —
+  `ingest.py:_node_payload`/`_edge_payload` then copy it onto the insert record exactly
+  like `id`. `_require_uniform_columns` is `_require_uniform`'s generalization: a batch
+  where some rows name an extra column and others do not would bind NULL for the rest
+  (the same executemany trap `id` has), so it is refused per-column, not just for `id`.
+  `merge_nodes`/`merge_edges` (`_merge_payload`) also add each extra column the payload
+  actually carries to the `ON CONFLICT DO UPDATE` `set_=` as `EXCLUDED.<col>` — a plain
+  column has no `||` merge the way `properties` does, so a re-import simply overwrites
+  it, in step with `properties`.
+- **Read**: `Graph.traverse()`'s two hydration `SELECT`s (not `build_query()`, which only
+  ever returns tagged `(kind, id)` rows) add the extra columns and fold each into its
+  node/edge dict by name. With no extra columns declared the statement and the dict
+  shape are unchanged from before this existed — the same "byte-identical when unused"
+  contract vectors.py's `near=` keeps.
+- **Constraints**: no new vocabulary — `Col("user_id")` (constraints.py) already named a
+  real column before this existed (`Col("start_id")`), so `Unique`/`Index`/merge's `on=`
+  need nothing extra to reach one.
+- **Column collisions are refused, not guessed.** Naming an extra column in a place that
+  means a JSONB property — `Property('user_id', ...)`/a dataclass field of that name,
+  `Required("user_id")`/`Unique("user_id")` etc. with no `Col(...)`, or a bare
+  `on=["user_id"]` — used to compile silently onto `properties->>'user_id'`, a key
+  ingestion never populates for that name. `constraints._reject_column_collision()`
+  (checked in `_key_expression`, so `Unique`/`Index` **and** `merge_nodes`/`merge_edges`'s
+  `on=` share one guard — both render through `key_sql()`) and
+  `schema.check_no_column_collisions()` (checked by `Graph.define_schema()` **and**
+  `load_schema()`, since a saved schema can be adopted onto a different table) both raise
+  naming the exact collision. Neither guesses a `Col(...)` on the caller's behalf —
+  refusing beats guessing, same as everywhere else in this library — and neither touches
+  `Check(...)`, whose filter tree has no fixed key list to check without re-deriving
+  `schema.py`'s own `_filter_vocabulary` walk.
+- **Deliberately out of scope**: `update_nodes()`/`update_edges()` stay `properties`-only
+  (`set=`/`remove=` are a JSONB merge with no equivalent for a plain column) and Cypher
+  writes never populate one (a property map literal has nowhere else to go but
+  `properties`) — both documented in ingest.py/models.py rather than half-supported.
+
 ## The write path
 
 `Graph` exposes the writes; `ingest.py` and `constraints.py` implement them; `core.py`

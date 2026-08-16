@@ -164,7 +164,7 @@ from sqlalchemy import String as SAString
 from sqlalchemy.dialects.postgresql import ARRAY, DOUBLE_PRECISION, REAL
 from sqlalchemy.exc import IntegrityError
 
-from .constraints import ConstraintViolation, _literal, _slug, _Target
+from .constraints import ConstraintViolation, _compile_check, _slug, _Target
 from .filters import resolve
 
 #: Every vector field lives in a real column named after itself with
@@ -1253,16 +1253,26 @@ def _constraint_name(target: _Target, field: Vector) -> str:
     return f"{name[:50]}_{digest}"
 
 
-def _dims_check_body(target: _Target, field: Vector) -> str:
-    column = sa_column(field.column_name, ARRAY(REAL))
-    shape = or_(
+def _dims_shape(target: _Target, field: Vector):
+    """The dimension CHECK's unscoped body, as a BOUND expression: NULL
+    passes (a vector is optional until set_vectors() writes one), a 1-D
+    array of exactly field.dimensions passes, anything else does not.
+
+    Built on `_attach(target.table, ...)` rather than an unbound
+    sa_column(), so the CheckConstraint compile_constraint()'s sibling
+    _compile_check() builds from it can infer target.table and
+    self-register -- the same real-metadata attachment every other
+    constraint in this library goes through (see hopai.constraints)."""
+    column = _attach(target.table, field.column_name)
+    return or_(
         column.is_(None),
         and_(func.array_ndims(column) == 1, func.array_length(column, 1) == field.dimensions),
     )
-    return _literal(target.scope_check(shape))
 
 
 def _field_ddl(target: _Target, field: Vector) -> list:
+    name = _constraint_name(target, field)
+    expression = target.scope_check(_dims_shape(target, field))
     return [
         f'ALTER TABLE {target.qualified} ADD COLUMN IF NOT EXISTS '
         f'"{field.column_name}" real[]',
@@ -1271,8 +1281,7 @@ def _field_ddl(target: _Target, field: Vector) -> list:
         # instead of decompressing every row first.
         f'ALTER TABLE {target.qualified} ALTER COLUMN "{field.column_name}" '
         f'SET STORAGE EXTERNAL',
-        f'ALTER TABLE {target.qualified} ADD CONSTRAINT "{_constraint_name(target, field)}" '
-        f'CHECK ({_dims_check_body(target, field)})',
+        _compile_check(target.table, name, expression),
     ]
 
 
@@ -1646,6 +1655,7 @@ def drop_vectors(graph, node_fields=None, edge_fields=None, connection=None) -> 
     re-embed") only works if the field is still declared when you get
     to step two. Returns "table.column" per field, the vocabulary
     migrate_vectors() returns."""
+    from .constraints import detach_constraint
     from .ingest import one_transaction
 
     dropped = []
@@ -1655,10 +1665,11 @@ def drop_vectors(graph, node_fields=None, edge_fields=None, connection=None) -> 
             target = _target_for(graph, target_name)
             for entry in names or ():
                 field = entry if isinstance(entry, Vector) else Vector(entry, 1)
+                name = _constraint_name(target, field)
                 conn.execute(text(
-                    f'ALTER TABLE {target.qualified} DROP CONSTRAINT IF EXISTS '
-                    f'"{_constraint_name(target, field)}"'
+                    f'ALTER TABLE {target.qualified} DROP CONSTRAINT IF EXISTS "{name}"'
                 ))
+                detach_constraint(table, "check", name)
                 exists = conn.execute(_COLUMN_TYPE, {
                     "table": table.name, "column": field.column_name, "schema": table.schema,
                 }).scalar()
