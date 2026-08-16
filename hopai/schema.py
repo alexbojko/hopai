@@ -1265,6 +1265,22 @@ class TypeConflict:
     json_types: tuple
 
 
+@dataclass(frozen=True)
+class DroppedEdgeType:
+    """An edge kind the edge sample saw, naming an endpoint type the
+    node sample never returned a row for -- only reachable under
+    sample_percent: an exact scan's node_types enumerates every named
+    type the (unsampled) endpoint join could possibly produce, so a
+    named endpoint missing from `observed` means the node side of the
+    sample simply didn't land on it. The kind is dropped rather than
+    built into an EdgeType GraphSchema would then reject; this is the
+    record of why it is missing, not silence."""
+    kind: str
+    end: str            # "source" or "target" -- which endpoint was unseen
+    type_name: str
+    rows: int
+
+
 @dataclass
 class InferenceReport:
     """What infer_schema() saw that the schema alone cannot say -- read
@@ -1276,6 +1292,7 @@ class InferenceReport:
     untyped_edges: int
     skipped_endpoint_edges: int
     conflicts: tuple
+    dropped_edge_types: tuple = ()
     sampled: Optional[float] = None
 
     def __str__(self) -> str:
@@ -1295,6 +1312,9 @@ class InferenceReport:
         for c in self.conflicts:
             lines.append(f"conflict: {c.table}/{c.type_name}.{c.key} observed as "
                          f"{list(c.json_types)}")
+        for d in self.dropped_edge_types:
+            lines.append(f"edge kind {d.kind!r} dropped: {d.end} type {d.type_name!r} "
+                         f"not present in the sampled nodes")
         return "\n".join(lines)
 
 
@@ -1430,11 +1450,22 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
     observed = {t.name for t in node_types}
     edge_types = []
     skipped = 0
+    dropped_edge_types = []
     for row in sorted(triples, key=lambda r: (r.kind or "", r.source or "", r.target or "")):
         if not _named(row.kind):
             continue  # already counted as kindless below
-        if row.source not in observed or row.target not in observed:
+        missing = [end for end in ("source", "target") if getattr(row, end) not in observed]
+        if missing:
             skipped += row.rows
+            for end in missing:
+                type_name = getattr(row, end)
+                if _named(type_name):
+                    # A named type missing from `observed` can only happen
+                    # under sampling (see DroppedEdgeType) -- an untyped
+                    # endpoint (type_name is None) is the pre-existing,
+                    # non-sampling dead end and stays folded into `skipped`.
+                    dropped_edge_types.append(
+                        DroppedEdgeType(row.kind, end, type_name, row.rows))
             continue
         edge_types.append(EdgeType(row.kind, source=row.source, target=row.target,
                                    properties=edge_props.get(row.kind, ())))
@@ -1446,6 +1477,7 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
         untyped_edges=sum(v for k, v in edge_counts.items() if not _named(k)),
         skipped_endpoint_edges=skipped,
         conflicts=tuple(conflicts),
+        dropped_edge_types=tuple(dropped_edge_types),
         sampled=sample_percent,
     )
     return GraphSchema(node_types, edge_types), report

@@ -1304,9 +1304,67 @@ class TestInferenceSampling:
         assert report.edge_counts == {"works_at": 2, "likes": 2, "dangles": 1}
         assert report.skipped_endpoint_edges == 5
         assert "not one of the above" in str(report)
+        # Every named endpoint the edge sample named -- 'person' (both
+        # ends of 'works_at' and 'likes') and 'company' -- is reported by
+        # name; the untyped 'dangles' target stays folded into the
+        # generic skipped count above, since it was never a type inference
+        # could have claimed regardless of sampling.
+        dropped_kinds = {(d.kind, d.end, d.type_name) for d in report.dropped_edge_types}
+        assert dropped_kinds == {
+            ("works_at", "source", "person"), ("works_at", "target", "company"),
+            ("likes", "source", "person"), ("likes", "target", "person"),
+            ("likes", "target", "company"),
+            ("dangles", "source", "person"),
+        }
+        assert ("edge kind 'works_at' dropped: source type 'person' not present "
+                "in the sampled nodes") in str(report)
         # The point of dropping rather than raising: what comes back is
         # still something define_schema() accepts. An inferred schema
         # its own library refuses is not a usable answer.
+        fresh_graph.define_schema(schema=schema)
+
+    def test_a_sample_that_saw_some_nodes_drops_only_the_edges_they_cant_support(
+            self, fresh_graph, monkeypatch):
+        """The bug from #41: the node sample need not miss EVERY type to
+        raise, just the one an edge names. Here the node sample lands on
+        'person' but never on 'company', while the (fully sampled) edge
+        side still reports 'works_at' and one 'likes' edge into 'company'.
+        Before the fix, EdgeType('works_at', source='person',
+        target='company') got built against a node_types list containing
+        'person' but not 'company', and GraphSchema raised all the same --
+        this is the case test_partial_sample_still_returns_a_valid_schema
+        only caught 2/25 runs of. Now the unsupported edge kinds are
+        dropped and named in the report, and the surviving schema (with
+        'person' but not 'company', and only the person->person 'likes'
+        edge) still adopts cleanly."""
+        from sqlalchemy import select
+
+        import hopai.schema as schema_module
+
+        real_source = schema_module._source
+
+        def node_sample_sees_only_person(table, sample_percent):
+            if table is fresh_graph.nodes_tbl:
+                return select(table).where(
+                    table.c.properties["type"].astext == "person").subquery()
+            return real_source(table, 100)
+
+        monkeypatch.setattr(schema_module, "_source", node_sample_sees_only_person)
+        seed_chaotic(fresh_graph)
+        schema, report = fresh_graph.infer_schema(sample_percent=5)
+
+        assert [nt.name for nt in schema.node_types] == ["person"]
+        assert [(et.kind, et.source, et.target) for et in schema.edge_types] == [
+            ("likes", "person", "person")]
+        dropped_kinds = {(d.kind, d.end, d.type_name) for d in report.dropped_edge_types}
+        assert dropped_kinds == {
+            ("works_at", "target", "company"), ("likes", "target", "company"),
+        }
+        assert ("edge kind 'works_at' dropped: target type 'company' not present "
+                "in the sampled nodes") in str(report)
+        assert ("edge kind 'likes' dropped: target type 'company' not present "
+                "in the sampled nodes") in str(report)
+        # Not a raise -- and what comes back adopts, same as the all-missing case.
         fresh_graph.define_schema(schema=schema)
 
     def test_out_of_range_percent_is_refused_offline(self, offgraph):
