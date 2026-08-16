@@ -93,9 +93,15 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[notebooks]"
-      # Not --save: CI verifies that they run, and never rewrites the committed
-      # outputs. Regenerating those is a deliberate local step.
-      - run: python scripts/run_notebooks.py
+      # --check, not --save: CI verifies that the notebooks run AND that what
+      # they print still matches the committed outputs (after normalizing
+      # execution metadata and timing-shaped numbers -- see mask_timings() in
+      # scripts/run_notebooks.py), but it never rewrites them. A bare run only
+      # answers "does this still execute" -- an API change can leave a
+      # notebook running cleanly while quietly printing something stale, which
+      # is what --check catches. Regenerating the committed outputs with
+      # --save is a deliberate local step.
+      - run: python scripts/run_notebooks.py --check
 
   # The documentation site (mkdocs.yml), built but never published here --
   # Read the Docs publishes it, from the release tag (see .readthedocs.yaml).
