@@ -406,14 +406,19 @@ class TestConnectionIsShared:
             await g.add_edges([{"start_id": 1, "end_id": 2, "tag": "e1"}])
             await g.merge_edges([{"start_id": 1, "end_id": 2, "tag": "e1", "weight": 2}],
                                 on=["tag"])
+            await g.ingest({"nodes": [{"id": 3, "email": "c@x.com"}],
+                            "edges": [{"start_id": 1, "end_id": 3, "tag": "e2"}]})
             await g.set_vectors(nodes=[{"id": 1, "summary": [1.0, 0.0]}])
             await g.vector_search(Near("summary", [1.0, 0.0]), k=1)
             await g.vector_search_many([Near("summary", [1.0, 0.0])], k=1)
             await g.get_vectors(node_ids=[1])
+            await g.stale_vectors()
             await g.drop_vectors(node_fields=["summary"])
             await g.mutate_cypher("MATCH (a {email: 'a@x.com'}) SET a.active = true")
-            await g.write_cypher("CREATE (c:person {email: 'c@x.com'})")
-            await g.delete_nodes(where={"email": "c@x.com"})
+            await g.write_cypher("CREATE (d:person {email: 'd@x.com'})")
+            await g.update_nodes(where={"email": "d@x.com"}, set={"checked": True})
+            await g.delete_nodes(where={"email": "d@x.com"})
+            await g.delete_edges(where={"tag": "e2"})
             await g.update_edges(where={"tag": "e1"}, set={"seen": True})
             await g.mutate({"operations": [
                 {"op": "update_nodes", "where": {"email": "b@x.com"}, "set": {"checked": True}},
