@@ -694,6 +694,38 @@ def build_registry(nodes, edges) -> dict:
     return registry
 
 
+def field_names(vectors: Optional[dict], target: Optional[str] = None) -> list:
+    """Sorted declared vector field names -- the one place that answers
+    "what can be searched here", so a tool schema's enum can never drift
+    from the registry it describes.
+
+    `vectors` is the {"nodes": {name: Vector}, "edges": {...}} shape
+    build_registry()/Graph.vectors produces; None (define_vectors()
+    never called) reads like an empty registry rather than raising --
+    every caller here is building an OPTIONAL enum, not requiring the
+    feature.
+
+    `target` narrows to "nodes" or "edges"; omitted, it is the union of
+    both. That union is what a schema whose `target` argument is picked
+    by the CALLER, not fixed at schema-build time, has to enumerate --
+    VECTOR_SEARCH_TOOL_SCHEMA's one `near` $def is shared by both, and
+    mcp.py's `search_similar` takes the same union when it cannot yet
+    tell which side a call will search.
+
+    Shared by Graph.tool_schemas() (this graph's own registry) and
+    hopai.mcp's Served.vector_fields() (unioned across every graph one
+    server serves) -- CLAUDE.md's "one place that answers this
+    question," restated for code instead of prose."""
+    if vectors is None:
+        return []
+    if target is not None:
+        return sorted(vectors.get(target) or {})
+    names: set = set()
+    for fields in vectors.values():
+        names.update(fields)
+    return sorted(names)
+
+
 def _attach(table, column_name: str):
     """The vec_* column as SQLAlchemy metadata, adding it if this
     handle never declared it.

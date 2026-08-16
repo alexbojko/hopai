@@ -476,9 +476,15 @@ class Served:
         Names only. This carried which graphs declared each field until
         a mutant replaced those names with None and nothing noticed --
         because nothing read them. Data no caller uses is where mutants
-        live, so it is gone rather than asserted into relevance."""
-        return {field for graph in self.graphs.values()
-                for field in _vector_fields(graph, target)}
+        live, so it is gone rather than asserted into relevance.
+
+        Built from vectors.field_names() -- the same "what can be
+        searched here" answer Graph.tool_schemas() reads for a single
+        graph, so a widened enum on one side can never drift from the
+        other (issue #51)."""
+        from .vectors import field_names
+        return {name for graph in self.graphs.values()
+                for name in field_names(graph.vectors, target)}
 
     def seeds_from_text(self, embed: Optional[Callable]) -> bool:
         return any(_seeds_from_text(graph, embed) for graph in self.graphs.values())
@@ -764,7 +770,8 @@ def _describe_tool(served: Served, read_only: bool, allow_ddl: bool, allow_mutat
     def describe_graph(graph: Optional[str] = None, counts: bool = False) -> dict:
         graph = served.pick(graph, "describe_graph")
         schema = graph.schema
-        vectors = {target: {name: field.dimensions
+        from .schema import vector_field_json
+        vectors = {target: {name: vector_field_json(name, field)
                             for name, field in _vector_fields(graph, target).items()}
                    for target in ("nodes", "edges")}
         result = {

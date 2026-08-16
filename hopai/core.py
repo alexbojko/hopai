@@ -750,7 +750,8 @@ class Graph:
         self._schema = schema
         return schema
 
-    def infer_schema(self, sample_percent: Optional[float] = None) -> tuple:
+    def infer_schema(self, sample_percent: Optional[float] = None,
+                     vector_populated: bool = False) -> tuple:
         """Derive the schema from the rows this graph already holds:
         node types from `properties->>'type'`, edge kinds from
         `properties->>'kind'` plus observed endpoint pairs, required
@@ -765,9 +766,18 @@ class Graph:
         hopai/schema.py's INFERENCE section for semantics and cost.
         On tables too large for that, sample_percent=5 reads a
         TABLESAMPLE SYSTEM slice instead; counts become estimates and
-        rare properties can be missed, and the report says so."""
+        rare properties can be missed, and the report says so.
+
+        The returned schema's `vectors` section mirrors THIS handle's
+        OWN define_vectors() declaration -- dimensions, source, whether
+        a field embeds -- for free; vector_populated=True additionally
+        reads stale_vectors() for each declared field (one more query,
+        on the same connection) and reports what fraction of the
+        target's rows actually carry one, so plain infer_schema() never
+        pays for a scan it did not ask for."""
         from .schema import infer_schema
-        return infer_schema(self, sample_percent=sample_percent)
+        return infer_schema(self, sample_percent=sample_percent,
+                            vector_populated=vector_populated)
 
     @property
     def schema(self):
@@ -815,12 +825,13 @@ class Graph:
                 _Target(self.edges_tbl, "edges", self.graph, self.graph_col))
 
     def tool_schemas(self) -> list:
-        """The four LLM tool definitions -- traverse, aggregate, ingest,
-        mutate -- as deep copies, with THIS graph's declared schema
-        summarized into each description so a function-calling model
-        sees what exists instead of guessing labels and property names.
-        With no schema defined, the static definitions come back
-        unchanged (as copies): the schema stays optional.
+        """The LLM tool definitions -- traverse, aggregate, ingest,
+        mutate, and (when this graph has declared any) vector search --
+        as deep copies, with THIS graph's declared schema summarized
+        into each description so a function-calling model sees what
+        exists instead of guessing labels and property names. With no
+        schema defined, the static definitions come back unchanged (as
+        copies): the schema stays optional.
 
         Every front end hopai has, including the one that deletes --
         handing a model three of four and leaving it to discover
@@ -828,17 +839,34 @@ class Graph:
         visible. Pick the subset you want to expose; this is the whole
         list.
 
+        VECTOR_SEARCH_TOOL_SCHEMA joins the other four only WHEN
+        self._vectors declares at least one field (issue #51) -- a
+        graph with none has nothing to search by meaning, and offering
+        the tool anyway would be a call that fails every time. Its
+        static `field` parameter is a bare string; the copy appended
+        here narrows it to an ENUM of this graph's own declared field
+        names (vectors.field_names(), the same "what can be searched
+        here" helper hopai.mcp's Served.vector_fields() calls), so a
+        model is choosing among real fields rather than guessing one --
+        the same treatment `search_field` already gets in hopai.mcp.
+
         Only descriptions differ from the module constants; the
         `parameters` sections are identical, because what the parsers
         accept has not changed -- this is presentation, not grammar."""
         import copy
 
         from .ingest import INGEST_TOOL_SCHEMA
-        from .json_api import AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA
+        from .json_api import AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, VECTOR_SEARCH_TOOL_SCHEMA
         from .mutate import MUTATE_TOOL_SCHEMA
         tools = [copy.deepcopy(tool) for tool in
                  (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA,
                   MUTATE_TOOL_SCHEMA)]
+        from .vectors import field_names
+        names = field_names(self._vectors)
+        if names:
+            search = copy.deepcopy(VECTOR_SEARCH_TOOL_SCHEMA)
+            search["parameters"]["$defs"]["near"]["properties"]["field"]["enum"] = names
+            tools.append(search)
         if self._schema is not None:
             from .schema import tool_summary
             summary = tool_summary(self._schema)
