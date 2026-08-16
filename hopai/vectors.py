@@ -128,9 +128,12 @@ A boost cannot push a row past a min_similarity floor (thresholds
 read each field's own similarity, not the combined score) -- but it
 DOES reorder, so with k it changes which rows come back, and the
 `similarity` in each result is then the combined score, which can
-exceed 1. The library will NOT normalize a property for you, because
-a raw view count would not boost a cosine ranking, it would replace
-it. See Boost.
+exceed 1. By default each boost is rescaled into [0, 1] -- similarity's
+own scale, not its sign -- with a min-max window function over the
+candidate set before it is weighted, so `weight` means what it says
+regardless of the property's own scale -- a raw view count would otherwise not
+boost a cosine ranking, it would replace it. `Boost(..., scale="raw")`
+is the unbounded, unscaled escape hatch. See Boost.
 
 A boost that dominates the ranking should be visible, not discovered
 by staring at scores that don't line up with similarity -- so each hit
@@ -194,7 +197,7 @@ from sqlalchemy import (
 )
 from sqlalchemy import String as SAString
 from sqlalchemy.dialects.postgresql import ARRAY, DOUBLE_PRECISION, REAL
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 
 from .constraints import ConstraintViolation, _compile_check, _slug, _Target
 from .filters import resolve
@@ -450,22 +453,62 @@ class Boost:
     `missing=` picks a MODE, this picks a VALUE, and one word for two
     kinds of thing is how you get a caller passing "zero" here.)
 
-    THE LIBRARY DOES NOT NORMALIZE FOR YOU, and will not guess: a
-    cosine similarity lives in [-1, 1], so a raw property of 1..10000
-    (a view count, a timestamp) does not "boost" the ranking, it
-    replaces it. Store a property already scaled to roughly [0, 1] --
-    or pass a callable and scale it in SQL. Guessing a normalization
-    would silently change which neighbors come back, and the caller
-    would have no way to see it happened.
+    NORMALIZED BY DEFAULT: a cosine similarity lives in [-1, 1], and a
+    raw property does not -- `Boost("importance", 0.2)` on view counts
+    in the thousands does not nudge the ranking, `0.2 * 4200` overwhelms
+    a similarity that never exceeds 1 and the "boost" becomes the whole
+    sort with the cosine reduced to rounding-error noise. So by default
+    each boost is rescaled into similarity's own range with min-max
+    normalization computed OVER THE CANDIDATE SET -- the rows still in
+    play after `where=` and the graph scope, the same set the similarity
+    itself is scored against:
+
+        (value - min(value) OVER ()) / nullif(max(value) OVER () - min(value) OVER (), 0)
+
+    That is a window function, not a guess at your data's distribution:
+    it reads the actual spread of THIS query's candidates, so
+    `Boost("importance", 0.2)` really does mean "20% weight" against a
+    same-scale similarity, whatever range `importance` happens to hold.
+    When every candidate's value is identical there is no spread to
+    normalize against (the denominator is 0) -- the normalized term
+    contributes NOTHING rather than divide-by-zero into NULL, since a
+    property with no variance across the candidates carries no ranking
+    signal to add. Recomputed per query, because "the candidate set"
+    changes with every `where=`.
+
+    `scale="raw"` is the escape hatch, and it is the FULL previous
+    behavior, unchanged: the coefficient multiplies the property as
+    stored, unbounded, and the caller owns scaling it (into [0, 1] by
+    hand, or with a callable that does it in SQL). Reach for it when you
+    already store a normalized value, or want to avoid the window
+    function's cost, or when the default's per-query rescaling itself is
+    the thing you do not want (it makes a boosted `similarity` above 1
+    depend on what else was in the candidate set, not just on this row)
+    -- see `benchmarks/README.md` for the measured cost of the default
+    against `raw`.
+
+    A boost cannot lift a row past a min_similarity floor (those read
+    each field's own similarity), but it reorders, so with `k` it
+    changes which rows you get. A boost reads a NUMERIC property; a row where the
+    property is absent, null, or non-numeric contributes `default`
+    (0.0) rather than dropping out -- a boost is a nudge, not a
+    filter. Use `where=` to filter. (`default`, not `missing`: Near's
+    `missing=` picks a MODE, this picks a VALUE, and one word for two
+    kinds of thing is how you get a caller passing "zero" here.)
 
     The callable form is the same escape hatch the filter DSL has: it
     receives the real `properties` column and returns any numeric
-    SQLAlchemy expression.
+    SQLAlchemy expression -- it too is normalized by default, since the
+    library cannot tell from the expression alone whether it is already
+    scaled.
 
         Boost(lambda p: func.ln(1 + cast(p["views"].astext, Float)), 0.1)
     """
 
-    def __init__(self, key, weight: float = 1.0, default: float = 0.0):
+    _SCALES = ("normalized", "raw")
+
+    def __init__(self, key, weight: float = 1.0, default: float = 0.0,
+                 scale: str = "normalized"):
         if not (isinstance(key, str) and key) and not callable(key):
             raise TypeError(
                 f"Boost takes a property name or a callable receiving the properties "
@@ -481,13 +524,22 @@ class Boost:
                 "Boost weight must be non-zero -- a zero weight contributes nothing; "
                 "drop the Boost instead"
             )
-        self.weight, self.default = float(weight), float(default)
+        if scale not in self._SCALES:
+            raise ValueError(
+                f"Boost scale must be one of {self._SCALES}, got {scale!r} -- "
+                f"'normalized' rescales the property into [0, 1] "
+                f"over the candidate set (the new default), 'raw' is today's unbounded "
+                f"behavior"
+            )
+        self.weight, self.default, self.scale = float(weight), float(default), scale
 
     def __repr__(self) -> str:
         key = self.key if isinstance(self.key, str) else "<callable>"
         parts = [repr(key) if isinstance(self.key, str) else key, f"weight={self.weight!r}"]
         if self.default != 0.0:
             parts.append(f"default={self.default!r}")
+        if self.scale != "normalized":
+            parts.append(f"scale={self.scale!r}")
         return f"Boost({', '.join(parts)})"
 
 
@@ -509,7 +561,21 @@ def _boost_columns(table, boosts: list) -> list:
 
     The jsonb_typeof guard is the same judgement aggregates.py makes:
     a property carrying "high" where a number was expected reads as
-    absent instead of aborting the statement."""
+    absent instead of aborting the statement.
+
+    scale="normalized" (the default) wraps the coalesced value in a
+    min-max window function -- computed HERE, at the same select level
+    that lists these columns, because a window function's OVER () sees
+    exactly the rows this SELECT is producing: the candidates that
+    survived where=/via= and the graph scope, never the whole table.
+    It normalizes the COALESCED value, not the raw nullable one, so a
+    missing property's `default` takes part in the min/max the same way
+    it takes part in the sum in _combined() -- normalizing the raw
+    value first and coalescing a default into an already-[0,1] range
+    would let one absent property silently outrank real data at either
+    end of it.
+    See Boost's docstring for the SQL this renders and why it is the
+    default; benchmarks/README.md has the measured cost."""
     columns = []
     for i, boost in enumerate(boosts):
         if callable(boost.key):
@@ -525,10 +591,33 @@ def _boost_columns(table, boosts: list) -> list:
         # bound parameter types are identical without it. Kept because it
         # says what the column holds; recorded so the next mutation run,
         # which flags dropping it, does not re-derive that it is inert.
-        columns.append(
-            func.coalesce(value, literal(boost.default, type_=DOUBLE_PRECISION))
-            .label(f"boost_{i}")
-        )
+        coalesced = func.coalesce(value, literal(boost.default, type_=DOUBLE_PRECISION))
+        if boost.scale == "normalized":
+            lo = func.min(coalesced).over()
+            hi = func.max(coalesced).over()
+            # nullif(hi - lo, 0): every candidate shares one value, so
+            # there is no spread to normalize against. Left as a bare
+            # division the NULL denominator would make the WHOLE term
+            # NULL, and _combined() adds boosts straight into the total
+            # -- one boost with no variance would then zero out a row's
+            # SIMILARITY too, breaking "combined IS NOT NULL means some
+            # similarity had a direction" for every row whenever a boost
+            # happened to be constant across the candidates. coalesce(.,
+            # 0) is what keeps a no-signal boost a no-op instead.
+            # type_ on nullif() is load-bearing here, not documentation
+            # (contrast the comment above): left to infer, SQLAlchemy
+            # types it NUMERIC, and a float8 numerator over a numeric
+            # denominator is numeric division -- slower, and a different
+            # arithmetic than the float8 this expression stays in
+            # otherwise. Same fix _similarity()'s own nullif() needed.
+            span = func.nullif(hi - lo, literal(0.0, type_=DOUBLE_PRECISION),
+                               type_=DOUBLE_PRECISION)
+            normalized = func.coalesce(
+                (coalesced - lo) / span, literal(0.0, type_=DOUBLE_PRECISION)
+            )
+            columns.append(normalized.label(f"boost_{i}"))
+        else:
+            columns.append(coalesced.label(f"boost_{i}"))
     return columns
 
 
@@ -564,7 +653,7 @@ def _norm(vector: tuple) -> float:
 
 def parse_boost(spec: Any):
     """The JSON form of Boost: {"property": "score", "weight": 0.2}
-    plus the optional "default", or a list of such objects. No
+    plus the optional "default"/"scale", or a list of such objects. No
     callable form here -- JSON cannot carry one, and a string that
     became SQL would be an injection, not a feature."""
     if isinstance(spec, list):
@@ -574,14 +663,14 @@ def parse_boost(spec: Any):
     if not isinstance(spec, dict):
         raise TypeError(f'"boost" must be an object or a list of objects -- '
                         f'got {type(spec).__name__}')
-    unknown = set(spec) - {"property", "weight", "default"}
+    unknown = set(spec) - {"property", "weight", "default", "scale"}
     if unknown:
         raise ValueError(f'unknown "boost" keys {sorted(unknown)} -- a boost spec has '
-                         f'"property" and optionally weight, default')
+                         f'"property" and optionally weight, default, scale')
     if "property" not in spec:
         raise ValueError('a boost spec needs "property" -- e.g. {"property": "score"}')
     return Boost(spec["property"], weight=spec.get("weight", 1.0),
-                 default=spec.get("default", 0.0))
+                 default=spec.get("default", 0.0), scale=spec.get("scale", "normalized"))
 
 
 def parse_near(spec: Any):
@@ -677,7 +766,8 @@ def _defined(graph, target: str, caller: str) -> dict:
         raise ValueError(
             f"{caller} needs vector fields and none are defined for {target} on this Graph -- "
             f"call define_vectors({target}=[Vector('name', dimensions)]) first (a handle from "
-            f"in_graph() starts without them, like a schema)"
+            f"in_graph() starts lazy -- a search or load_vectors() recovers it from the "
+            f"database, but this call didn't go through either)"
         )
     return registry[target]
 
@@ -946,11 +1036,13 @@ def _similarity_terms(table, nears: list, query=None) -> tuple:
 def _combined(inner, nears: list, boosts: list = ()):
     """The ranked score: weighted similarities, plus weighted boosts.
 
-    Boosts are added AFTER the similarity terms and never NULL (they
-    coalesce to their `default`), which is what keeps
-    `combined IS NOT NULL` meaning "some similarity had a direction".
-    It does NOT mean a boost is free of consequence: it reorders, and
-    with a `k` limit reordering decides membership."""
+    Boosts are added AFTER the similarity terms and never NULL --
+    `_boost_columns()` coalesces a missing property to `default`, and
+    (scale="normalized") coalesces a zero-spread candidate set to 0 on
+    top of that -- which is what keeps `combined IS NOT NULL` meaning
+    "some similarity had a direction". It does NOT mean a boost is free
+    of consequence: it reorders, and with a `k` limit reordering
+    decides membership."""
     total = None
     for i, near in enumerate(nears):
         term = inner.c[f"sim_{i}"] if near.weight == 1.0 else inner.c[f"sim_{i}"] * near.weight
@@ -1167,12 +1259,94 @@ def build_search_query(graph, near, target: str = "nodes", k: Optional[int] = 10
     return query
 
 
+#: Postgres's SQLSTATE for "column does not exist" -- what a compiled
+#: query referencing a declared-but-never-migrated vec_* column raises
+#: as. Comparing this rather than the exception's Python class name
+#: keeps _raise_if_unmigrated() driver-agnostic (psycopg2's pgcode and
+#: psycopg3's sqlstate both carry it), the same reason embeddings.py
+#: never imports a provider package to recognize one.
+_UNDEFINED_COLUMN = "42703"
+
+
+def _ensure_lazy_vectors(graph, connection) -> None:
+    """in_graph() marks its handle `_vectors_lazy` instead of starting
+    it permanently blank (see Graph.in_graph()): the vec_* columns are
+    SHARED storage, so a field another handle already migrated for
+    THIS graph is usable here too, without an explicit load_vectors()
+    call from the caller. Fires at most meaningfully once -- a handle
+    that already has a registry, lazy or explicitly declared, is left
+    alone."""
+    if graph._vectors is None and getattr(graph, "_vectors_lazy", False):
+        load_vectors(graph, connection=connection)
+
+
+def _near_field_names(near) -> list:
+    """Every Near.field in one search's near= argument, in the shape
+    it was given (single Near or a list) -- used only to name fields
+    on the error path below, so it does not need validate_nears()'s
+    normalization."""
+    items = near if isinstance(near, (list, tuple)) else [near]
+    return [one.field for one in items if isinstance(one, Near)]
+
+
+def _raise_if_unmigrated(graph, target: str, field_names: list, conn,
+                         exc: ProgrammingError, caller: str) -> None:
+    """Turn a raw UndefinedColumn on a vec_* column into a refusal
+    naming migrate_vectors() -- the one gap validate_nears() cannot
+    close by itself. A field can be DECLARED (define_vectors() ran)
+    while its column was never added (migrate_vectors() never ran):
+    the registry says "declared" either way, so only the catalog
+    itself can tell "undeclared" and "declared but not migrated"
+    apart. That catalog check runs ONLY here, on the error path a
+    genuine query failure already took, so the ordinary search that
+    never hits it pays nothing for it -- proactively probing
+    information_schema before every search would cost a round trip
+    for a case that almost never happens.
+
+    Silently returns (letting the caller re-raise the original
+    ProgrammingError unchanged) when the SQLSTATE is not "undefined
+    column", or when every named field's column turns out to exist --
+    this diagnosis is specific to vec_* columns and must not swallow
+    an unrelated undefined-column error."""
+    orig = getattr(exc, "orig", None)
+    sqlstate = getattr(orig, "pgcode", None) or getattr(orig, "sqlstate", None)
+    if sqlstate != _UNDEFINED_COLUMN:
+        return
+    # Postgres aborts the whole transaction on the failed statement, so
+    # this connection refuses every further query ("current transaction
+    # is aborted") until it is rolled back -- the diagnostic queries
+    # below are read-only and change nothing this rollback could lose.
+    conn.rollback()
+    table = _table(graph, target)
+    missing = sorted(
+        name for name in field_names
+        if conn.execute(_COLUMN_TYPE, {
+            "table": table.name, "column": VECTOR_COLUMN_PREFIX + name, "schema": table.schema,
+        }).scalar() is None
+    )
+    if not missing:
+        return
+    raise ValueError(
+        f"{caller}: vector field(s) {missing} are declared for {target} in this graph but "
+        f"never migrated -- call migrate_vectors() to add the column(s). load_vectors() "
+        f"reads the same catalog this check just did and would find nothing either, since "
+        f"the column genuinely does not exist yet for ANY graph -- it only helps once "
+        f"migrate_vectors() has actually run, on some other handle this one forgot to match"
+    ) from exc
+
+
 def search(graph, near, target: str = "nodes", k: Optional[int] = 10, where: Any = None,
            boost=None, connection=None) -> list:
-    nears, boosts, query = _prepare_search_query(graph, near, target=target, k=k, where=where,
-                                                 boost=boost)
     with _read_connection(graph, connection) as conn:
-        rows = conn.execute(query).mappings().all()
+        _ensure_lazy_vectors(graph, conn)
+        nears, boosts, query = _prepare_search_query(graph, near, target=target, k=k, where=where,
+                                                     boost=boost)
+        try:
+            rows = conn.execute(query).mappings().all()
+        except ProgrammingError as exc:
+            _raise_if_unmigrated(graph, target, _near_field_names(near), conn, exc,
+                                 "vector_search()")
+            raise
     return [_format_hit(row, nears, boosts) for row in rows]
 
 
@@ -1342,11 +1516,18 @@ def search_many(graph, queries, target: str = "nodes", k: Optional[int] = 10,
     """Results per query, in the order the queries were given -- an
     empty list for a query nothing matched, so index i always answers
     query i."""
-    parsed, template, boosts, query = _prepare_search_many_query(
-        graph, queries, target=target, k=k, where=where, boost=boost)
-    grouped: dict = {str(i): [] for i in range(len(parsed))}
     with _read_connection(graph, connection) as conn:
-        for row in conn.execute(query).mappings():
+        _ensure_lazy_vectors(graph, conn)
+        parsed, template, boosts, query = _prepare_search_many_query(
+            graph, queries, target=target, k=k, where=where, boost=boost)
+        grouped: dict = {str(i): [] for i in range(len(parsed))}
+        try:
+            rows = conn.execute(query).mappings().all()
+        except ProgrammingError as exc:
+            names = [name for one in parsed for name in _near_field_names(one)]
+            _raise_if_unmigrated(graph, target, names, conn, exc, "vector_search_many()")
+            raise
+        for row in rows:
             hit = _format_hit({key: value for key, value in row.items() if key != "q"},
                               template, boosts)
             grouped[row["q"]].append(hit)
@@ -1725,6 +1906,16 @@ _CONSTRAINT_DEF = text("""
     WHERE conname = :name AND conrelid = CAST(:table AS regclass)
 """)
 
+#: Every column name on a table, for load_vectors() to sift for
+#: vec_* prefixes in Python -- LIKE 'vec\\_%' ESCAPE '\\' would do the
+#: same filtering in SQL, but a table has few enough columns that
+#: fetching them all and testing str.startswith() avoids getting the
+#: escape right for a query that runs once, not per row.
+_ALL_COLUMNS = text("""
+    SELECT column_name FROM information_schema.columns
+    WHERE table_name = :table AND table_schema = COALESCE(CAST(:schema AS text), current_schema())
+""")
+
 
 def migrate_vectors(graph, connection=None) -> list:
     """Apply the declared vector fields: add each column and its
@@ -1788,6 +1979,81 @@ def migrate_vectors(graph, connection=None) -> list:
                         ) from exc
                 ensured.append(f"{table.name}.{field.column_name}")
     return ensured
+
+
+def load_vectors(graph, connection=None) -> dict:
+    """The inverse of a lost declaration: read every vec_* column
+    already migrated for THIS graph back out of the database, and
+    populate this handle's registry from it -- issue #53's fix for the
+    handle (a fresh process, a second Graph object, an in_graph() that
+    forgot to redeclare) that finds only a raw UndefinedColumn where
+    every other refusal here names the fix.
+
+    THE COLUMN IS SHARED, THE DIMENSION IS NOT: a vec_* column can be
+    present because SOME graph in this table migrated it, but the
+    dimension CHECK migrate_vectors() adds is scoped to one graph's
+    token (see schema._graph_token / _constraint_name). So a column
+    with no matching constraint FOR THIS GRAPH is skipped rather than
+    guessed at -- it means this graph never migrated the field, even
+    though the physical column already exists for another graph's
+    sake. This is also why the check is read back from
+    information_schema/pg_constraint directly rather than from
+    graph.nodes_tbl/edges_tbl's SQLAlchemy metadata: a fresh handle
+    that never called define_vectors() has no vec_* Column attached to
+    that metadata at all (attach_columns() is what puts it there), so
+    the only place the shape still exists is the database itself.
+
+    RECOVERING THE SHAPE IS NOT RECOVERING THE POLICY: embed= is an
+    application's own embedding client and source= is a choice of
+    which property holds the text to embed -- neither is stored in
+    SQL, so every recovered field comes back with embed=None and
+    source=<field name>, Vector's own defaults. A field that embeds
+    text needs `define_vectors(nodes=[Vector('summary', 1536,
+    embed=<your client>)])` after this call to write or Near(text=...)
+    against it again; reading and vector_search() with a vector= need
+    nothing more than what this call already recovers.
+
+    Populates and returns the registry exactly like define_vectors()
+    does (attach_columns() included), so the result is immediately
+    usable:
+
+        g2 = Graph(engine)     # a second handle; define_vectors() never ran here
+        g2.load_vectors()      # -> {"nodes": {"summary": Vector("summary", 1536)}, "edges": {}}
+        g2.vector_search(Near("summary", q))    # now works
+    """
+    registry: dict = {"nodes": {}, "edges": {}}
+    with _read_connection(graph, connection) as conn:
+        for target_name in _TARGETS:
+            table = _table(graph, target_name)
+            target = _target_for(graph, target_name)
+            columns = conn.execute(_ALL_COLUMNS, {
+                "table": table.name, "schema": table.schema,
+            }).scalars().all()
+            for column_name in columns:
+                if not column_name.startswith(VECTOR_COLUMN_PREFIX):
+                    continue
+                name = column_name[len(VECTOR_COLUMN_PREFIX):]
+                if not _NAME.match(name):
+                    # A vec_*-prefixed column this library did not name --
+                    # someone else's column, not a field it forgot.
+                    continue
+                # dimensions=1 is a placeholder: _constraint_name() only
+                # reads .name off the field, and the real dimensions are
+                # what this lookup exists to recover.
+                probe_name = _constraint_name(target, Vector(name, 1))
+                definition = conn.execute(_CONSTRAINT_DEF, {
+                    "name": probe_name, "table": target.qualified,
+                }).scalar()
+                if definition is None:
+                    continue
+                declared = re.search(
+                    rf'array_length\("?{re.escape(column_name)}"?, 1\) = (\d+)', definition)
+                if declared is None:
+                    continue
+                registry[target_name][name] = Vector(name, int(declared.group(1)))
+    graph._vectors = registry
+    attach_columns(graph)
+    return {target: dict(fields) for target, fields in registry.items()}
 
 
 def drop_vectors(graph, node_fields=None, edge_fields=None, connection=None) -> list:

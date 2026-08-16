@@ -704,9 +704,9 @@ nothing extra:
 from hopai import Vector, Near
 
 graph.define_vectors(nodes=[Vector("summary", 1536), Vector("title", 384)],
-                     edges=[Vector("relation", 384)])
-graph.migrate_vectors()      # ALTER TABLE, idempotent; vector_ddl() previews it
-                              # (the dimension CHECK it adds is real SA metadata too)
+                     edges=[Vector("relation", 384)],
+                     migrate=True)   # ALTER TABLE, idempotent; vector_ddl() previews it
+                                     # (the dimension CHECK it adds is real SA metadata too)
 
 graph.set_vectors(nodes=[{"id": 1, "summary": embedding}])
 
@@ -715,6 +715,13 @@ graph.vector_search(Near("summary", query_embedding), k=10,
 # [{"id": "1", "similarity": 0.93, "properties": {...},
 #   "similarities": {"summary": 0.93}, "boosts": {}}, ...]
 ```
+
+`migrate=True` runs `migrate_vectors()` for you and hands back what it
+returned, so the DDL stays visible instead of happening invisibly. Skip it
+(`migrate=False`, the default) and call `migrate_vectors()` yourself when
+migrations run separately from application code — a deploy step with
+schema-changing credentials, kept apart from the read-only process that
+declares fields and calls `vector_search()`.
 
 Declare as many fields as you need — each is one migration-managed
 column, dimension-checked by the server **per graph**, so two graphs
@@ -789,9 +796,16 @@ combined score, no longer a cosine in `[-1, 1]`:
 graph.vector_search(Near("summary", q), boost=Boost("importance", 0.2), k=10)
 ```
 
-Store the property already scaled to roughly `[0, 1]`: a cosine lives in
-`[-1, 1]`, so a raw view count wouldn't boost the ranking, it would
-replace it — and hopai won't guess a normalization on your behalf.
+By default the property is rescaled into `[0, 1]` — similarity's own
+scale, not its sign — with a min-max window function over the candidate rows — the ones
+still in play after `where=` — before `weight` is applied, so
+`Boost("importance", 0.2)` means "20% weight" whatever raw range
+`importance` holds: a raw view count in the thousands would otherwise
+overwhelm a cosine that never exceeds 1, and the "boost" would replace
+the ranking instead of nudging it. `Boost("importance", 0.2,
+scale="raw")` opts back into the unscaled coefficient — for a property
+you already normalized, or when you want the per-query window function
+off the query path.
 
 Like `similarities`, every hit also carries `boosts`, keyed by the
 boosted property (empty when no `boost=` was given), so a boost that's
@@ -857,8 +871,7 @@ from hopai import Vector, Near
 graph.define_vectors(nodes=[
     Vector("summary", 1536, source="abstract",
            embed=openai.OpenAI()),          # or cohere, voyage, google...
-])
-graph.migrate_vectors()
+], migrate=True)
 
 graph.set_vectors(nodes=[{"id": 1, "summary": "a paper about Raft"}])
 graph.vector_search(Near("summary", "how do nodes agree?"), k=10)

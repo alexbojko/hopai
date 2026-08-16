@@ -366,6 +366,17 @@ _BOOST_DEF: dict = {
             "type": "number",
             "description": "Value to use for rows lacking the property. Defaults to 0.",
         },
+        "scale": {
+            "type": "string",
+            "enum": ["normalized", "raw"],
+            "description": (
+                "'normalized' (default) rescales the property into similarity's own "
+                "[-1, 1] range over the candidate rows before weighting it, so the "
+                "weight means what it says regardless of the property's own scale. "
+                "'raw' multiplies the property as stored, unbounded -- yesterday's "
+                "behavior, for a caller who already normalized it."
+            ),
+        },
     },
     "required": ["property", "weight"],
 }

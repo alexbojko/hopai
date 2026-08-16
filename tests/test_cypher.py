@@ -1241,6 +1241,18 @@ class TestStrictSchema:
         validate_operations(self.schema(), [
             {"op": "create_edges", "rows": [{"start_id": 1, "end_id": 2}]}])
 
+    def test_ops_outside_the_recognized_vocabulary_are_left_alone(self):
+        """validate_operations recognizes exactly create_nodes/merge_nodes,
+        create_edges/merge_edges and match -- anything else (an
+        update_nodes/delete_nodes op meant for validate_mutations, or a
+        typo) must be silently skipped even with a label key configured.
+        An `op["op"] == "match" and node_label_key is not None` weakened
+        to `or` would validate ANY op the moment a label key is set,
+        raising on a 'where' this function was never meant to read."""
+        from hopai.schema import validate_operations
+        validate_operations(self.schema(), [
+            {"op": "update_nodes", "where": {"type": "not_a_real_label"}, "set": {}}])
+
     def test_several_unknown_properties_and_labels_are_listed_together(self):
         """The refusal names EVERY unknown property (plural spelling
         included) and every label whose vocabulary was searched -- an

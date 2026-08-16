@@ -126,6 +126,27 @@ class WideFlag:
     value: Union[int, str, None]   # None present, but not Optional-shaped
 
 
+class _NamelessUnionMember:
+    """A union member that is a plain instance, not a class or a typing
+    generic alias -- both of those carry a real __name__, which is why
+    Flag/WideFlag above cannot exercise the getattr(a, "__name__",
+    repr(a)) fallback in the refusal message. This one has none, so it
+    proves the fallback is reachable rather than dead code."""
+    def __call__(self, *args, **kwargs):
+        pass   # typing._type_check only requires the member be callable
+
+    def __repr__(self):
+        return "<nameless>"
+
+
+_NAMELESS_MEMBER = _NamelessUnionMember()
+
+
+@dataclass
+class NamelessUnion:
+    value: Union[int, _NAMELESS_MEMBER]   # one named member, one without __name__
+
+
 PydanticPerson = pydantic.create_model(
     "Person", email=(str, ...), nickname=(str, ""), age=(Optional[int], None))
 PydanticCompany = pydantic.create_model("Company", name=(str, ...))
@@ -373,6 +394,17 @@ class TestClassNotation:
         # the members must be named readably -- "int, str", not reprs or
         # placeholders -- or the suggested type-set rewrite is a puzzle
         assert "int, str" in str(exc.value)
+
+    def test_union_member_with_no_dunder_name_falls_back_to_repr(self, offgraph):
+        """getattr(a, "__name__", repr(a)) in the refusal message is not
+        unreachable dead code: every class and typing generic alias
+        carries a __name__ (that's what the "int, str" assertion above
+        exercises), but a plain instance does not, and Union[...] admits
+        any callable. Constructing one proves the fallback is live and
+        pins its exact rendering."""
+        with pytest.raises(TypeError, match="union") as exc:
+            offgraph.define_schema(nodes=[NamelessUnion])
+        assert "int, <nameless>" in str(exc.value)
 
     def test_pep604_optional_matches_typing_optional(self, offgraph):
         """`str | None` and Optional[str] are the same annotation spelled
@@ -680,6 +712,27 @@ class TestSchemaEnforcement:
         fresh_graph.enforce_schema()
         other = fresh_graph.in_graph("elsewhere")
         assert other.add_nodes([{"type": "person", "nickname": "lawless"}]) == 1
+
+    def test_graph_token_is_a_fixed_ten_char_hash(self):
+        """The width is load-bearing (CLAUDE.md): every generated
+        constraint name packs this token into a 63-char budget shared
+        with the type/kind/property slugs it's concatenated with. A
+        wider token is not "more unique", it silently shifts where
+        every name gets truncated -- and two graphs whose tokens now
+        collide (or whose truncated names now collide) would share a
+        constraint, the exact bug _graph_token exists to prevent
+        (test_field_and_graph_can_never_share_a_constraint_name's
+        invariant, one level up). Pinned directly since nothing else
+        in this file asserts the width."""
+        import hashlib
+
+        from hopai.schema import _graph_token
+        token = _graph_token("my-graph")
+        assert token == hashlib.sha256(b"my-graph").hexdigest()[:10]
+        assert len(token) == 10
+        # 'default' (and no discriminator at all) stay readable, never hashed
+        assert _graph_token("default") == "default"
+        assert _graph_token(None) == "default"
 
 
 class TestSchemaViolations:
@@ -1304,9 +1357,79 @@ class TestInferenceSampling:
         assert report.edge_counts == {"works_at": 2, "likes": 2, "dangles": 1}
         assert report.skipped_endpoint_edges == 5
         assert "not one of the above" in str(report)
+        # Every named endpoint the edge sample named -- 'person' (both
+        # ends of 'works_at' and 'likes') and 'company' -- is reported by
+        # name; the untyped 'dangles' target stays folded into the
+        # generic skipped count above, since it was never a type inference
+        # could have claimed regardless of sampling.
+        dropped_kinds = {(d.kind, d.end, d.type_name) for d in report.dropped_edge_types}
+        assert dropped_kinds == {
+            ("works_at", "source", "person"), ("works_at", "target", "company"),
+            ("likes", "source", "person"), ("likes", "target", "person"),
+            ("likes", "target", "company"),
+            ("dangles", "source", "person"),
+        }
+        # 'likes' has TWO triples missing 'person' at the source end --
+        # (person,person) and (person,company) -- so this is the case
+        # that would print as two identical report lines and two
+        # DroppedEdgeType objects if they weren't aggregated by
+        # (kind, end, type_name) with rows summed. One object, one line.
+        assert len(report.dropped_edge_types) == len(dropped_kinds)
+        likes_source_person = next(d for d in report.dropped_edge_types
+                                   if (d.kind, d.end) == ("likes", "source"))
+        assert likes_source_person.rows == 2
+        assert str(report).count(
+            "edge kind 'likes' dropped: source type 'person' not present "
+            "in the sampled nodes") == 1
+        assert ("edge kind 'works_at' dropped: source type 'person' not present "
+                "in the sampled nodes") in str(report)
         # The point of dropping rather than raising: what comes back is
         # still something define_schema() accepts. An inferred schema
         # its own library refuses is not a usable answer.
+        fresh_graph.define_schema(schema=schema)
+
+    def test_a_sample_that_saw_some_nodes_drops_only_the_edges_they_cant_support(
+            self, fresh_graph, monkeypatch):
+        """The bug from #41: the node sample need not miss EVERY type to
+        raise, just the one an edge names. Here the node sample lands on
+        'person' but never on 'company', while the (fully sampled) edge
+        side still reports 'works_at' and one 'likes' edge into 'company'.
+        Before the fix, EdgeType('works_at', source='person',
+        target='company') got built against a node_types list containing
+        'person' but not 'company', and GraphSchema raised all the same --
+        this is the case test_partial_sample_still_returns_a_valid_schema
+        only caught 2/25 runs of. Now the unsupported edge kinds are
+        dropped and named in the report, and the surviving schema (with
+        'person' but not 'company', and only the person->person 'likes'
+        edge) still adopts cleanly."""
+        from sqlalchemy import select
+
+        import hopai.schema as schema_module
+
+        real_source = schema_module._source
+
+        def node_sample_sees_only_person(table, sample_percent):
+            if table is fresh_graph.nodes_tbl:
+                return select(table).where(
+                    table.c.properties["type"].astext == "person").subquery()
+            return real_source(table, 100)
+
+        monkeypatch.setattr(schema_module, "_source", node_sample_sees_only_person)
+        seed_chaotic(fresh_graph)
+        schema, report = fresh_graph.infer_schema(sample_percent=5)
+
+        assert [nt.name for nt in schema.node_types] == ["person"]
+        assert [(et.kind, et.source, et.target) for et in schema.edge_types] == [
+            ("likes", "person", "person")]
+        dropped_kinds = {(d.kind, d.end, d.type_name) for d in report.dropped_edge_types}
+        assert dropped_kinds == {
+            ("works_at", "target", "company"), ("likes", "target", "company"),
+        }
+        assert ("edge kind 'works_at' dropped: target type 'company' not present "
+                "in the sampled nodes") in str(report)
+        assert ("edge kind 'likes' dropped: target type 'company' not present "
+                "in the sampled nodes") in str(report)
+        # Not a raise -- and what comes back adopts, same as the all-missing case.
         fresh_graph.define_schema(schema=schema)
 
     def test_out_of_range_percent_is_refused_offline(self, offgraph):
@@ -1316,6 +1439,31 @@ class TestInferenceSampling:
         for bad in (0, -5, 100.5):
             with pytest.raises(ValueError, match=r"0 < sample_percent <= 100"):
                 offgraph.infer_schema(sample_percent=bad)
+
+    def test_the_edge_table_is_sampled_too_not_just_nodes(self, fresh_graph, monkeypatch):
+        """node_source and edge_source are built the same way one line
+        apart, and nothing downstream tells them apart by name -- easy
+        for a future edit to sample one and forget the other, and
+        test_full_sample_equals_the_exact_scan can't catch it (100%
+        sampling and no sampling read every page either way). Spy on
+        _source() directly rather than inferring sampling from row
+        counts, which TABLESAMPLE's own randomness would make flaky."""
+        import hopai.schema as schema_module
+
+        real_source = schema_module._source
+        calls = []
+
+        def spying_source(table, sample_percent):
+            calls.append((table, sample_percent))
+            return real_source(table, sample_percent)
+
+        monkeypatch.setattr(schema_module, "_source", spying_source)
+        seed_chaotic(fresh_graph)
+        fresh_graph.infer_schema(sample_percent=5)
+
+        tables_sampled = dict(calls)
+        assert tables_sampled[fresh_graph.nodes_tbl] == 5
+        assert tables_sampled[fresh_graph.edges_tbl] == 5
 
 
 # ---------------------------------------------------------------------

@@ -450,6 +450,11 @@ def _map_annotation(owner: str, field: str, annotation) -> tuple:
     plus allowed values, datetime/date become "string" with a JSON
     Schema format, and a nested dataclass/pydantic model becomes an
     "object" with a nested property schema."""
+    # False, not None: equivalent-mutant proof (issue #42) -- every read
+    # of this local is a truthiness check (the `if optional else` below,
+    # and `not optional` at _bag_properties' one call site), and False
+    # and None are both falsy with nothing here ever using `is`/`==`, so
+    # the two are indistinguishable at every use site.
     optional = False
     origin = typing.get_origin(annotation)
     if origin is Union or origin is _pytypes.UnionType:
@@ -713,6 +718,16 @@ def _pydantic_model(name: str, properties: tuple, create_model):
         elif p.format == "date":
             annotation = _datetime.date
         else:
+            # equivalent-mutant proof (issue #42): if this filter failed
+            # to drop "null" (or matched a name that never occurs), the
+            # line below wraps the result in Optional[...] unconditionally
+            # whenever "null" IS in p.json_type -- and typing.Optional
+            # over a Union that already contains NoneType is a no-op
+            # (Union de-dupes), so the member SET built here is identical
+            # either way; confirmed by comparing generated pydantic
+            # models' accept/reject behavior across every non-empty
+            # subset of JSON_TYPES and a battery of boundary values
+            # (0, 1, "true", "3.14", ...) -- zero differences.
             non_null = [_PYTHON_TYPES[t] for t in p.json_type if t != "null"]
             annotation = (non_null[0] if len(non_null) == 1
                           else Union[tuple(non_null)] if non_null else type(None))
@@ -1265,6 +1280,30 @@ class TypeConflict:
     json_types: tuple
 
 
+@dataclass(frozen=True)
+class DroppedEdgeType:
+    """An edge kind the edge sample saw, naming an endpoint type the
+    node sample never returned a row for -- only reachable under
+    sample_percent: an exact scan's node_types enumerates every named
+    type the (unsampled) endpoint join could possibly produce, so a
+    named endpoint missing from `observed` means the node side of the
+    sample simply didn't land on it. The kind is dropped rather than
+    built into an EdgeType GraphSchema would then reject; this is the
+    record of why it is missing, not silence.
+
+    One entry per (kind, end, type_name), not per (kind, source, target)
+    triple: two triples sharing a kind and the same missing endpoint
+    type name are the same drop reason, reported once with rows summed,
+    not printed twice. Every row counted here is already inside
+    InferenceReport.skipped_endpoint_edges -- this is the itemized
+    breakdown of a subset of that count (the part sample_percent alone
+    explains), not an additional one to add to it."""
+    kind: str
+    end: str            # "source" or "target" -- which endpoint was unseen
+    type_name: str
+    rows: int
+
+
 @dataclass
 class InferenceReport:
     """What infer_schema() saw that the schema alone cannot say -- read
@@ -1276,6 +1315,12 @@ class InferenceReport:
     untyped_edges: int
     skipped_endpoint_edges: int
     conflicts: tuple
+    #: Itemized breakdown of the sample_percent-only slice of
+    #: skipped_endpoint_edges above -- rows already counted there,
+    #: named here by which kind/endpoint/type caused the skip. Empty
+    #: whenever sample_percent is None, since an exact scan cannot
+    #: miss a named type.
+    dropped_edge_types: tuple = ()
     sampled: Optional[float] = None
 
     def __str__(self) -> str:
@@ -1295,6 +1340,9 @@ class InferenceReport:
         for c in self.conflicts:
             lines.append(f"conflict: {c.table}/{c.type_name}.{c.key} observed as "
                          f"{list(c.json_types)}")
+        for d in self.dropped_edge_types:
+            lines.append(f"edge kind {d.kind!r} dropped: {d.end} type {d.type_name!r} "
+                         f"not present in the sampled nodes")
         return "\n".join(lines)
 
 
@@ -1329,6 +1377,12 @@ def _observed_keys(connection, graph, source, discriminator: str) -> list:
     """(type name, key, json type, row count) per distinct combination
     -- one lateral jsonb_each scan, Postgres doing all the work."""
     from sqlalchemy import func, select
+    # joins_implicitly=True only tells the compiler's cartesian-product
+    # linter to trust a correlation it can't otherwise see -- and it can
+    # already see this one, since the function call embeds a direct
+    # reference to source.c.properties. Verified equivalent to False:
+    # byte-identical compiled SQL, identical query results, no linter
+    # warning either way (mutmut survivor x__observed_keys__mutmut_13).
     kv = func.jsonb_each(source.c.properties).table_valued(
         "key", "value", joins_implicitly=True)
     name = source.c.properties[discriminator].astext
@@ -1400,6 +1454,10 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
             connection, graph, edge_source, "kind"), "kind", "edges", conflicts)
 
         edges = edge_source
+        # "src"/"dst" are SQLAlchemy alias labels that only ever appear
+        # inside generated SQL text -- nothing in this module or its
+        # tests reads them back by name, so any other spelling is
+        # observably identical (mutmut x_infer_schema__mutmut_100).
         source, target = nt.alias("src"), nt.alias("dst")
         kind = edges.c.properties["kind"].astext
         node_id = graph.node_id_col
@@ -1430,14 +1488,33 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
     observed = {t.name for t in node_types}
     edge_types = []
     skipped = 0
+    # Keyed by (kind, end, type_name), not appended per triple: two
+    # triples sharing a kind can miss the SAME endpoint type (e.g.
+    # likes(person,person) and likes(person,company) both missing
+    # 'person'), and DroppedEdgeType reports that once with rows
+    # summed -- see its docstring for why a per-triple list would
+    # print the identical line twice.
+    dropped_by_reason = {}
     for row in sorted(triples, key=lambda r: (r.kind or "", r.source or "", r.target or "")):
         if not _named(row.kind):
             continue  # already counted as kindless below
-        if row.source not in observed or row.target not in observed:
+        missing = [end for end in ("source", "target") if getattr(row, end) not in observed]
+        if missing:
             skipped += row.rows
+            for end in missing:
+                type_name = getattr(row, end)
+                if _named(type_name):
+                    # A named type missing from `observed` can only happen
+                    # under sampling (see DroppedEdgeType) -- an untyped
+                    # endpoint (type_name is None) is the pre-existing,
+                    # non-sampling dead end and stays folded into `skipped`.
+                    reason = (row.kind, end, type_name)
+                    dropped_by_reason[reason] = dropped_by_reason.get(reason, 0) + row.rows
             continue
         edge_types.append(EdgeType(row.kind, source=row.source, target=row.target,
                                    properties=edge_props.get(row.kind, ())))
+    dropped_edge_types = [DroppedEdgeType(kind, end, type_name, rows)
+                          for (kind, end, type_name), rows in sorted(dropped_by_reason.items())]
 
     report = InferenceReport(
         node_counts={k: v for k, v in node_counts.items() if _named(k)},
@@ -1446,6 +1523,7 @@ def infer_schema(graph, sample_percent: Optional[float] = None) -> tuple:
         untyped_edges=sum(v for k, v in edge_counts.items() if not _named(k)),
         skipped_endpoint_edges=skipped,
         conflicts=tuple(conflicts),
+        dropped_edge_types=tuple(dropped_edge_types),
         sampled=sample_percent,
     )
     return GraphSchema(node_types, edge_types), report

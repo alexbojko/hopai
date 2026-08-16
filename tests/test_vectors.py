@@ -165,6 +165,59 @@ class TestVectorDeclaration:
         with pytest.raises(TypeError, match=r"takes Vector\(name, dimensions\) entries"):
             offline().define_vectors(nodes=["summary"])
 
+    def test_no_migrate_kwarg_is_byte_identical_to_today(self, monkeypatch):
+        """The default (issue #57): no `migrate=` at all, and `migrate=False`
+        explicitly, must both be exactly today's behavior -- no DDL, the
+        registry returned -- for every existing caller that never heard of
+        the kwarg."""
+        called = []
+        monkeypatch.setattr(Graph, "migrate_vectors", lambda self: called.append(True))
+
+        g = offline()
+        result = g.define_vectors(nodes=[Vector("summary", 3)])
+        assert result == g.vectors
+        assert isinstance(result, dict) and set(result) == {"nodes", "edges"}
+
+        g2 = offline()
+        result2 = g2.define_vectors(nodes=[Vector("summary", 3)], migrate=False)
+        assert result2 == g2.vectors
+
+        assert called == []  # migrate_vectors() never ran in either call
+
+    def test_migrate_true_creates_the_column_and_returns_migrate_vectors_result(
+            self, fresh_graph):
+        """The one-call form (issue #57): define_vectors(migrate=True) must
+        have the same effect on the database as the two-call
+        define_vectors()+migrate_vectors() sequence, and must hand back
+        migrate_vectors()'s own return value -- not the registry -- so the
+        DDL result stays visible instead of happening invisibly."""
+        result = fresh_graph.define_vectors(nodes=[Vector("docvec", 3)], migrate=True)
+
+        assert result == ["nodes.vec_docvec"]  # migrate_vectors()'s own return, verbatim
+        assert result != fresh_graph.vectors  # NOT the registry
+
+        with fresh_graph.engine.connect() as conn:
+            udt = conn.execute(text(
+                "SELECT udt_name FROM information_schema.columns "
+                "WHERE table_name = 'nodes' AND column_name = 'vec_docvec'"
+            )).scalar()
+            names = {row[0] for row in conn.execute(text(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid = CAST('nodes' AS regclass) AND contype = 'c'"))}
+        assert udt == "_float4"
+        assert "ck_vec_dims_default_nodes_docvec" in names
+
+    def test_migrate_true_matches_calling_migrate_vectors_separately(self, fresh_graph):
+        """Equivalence check against the existing two-call path: same
+        column, same constraint, on an equally fresh graph."""
+        one_call = fresh_graph.define_vectors(nodes=[Vector("docvec", 3)], migrate=True)
+
+        two_call_graph = fresh_graph.in_graph("two_call")
+        two_call_graph.define_vectors(nodes=[Vector("docvec", 3)])
+        two_call = two_call_graph.migrate_vectors()
+
+        assert one_call == two_call == ["nodes.vec_docvec"]
+
 
 # ---------------------------------------------------------------------
 # The migration's DDL
@@ -1158,6 +1211,237 @@ class TestVectorMigrationLive:
 
 
 # ---------------------------------------------------------------------
+# Live: recovering a lost declaration (#53)
+# ---------------------------------------------------------------------
+
+class TestSearchRefusalsNameTheRightFixLive:
+    """The symptom issue #53 was filed about: a raw UndefinedColumn
+    where every other refusal here names the fix. Two DIFFERENT causes
+    look identical to the registry (both read as "not usable yet"), so
+    both must still read as two DIFFERENT refusals to a caller."""
+
+    def test_undeclared_field_still_refuses_before_touching_the_database(self, fresh_graph):
+        """The registry check in _defined() already catches this --
+        this pins that it keeps doing so, and that the message is the
+        ordinary "define_vectors() first" one, not the new
+        migrate_vectors() one below."""
+        with pytest.raises(ValueError,
+                           match=r"needs vector fields and none are defined") as excinfo:
+            fresh_graph.vector_search(Near("nosuchfield", QUERY))
+        assert "migrate_vectors" not in str(excinfo.value)
+
+    def test_declared_but_never_migrated_names_migrate_vectors(self, fresh_graph):
+        """define_vectors() ran, migrate_vectors() never did -- the ONE
+        case validate_nears() cannot catch from the registry alone,
+        since the registry says "declared" either way. Without the fix
+        this raises psycopg2.errors.UndefinedColumn instead.
+
+        A field name used nowhere else in this file: create_schema()
+        emits every vec_* column EVER attached to the shared
+        Node/Edge metadata in this process (see define_vectors()'s
+        docstring), so reusing "docvec" here would find the column
+        already created by an earlier test and never reach the bug
+        this pins."""
+        fresh_graph.define_vectors(nodes=[Vector("unmigrated_solo", 3)])
+        with pytest.raises(ValueError, match=r"declared for nodes in this graph but never "
+                                             r"migrated.*migrate_vectors\(\)") as excinfo:
+            fresh_graph.vector_search(Near("unmigrated_solo", QUERY))
+        # The two refusals must stay TEXTUALLY distinguishable -- a
+        # caller who already called define_vectors() must not be told
+        # to call it again.
+        assert "define_vectors" not in str(excinfo.value)
+
+    def test_declared_but_never_migrated_names_migrate_vectors_for_search_many_too(
+            self, fresh_graph):
+        fresh_graph.define_vectors(nodes=[Vector("unmigrated_many", 3)])
+        with pytest.raises(ValueError, match=r"declared for nodes in this graph but never "
+                                             r"migrated.*migrate_vectors\(\)"):
+            fresh_graph.vector_search_many([Near("unmigrated_many", QUERY)])
+
+    def test_a_field_that_never_existed_is_not_reported_as_unmigrated(self, fresh_graph):
+        """Multivector search over one migrated and one never-migrated
+        field: the refusal must name only the field actually missing
+        its column, not every field in the query."""
+        g = _migrated(fresh_graph)          # docvec + titlevec migrated
+        g.define_vectors(nodes=[Vector("docvec", 3), Vector("titlevec", 3),
+                                Vector("unmigrated_mixed", 3)])
+        with pytest.raises(ValueError, match=r"\['unmigrated_mixed'\].*never migrated"):
+            g.vector_search(Near("docvec", QUERY), Near("titlevec", QUERY),
+                            Near("unmigrated_mixed", QUERY))
+
+    def test_after_migrating_the_same_query_succeeds(self, fresh_graph):
+        """The refusal path (rollback + two catalog probes on the SAME
+        connection the failed query used) must not leave that
+        connection, or this graph's declaration, unusable afterward."""
+        fresh_graph.define_vectors(nodes=[Vector("unmigrated_recovers", 3)])
+        with pytest.raises(ValueError, match="migrate_vectors"):
+            fresh_graph.vector_search(Near("unmigrated_recovers", QUERY))
+        fresh_graph.migrate_vectors()
+        fresh_graph.add_nodes([{"id": 1, "t": "doc"}])
+        fresh_graph.set_vectors(nodes=[{"id": 1, "unmigrated_recovers": QUERY}])
+        assert [h["id"] for h in
+                fresh_graph.vector_search(Near("unmigrated_recovers", QUERY))] == ["1"]
+
+
+class TestRaiseIfUnmigratedLeavesUnrelatedErrorsAlone:
+    """_raise_if_unmigrated() has two "this was not about a vec_* field
+    after all, let the original error through" branches -- a different
+    SQLSTATE, and a SQLSTATE match where every named column turns out
+    to exist anyway. Neither is reachable through vector_search()
+    itself (both mean "the UndefinedColumn was about something else"),
+    so they are pinned directly: called exactly the way the except
+    block above calls them, asserting they return instead of raising."""
+
+    class _FakeOrig:
+        def __init__(self, pgcode):
+            self.pgcode = pgcode
+
+    class _FakeExc(Exception):
+        def __init__(self, pgcode):
+            super().__init__()
+            self.orig = TestRaiseIfUnmigratedLeavesUnrelatedErrorsAlone._FakeOrig(pgcode)
+
+    def test_a_different_sqlstate_is_left_alone(self, fresh_graph):
+        from hopai.vectors import _raise_if_unmigrated
+        fresh_graph.define_vectors(nodes=[Vector("irrelevant_field", 3)])
+        with fresh_graph.engine.connect() as conn:
+            # No exception: undefined_table (42P01), not undefined_column,
+            # so this diagnosis has nothing to say about it.
+            _raise_if_unmigrated(fresh_graph, "nodes", ["irrelevant_field"], conn,
+                                 self._FakeExc("42P01"), "vector_search()")
+
+    def test_a_column_that_actually_exists_is_left_alone(self, fresh_graph):
+        from hopai.vectors import _raise_if_unmigrated
+        g = _migrated(fresh_graph)          # docvec's column genuinely exists
+        with fresh_graph.engine.connect() as conn:
+            _raise_if_unmigrated(g, "nodes", ["docvec"], conn,
+                                 self._FakeExc("42703"), "vector_search()")
+
+
+class TestLoadVectorsLive:
+    def test_a_second_handle_recovers_and_can_search(self, fresh_graph):
+        """The scenario issue #53 opens with: a fresh process/handle
+        that never called define_vectors()."""
+        _corpus(fresh_graph)
+        second = Graph(fresh_graph.engine)
+        assert second.vectors is None
+        recovered = second.load_vectors()
+        assert recovered["nodes"]["docvec"].dimensions == 3
+        assert recovered["nodes"]["titlevec"].dimensions == 3
+        assert recovered["edges"]["relvec"].dimensions == 3   # migrated by _corpus() too
+        # Populates the handle itself, not just the return value.
+        assert second.vectors["nodes"]["docvec"].dimensions == 3
+        hits = second.vector_search(Near("docvec", QUERY), k=10, where={"type": "doc"})
+        assert [h["id"] for h in hits] == ["1", "3", "2", "4", "5"]
+
+    def test_embed_and_source_come_back_as_defaults_not_guesses(self, fresh_graph):
+        """embed= is an application's own HTTP client and a non-default
+        source= is a choice of property -- neither is stored in SQL, so
+        recovering them would mean inventing one. Documented as "not
+        recovering the policy"; asserted here as the two defaults
+        Vector() itself would pick."""
+        g = fresh_graph
+        g.define_vectors(nodes=[Vector("summary", 3, source="abstract",
+                                       embed=lambda t: [QUERY for _ in t])])
+        g.migrate_vectors()
+        second = Graph(fresh_graph.engine)
+        recovered = second.load_vectors()
+        field = recovered["nodes"]["summary"]
+        assert field.embed is None
+        assert field.source == "summary"          # not "abstract"
+
+    def test_a_field_migrated_by_a_different_graph_is_not_recovered(self, fresh_graph):
+        """vec_* columns are shared storage; the dimension CHECK is
+        scoped per graph. A column present only because ANOTHER graph
+        migrated it must not be guessed at for this one -- there is no
+        dimension to read for a constraint that does not exist here."""
+        g = _migrated(fresh_graph)
+        other = fresh_graph.in_graph("elsewhere")
+        other.define_vectors(nodes=[Vector("onlythere", 4)])
+        other.migrate_vectors()
+        recovered = g.load_vectors()
+        assert "onlythere" not in recovered["nodes"]
+        assert set(recovered["nodes"]) == {"docvec", "titlevec"}
+
+    def test_two_graphs_recover_their_own_dimensions(self, fresh_graph):
+        """The per-graph CHECK is what makes this safe: two graphs
+        sharing one vec_docvec column, at different dimensions, must
+        each recover THEIR OWN size rather than either one's."""
+        _migrated(fresh_graph)                            # docvec = 3
+        b = fresh_graph.in_graph("other")
+        b.define_vectors(nodes=[Vector("docvec", 2)])
+        b.migrate_vectors()
+
+        a2 = Graph(fresh_graph.engine)
+        assert a2.load_vectors()["nodes"]["docvec"].dimensions == 3
+        b2 = Graph(fresh_graph.engine, graph="other")
+        assert b2.load_vectors()["nodes"]["docvec"].dimensions == 2
+
+    def test_columns_this_library_did_not_name_are_ignored(self, fresh_graph):
+        """A vec_*-prefixed column load_vectors() cannot have created
+        (an invalid field-name suffix) must not blow up the whole
+        call -- it is someone else's column, not a field this library
+        forgot."""
+        _migrated(fresh_graph)
+        with fresh_graph.engine.begin() as conn:
+            conn.execute(text("ALTER TABLE nodes ADD COLUMN vec_9invalid real[]"))
+        second = Graph(fresh_graph.engine)
+        recovered = second.load_vectors()
+        assert "9invalid" not in recovered["nodes"]
+        assert set(recovered["nodes"]) == {"docvec", "titlevec"}
+
+
+class TestInGraphLazyVectorsLive:
+    """in_graph() no longer starts PERMANENTLY blank on vectors -- see
+    its docstring. Offline behavior (test_in_graph_starts_without_vectors
+    in TestVectorDeclaration) is unchanged: `.vectors` itself never
+    touches the database, on ANY handle including one from in_graph(),
+    so reading it before ever connecting still answers None for a lazy
+    handle even when the database could prove otherwise -- only
+    vector_search()/vector_search_many()/load_vectors() actually
+    connect and trigger the recovery. .vectors's own docstring says so
+    explicitly (issue #53's review flagged the silent-until-asked gap;
+    the fix is stating it, not making a property connect)."""
+
+    def test_in_graph_handle_searches_a_field_migrated_by_the_originating_handle(
+            self, fresh_graph):
+        g = _corpus(fresh_graph)
+        lazy = Graph(fresh_graph.engine).in_graph(g.graph)
+        assert lazy.vectors is None                # no implicit trigger yet
+        hits = lazy.vector_search(Near("docvec", QUERY), k=10, where={"type": "doc"})
+        assert [h["id"] for h in hits] == ["1", "3", "2", "4", "5"]
+        assert lazy.vectors is not None             # the search WAS the trigger
+
+    def test_in_graph_handle_search_many_also_carries_vectors_lazily(self, fresh_graph):
+        g = _corpus(fresh_graph)
+        lazy = Graph(fresh_graph.engine).in_graph(g.graph)
+        results = lazy.vector_search_many([Near("docvec", QUERY)], k=10,
+                                          where={"type": "doc"})
+        assert [h["id"] for h in results[0]] == ["1", "3", "2", "4", "5"]
+
+    def test_in_graph_to_a_genuinely_different_graph_still_refuses_by_name(self, fresh_graph):
+        """Lazy is not magic: a graph this in_graph() handle points at
+        that was NEVER migrated still refuses normally, exactly like a
+        plain fresh Graph() would."""
+        _migrated(fresh_graph)                      # migrates "default" only
+        lazy = fresh_graph.in_graph("nobody_migrated_this_one")
+        with pytest.raises(ValueError, match="needs vector fields and none are defined"):
+            lazy.vector_search(Near("docvec", QUERY))
+
+    def test_a_plain_fresh_graph_stays_immediate_not_lazy(self, fresh_graph):
+        """The lazy fallback is in_graph()'s alone. A plain Graph()
+        that never called define_vectors() or load_vectors() must keep
+        refusing immediately -- auto-recovering for every unset
+        registry would make "you forgot define_vectors()" quietly mean
+        something else."""
+        _corpus(fresh_graph)
+        plain = Graph(fresh_graph.engine)
+        assert plain._vectors_lazy is False
+        with pytest.raises(ValueError, match="needs vector fields and none are defined"):
+            plain.vector_search(Near("docvec", QUERY))
+
+
+# ---------------------------------------------------------------------
 # Live: writing and reading vectors
 # ---------------------------------------------------------------------
 
@@ -1953,6 +2237,40 @@ class TestBoost:
         assert "jsonb_typeof" in sql          # non-numeric reads as absent
         assert "coalesce" in sql              # absent contributes `missing`, never NULL
 
+    def test_scale_normalized_is_the_default_and_emits_a_window_function(self, vg):
+        """#55: the default rescales the boost with a min-max window
+        function over the select's own candidate rows -- OVER () with no
+        PARTITION BY, so it is the whole result set at that select level,
+        not the whole table."""
+        sql = norm(vg.build_vector_search_query(
+            Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.2)), literal_binds=True)
+        assert "OVER ()" in sql
+        assert "min(coalesce" in sql and "max(coalesce" in sql
+        assert "nullif" in sql
+
+    def test_scale_raw_emits_no_window_function(self, vg):
+        """The escape hatch's whole point: with scale="raw" the compiled
+        SQL has no OVER() at all -- the coefficient multiplies the
+        coalesced property exactly as #55 found it."""
+        sql = norm(vg.build_vector_search_query(
+            Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.2, scale="raw")),
+            literal_binds=True)
+        assert "OVER ()" not in sql
+        assert "boost_0" in sql and "* 0.2" in sql
+
+    def test_scale_must_be_normalized_or_raw(self):
+        with pytest.raises(ValueError, match=r"scale must be one of"):
+            Boost("score", scale="clamped")
+
+    def test_scale_reaches_ranked_ids_too(self, vg):
+        """Boost's normalization is not vector_search()-only -- Start/Hop
+        near= builds its seed/match set through ranked_ids(), which calls
+        the same _boost_columns()."""
+        sql = norm(vg.build_query(
+            Start(near=Near("summary", [1.0, 0.0, 0.0]), keep=5,
+                 boost=Boost("score", 0.2)), []), literal_binds=True)
+        assert "OVER ()" in sql
+
     def test_callable_boost_is_passed_the_properties_column(self, vg):
         sql = norm(vg.build_vector_search_query(
             Near("summary", [1.0, 0.0, 0.0]),
@@ -2007,11 +2325,27 @@ class TestBoost:
         assert repr(Boost("score", 0.5)) == "Boost('score', weight=0.5)"
         assert repr(Boost("score", 1.0, default=-1.0)) \
             == "Boost('score', weight=1.0, default=-1.0)"
+        # scale="normalized" is the default -- it stays out of repr like
+        # any other unstated default, so a caller who never touched the
+        # knob does not see an implementation detail in every repr.
+        assert repr(Boost("score", 0.5, scale="normalized")) == "Boost('score', weight=0.5)"
+        assert repr(Boost("score", 0.5, scale="raw")) == "Boost('score', weight=0.5, scale='raw')"
 
     def test_json_form_matches_the_python_form(self, vg):
         python = vg.build_vector_search_query(
             Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.5, default=-1.0))
         parsed = parse_boost({"property": "score", "weight": 0.5, "default": -1.0})
+        assert norm(vg.build_vector_search_query(Near("summary", [1.0, 0.0, 0.0]), boost=parsed),
+                    literal_binds=True) == norm(python, literal_binds=True)
+
+    def test_json_form_carries_scale_too(self, vg):
+        """scale="raw" from JSON must reach the same query shape as the
+        Python form -- otherwise a caller behind json_api.py has no way
+        to reach the escape hatch #55 added."""
+        python = vg.build_vector_search_query(
+            Near("summary", [1.0, 0.0, 0.0]), boost=Boost("score", 0.5, scale="raw"))
+        parsed = parse_boost({"property": "score", "weight": 0.5, "scale": "raw"})
+        assert parsed.scale == "raw"
         assert norm(vg.build_vector_search_query(Near("summary", [1.0, 0.0, 0.0]), boost=parsed),
                     literal_binds=True) == norm(python, literal_binds=True)
 
@@ -2028,6 +2362,11 @@ class TestBoost:
 
 class TestBoostLive:
     def test_boost_reorders_without_changing_membership(self, fresh_graph):
+        """scale="normalized" is the default (#55): the boost is rescaled
+        into similarity's own range by a min-max window over the
+        candidates (0.0/0.9/default-0.0 here -> 0/1/0), so node 2's
+        contribution is weight * 1.0, not weight * 0.9 -- 1.0 rather than
+        the raw property."""
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": 1, "n": "closest", "score": 0.0},
                      {"id": 2, "n": "runner-up", "score": 0.9},
@@ -2042,6 +2381,26 @@ class TestBoostLive:
         # Same rows, different order -- and the missing property is 0,
         # not a dropped row.
         assert {h["id"] for h in boosted} == set(plain)
+        assert boosted[0]["similarity"] == pytest.approx(0.8 + 1.0, abs=1e-6)
+
+    def test_scale_raw_reproduces_the_old_unbounded_behavior(self, fresh_graph):
+        """The regression test that scale="raw" is a real, working escape
+        hatch and not just accepted and ignored: identical setup to
+        test_boost_reorders_without_changing_membership, but the
+        combined score is exactly what it was BEFORE #55 -- the raw
+        property multiplied straight in, unbounded, node 2's runner-up
+        cosine buried under a boost of 0.9 rather than the normalized 1.0
+        above."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "n": "closest", "score": 0.0},
+                     {"id": 2, "n": "runner-up", "score": 0.9},
+                     {"id": 3, "n": "no-score"}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 2, "docvec": [0.8, 0.6, 0.0]},
+                             {"id": 3, "docvec": [0.6, 0.8, 0.0]}])
+        boosted = g.vector_search(Near("docvec", QUERY), boost=Boost("score", 1.0, scale="raw"),
+                                  k=10)
+        assert [h["id"] for h in boosted] == ["2", "1", "3"]
         assert boosted[0]["similarity"] == pytest.approx(0.8 + 0.9, abs=1e-6)
         # boosts is keyed by the boosted PROPERTY, so a caller can see
         # the boost's own contribution and not just the combined total
@@ -2085,6 +2444,31 @@ class TestBoostLive:
         assert hits[0]["boosts"] == pytest.approx({"score": 0.4 + 0.4}, abs=1e-6)
         assert hits[0]["similarity"] == pytest.approx(1.0 + 0.4 * 0.5 + 0.4 * 2.0, abs=1e-6)
 
+    def test_a_thousand_fold_property_no_longer_dominates_a_perfect_match(self, fresh_graph):
+        """The bug report itself: Boost("importance", 0.2) on a view count
+        in the thousands used to multiply an unbounded quantity by 0.2 and
+        add it to a cosine that never exceeds 1 -- so a perfect match
+        (similarity 1.0) could still lose to a mediocre match with a big
+        enough property. Under the new default it cannot: the property is
+        rescaled into [-1, 1] before `weight` is applied, so 20% weight
+        really is 20%, capped at a 0.2 contribution."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "n": "perfect-match", "importance": 0.0},
+                     {"id": 2, "n": "irrelevant-match", "importance": 4200.0}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 2, "docvec": [0.0, 1.0, 0.0]}])  # orthogonal: sim 0.0
+        hits = g.vector_search(Near("docvec", QUERY), boost=Boost("importance", 0.2), k=10)
+        assert [h["id"] for h in hits] == ["1", "2"]
+        # The perfect match's contribution is bounded: it starts at 1.0
+        # and the whole boost term can add at most `weight` (0.2), so it
+        # can never be beaten by a property alone, however large.
+        assert hits[0]["similarity"] <= 1.0 + 0.2 + 1e-6
+        # Node 2 is exactly the pre-#55 winner: raw would have added
+        # 0.2 * 4200 = 840 to a similarity that never exceeds 1.
+        raw_hits = g.vector_search(Near("docvec", QUERY),
+                                   boost=Boost("importance", 0.2, scale="raw"), k=10)
+        assert [h["id"] for h in raw_hits] == ["2", "1"]
+
     def test_non_numeric_property_contributes_missing_not_an_error(self, fresh_graph):
         """One row carrying "high" where a number was expected must not
         abort the statement -- the judgement aggregates.py already makes."""
@@ -2097,16 +2481,49 @@ class TestBoostLive:
         assert hits[1]["similarity"] == pytest.approx(1.0, abs=1e-6)
 
     def test_boost_applies_to_a_ranked_traversal_seed(self, fresh_graph):
+        """Boost's normalization is not vector_search()-only: Start(near=)
+        builds its ranked seed through the same ranked_ids()/
+        _boost_columns() path (#55)."""
         g = _migrated(fresh_graph)
+        # weight=2.0: at weight=1.0 the normalized boost (0 vs. the
+        # candidate-set max, 1.0) exactly cancels node 1's similarity
+        # lead (1.0 vs 0.0), a real tie this test must not depend on
+        # Postgres breaking one particular way.
         g.add_nodes([{"id": 1, "score": 0.0}, {"id": 2, "score": 5.0}, {"id": 3, "n": "target"}])
         g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
                              {"id": 2, "docvec": [0.0, 1.0, 0.0]}])
         g.add_edges([{"start_id": 1, "end_id": 3, "kind": "k"},
                      {"start_id": 2, "end_id": 3, "kind": "k"}])
         result = g.traverse(Start(near=Near("docvec", QUERY), keep=1,
-                                  boost=Boost("score", 1.0)), Hop(via={"kind": "k"}))
-        # Node 2 loses on similarity and wins on the boost.
+                                  boost=Boost("score", 2.0)), Hop(via={"kind": "k"}))
+        # Node 2 loses on similarity (0.0 vs node 1's 1.0) and wins on the
+        # boost (normalized to 1.0, weight 2.0 -> +2.0 vs node 1's +0.0).
         assert {n["id"] for n in result.nodes} == {"2", "3"}
+
+    def test_zero_spread_boost_is_a_no_op_and_keeps_combined_not_null(self, fresh_graph):
+        """Every candidate sharing one boost value means no spread to
+        normalize against -- nullif(0, 0) is NULL, and left uncoalesced
+        that NULL would propagate through `total = term + term` in
+        _combined() and null out rows whose SIMILARITY was real, breaking
+        `combined IS NOT NULL`'s meaning for every row a constant boost
+        touches. It must instead contribute nothing, identically to no
+        boost at all -- including when a boost is the only ranking signal
+        near= min_similarity=None would otherwise refuse (min_similarity
+        keeps this call legal without k)."""
+        g = _migrated(fresh_graph)
+        g.add_nodes([{"id": 1, "score": 3.0}, {"id": 2, "score": 3.0}, {"id": 3, "score": 3.0}])
+        g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 2, "docvec": [0.8, 0.6, 0.0]},
+                             {"id": 3, "docvec": [0.0, 1.0, 0.0]}])
+        plain = g.vector_search(Near("docvec", QUERY, min_similarity=-1.0), k=10)
+        boosted = g.vector_search(Near("docvec", QUERY, min_similarity=-1.0),
+                                  boost=Boost("score", 1.0), k=10)
+        assert [(h["id"], h["similarity"]) for h in boosted] \
+            == [(h["id"], h["similarity"]) for h in plain]
+        # combined IS NOT NULL still means "some similarity had a
+        # direction" -- all three rows, including the orthogonal one
+        # (similarity 0.0, a real direction, not missing), still score.
+        assert {h["id"] for h in boosted} == {"1", "2", "3"}
 
 
 # ---------------------------------------------------------------------
@@ -3315,6 +3732,7 @@ class TestGraphVectorWrappersForwardEveryArgument:
         "set_vectors": {"nodes": ["N"], "edges": ["E"]},
         "vector_search_many": {"queries": ["Q"], "target": "edges", "k": 3,
                                "where": {"w": 1}, "boost": "B"},
+        "load_vectors": {"connection": "C"},
     }
 
     #: The two names that differ: Graph says vector_*, vectors.py does

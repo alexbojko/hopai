@@ -81,6 +81,13 @@ set plugs into the walk.
   `combined IS NOT NULL` meaning "some similarity had a direction" — but a boost is not
   consequence-free: it reorders, and with a `keep`/`k` limit reordering decides
   membership, so a boosted `similarity` is the combined score and can exceed 1.
+  `scale="normalized"` (the default) rescales the coalesced value into similarity's
+  own range with a min-max window function over the candidate set, at the same
+  select level `_boost_columns()` builds the column at — a zero-spread candidate
+  set coalesces the result to 0 rather than propagating the window function's NULL,
+  which is what keeps the invariant true even when a boost carries no signal.
+  `scale="raw"` is the unscaled, unbounded escape hatch: today's only behavior
+  before this normalization existed.
 - `vector_search()`/`vector_search_many()` report each Near's own similarity and each
   Boost's own value alongside the combined score, keyed by name (`similarities`,
   `boosts`) rather than by the `sim_i`/`boost_j` SQL alias. `_report_columns()` reads

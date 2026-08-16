@@ -211,6 +211,25 @@ class TestToolInventory:
         with pytest.raises(ValueError, match="strict_schema"):
             tools(offline(), strict_schema=True)
 
+    def test_max_nodes_defaults_to_five_hundred(self):
+        """A model never has to configure the ceiling to be protected by
+        it -- the default itself is the guard."""
+        from hopai.mcp import DEFAULT_MAX_NODES
+        assert DEFAULT_MAX_NODES == 500
+        assert named(offline())["describe_graph"].call()["max_nodes"] == 500
+
+    @pytest.mark.parametrize("bad", [True, False, 0, -1, 1.5, "500"])
+    def test_max_nodes_is_checked_not_coerced(self, bad):
+        """The same rule CLAUDE.md names for all=/detach=/replace=,
+        applied here: `bool` is an `int` subclass in Python, so
+        max_nodes=True would otherwise silently become a 1-node
+        ceiling rather than the type error it actually is."""
+        with pytest.raises(TypeError, match="max_nodes"):
+            tools(offline(), max_nodes=bad)
+
+    def test_max_nodes_none_is_the_documented_way_to_disable_it(self):
+        assert tools(offline(), max_nodes=None)  # does not raise
+
 
 class TestManyGraphs:
     """One server, several graphs -- because `Graph` is a cheap handle
@@ -1447,6 +1466,23 @@ class TestCommandLine:
             build_parser().parse_args(["--embed", "no_such_module_xyz:b:c"])
         assert "'no_such_module_xyz'" in capsys.readouterr().err
 
+    def test_max_nodes_defaults_to_five_hundred_on_the_cli(self):
+        assert build_parser().parse_args(["--dsn", "x"]).max_nodes == 500
+
+    @pytest.mark.parametrize("value, expected", [("500", 500), ("1", 1)])
+    def test_max_nodes_accepts_a_positive_integer(self, value, expected):
+        assert build_parser().parse_args(["--dsn", "x", "--max-nodes", value]).max_nodes == expected
+
+    @pytest.mark.parametrize("value", ["none", "None", "NONE", "unlimited"])
+    def test_max_nodes_none_disables_the_ceiling_on_the_cli(self, value):
+        assert build_parser().parse_args(["--dsn", "x", "--max-nodes", value]).max_nodes is None
+
+    @pytest.mark.parametrize("value", ["0", "-5", "many", "1.5"])
+    def test_a_malformed_max_nodes_says_which_part_is_wrong(self, value, capsys):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--dsn", "x", "--max-nodes", value])
+        assert "--max-nodes must be a positive integer or 'none'" in capsys.readouterr().err
+
     def test_defaults_are_the_cautious_ones(self):
         args = build_parser().parse_args(["--dsn", "postgresql://x/y"])
         assert (args.transport, args.host, args.read_only, args.allow_ddl,
@@ -1495,6 +1531,17 @@ class TestCommandLine:
         # ...and a prefixed --vector lands on that graph alone
         assert served["graph"]["crm"].vectors["nodes"]["notes"].dimensions == 8
         assert served["graph"]["docs"].vectors is None
+
+    def test_max_nodes_reaches_serve_from_the_command_line(self, monkeypatch):
+        """The CLI flag has to actually arrive at serve()/tools(), not
+        just parse -- a dropped kwarg here is a ceiling that looks
+        configured and does nothing."""
+        served = {}
+        monkeypatch.setattr("hopai.mcp.serve",
+                            lambda graph, **options: served.update(graph=graph, **options))
+        main(["--dsn", "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+              "--no-load-schema", "--graph", "docs", "--max-nodes", "42"])
+        assert served["max_nodes"] == 42
 
     def test_without_graph_every_graph_in_the_database_is_served(self, monkeypatch, capsys):
         """The default is full access, because the DSN already is: a
@@ -1816,6 +1863,131 @@ class TestReadToolsLive:
         assert result["adopted"] is False
         assert result["report"]["untyped_nodes"] == 2
         assert graph.schema is None
+
+
+class TestMaxNodesLive:
+    """traverse_graph and cypher's MATCH path share one node ceiling
+    (hopai/mcp.py's SIZE section) -- a truncated subgraph is refused
+    instead of returned, naming the real count and the real ceiling.
+
+    Enforced on the traversal's ACTUAL, already-computed node count,
+    not a Count()-based pre-count: a pre-count was measured and
+    rejected, not for speed but for correctness -- Count() aggregates
+    only the LAST hop's matched nodes (see hopai/aggregates.py and the
+    CLAUDE.md invariant it documents), while the subgraph a traversal
+    reports is the union of every node on every hop's matching edges,
+    which is a bigger and different number. On
+    benchmarks/generate_graph.py's own hub data, a chain that returns
+    10,350 actual nodes counts 225 through Count() -- a pre-count gate
+    would have waved that traversal straight through a 500-node
+    ceiling. So these tests check that the OVERSIZED RESULT NEVER
+    REACHES THE CALLER, not that the traversal never ran -- it does
+    run, deliberately, because running it is the only way to know the
+    real count."""
+
+    def test_a_traversal_under_the_ceiling_succeeds_normally(self, fresh_graph):
+        fresh_graph.add_nodes([{"id": i, "type": "leaf"} for i in range(5)])
+        result = named(fresh_graph, read_only=True, max_nodes=10)["traverse_graph"].call(
+            start={"where": {"type": "leaf"}})
+        assert len(result["nodes"]) == 5
+
+    def test_a_traversal_over_the_ceiling_refuses_naming_the_real_count(self, fresh_graph):
+        fresh_graph.add_nodes([{"id": i, "type": "leaf"} for i in range(5)])
+        spec = named(fresh_graph, read_only=True, max_nodes=3)["traverse_graph"]
+        with pytest.raises(ValueError,
+                           match=r"traverse_graph: this matches 5 nodes, over the 3-node "
+                                 r"ceiling"):
+            spec.call(start={"where": {"type": "leaf"}})
+
+    def test_the_traversal_runs_but_its_result_never_reaches_the_caller(
+            self, fresh_graph, monkeypatch):
+        """Pins the design actually shipped, as distinct from a
+        pre-count gate: spying on traverse_json() (the same call a
+        Python caller's graph.traverse() reaches through) proves the
+        real traversal ran exactly once and produced the full 5-node
+        result internally, while the tool call the client sees still
+        raises instead of returning it -- the oversized dict is built
+        and then never handed back."""
+        import hopai.mcp as mcp_module
+
+        fresh_graph.add_nodes([{"id": i, "type": "leaf"} for i in range(5)])
+        real_traverse_json = mcp_module.traverse_json
+        seen = []
+
+        def spy(*args, **kwargs):
+            result = real_traverse_json(*args, **kwargs)
+            seen.append(result)
+            return result
+
+        monkeypatch.setattr(mcp_module, "traverse_json", spy)
+        spec = named(fresh_graph, read_only=True, max_nodes=1)["traverse_graph"]
+        with pytest.raises(ValueError, match="matches 5 nodes"):
+            spec.call(start={"where": {"type": "leaf"}})
+        assert len(seen) == 1
+        assert len(seen[0]["nodes"]) == 5
+
+    def test_max_nodes_none_never_refuses_regardless_of_size(self, fresh_graph):
+        fresh_graph.add_nodes([{"id": i, "type": "leaf"} for i in range(50)])
+        result = named(fresh_graph, read_only=True, max_nodes=None)["traverse_graph"].call(
+            start={"where": {"type": "leaf"}})
+        assert len(result["nodes"]) == 50
+
+    def test_the_ceiling_check_leaves_a_passing_result_unchanged(self, fresh_graph):
+        """No pre-count exists to disagree with the traversal (see the
+        class docstring), so this instead pins that the check ADDED
+        here does not itself filter or reshape what a passing call
+        returns."""
+        fresh_graph.add_nodes([{"id": 1, "type": "leaf"}, {"id": 2, "type": "leaf"}])
+        fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}])
+        query = {"start": {"where": {"type": "leaf"}}, "hops": [{"via": {"kind": "knows"}}]}
+        capped = named(fresh_graph, read_only=True, max_nodes=100)["traverse_graph"].call(**query)
+        uncapped = named(fresh_graph, read_only=True, max_nodes=None)["traverse_graph"].call(**query)
+        # elapsed_ms is a real per-call timing, not part of the content
+        # the ceiling check could have touched.
+        assert capped["nodes"] == uncapped["nodes"]
+        assert capped["edges"] == uncapped["edges"]
+
+    def test_the_refusal_mentions_start_search_only_with_an_embedder(self, fresh_graph):
+        fresh_graph.define_vectors(nodes=[Vector("summary", 3)])
+        fresh_graph.add_nodes([{"id": i, "type": "leaf"} for i in range(5)])
+
+        without_embed = named(fresh_graph, read_only=True, max_nodes=1)["traverse_graph"]
+        with pytest.raises(ValueError) as exc:
+            without_embed.call(start={"where": {"type": "leaf"}})
+        assert "start.search" not in str(exc.value)
+
+        with_embed = named(fresh_graph, read_only=True, max_nodes=1,
+                           embed=embedder())["traverse_graph"]
+        with pytest.raises(ValueError) as exc:
+            with_embed.call(start={"where": {"type": "leaf"}})
+        assert "start.search" in str(exc.value)
+
+    def test_cypher_match_shares_the_ceiling_but_a_cypher_write_is_never_capped(
+            self, fresh_graph):
+        """The same guard, reachable a second way: a MATCH goes through
+        the identical traversal engine traverse_graph does, so a model
+        that switches tools must not find an unguarded path to the same
+        unbounded result. A CREATE is a different kind of result
+        entirely (an IngestResult, not a subgraph) and is never
+        capped -- creating 4 rows in one statement succeeds even under
+        a 3-node ceiling."""
+        fresh_graph.add_nodes([{"id": i, "type": "leaf"} for i in range(5)])
+        specs = named(fresh_graph, max_nodes=3)
+        with pytest.raises(ValueError,
+                           match=r"cypher: this matches 5 nodes, over the 3-node ceiling"):
+            specs["cypher"].call(query="MATCH (a:leaf) RETURN a")
+
+        result = specs["cypher"].call(
+            query="CREATE (a:person {x: 1}), (b:person {x: 2}), "
+                  "(c:person {x: 3}), (d:person {x: 4})")
+        assert result["nodes"] == 4
+
+    def test_describe_graph_reports_the_configured_ceiling(self, fresh_graph):
+        assert named(fresh_graph, max_nodes=250)["describe_graph"].call()["max_nodes"] == 250
+        assert named(fresh_graph, max_nodes=None)["describe_graph"].call()["max_nodes"] is None
+        # The default a bare tools()/serve() call gets, unasked -- the
+        # ceiling protects a model even when nobody configured it.
+        assert named(fresh_graph)["describe_graph"].call()["max_nodes"] == 500
 
 
 class TestWriteToolsLive:

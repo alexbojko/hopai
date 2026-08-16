@@ -97,6 +97,13 @@ _NEEDS_SYNC_GRAPH = frozenset({
     "create_schema", "drop_schema", "define_constraints", "drop_constraints",
     "enforce_schema", "save_schema", "load_schema", "infer_schema",
     "schema_violations", "add_networkx",
+    # load_vectors() (#53) is a database round trip, unlike
+    # define_vectors()/vectors/*_ddl(), which is why it is named here
+    # rather than left to fall through __getattr__ to the wrapped sync
+    # Graph -- that would run it straight against the async engine's
+    # sync facade outside the greenlet bridge, same MissingGreenlet trap
+    # as every other admin call in this list.
+    "load_vectors",
 })
 
 
@@ -231,6 +238,34 @@ class AsyncGraph:
         async with self._async_engine.begin() as conn:
             return await conn.run_sync(
                 lambda c: set_vectors(self._sync, connection=c, plan=plan))
+
+    def define_vectors(self, nodes=None, edges=None, migrate: bool = False):
+        """The declaration half of Graph.define_vectors() -- connection-
+        free, so (like build_query()/define_schema()) it passes straight
+        through to the wrapped sync Graph with no run_sync() needed.
+
+        `migrate=True` is refused here rather than silently attempted:
+        it would run migrate_vectors() directly against the async
+        engine's sync facade, outside the greenlet bridge, which
+        SQLAlchemy refuses with a raw MissingGreenlet instead of a named
+        fix -- the same failure _NEEDS_SYNC_GRAPH exists to turn into an
+        AttributeError for the other setup calls. Declare here, then
+        `await graph.migrate_vectors()` for the DDL:
+
+            graph.define_vectors(nodes=[Vector("summary", 1536)])
+            await graph.migrate_vectors()
+        """
+        if migrate:
+            raise AttributeError(
+                "AsyncGraph.define_vectors(migrate=True) is not supported -- it would run "
+                "migrate_vectors() directly against the async engine's sync facade outside "
+                "the greenlet bridge, which SQLAlchemy refuses (MissingGreenlet). Call "
+                "define_vectors(...) here with no migrate=, then `await "
+                "graph.migrate_vectors()` separately -- or run both together on a plain "
+                "Graph pointed at the same database: Graph(<dsn>).define_vectors(..., "
+                "migrate=True)"
+            )
+        return self._sync.define_vectors(nodes, edges)
 
     async def migrate_vectors(self) -> list:
         from .vectors import migrate_vectors
