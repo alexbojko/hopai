@@ -126,6 +126,27 @@ class WideFlag:
     value: Union[int, str, None]   # None present, but not Optional-shaped
 
 
+class _NamelessUnionMember:
+    """A union member that is a plain instance, not a class or a typing
+    generic alias -- both of those carry a real __name__, which is why
+    Flag/WideFlag above cannot exercise the getattr(a, "__name__",
+    repr(a)) fallback in the refusal message. This one has none, so it
+    proves the fallback is reachable rather than dead code."""
+    def __call__(self, *args, **kwargs):
+        pass   # typing._type_check only requires the member be callable
+
+    def __repr__(self):
+        return "<nameless>"
+
+
+_NAMELESS_MEMBER = _NamelessUnionMember()
+
+
+@dataclass
+class NamelessUnion:
+    value: Union[int, _NAMELESS_MEMBER]   # one named member, one without __name__
+
+
 PydanticPerson = pydantic.create_model(
     "Person", email=(str, ...), nickname=(str, ""), age=(Optional[int], None))
 PydanticCompany = pydantic.create_model("Company", name=(str, ...))
@@ -373,6 +394,17 @@ class TestClassNotation:
         # the members must be named readably -- "int, str", not reprs or
         # placeholders -- or the suggested type-set rewrite is a puzzle
         assert "int, str" in str(exc.value)
+
+    def test_union_member_with_no_dunder_name_falls_back_to_repr(self, offgraph):
+        """getattr(a, "__name__", repr(a)) in the refusal message is not
+        unreachable dead code: every class and typing generic alias
+        carries a __name__ (that's what the "int, str" assertion above
+        exercises), but a plain instance does not, and Union[...] admits
+        any callable. Constructing one proves the fallback is live and
+        pins its exact rendering."""
+        with pytest.raises(TypeError, match="union") as exc:
+            offgraph.define_schema(nodes=[NamelessUnion])
+        assert "int, <nameless>" in str(exc.value)
 
     def test_pep604_optional_matches_typing_optional(self, offgraph):
         """`str | None` and Optional[str] are the same annotation spelled
@@ -782,6 +814,27 @@ class TestSchemaEnforcement:
         fresh_graph.enforce_schema()
         other = fresh_graph.in_graph("elsewhere")
         assert other.add_nodes([{"type": "person", "nickname": "lawless"}]) == 1
+
+    def test_graph_token_is_a_fixed_ten_char_hash(self):
+        """The width is load-bearing (CLAUDE.md): every generated
+        constraint name packs this token into a 63-char budget shared
+        with the type/kind/property slugs it's concatenated with. A
+        wider token is not "more unique", it silently shifts where
+        every name gets truncated -- and two graphs whose tokens now
+        collide (or whose truncated names now collide) would share a
+        constraint, the exact bug _graph_token exists to prevent
+        (test_field_and_graph_can_never_share_a_constraint_name's
+        invariant, one level up). Pinned directly since nothing else
+        in this file asserts the width."""
+        import hashlib
+
+        from hopai.schema import _graph_token
+        token = _graph_token("my-graph")
+        assert token == hashlib.sha256(b"my-graph").hexdigest()[:10]
+        assert len(token) == 10
+        # 'default' (and no discriminator at all) stay readable, never hashed
+        assert _graph_token("default") == "default"
+        assert _graph_token(None) == "default"
 
 
 class TestSchemaViolations:
