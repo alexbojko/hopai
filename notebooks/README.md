@@ -41,13 +41,16 @@ demo graph they share, and two display helpers.
 ```bash
 python scripts/run_notebooks.py              # execute all of them, fail on any error
 python scripts/run_notebooks.py 03           # just the ones whose name matches
+python scripts/run_notebooks.py --check      # ...and fail if outputs went stale
 python scripts/run_notebooks.py --save       # ...and write the outputs back in
 ```
 
-CI runs the first of those on every PR, with `HOPAI_REQUIRE_DB=1` so a missing
-database is an error rather than a skip. Committed outputs are regenerated with
-`--save` — do that when an API change makes an output stale, and read the diff
-rather than trusting it.
+CI runs `--check` on every PR, with `HOPAI_REQUIRE_DB=1` so a missing database is
+an error rather than a skip. A bare run only proves the notebook still executes;
+`--check` also diffs the fresh output against the committed one (ignoring
+execution metadata and timing-shaped numbers) and names the exact cell that
+went stale. Committed outputs are regenerated with `--save` — do that when an
+API change makes an output stale, and read the diff rather than trusting it.
 
 The notebooks lean on assertions where the behaviour is the point (fan-in
 preserved, dead ends pruned, `NOT` keeping rows with a missing key), so a
