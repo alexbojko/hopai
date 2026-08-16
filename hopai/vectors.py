@@ -162,7 +162,7 @@ from sqlalchemy import (
 )
 from sqlalchemy import String as SAString
 from sqlalchemy.dialects.postgresql import ARRAY, DOUBLE_PRECISION, REAL
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 
 from .constraints import ConstraintViolation, _compile_check, _slug, _Target
 from .filters import resolve
@@ -1045,11 +1045,91 @@ def build_search_query(graph, near, target: str = "nodes", k: Optional[int] = 10
     return query if k is None else query.limit(k)
 
 
+#: Postgres's SQLSTATE for "column does not exist" -- what a compiled
+#: query referencing a declared-but-never-migrated vec_* column raises
+#: as. Comparing this rather than the exception's Python class name
+#: keeps _raise_if_unmigrated() driver-agnostic (psycopg2's pgcode and
+#: psycopg3's sqlstate both carry it), the same reason embeddings.py
+#: never imports a provider package to recognize one.
+_UNDEFINED_COLUMN = "42703"
+
+
+def _ensure_lazy_vectors(graph, connection) -> None:
+    """in_graph() marks its handle `_vectors_lazy` instead of starting
+    it permanently blank (see Graph.in_graph()): the vec_* columns are
+    SHARED storage, so a field another handle already migrated for
+    THIS graph is usable here too, without an explicit load_vectors()
+    call from the caller. Fires at most meaningfully once -- a handle
+    that already has a registry, lazy or explicitly declared, is left
+    alone."""
+    if graph._vectors is None and getattr(graph, "_vectors_lazy", False):
+        load_vectors(graph, connection=connection)
+
+
+def _near_field_names(near) -> list:
+    """Every Near.field in one search's near= argument, in the shape
+    it was given (single Near or a list) -- used only to name fields
+    on the error path below, so it does not need validate_nears()'s
+    normalization."""
+    items = near if isinstance(near, (list, tuple)) else [near]
+    return [one.field for one in items if isinstance(one, Near)]
+
+
+def _raise_if_unmigrated(graph, target: str, field_names: list, conn,
+                         exc: ProgrammingError, caller: str) -> None:
+    """Turn a raw UndefinedColumn on a vec_* column into a refusal
+    naming migrate_vectors() -- the one gap validate_nears() cannot
+    close by itself. A field can be DECLARED (define_vectors() ran)
+    while its column was never added (migrate_vectors() never ran):
+    the registry says "declared" either way, so only the catalog
+    itself can tell "undeclared" and "declared but not migrated"
+    apart. That catalog check runs ONLY here, on the error path a
+    genuine query failure already took, so the ordinary search that
+    never hits it pays nothing for it -- proactively probing
+    information_schema before every search would cost a round trip
+    for a case that almost never happens.
+
+    Silently returns (letting the caller re-raise the original
+    ProgrammingError unchanged) when the SQLSTATE is not "undefined
+    column", or when every named field's column turns out to exist --
+    this diagnosis is specific to vec_* columns and must not swallow
+    an unrelated undefined-column error."""
+    orig = getattr(exc, "orig", None)
+    sqlstate = getattr(orig, "pgcode", None) or getattr(orig, "sqlstate", None)
+    if sqlstate != _UNDEFINED_COLUMN:
+        return
+    # Postgres aborts the whole transaction on the failed statement, so
+    # this connection refuses every further query ("current transaction
+    # is aborted") until it is rolled back -- the diagnostic queries
+    # below are read-only and change nothing this rollback could lose.
+    conn.rollback()
+    table = _table(graph, target)
+    missing = sorted(
+        name for name in field_names
+        if conn.execute(_COLUMN_TYPE, {
+            "table": table.name, "column": VECTOR_COLUMN_PREFIX + name, "schema": table.schema,
+        }).scalar() is None
+    )
+    if not missing:
+        return
+    raise ValueError(
+        f"{caller}: vector field(s) {missing} are declared for {target} in this graph but "
+        f"never migrated -- call migrate_vectors() to add the column(s), or load_vectors() "
+        f"if another handle already migrated them and this one just needs to catch up"
+    ) from exc
+
+
 def search(graph, near, target: str = "nodes", k: Optional[int] = 10, where: Any = None,
            boost=None, connection=None) -> list:
-    query = build_search_query(graph, near, target=target, k=k, where=where, boost=boost)
     with _read_connection(graph, connection) as conn:
-        rows = conn.execute(query).mappings().all()
+        _ensure_lazy_vectors(graph, conn)
+        query = build_search_query(graph, near, target=target, k=k, where=where, boost=boost)
+        try:
+            rows = conn.execute(query).mappings().all()
+        except ProgrammingError as exc:
+            _raise_if_unmigrated(graph, target, _near_field_names(near), conn, exc,
+                                 "vector_search()")
+            raise
     return [{**row, "similarity": float(row["similarity"])} for row in rows]
 
 
@@ -1188,10 +1268,18 @@ def search_many(graph, queries, target: str = "nodes", k: Optional[int] = 10,
     empty list for a query nothing matched, so index i always answers
     query i."""
     parsed = _as_query_list(queries, "vector_search_many()")
-    query = build_search_many_query(graph, queries, target=target, k=k, where=where, boost=boost)
     grouped: dict = {str(i): [] for i in range(len(parsed))}
     with _read_connection(graph, connection) as conn:
-        for row in conn.execute(query).mappings():
+        _ensure_lazy_vectors(graph, conn)
+        query = build_search_many_query(graph, queries, target=target, k=k, where=where,
+                                        boost=boost)
+        try:
+            rows = conn.execute(query).mappings().all()
+        except ProgrammingError as exc:
+            names = [name for one in parsed for name in _near_field_names(one)]
+            _raise_if_unmigrated(graph, target, names, conn, exc, "vector_search_many()")
+            raise
+        for row in rows:
             hit = {key: value for key, value in row.items() if key != "q"}
             grouped[row["q"]].append({**hit, "similarity": float(hit["similarity"])})
     return [grouped[str(i)] for i in range(len(parsed))]
@@ -1569,6 +1657,16 @@ _CONSTRAINT_DEF = text("""
     WHERE conname = :name AND conrelid = CAST(:table AS regclass)
 """)
 
+#: Every column name on a table, for load_vectors() to sift for
+#: vec_* prefixes in Python -- LIKE 'vec\\_%' ESCAPE '\\' would do the
+#: same filtering in SQL, but a table has few enough columns that
+#: fetching them all and testing str.startswith() avoids getting the
+#: escape right for a query that runs once, not per row.
+_ALL_COLUMNS = text("""
+    SELECT column_name FROM information_schema.columns
+    WHERE table_name = :table AND table_schema = COALESCE(CAST(:schema AS text), current_schema())
+""")
+
 
 def migrate_vectors(graph, connection=None) -> list:
     """Apply the declared vector fields: add each column and its
@@ -1632,6 +1730,81 @@ def migrate_vectors(graph, connection=None) -> list:
                         ) from exc
                 ensured.append(f"{table.name}.{field.column_name}")
     return ensured
+
+
+def load_vectors(graph, connection=None) -> dict:
+    """The inverse of a lost declaration: read every vec_* column
+    already migrated for THIS graph back out of the database, and
+    populate this handle's registry from it -- issue #53's fix for the
+    handle (a fresh process, a second Graph object, an in_graph() that
+    forgot to redeclare) that finds only a raw UndefinedColumn where
+    every other refusal here names the fix.
+
+    THE COLUMN IS SHARED, THE DIMENSION IS NOT: a vec_* column can be
+    present because SOME graph in this table migrated it, but the
+    dimension CHECK migrate_vectors() adds is scoped to one graph's
+    token (see schema._graph_token / _constraint_name). So a column
+    with no matching constraint FOR THIS GRAPH is skipped rather than
+    guessed at -- it means this graph never migrated the field, even
+    though the physical column already exists for another graph's
+    sake. This is also why the check is read back from
+    information_schema/pg_constraint directly rather than from
+    graph.nodes_tbl/edges_tbl's SQLAlchemy metadata: a fresh handle
+    that never called define_vectors() has no vec_* Column attached to
+    that metadata at all (attach_columns() is what puts it there), so
+    the only place the shape still exists is the database itself.
+
+    RECOVERING THE SHAPE IS NOT RECOVERING THE POLICY: embed= is an
+    application's own embedding client and source= is a choice of
+    which property holds the text to embed -- neither is stored in
+    SQL, so every recovered field comes back with embed=None and
+    source=<field name>, Vector's own defaults. A field that embeds
+    text needs `define_vectors(nodes=[Vector('summary', 1536,
+    embed=<your client>)])` after this call to write or Near(text=...)
+    against it again; reading and vector_search() with a vector= need
+    nothing more than what this call already recovers.
+
+    Populates and returns the registry exactly like define_vectors()
+    does (attach_columns() included), so the result is immediately
+    usable:
+
+        g2 = Graph(engine)     # a second handle; define_vectors() never ran here
+        g2.load_vectors()      # -> {"nodes": {"summary": Vector("summary", 1536)}, "edges": {}}
+        g2.vector_search(Near("summary", q))    # now works
+    """
+    registry: dict = {"nodes": {}, "edges": {}}
+    with _read_connection(graph, connection) as conn:
+        for target_name in _TARGETS:
+            table = _table(graph, target_name)
+            target = _target_for(graph, target_name)
+            columns = conn.execute(_ALL_COLUMNS, {
+                "table": table.name, "schema": table.schema,
+            }).scalars().all()
+            for column_name in columns:
+                if not column_name.startswith(VECTOR_COLUMN_PREFIX):
+                    continue
+                name = column_name[len(VECTOR_COLUMN_PREFIX):]
+                if not _NAME.match(name):
+                    # A vec_*-prefixed column this library did not name --
+                    # someone else's column, not a field it forgot.
+                    continue
+                # dimensions=1 is a placeholder: _constraint_name() only
+                # reads .name off the field, and the real dimensions are
+                # what this lookup exists to recover.
+                probe_name = _constraint_name(target, Vector(name, 1))
+                definition = conn.execute(_CONSTRAINT_DEF, {
+                    "name": probe_name, "table": target.qualified,
+                }).scalar()
+                if definition is None:
+                    continue
+                declared = re.search(
+                    rf'array_length\("?{re.escape(column_name)}"?, 1\) = (\d+)', definition)
+                if declared is None:
+                    continue
+                registry[target_name][name] = Vector(name, int(declared.group(1)))
+    graph._vectors = registry
+    attach_columns(graph)
+    return {target: dict(fields) for target, fields in registry.items()}
 
 
 def drop_vectors(graph, node_fields=None, edge_fields=None, connection=None) -> list:
