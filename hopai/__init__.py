@@ -191,7 +191,8 @@ from .embeddings import Embedder, EmbeddingError
 from .models import Edge, Node
 from .mutate import MUTATE_TOOL_SCHEMA, MutationResult, spec_to_mutations
 from .schema import (
-    EdgeType, GraphSchema, InferenceReport, NodeType, Property, SchemaViolations, TypeConflict,
+    DroppedEdgeType, EdgeType, GraphSchema, InferenceReport, NodeType, Property,
+    SchemaViolations, TypeConflict,
 )
 from .vectors import Boost, Near, Vector, parse_boost, parse_near
 
@@ -215,7 +216,7 @@ __all__ = [
     "spec_to_mutations", "MUTATE_TOOL_SCHEMA", "MutationResult",
     "Unique", "Required", "Check", "Index", "PropertyType", "Col", "ConstraintViolation",
     "GraphSchema", "NodeType", "EdgeType", "Property", "InferenceReport", "TypeConflict",
-    "SchemaViolations",
+    "DroppedEdgeType", "SchemaViolations",
     "Vector", "Near", "Boost", "parse_near", "parse_boost", "vector_search_json",
     "VECTOR_SEARCH_TOOL_SCHEMA",
     "Embedder", "EmbeddingError",
