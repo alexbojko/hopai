@@ -790,7 +790,7 @@ traversal cannot be seeded from a list of ids.
 
 Exact means no ANN index, so every candidate row is scored, and the cost is
 a measured constant, not a guess: **0.13 µs per vector element** per
-candidate row (Postgres 16, one core — [`benchmarks/README.md`](benchmarks/README.md)
+candidate row (Postgres 16, one core — `benchmarks/README.md`
 has the methodology, including why the similarity is a LATERAL and not a
 scalar subquery: the naive form re-evaluates it at every site the query
 names it and was measured at 2× the cost for identical results). Worked
