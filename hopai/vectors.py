@@ -293,7 +293,15 @@ class Near:
     weight:          this field's coefficient in the combined score
                      (only meaningful when several Near are combined).
     min_similarity:  drop rows whose similarity ON THIS FIELD is below
-                     the bound -- a filter, applied before k.
+                     the bound -- a filter, applied before k, but AFTER
+                     every candidate has already been scanned and
+                     scored (`WHERE ... sim_0 >= min_similarity` runs
+                     on the LATERAL's output). It shrinks the RESULT,
+                     not the work done to get there -- unlike an ANN
+                     index's search radius, this never skips a
+                     candidate. where= is what actually cuts cost, by
+                     removing rows before they reach the LATERAL; see
+                     the module docstring's cost model.
     missing:         "exclude" (default) drops rows lacking this
                      field's vector; "zero" scores them 0 here and
                      lets other fields carry the row.

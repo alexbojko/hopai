@@ -41,7 +41,10 @@ use it without being taught anything new.
   plain `real[]` columns, many named fields per node/edge, weighted
   multivector queries, and similarity-seeded traversals. Hand a field
   your OpenAI/Cohere/Voyage/SentenceTransformer client and store text
-  instead of floats.
+  instead of floats. Exact means no recall tuning and no index to
+  rebuild — and an unfiltered scan is linear in rows × dimensions (see
+  [What this costs](#what-this-costs)); `pgvector_exit_ddl()` prints
+  the migration for when you outgrow it.
 - 🧪 **Tested like it matters** — SQL-level assertions, a live-Postgres
   suite, an 85% coverage gate and mutation testing in CI.
 - 📊 **Measured, not claimed** — real benchmark numbers in `benchmarks/`,
@@ -790,6 +793,41 @@ no hops, `Start(near=…, keep=N)` selects exactly what `vector_search()
 ` would, minus the score: `near=` on `Start` earns its place because a
 traversal cannot be seeded from a list of ids.
 
+### What this costs
+
+Exact means no ANN index, so every candidate row is scored, and the cost is
+a measured constant, not a guess: **0.13 µs per vector element** per
+candidate row (Postgres 16, one core — `benchmarks/README.md`
+has the methodology, including why the similarity is a LATERAL and not a
+scalar subquery: the naive form re-evaluates it at every site the query
+names it and was measured at 2× the cost for identical results). Worked
+through at that rate, a candidate costs about `dimensions × 0.13 µs`:
+
+| rows | 384-dim | 1536-dim |
+| ---: | ---: | ---: |
+| 10k | ~0.5 s | ~2 s |
+| 100k | ~5 s | ~20 s |
+| 1M | ~50 s | ~200 s |
+
+That's fine for the shape this is built for — a knowledge graph, filtered
+by `where=` down to a manageable candidate set before ranking — but it
+should never be a surprise found in production, which is why it's a number
+and not a vibe. Two knobs look like they both narrow the search; they do
+opposite things to that bill:
+
+- **`where=` reduces cost.** It removes rows *before* they reach the
+  LATERAL, the same index-backed filter every other read here uses.
+  Measured: a 20k × 384-dim search filtered to 25% of rows dropped from
+  ~1.0s to ~0.25s.
+- **`min_similarity=` reduces results, not cost.** Every candidate is
+  scanned and scored regardless; the bound only drops rows from the
+  output *after* scoring — unlike an ANN index's search radius, it never
+  skips a candidate. See `Near.min_similarity` in `hopai/vectors.py`.
+
+Outgrowing this is a planned move, not a rewrite: `pgvector_exit_ddl()`
+(below) prints the migration onto pgvector whenever the numbers above say
+it's time.
+
 ### Text in, vectors out
 
 You do not have to produce the floats. Give a field the embedding
@@ -913,12 +951,9 @@ print("\n".join(graph.pgvector_exit_ddl()))   # one-way; read vectors.py first
 ```
 
 One honest limit, documented in depth in `hopai/vectors.py`: the search
-is an exact scan, so its cost is linear in the candidates left after
-filtering — measured at roughly dimensions × 0.13 µs per candidate row
-(≈0.2 ms per 1536-dim vector; an unfiltered 20k × 384-dim scan lands
-near one second — `benchmarks/bench_vectors.py` has the numbers), which
-makes a few thousand filtered candidates interactive and unfiltered
-hundreds of thousands the wrong tool.
+is an exact scan, linear in the candidates left after filtering — see
+[What this costs](#what-this-costs) above for the numbers, and why
+`where=` and `min_similarity=` do opposite things to the bill.
 
 And one rule, in one key: a model may send `"text"`, never `"vector"`.
 Text is embedded by the field itself, with your client, so the query
