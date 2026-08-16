@@ -868,45 +868,99 @@ def _every_tool_spec() -> list:
         many, allow_ddl=True, allow_mutations=True, embed=embedder())
 
 
+def _resolve_ref(ref: str, defs: dict) -> dict:
+    # Every $ref in this codebase is "#/$defs/<name>" -- a local,
+    # same-document pointer, never an external schema. Refusing
+    # anything else surfaces a new $ref shape here instead of silently
+    # walking past it unresolved.
+    prefix = "#/$defs/"
+    if not ref.startswith(prefix):
+        raise ValueError(f"unrecognized $ref {ref!r} -- this walker only resolves {prefix}<name>")
+    return defs[ref[len(prefix):]]
+
+
+def _walk_property_schemas(parameters: dict):
+    """Every (path, schema) pair reachable from a tool's top-level
+    `properties`, at ANY depth this codebase actually uses: a plain
+    top-level property, one nested under an array's `items.properties`
+    (hops), one nested under an open object's
+    `additionalProperties.properties` (aggregates), and a `$ref`
+    against the schema's own `$defs` (near/boost) -- resolved before
+    yielding, so a caller never has to know a property arrived by
+    reference. `path` is a dotted string naming where it lives, for a
+    readable assertion failure.
+
+    Without this, "every parameter has a description" and "every enum
+    is named in its own description" only ever saw top-level
+    properties -- silently missing hops[].direction and
+    aggregates{}.fn, which really did carry no description at all
+    until this same review round added one (issue #58's review)."""
+    defs = parameters.get("$defs", {})
+
+    def schemas_in(node: dict):
+        if "$ref" in node:
+            node = _resolve_ref(node["$ref"], defs)
+        return node
+
+    def walk(properties: dict, prefix: str):
+        for name, raw in properties.items():
+            schema = schemas_in(raw)
+            path = f"{prefix}{name}"
+            yield path, schema
+            if schema.get("type") == "array":
+                nested = schemas_in(schema.get("items", {}))
+                yield from walk(nested.get("properties", {}), f"{path}[].")
+            nested_open = schema.get("additionalProperties")
+            if isinstance(nested_open, dict):
+                nested_open = schemas_in(nested_open)
+                yield from walk(nested_open.get("properties", {}), f"{path}{{}}.")
+
+    yield from walk(parameters.get("properties", {}), "")
+
+
 class TestDescriptionsAreStructurallyComplete:
     """Option 3 of issue #58: catches "a description went missing or was
     truncated to a stub" as a structural fact about every tool this
     server registers, with nothing here naming a tool or a parameter --
-    a new one is covered automatically."""
+    a new one is covered automatically, AT WHATEVER DEPTH IT LIVES
+    (see _walk_property_schemas -- a top-level-only version of these
+    two checks missed hops[].direction and aggregates{}.fn entirely,
+    both of which had zero description until this review round)."""
 
     def test_every_tool_has_a_real_description(self):
         for spec in _every_tool_spec():
             assert len(spec.description.strip()) >= MIN_TOOL_DESCRIPTION_LENGTH, spec.name
 
     def test_every_advertised_parameter_has_a_real_description(self):
-        """Every key under a tool's top-level `properties`. This is the
-        promise CLAUDE.md makes for this module in particular: the SDK
-        would derive `{"type": "object"}` from a handler's signature and
-        leave a model to guess `where`/`via`/`hops`, which is why hopai
+        """Every key reachable from a tool's `parameters`, at any depth
+        _walk_property_schemas reaches. This is the promise CLAUDE.md
+        makes for this module in particular: the SDK would derive
+        `{"type": "object"}` from a handler's signature and leave a
+        model to guess `where`/`via`/`hops`, which is why hopai
         hand-writes these schemas instead -- a parameter with no
         description is exactly that regression, one key at a time."""
         for spec in _every_tool_spec():
-            for name, schema in spec.parameters["properties"].items():
+            for path, schema in _walk_property_schemas(spec.parameters):
                 description = schema.get("description", "")
                 assert len(description.strip()) >= MIN_PARAMETER_DESCRIPTION_LENGTH, \
-                    f"{spec.name}.{name}"
+                    f"{spec.name}.{path}"
 
     def test_every_enum_value_is_named_in_its_own_description(self):
         """A description that drifts from its OWN enum -- gains a value
-        the prose never learned about -- is invisible to the two checks
-        above, which only ask whether a description exists. Singular
+        the prose never learned about -- is invisible to the check
+        above, which only asks whether a description exists. Singular
         vs. plural is normalized (`.rstrip("s")`) because the prose says
         "edge vectors" for the enum value "edges"; what has to be true
         is that the CONCEPT is named, not the exact noun form."""
         for spec in _single_graph_tool_specs():
-            for name, schema in spec.parameters["properties"].items():
+            for path, schema in _walk_property_schemas(spec.parameters):
                 values = schema.get("enum")
                 if not values:
                     continue
                 description = schema.get("description", "").lower()
                 for value in values:
                     assert value.lower().rstrip("s") in description, \
-                        f"{spec.name}.{name}: {value!r} not named in its own description"
+                        f"{spec.name}.{path}: {value!r} not named in its own description"
 
 
 class TestPinnedPermissionClaims:
@@ -935,9 +989,19 @@ class TestPinnedPermissionClaims:
         `sentence not in schema["description"]` check: a mutant that
         uppercases this whole literal (the shape the issue's own
         example was -- "WHICH VECTOR FIELD SEARCH RANKS AGAINST.") stays
-        caught, where a case-folded comparison would let it through."""
+        caught, where a case-folded comparison would let it through.
+
+        Bare "refused" is NOT enough to pin: a read-only server also has
+        allow_mutations=False (the two can't combine), so the
+        delete-refusal sentence pinned separately below
+        ("...are refused on this server: it is not permitted...")
+        already contains the word "refused" and would make a bare
+        `"refused" in description` pass even if THIS sentence's own
+        "refused" were mutated away -- verified by hand-mutating just
+        this sentence's wording and confirming a bare substring check
+        stayed green. Pin the phrase unique to read-only instead."""
         description = named(offline(), read_only=True)["cypher"].description
-        assert "refused" in description
+        assert "READ-ONLY: CREATE and MERGE are refused" in description
 
     def test_the_default_server_says_deletes_and_updates_are_refused(self):
         """The other permission axis: allow_mutations is off by default,
