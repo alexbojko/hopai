@@ -97,6 +97,48 @@ class TestIsolation:
             assert {n["properties"]["n"] for n in got} == {i}
 
 
+class TestListingTheGraphs:
+    """`graphs()` is the counterpart to `in_graph()`: that one moves to a
+    graph you can name, this one says which names there are."""
+
+    def test_it_names_every_graph_that_has_rows(self, two):
+        marketing, _ = two
+        assert marketing.graphs() == ["marketing", "support"]
+
+    def test_it_answers_the_same_from_any_handle(self, two):
+        """The question is about the TABLES, not about the handle asking
+        -- so scoping it to the calling graph, which is what every other
+        read does, would be the bug here rather than the rule."""
+        marketing, support = two
+        assert marketing.graphs() == support.graphs() == marketing.in_graph("x").graphs()
+
+    def test_a_graph_with_no_rows_is_not_a_graph_yet(self, two):
+        """Nothing has been written to it, so there is nothing to find.
+        `in_graph()` invents a name; it does not create anything."""
+        marketing, _ = two
+        marketing.in_graph("brand-new")
+        assert "brand-new" not in marketing.graphs()
+
+    def test_a_new_graph_appears_once_it_has_rows(self, two):
+        marketing, _ = two
+        marketing.in_graph("brand-new").add_nodes([{"type": "person", "name": "n1"}])
+        assert marketing.graphs() == ["brand-new", "marketing", "support"]
+
+    def test_an_empty_pair_of_tables_lists_nothing(self, fresh_graph):
+        assert fresh_graph.graphs() == []
+
+    def test_unscoped_tables_have_exactly_one_graph_and_no_query(self):
+        """graph_col=None means the caller brought tables with no
+        discriminator, so there is nothing to select DISTINCT on -- and
+        the answer is known without connecting, which is what this
+        asserts by using a DSN that goes nowhere."""
+        from hopai import Graph
+
+        offline = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+                        graph_col=None)
+        assert offline.graphs() == ["default"]
+
+
 class TestScopedMutations:
     """Deleting and updating are where forgetting the discriminator
     stops being a wrong answer and becomes someone else's missing data,

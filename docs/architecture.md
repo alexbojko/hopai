@@ -205,6 +205,68 @@ One pair of tables holds every graph, discriminated by `graph_id`.
   exists, it is created lazily on first save (never by `create_schema()`), and its one
   row per `graph_id` is the same per-graph discipline as everything above.
 
+## The MCP server
+
+`hopai/mcp.py` is a front end in the same sense `json_api.py` and `cypher.py` are: each
+tool is one call into those, and there is no query logic in it. Three things about it
+are not obvious from the outside.
+
+- **The advertised JSON Schemas are hopai's own.** The MCP SDK derives a tool's input
+  schema from its handler's Python annotations, which turns `start: dict` into
+  `{"type": "object"}` and leaves the model to guess `where`/`via`/`hops`/`direction`.
+  `_register()` builds the tool and then replaces that schema with the hand-written one
+  (`TRAVERSE_TOOL_SCHEMA` and friends, via `graph.tool_schemas()` so the descriptions
+  carry this graph's vocabulary). Argument *validation* still runs against the handler
+  signature, so `tests/test_mcp.py` asserts the two agree about every top-level
+  parameter — an advertised parameter no handler accepts is a promise broken at call
+  time.
+- **Similarity arrives as text.** Vectors never travel through a tool schema, so
+  `search_similar` and `start.search` take words, and the server embeds them with the
+  operator's `embed` callable. The refusal is not re-implemented here:
+  `json_api.refuse_vectors()` runs on what the model sent *before* the embedding is
+  injected, which is why that function lost its underscore.
+- **Permissions decide which tools are registered**, rather than being checked inside a
+  handler. `read_only` drops every write tool, `allow_mutations` is what adds
+  `mutate_graph`, `allow_ddl` is what adds `enforce_schema`, and `serve()` never mixes
+  `read_only` with either. They belong to the server, not to a graph — two graphs needing
+  different permissions are two servers. `allow_mutations` is separate from the write
+  level because creating rows and destroying them are not the same power: a delete matches
+  by filter and does not come back. The one tool that cannot be gated by registration is
+  `cypher`, since one tool covers all four kinds — it calls `cypher.classify_cypher()` and
+  refuses by permission *before* opening a connection, which is why that function is in
+  `cypher.py` rather than inlined in `Graph.cypher()`. Classifying `"mutate"` apart from
+  `"write"` is what keeps a write-enabled server from picking up `DETACH DELETE` with
+  `CREATE`.
+- **One server holds many graphs**, because `Graph` is a handle and `in_graph()` shares
+  the engine's pool: `Served` keeps `{name: Graph}`, every tool then *requires* a `graph`,
+  and `list_graphs` is registered to answer the chicken-and-egg that creates. `Served.pick()`
+  is the enforcement — an unserved name is refused with the list, and an omitted one is
+  refused rather than defaulted, because falling back to one graph answers a question
+  about another (and for a write, puts the rows there). The handler signatures keep
+  `graph` optional since one handler serves both configurations; `tools()` marks it
+  required in the advertised schema, and a test pins the resulting rule: everything
+  advertised is accepted, everything the signature demands is advertised. Each handle
+  keeps its own schema and vector fields, which is why the registry holds handles rather
+  than one handle and a list of names. With a single graph nothing is advertised — the
+  same rule as `search_field`, and the reason the single-graph tool surface is
+  byte-identical to what it was before this existed.
+- **Which graphs is decided in `main()`, not in `Served`.** With no `--graph`, the CLI
+  calls `Graph.graphs()` — `SELECT DISTINCT graph_id FROM nodes` — and serves every one;
+  `--graph` restricts it and skips the lookup entirely, so a restricted server never
+  enumerates. `Served` itself only ever receives a finished `{name: Graph}`, which keeps
+  discovery out of the request path: `list_graphs` reports the served set rather than
+  re-querying, so a graph created after start-up is not silently in scope. The default is
+  full access because the DSN already is — the alternative served only the graph literally
+  named `default`, which is how a server pointed at a database of `docs` and `crm` came to
+  answer "nothing here". An empty database still starts, on `DEFAULT_GRAPH`, since refusing
+  would break the server exactly when someone is setting it up.
+
+Handlers are synchronous and are wrapped to run in a worker thread: a blocking database
+call in an async server would stall every other request on the connection. The SDK's
+1.x/2.x split (`FastMCP` → `MCPServer`) is contained entirely in `_sdk()`, plus the one
+place the eras disagree about where HTTP bind settings go — the constructor on 1.x,
+`run()` on 2.0.
+
 ## Two gotchas in the results
 
 - **Ids come back as strings.** `build_query` casts them so node and edge ids share one
@@ -233,5 +295,6 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/schema.py` | The graph-schema notations, the annotation mapping, what enforcement compiles to and the endpoint-type limit, and why inference is an observation rather than a `.schema` fallback |
 | `hopai/cypher.py` | The translatable subset — read, write and aggregate — and why each refusal is a refusal |
 | `hopai/asyncio.py` | Why `AsyncGraph` is a bridge, not a second implementation, what it deliberately does not cover, and the benchmark numbers behind the design |
+| `hopai/mcp.py` | The tool inventory, the four permission levels, why similarity takes text, and the 1.x/2.x SDK adapter |
 | `tests/conftest.py` | The fixture graph's shape |
 | `benchmarks/README.md` | Measured numbers, including where raw CTEs beat this library 2-5x |

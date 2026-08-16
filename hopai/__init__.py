@@ -114,6 +114,17 @@ Several Near specs combine into one weighted score (multivector
 search). See hopai/vectors.py for the storage model, the cost model,
 and every deliberate refusal.
 
+FOR MCP CLIENTS -- Claude Desktop, an IDE, an agent framework -- the
+same graph is one command, over stdio or HTTP:
+
+    pip install "hopai[mcp]"
+    hopai-mcp --dsn postgresql+psycopg2://user:pass@host/db --read-only
+
+...or hopai.mcp.serve(graph, embed=...) from Python, when the graph
+needs setting up first. See hopai/mcp.py for the tool inventory and the
+four permission levels -- read, write, delete/update, DDL -- each of
+which is a separate flag because they are separate sentences.
+
 FOR TOOL-CALLING MODELS: TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
 INGEST_TOOL_SCHEMA and MUTATE_TOOL_SCHEMA are JSON Schemas ready to hand
 to a function-calling definition, covering reading, aggregating,
