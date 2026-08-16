@@ -798,6 +798,232 @@ class TestToolSchemas:
 
 
 # ---------------------------------------------------------------------
+# Description completeness (issue #58)
+#
+# A mutation run on an earlier PR reported ~120 survivors in this file,
+# almost all one shape: a string literal inside a tool description or a
+# parameter's `description` got uppercased or XX-wrapped, and no test
+# objected. Pinning every one of them verbatim (snapshotting each tool's
+# whole schema) was rejected in the issue -- it would freeze wording
+# CLAUDE.md wants to stay editable, and train reviewers to update an
+# assertion without reading it. What follows instead: structural checks
+# that walk whatever tools() actually registers -- so "a description
+# went missing" is caught as a fact about the schema's shape, not by
+# naming a tool -- plus a small, separately-commented set of claims
+# pinned by SUBSTRING because they are load-bearing by MEANING (an
+# invariant from CLAUDE.md), the same way _with_search() already treats
+# one sentence in this module as load-bearing enough to raise on. Why
+# the other ~120 are not chased one by one is recorded in
+# docs/testing.md's mutation-testing section, so the next mutation run
+# does not have to re-derive it from a skim.
+# ---------------------------------------------------------------------
+
+# Real tool descriptions in this file run 329-1100+ characters
+# (ingest_graph's single-graph description, at 329, is the shortest);
+# picked far below that so a legitimately terse-but-complete one is
+# never flagged, while a description blanked to a stub word or two is.
+MIN_TOOL_DESCRIPTION_LENGTH = 40
+# Real top-level parameter descriptions run 17-250 characters
+# ("The Cypher query." on `cypher.query` is the shortest); same margin,
+# same reasoning.
+MIN_PARAMETER_DESCRIPTION_LENGTH = 10
+
+
+def _single_graph_tool_specs() -> list:
+    """Every ToolSpec a SINGLE-graph server can register, across every
+    permission and embedding configuration that adds one -- gathered by
+    calling tools() rather than by naming a tool, so a tool or parameter
+    this module starts registering later is swept in with no edit here.
+
+    Deliberately never serves SEVERAL graphs. `graph`'s enum is the
+    served graph names, and this library deliberately never echoes them
+    in prose -- a per-tool list does not scale to the thousands of
+    graphs one server may serve (_named_graphs()'s own docstring says
+    so; test_descriptions_name_the_graphs_instead_of_one_vocabulary
+    pins it). test_every_enum_value_is_named_in_its_own_description
+    below would fail on `graph` in every multi-graph configuration for a
+    reason that has nothing to do with a stale description, so the enum
+    check runs only over this sweep; _every_tool_spec() adds the
+    multi-graph configuration back in for the two checks that do not
+    read an enum's own values."""
+    graph = offline()
+    graph.define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)],
+                         edges=[Vector("rel", 3)])
+    specs = []
+    for options in ({}, {"read_only": True}, {"allow_mutations": True},
+                    {"allow_ddl": True}, {"embed": embedder()}):
+        specs.extend(tools(graph, **options))
+    return specs
+
+
+def _every_tool_spec() -> list:
+    """The single-graph sweep above, plus one multi-graph, every-
+    permission configuration -- so list_graphs and every tool's `graph`
+    parameter are covered too. Used only by the two checks that do not
+    care what an enum's own values are (see _single_graph_tool_specs)."""
+    base = offline()
+    many = {"docs": base.in_graph("docs"), "crm": base.in_graph("crm")}
+    many["docs"].define_vectors(nodes=[Vector("summary", 3)])
+    return _single_graph_tool_specs() + tools(
+        many, allow_ddl=True, allow_mutations=True, embed=embedder())
+
+
+def _resolve_ref(ref: str, defs: dict) -> dict:
+    # Every $ref in this codebase is "#/$defs/<name>" -- a local,
+    # same-document pointer, never an external schema. Refusing
+    # anything else surfaces a new $ref shape here instead of silently
+    # walking past it unresolved.
+    prefix = "#/$defs/"
+    if not ref.startswith(prefix):
+        raise ValueError(f"unrecognized $ref {ref!r} -- this walker only resolves {prefix}<name>")
+    return defs[ref[len(prefix):]]
+
+
+def _walk_property_schemas(parameters: dict):
+    """Every (path, schema) pair reachable from a tool's top-level
+    `properties`, at ANY depth this codebase actually uses: a plain
+    top-level property, one nested under an array's `items.properties`
+    (hops), one nested under an open object's
+    `additionalProperties.properties` (aggregates), and a `$ref`
+    against the schema's own `$defs` (near/boost) -- resolved before
+    yielding, so a caller never has to know a property arrived by
+    reference. `path` is a dotted string naming where it lives, for a
+    readable assertion failure.
+
+    Without this, "every parameter has a description" and "every enum
+    is named in its own description" only ever saw top-level
+    properties -- silently missing hops[].direction and
+    aggregates{}.fn, which really did carry no description at all
+    until this same review round added one (issue #58's review)."""
+    defs = parameters.get("$defs", {})
+
+    def schemas_in(node: dict):
+        if "$ref" in node:
+            node = _resolve_ref(node["$ref"], defs)
+        return node
+
+    def walk(properties: dict, prefix: str):
+        for name, raw in properties.items():
+            schema = schemas_in(raw)
+            path = f"{prefix}{name}"
+            yield path, schema
+            if schema.get("type") == "array":
+                nested = schemas_in(schema.get("items", {}))
+                yield from walk(nested.get("properties", {}), f"{path}[].")
+            nested_open = schema.get("additionalProperties")
+            if isinstance(nested_open, dict):
+                nested_open = schemas_in(nested_open)
+                yield from walk(nested_open.get("properties", {}), f"{path}{{}}.")
+
+    yield from walk(parameters.get("properties", {}), "")
+
+
+class TestDescriptionsAreStructurallyComplete:
+    """Option 3 of issue #58: catches "a description went missing or was
+    truncated to a stub" as a structural fact about every tool this
+    server registers, with nothing here naming a tool or a parameter --
+    a new one is covered automatically, AT WHATEVER DEPTH IT LIVES
+    (see _walk_property_schemas -- a top-level-only version of these
+    two checks missed hops[].direction and aggregates{}.fn entirely,
+    both of which had zero description until this review round)."""
+
+    def test_every_tool_has_a_real_description(self):
+        for spec in _every_tool_spec():
+            assert len(spec.description.strip()) >= MIN_TOOL_DESCRIPTION_LENGTH, spec.name
+
+    def test_every_advertised_parameter_has_a_real_description(self):
+        """Every key reachable from a tool's `parameters`, at any depth
+        _walk_property_schemas reaches. This is the promise CLAUDE.md
+        makes for this module in particular: the SDK would derive
+        `{"type": "object"}` from a handler's signature and leave a
+        model to guess `where`/`via`/`hops`, which is why hopai
+        hand-writes these schemas instead -- a parameter with no
+        description is exactly that regression, one key at a time."""
+        for spec in _every_tool_spec():
+            for path, schema in _walk_property_schemas(spec.parameters):
+                description = schema.get("description", "")
+                assert len(description.strip()) >= MIN_PARAMETER_DESCRIPTION_LENGTH, \
+                    f"{spec.name}.{path}"
+
+    def test_every_enum_value_is_named_in_its_own_description(self):
+        """A description that drifts from its OWN enum -- gains a value
+        the prose never learned about -- is invisible to the check
+        above, which only asks whether a description exists. Singular
+        vs. plural is normalized (`.rstrip("s")`) because the prose says
+        "edge vectors" for the enum value "edges"; what has to be true
+        is that the CONCEPT is named, not the exact noun form."""
+        for spec in _single_graph_tool_specs():
+            for path, schema in _walk_property_schemas(spec.parameters):
+                values = schema.get("enum")
+                if not values:
+                    continue
+                description = schema.get("description", "").lower()
+                for value in values:
+                    assert value.lower().rstrip("s") in description, \
+                        f"{spec.name}.{path}: {value!r} not named in its own description"
+
+
+class TestPinnedPermissionClaims:
+    """Option 2 of issue #58. The structural tests above catch a
+    description going MISSING; they cannot catch one that is present but
+    now says the wrong thing. A handful of claims here are load-bearing
+    by MEANING rather than by exact wording -- CLAUDE.md names two of
+    them directly (what a read-only or otherwise-restricted server will
+    and will not do, and the rule that a vector never reaches a tool
+    schema) -- so each is pinned by a SUBSTRING a reword would have to
+    deliberately remove, the same idiom _with_search() already relies on
+    to guard one sentence it depends on still being present (a `not in`
+    check against the live description, never a snapshot of the whole
+    string). Everything else in these descriptions stays free to
+    reword; docs/testing.md records why the ~120 other survivors from
+    the mutation run that prompted this are knowingly not pinned too."""
+
+    def test_a_read_only_server_says_writes_are_refused(self):
+        """CLAUDE.md's read_only invariant, as told to the MODEL and not
+        merely enforced when the call is made: the cypher tool's own
+        description has to say writes are refused, or a model reading
+        only the schema has no way to know CREATE/MERGE will fail
+        before it tries them.
+
+        Case-sensitive on purpose, exactly like _with_search()'s own
+        `sentence not in schema["description"]` check: a mutant that
+        uppercases this whole literal (the shape the issue's own
+        example was -- "WHICH VECTOR FIELD SEARCH RANKS AGAINST.") stays
+        caught, where a case-folded comparison would let it through.
+
+        Bare "refused" is NOT enough to pin: a read-only server also has
+        allow_mutations=False (the two can't combine), so the
+        delete-refusal sentence pinned separately below
+        ("...are refused on this server: it is not permitted...")
+        already contains the word "refused" and would make a bare
+        `"refused" in description` pass even if THIS sentence's own
+        "refused" were mutated away -- verified by hand-mutating just
+        this sentence's wording and confirming a bare substring check
+        stayed green. Pin the phrase unique to read-only instead."""
+        description = named(offline(), read_only=True)["cypher"].description
+        assert "READ-ONLY: CREATE and MERGE are refused" in description
+
+    def test_the_default_server_says_deletes_and_updates_are_refused(self):
+        """The other permission axis: allow_mutations is off by default,
+        and that server still has to tell a model DELETE/DETACH
+        DELETE/SET/REMOVE will not run -- a claim distinct from
+        read_only's (a server can write but still refuse to delete),
+        so it needs its own pin."""
+        description = named(offline())["cypher"].description
+        assert "not permitted to change or remove" in description
+
+    def test_search_seeding_tells_a_model_to_send_text_never_a_vector(self, vector_graph):
+        """CLAUDE.md's own vector invariant: 'a "vector" never reaches a
+        tool schema... a model may send "text"'. The prose that teaches
+        a model the fallback way in (`start.search`) is the one place
+        that has to say this, since it is also the one place a model
+        could otherwise be tempted to invent floats instead of sending
+        words."""
+        description = named(vector_graph, embed=embedder())["traverse_graph"].description
+        assert "Never invent a vector" in description
+
+
+# ---------------------------------------------------------------------
 # The similarity rule
 # ---------------------------------------------------------------------
 
