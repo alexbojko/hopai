@@ -80,6 +80,20 @@ class TestSameAnswerAsSync:
         async_result = run(async_graph.cypher(query))
         assert async_result == sync_result
 
+    def test_cypher_aggregate_carries_its_hops(self, graph, async_graph):
+        """The case above has no hops, so it cannot see cypher()'s
+        dispatch dropping `*hops` on the way to aggregate() -- with none
+        to drop, both spellings count the same set. With a hop, dropping
+        it counts the SEED set instead: a different number, from a query
+        that still succeeds and says nothing."""
+        walked = "MATCH (a {type: 'leaf'})-[:knows]->(b) RETURN count(DISTINCT b)"
+        seeds = "MATCH (a {type: 'leaf'}) RETURN count(a)"
+        sync_result = graph.cypher(walked)
+        assert run(async_graph.cypher(walked)) == sync_result
+        # Without this the assertion above is vacuous: it only means
+        # something while the hop actually changes the answer.
+        assert sync_result != graph.cypher(seeds)
+
 
 class TestIngestAndMutate:
     def test_add_nodes_edges_and_traverse(self, async_fresh_graph):
