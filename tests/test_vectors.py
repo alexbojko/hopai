@@ -2423,7 +2423,7 @@ class TestBoostLive:
         g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]}])
         hits = g.vector_search(
             Near("docvec", QUERY),
-            boost=Boost(lambda p: func.length(p["title"].astext), 0.1), k=10)
+            boost=Boost(lambda p: func.length(p["title"].astext), 0.1, scale="raw"), k=10)
         assert hits[0]["boosts"] == pytest.approx({"boost_0": 3.0}, abs=1e-6)
         assert hits[0]["similarity"] == pytest.approx(1.0 + 3.0 * 0.1, abs=1e-6)
 
@@ -2439,8 +2439,9 @@ class TestBoostLive:
         g = _migrated(fresh_graph)
         g.add_nodes([{"id": 1, "score": 0.4}])
         g.set_vectors(nodes=[{"id": 1, "docvec": [1.0, 0.0, 0.0]}])
-        hits = g.vector_search(Near("docvec", QUERY),
-                               boost=[Boost("score", 0.5), Boost("score", 2.0)], k=10)
+        hits = g.vector_search(
+            Near("docvec", QUERY),
+            boost=[Boost("score", 0.5, scale="raw"), Boost("score", 2.0, scale="raw")], k=10)
         assert hits[0]["boosts"] == pytest.approx({"score": 0.4 + 0.4}, abs=1e-6)
         assert hits[0]["similarity"] == pytest.approx(1.0 + 0.4 * 0.5 + 0.4 * 2.0, abs=1e-6)
 
