@@ -442,6 +442,18 @@ class TestJsonApi:
         python_ids = {n["id"] for n in python_result.nodes}
         assert json_ids == python_ids
 
+    def test_traverse_json_has_no_node_ceiling(self, fresh_graph):
+        """The MCP server's max_nodes (hopai/mcp.py, #47) is enforced in
+        mcp.py alone: a Python/JSON caller going through traverse_json()
+        directly has no context window and no reason to be capped, and
+        this pins that a traversal bigger than any MCP default (500)
+        still comes back whole when called this way -- proving the cap
+        lives in the front end that needs it, not in traverse_json()
+        itself."""
+        fresh_graph.add_nodes([{"id": i, "type": "leaf"} for i in range(600)])
+        result = traverse_json(fresh_graph, {"start": {"where": {"type": "leaf"}}})
+        assert len(result["nodes"]) == 600
+
     def test_parse_filter_passthrough_for_plain_dict(self):
         assert parse_filter({"type": "leaf"}) == {"type": "leaf"}
 
