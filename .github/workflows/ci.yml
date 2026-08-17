@@ -162,17 +162,24 @@ jobs:
       # waiting on: past this the run is stopped and whatever it finished
       # is reported as partial.
       #
-      # Raised from 900 because the budget is not spent on mutants
-      # alone. Before the first one, mutmut runs the whole suite for a
-      # baseline and again under tracing to map tests to lines, and that
-      # cost grows with the suite -- at ~1400 tests it consumed the old
-      # budget outright and the run reported zero checked, which reads
-      # like a clean sweep and is the opposite. The per-mutant cost is
-      # small by comparison (thousands checked inside the same budget
-      # once the baseline is paid), so headroom buys mutants, not
-      # waiting. If this is exhausted again the report now says so by
-      # name rather than blaming `also_copy`.
-      MUTATION_BUDGET_SECONDS: "1800"
+      # Raised from 900, then from 1800, and the reason is the same both
+      # times: the budget is not spent on mutants alone. Before the first
+      # one mutmut runs the whole suite for a baseline and again under
+      # tracing to map tests to lines, and that fixed cost grows with the
+      # suite -- at ~1400 tests it consumed 900s outright, and at ~2600 it
+      # consumed 1800s, each time reporting zero checked.
+      #
+      # MEASURED rather than guessed this time: at the 9-file scope of a
+      # large PR, the first mutant verdict arrives 321s in on a quiet
+      # developer machine. CI reached none inside 1800s, so a runner is
+      # several times slower than that -- tracing is the expensive half,
+      # and it slows every test in the suite at once. 3600 buys real
+      # mutants on a runner instead of only paying the entry fee.
+      #
+      # It is a budget, not a target: the report already distinguishes
+      # "stopped early, here is what it checked" from "checked nothing",
+      # so a partial run is honest evidence and only a zero run is not.
+      MUTATION_BUDGET_SECONDS: "3600"
 
     steps:
       - uses: actions/checkout@v4
