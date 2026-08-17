@@ -27,6 +27,7 @@ this project before; a tuple cannot be one of those.
 from __future__ import annotations
 
 import contextlib
+import json
 import time
 
 import pytest
@@ -108,6 +109,12 @@ ACCEPTED = (
     # nested string would end the interpolation early.
     '"title: \\(.properties.title + " (draft)")"',
     "[.properties.title, .properties.summary] | .[0]",
+    # A comment INSIDE an interpolation: where the extent of `\(...)`
+    # is decided, and where a comment-blind scanner let a `)` in a
+    # comment end the expression early. See
+    # TestACommentCannotSmuggleCodeIntoAnInterpolation.
+    '"title: \\(.properties.title # which field\n)"',
+    '"\\(.properties.title) # not a comment, string text"',
 )
 
 
@@ -130,6 +137,27 @@ class TestTheAllowedSubset:
         """jq comments run to end of line. Treating `#` as an unknown
         character would refuse a filter an operator documented."""
         assert is_total("# doc\n.properties.title") is True
+
+    @pytest.mark.parametrize("program", ["1.a", '1."k"', "1[0]", "1?", "2.5.a"])
+    def test_a_number_takes_no_suffix(self, program):
+        """libjq's LEXER takes the dot: it reads `1.a` as the number `1.`
+        followed by a name and reports a syntax error. Reading it as
+        "field a of 1" was the only shape in 37,000 fuzz-generated
+        accepted programs that libjq refused -- and every instance of
+        that fuzz run's divergence."""
+        with pytest.raises(UnsafeFilter):
+            validate(program)
+
+    def test_a_backslash_in_a_comment_is_refused(self):
+        """jq 1.7 continues a comment onto the NEXT line when it ends
+        with `\\`; jq 1.6 does not. `# c\\<newline>.properties.title` is
+        therefore an empty program on 1.7 -- libjq answers "Top-level
+        program not given" -- while a to-end-of-line reader sees
+        `.properties.title`. Refusing the backslash is what keeps this
+        module's comment rule identical to every jq's."""
+        with pytest.raises(UnsafeFilter) as refused:
+            validate("# c \\\n.properties.title")
+        assert "backslash inside a comment" in str(refused.value)
 
 
 class TestForbiddenConstructs:
@@ -580,6 +608,29 @@ class TestGrowthIsBounded:
         assert "128 times its own input" in message
         assert f"{MAX_GROWTH}x" in message
 
+    @pytest.mark.parametrize("program", [
+        '.properties.tags | join("\\(.)")',
+        ".properties.tags | join(.properties.sep)",
+        ".properties | has(.key)",
+        ".properties.title | split(.properties.sep)",
+        ".properties.title | ltrimstr(.properties.prefix)",
+        ".properties.tags | flatten(.properties.depth)",
+    ])
+    def test_a_separator_or_needle_taken_from_the_row_is_refused(self, program):
+        """`join` emits its separator once per ELEMENT, so a separator
+        interpolating the row grows with the SQUARE of the row -- 9,899
+        characters out of a 50-element array, measured -- which the
+        growth factor, counting multiples of the input, cannot see. And
+        a computed needle is the same invisible argument that keeps
+        `getpath` out."""
+        with pytest.raises(UnsafeFilter):
+            validate(program)
+
+    def test_a_literal_separator_still_works(self):
+        """The refusal above must not take `join(", ")` with it -- that
+        is the whole reason `join` is in the allowlist."""
+        validate('[.properties.title, .properties.summary] | join(" -- ")')
+
     def test_a_real_projection_is_nowhere_near_the_cap(self):
         """The cap has to be invisible to the filters this feature is
         for -- a document concatenates a handful of fields."""
@@ -612,6 +663,19 @@ class TestLimits:
         catching UnsafeFilter would crash on a filter that is merely
         silly."""
         program = "(" * (MAX_DEPTH + 5) + "." + ")" * (MAX_DEPTH + 5)
+        with pytest.raises(UnsafeFilter) as refused:
+            validate(program)
+        assert str(MAX_DEPTH) in str(refused.value)
+
+    def test_nested_interpolations_are_refused_by_the_scanner_too(self):
+        """The parser's depth guard runs too late for these: measuring
+        where each `\\(...)` ENDS is done by two scanners that recurse
+        into each other, before a single token exists. 399 nested
+        interpolations fit inside MAX_LENGTH and raised RecursionError
+        out of a function whose whole contract is UnsafeFilter or
+        nothing."""
+        program = '"' + '\\("' * 399 + ".a" + '")' * 399 + '"'
+        assert len(program) <= MAX_LENGTH
         with pytest.raises(UnsafeFilter) as refused:
             validate(program)
         assert str(MAX_DEPTH) in str(refused.value)
@@ -658,24 +722,179 @@ class TestTheSubsetIsRealJq:
         jq.compile(program)
 
 
+class TestACommentCannotSmuggleCodeIntoAnInterpolation:
+    """The hole this class exists for, and the reason a second scanner
+    is never allowed to grow back.
+
+    `_scan_paren` decides how far a `\\(...)` interpolation extends --
+    which half of the filter is an EXPRESSION and which half is inert
+    text. It used to count parentheses while knowing nothing about `#`
+    comments, so a `)` written inside a comment closed the interpolation
+    here and not in libjq. Everything after that point was "string text"
+    this module never tokenized, while libjq read on to the real `)` and
+    ran it. Confirmed live: `env.FAKE_SECRET` came back as
+    `sk-leak-me`, and the same shape reached `def f: f; f` (only SIGKILL
+    ended it) and `[range(100000000)]` (SIGABRT). SOUNDNESS and TOTALITY
+    were both false for these inputs -- the analysis was being applied
+    to a program that was not the one that ran.
+
+    The payloads here are never executed. They are asserted refused."""
+
+    @pytest.mark.parametrize("program", [
+        '"\\(.properties.a # )\n|env.FAKE_SECRET)"',
+        '"\\(.properties.a # )\n|$ENV.FAKE_SECRET)"',
+        '"a\\(.properties.a)b\\(null # )\n// $ENV.HOME)c"',
+        '"\\(.a # )\n|env)"',
+    ])
+    def test_the_environment_payloads_are_refused(self, program):
+        """The exfiltration this module exists to stop, wearing a
+        comment. `env` is refused when it is INSIDE the interpolation --
+        which it is, once the extent is measured the way libjq measures
+        it."""
+        with pytest.raises(UnsafeFilter):
+            validate(program)
+
+    @pytest.mark.parametrize("program", [
+        '"\\(. # )\ndef f: f; f)"',
+        '"\\(. # )\n|[range(100000000)])"',
+        '"\\(. # )\n|recurse)"',
+        '"\\(. # )\n|reduce .[] as $x (0; .+$x))"',
+    ])
+    def test_the_non_terminating_payloads_are_refused_never_run(self, program):
+        """`def f: f; f` holds the GIL with SIGINT ignored and
+        `[range(100000000)]` aborts the process -- neither is survivable,
+        so this test asserts the refusal and never evaluates them."""
+        with pytest.raises(UnsafeFilter):
+            validate(program)
+
+    def test_the_allowlist_bypass_is_refused(self):
+        """`"\\(null # )\\n// .properties.ssn)"` returned the ssn while
+        paths_read() reported NOTHING -- the allowlist was not bypassed,
+        it was never consulted, because the read was hidden in what this
+        module thought was string text."""
+        with pytest.raises(UnsafeFilter) as refused:
+            validate('"\\(null # )\n// .properties.ssn)"',
+                     fields=["properties.a"])
+        assert "properties.ssn" in str(refused.value)
+
+    def test_the_smuggled_tail_is_part_of_the_program(self):
+        """The direct regression: what came after the comment's `)` is
+        now tokenized and reported. This assertion returned an EMPTY set
+        while the bug was live."""
+        assert paths_read('"\\(null # )\n// .properties.ssn)"') == \
+            frozenset({"properties.ssn"})
+
+    def test_a_comment_that_swallows_the_closing_paren_is_refused(self):
+        """The benign direction of the same confusion: in `"\\(1 # x)"`
+        the comment eats `)"` and libjq reports an unterminated
+        interpolation. Accepting it fails safe but still breaks the
+        genuine-subset claim the whole design rests on."""
+        with pytest.raises(UnsafeFilter) as refused:
+            validate('"\\(1 # x)"')
+        assert "never closed" in str(refused.value)
+
+    def test_a_comment_inside_an_interpolation_still_works(self):
+        """The fix must not refuse the ordinary case -- an interpolation
+        spanning lines with a note in it is legal jq, and libjq and this
+        module must agree on what it means."""
+        jq = pytest.importorskip("jq")
+        program = '"title: \\(.properties.title # which one\n)"'
+        validate(program, fields=["properties.title"])
+        assert paths_read(program) == frozenset({"properties.title"})
+        assert jq.compile(program).input(
+            {"properties": {"title": "Raft", "ssn": "123"}}).all() == ["title: Raft"]
+
+
+#: One value per field, so that what a filter EMITS can be traced back to
+#: the fields it read. Array elements carry the array's own path, which
+#: is the convention paths_read() uses: an index is not a segment.
+SENTINEL_ROW = {
+    "properties": {
+        "title": "S:properties.title",
+        "summary": "S:properties.summary",
+        "type": "S:properties.type",
+        "name": "S:properties.name",
+        "n": 3,
+        "tags": ["S:properties.tags:0", "S:properties.tags:1"],
+        "odd key": {"title": "S:properties.odd key.title"},
+        "ssn": "S:properties.ssn",
+    },
+    "quoted key": "S:quoted key",
+    "a": {"b": "S:a.b"},
+    "c": "S:c",
+}
+
+
+def _sentinels(value, out: dict):
+    """Every sentinel in SENTINEL_ROW, mapped to the path it sits at."""
+    if isinstance(value, dict):
+        for item in value.values():
+            _sentinels(item, out)
+    elif isinstance(value, list):
+        for item in value:
+            _sentinels(item, out)
+    elif isinstance(value, str) and value.startswith("S:"):
+        out[value] = value[2:].split(":")[0]
+    return out
+
+
+class TestPathsReadAgreesWithWhatLibjqRuns:
+    """The property the security posture actually needs, and the one
+    nothing tested while the interpolation bug was live: not "libjq
+    compiles this too", but "libjq MEANS the same thing".
+
+    Compilability is too weak a check -- every payload in the class above
+    was valid jq that compiled and ran. So this evaluates each accepted
+    program against a row whose every field carries its own sentinel, and
+    asserts that every field the OUTPUT proves was touched is covered by
+    what paths_read() reported. A validator that misreads where an
+    expression ends fails here, because libjq's answer contains a
+    sentinel the validator never named."""
+
+    @staticmethod
+    def _covered(path: str, reported) -> bool:
+        return any(named == "." or path == named or path.startswith(named + ".")
+                   for named in reported)
+
+    def test_every_field_that_reaches_the_output_was_reported(self):
+        """`fields=` is enforced on paths_read()'s answer, so a field
+        that reaches a vendor without appearing there is a field nobody
+        allowed. Run over the whole corpus in one test, with a floor on
+        how many sentinels were actually observed, so the check cannot
+        quietly become vacuous."""
+        jq = pytest.importorskip("jq")
+        known = _sentinels(SENTINEL_ROW, {})
+        observed = 0
+        for program in ACCEPTED:
+            reported = paths_read(program)
+            try:
+                answer = jq.compile(program).input(SENTINEL_ROW).all()
+            except ValueError:
+                continue                    # a runtime type error emits nothing
+            printed = json.dumps(answer)
+            for sentinel, path in known.items():
+                if sentinel not in printed:
+                    continue
+                observed += 1
+                assert self._covered(path, reported), (
+                    f"{program!r} emitted {path} but paths_read() reported {set(reported)}")
+        assert observed > 20, "the corpus stopped exercising the sentinels"
+
+    def test_the_check_can_fail(self):
+        """A test that cannot fail proves nothing. `.properties.ssn`
+        emits a sentinel that a report of `properties.title` does not
+        cover, which is exactly the shape of the bug this guards."""
+        assert not self._covered("properties.ssn", frozenset({"properties.title"}))
+        assert self._covered("properties.ssn", frozenset({"."}))
+        assert self._covered("properties.tags", frozenset({"properties"}))
+
+
 class TestAcceptedProgramsTerminate:
     """The totality claim, spot-checked by running it. The proof is
     structural -- no recursion, no generator, no loop, no fold -- but a
     proof nothing exercises is a comment."""
 
-    ROW = {
-        "properties": {
-            "title": "Raft consensus",
-            "summary": "how nodes agree",
-            "tags": ["Alpha", "Beta"],
-            "type": "paper",
-            "n": 3,
-            "odd key": {"title": "nested"},
-        },
-        "quoted key": "value",
-        "a": {"b": "deep"},
-        "c": "see",
-    }
+    ROW = SENTINEL_ROW
 
     def test_every_accepted_program_finishes_in_milliseconds(self):
         """`def f: f; f` holds the GIL forever and only SIGKILL ends it,

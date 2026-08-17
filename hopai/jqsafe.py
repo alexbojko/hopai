@@ -58,6 +58,28 @@ THE TWO CLAIMS THE WHOLE SECURITY POSTURE RESTS ON.
      input -- so the hang above is not "unlikely", it is unreachable.
      `is_total()` is exactly "does this parse in the subset".
 
+BOTH CLAIMS HAVE THE SAME PRECONDITION, and it is the one that failed
+in review: this module and libjq must agree about WHICH CHARACTERS ARE
+CODE. An allowlist over the names in a program is worth nothing if the
+program being analyzed is not the program being run. The way that broke
+was lexical, not grammatical -- `_scan_paren` measured how far a
+`\\(...)` interpolation extends by counting parentheses without knowing
+that jq treats `#` as a comment, so
+
+    "\\(.properties.a # )\\n|env.FAKE_SECRET)"
+
+closed the interpolation HERE at the `)` inside the comment, while libjq
+read on to the real one. Everything after it was "string text" that was
+never tokenized: `env` returned the process environment, and the same
+shape reached `def f: f; f` and `[range(100000000)]`. Hence the rule
+that now governs this file: EVERY reader of the source goes through
+_skip_trivia and _scan_string, so each of jq's lexical rules has exactly
+one implementation and no second scanner can drift. A differential test
+on COMPILABILITY could not catch that -- the payload is valid jq -- so
+there is a second one on MEANING: each accepted program is run against a
+row of per-field sentinels, and every field that reaches the output must
+be covered by what paths_read() reported.
+
 Totality bounds the number of outputs but not their SIZE: `(. + .)` is
 one node and doubles a string, and `(.+.)|(.+.)|(.+.)|...` doubles once
 per stage, so a 60-character program could ask for 2**10 times the row.
@@ -65,6 +87,16 @@ So every accepted program also carries a statically computed growth
 factor -- how many times its own input it may emit -- and anything above
 MAX_GROWTH is refused with that number in the message. Concatenation is
 the only amplifier left once `*` is gone, and it is now bounded.
+
+That factor COMPOSES because there are no variable bindings: with `as
+$x` absent, no subexpression can name a value from an enclosing context,
+so `map(f)` really is f applied elementwise and cannot smuggle the whole
+document into each element. The one construct that broke the arithmetic
+was `join`, which emits its separator once per ELEMENT -- `.tags |
+join("\\(.)")` measured 9,899 characters out of a 50-element array,
+quadratic in the row rather than linear in it. Hence _LITERAL_ARGUMENT:
+a separator (and a needle) comes from the program text, whose length is
+already capped.
 
 WHAT WAS REJECTED, and why none of it is enough on its own:
 
@@ -88,6 +120,9 @@ WHAT WAS REJECTED, and why none of it is enough on its own:
     verbatim, and a differential test asserts that everything this
     parser accepts, `jq.compile()` also accepts. The subset is a genuine
     subset; we never accept something libjq then rejects at runtime.
+    That test is not decoration -- it is what caught jq 1.7's comment
+    rule, where a comment ending in `\\` swallows the NEXT line and a
+    filter this module read as `.a` compiles to nothing at all.
 
 WHAT IS IN THE SUBSET: identity `.`; field access `.foo`, `."quoted"`,
 with `?`; indexing `.[0]`, `.[-1]`, slices `.[1:3]`, iteration `.[]`;
@@ -213,6 +248,23 @@ _ARITY = {
     "unique": frozenset({0}),
     "values": frozenset({0}),
 }
+
+#: Calls whose argument must be a LITERAL -- a string with no
+#: interpolation, or a number.
+#:
+#: Not a style rule: `join` emits its separator ONCE PER ELEMENT, so
+#: `.tags | join("\(.)")` is quadratic in the row rather than linear in
+#: it -- measured at 9,899 characters out of a 50-element array, and it
+#: is the one hole in the growth analysis, which counts factors of the
+#: input and not products with the element count. Pinning the separator
+#: to program text bounds that term by MAX_LENGTH. The others are here
+#: because a computed needle (`has(.k)`, `split(.sep)`) is the same
+#: invisible-to-the-allowlist argument that keeps `getpath` out, and
+#: because a separator or a prefix in a document projection is a
+#: constant in every real filter anyone writes.
+_LITERAL_ARGUMENT = frozenset({
+    "endswith", "flatten", "has", "join", "ltrimstr", "rtrimstr", "split", "startswith",
+})
 
 #: Calls that hand their input through rather than reading a value out
 #: of it -- filters, reorderings and selections. Used by paths_read():
@@ -360,9 +412,46 @@ def _refuse(owner: str, pos: int, what: str, why: str):
 # Tokenizer. A tokenizer and not a regex scan, because the whole point
 # is to tell a NAME (`env`) from a FIELD (`.environment`) from TEXT
 # ("env") -- the three spellings a substring blacklist confuses.
+#
+# Three functions, and EVERY reader of the source goes through them, so
+# each of jq's lexical rules has exactly one implementation:
+#   _skip_trivia  whitespace and comments
+#   _scan_string  string literals, including their interpolations
+#   _tokenize     everything else
+# _scan_paren -- which decides where an interpolation ENDS -- drives the
+# first two rather than reading characters itself. See its docstring for
+# the exfiltration that a second, comment-blind scanner allowed.
 # ---------------------------------------------------------------------
 
-def _scan_string(src: str, i: int, base: int, owner: str):
+def _skip_trivia(src: str, i: int, base: int, owner: str) -> int:
+    """Index past the whitespace and comments starting at `i`, or `i`
+    itself when there are none."""
+    n = len(src)
+    while i < n:
+        if src[i] in " \t\r\n":
+            i += 1
+            continue
+        if src[i] != "#":
+            return i
+        i += 1
+        while i < n and src[i] != "\n":
+            # jq 1.7 lets a comment CONTINUE onto the next line when the
+            # line ends with a backslash; jq 1.6 does not. So a comment
+            # containing one means two different programs depending on
+            # the libjq the application installed -- measured:
+            # `# c\<newline>.a` compiles to nothing at all on 1.7, and
+            # this module would have accepted `.a`. Refusing the
+            # backslash makes our comment rule identical to every jq's.
+            if src[i] == "\\":
+                _refuse(owner, base + i, "a backslash inside a comment",
+                        "jq 1.7 continues a comment onto the next line when it ends "
+                        "with `\\` and jq 1.6 does not, so the same filter would mean "
+                        "two different things. Drop the backslash")
+            i += 1
+    return i
+
+
+def _scan_string(src: str, i: int, base: int, owner: str, depth: int = 0):
     """Scan the string literal starting at src[i] == '"'.
 
     Returns (parts, index-after-the-closing-quote). `parts` alternates
@@ -391,7 +480,7 @@ def _scan_string(src: str, i: int, base: int, owner: str):
             if text:
                 parts.append("".join(text))
                 text = []
-            end = _scan_paren(src, i + 1, base, owner)
+            end = _scan_paren(src, i + 1, base, owner, depth + 1)
             parts.append(("interp", src[i + 2:end - 1], base + i + 2))
             i = end
             continue
@@ -414,25 +503,54 @@ def _scan_string(src: str, i: int, base: int, owner: str):
     return parts, i
 
 
-def _scan_paren(src: str, i: int, base: int, owner: str) -> int:
+def _scan_paren(src: str, i: int, base: int, owner: str, depth: int = 0) -> int:
     """Index just past the `)` matching src[i] == `(`.
 
-    Strings inside are skipped by _scan_string, which recurses back here
-    for their own interpolations -- so `"\\("\\(.a)")"` is measured the
-    same way jq measures it, rather than by counting parentheses in
-    text."""
-    depth = 0
+    THE THINGS THAT ARE NOT CODE HAVE TO BE SKIPPED THE WAY LIBJQ SKIPS
+    THEM, and this function is where that matters most, because what it
+    measures is how far a `\\(...)` interpolation extends -- i.e. which
+    part of the filter is an expression and which part is inert text.
+
+    That is not a parsing nicety, it is the security boundary. A version
+    of this function that counted parentheses without knowing about
+    comments accepted
+
+        "\\(.properties.a # )\\n|env.FAKE_SECRET)"
+
+    because the `)` inside the comment closed the interpolation HERE
+    while libjq, honouring the comment, read on to the real `)` and ran
+    `env.FAKE_SECRET`. Everything past our fake closing paren was
+    "string text" that this module never even tokenized: the allowlist,
+    the totality argument and the whole static analysis applied to a
+    program that was not the one being run. Strings and comments are
+    therefore skipped by the SAME two helpers the tokenizer uses --
+    _scan_string and _skip_trivia -- so there is exactly one
+    implementation of each of jq's lexical rules, and no second scanner
+    to drift out of step with the first."""
+    # The scanners recurse into each other for a string inside an
+    # interpolation, and they run BEFORE the parser's own nesting guard
+    # -- so without this, 399 nested interpolations (which fit inside
+    # MAX_LENGTH) raise RecursionError out of a function whose entire
+    # contract is UnsafeFilter or nothing.
+    if depth > MAX_DEPTH:
+        _refuse(owner, base + i, f"the filter nests more than {MAX_DEPTH} deep",
+                "a document projection is a few fields joined together; this is a program")
+    nesting = 0
     n = len(src)
     while i < n:
+        skipped = _skip_trivia(src, i, base, owner)
+        if skipped != i:
+            i = skipped
+            continue
         ch = src[i]
         if ch == '"':
-            _, i = _scan_string(src, i, base, owner)
+            _, i = _scan_string(src, i, base, owner, depth)
             continue
         if ch == "(":
-            depth += 1
+            nesting += 1
         elif ch == ")":
-            depth -= 1
-            if depth == 0:
+            nesting -= 1
+            if nesting == 0:
                 return i + 1
         i += 1
     _refuse(owner, base + i, "an interpolation `\\(` is never closed", "add the missing `)`")
@@ -446,14 +564,11 @@ def _tokenize(src: str, owner: str, base: int = 0) -> list:
     tokens: list = []
     i, n = 0, len(src)
     while i < n:
+        skipped = _skip_trivia(src, i, base, owner)     # whitespace and comments
+        if skipped != i:
+            i = skipped
+            continue
         ch = src[i]
-        if ch in " \t\r\n":
-            i += 1
-            continue
-        if ch == "#":                                   # jq comment, to end of line
-            while i < n and src[i] != "\n":
-                i += 1
-            continue
         if ch == ".":
             if src.startswith("..", i):
                 _refuse(owner, base + i, "`..` (recursive descent) is not in the subset",
@@ -579,6 +694,14 @@ _UNEXPECTED = {
 }
 
 
+def _is_literal(node) -> bool:
+    """A constant the parser can see whole: a number, or a string with no
+    interpolation in it. Anything else is data from the row."""
+    if node[0] == "num":
+        return True
+    return node[0] == "str" and all(isinstance(part, str) for part in node[1])
+
+
 class _Parser:
     def __init__(self, tokens: list, owner: str, depth: int = 0):
         self.tokens = tokens
@@ -701,6 +824,16 @@ class _Parser:
         node = self.primary()
         while True:
             token = self.peek()
+            if node[0] == "num" and (token.kind == "field" or token.text in ("[", "?")):
+                # jq's LEXER takes the dot: it reads `1.a` as the number
+                # `1.` followed by an identifier and calls it a syntax
+                # error. Found by fuzzing this parser against libjq --
+                # it was the only shape in 37,000 accepted programs that
+                # libjq refused, and every instance of it.
+                _refuse(self.owner, token.pos, "a number takes no suffix",
+                        "libjq lexes `1.a` as the number `1.` followed by a name and "
+                        "refuses it. Read the property from the row instead, e.g. "
+                        "`.properties.title`")
             if token.kind == "field":
                 self.take()
                 node = self._extend(node, ("field", token.value))
@@ -835,6 +968,13 @@ class _Parser:
                         "`sub/3`), and a regex from a model is a hang hopai cannot "
                         "interrupt")
             self.expect("punct", ")")
+        if args and name in _LITERAL_ARGUMENT and not _is_literal(args[0]):
+            _refuse(self.owner, token.pos,
+                    f"`{name}` takes a literal argument here",
+                    "a separator taken from the row is emitted once per element, which "
+                    "grows with the SQUARE of the row rather than with the row -- and a "
+                    'computed needle is invisible to the field allowlist. Write it out, '
+                    'e.g. `join(", ")`')
         if len(args) not in _ARITY[name]:
             _refuse(self.owner, token.pos,
                     f"`{name}` takes {' or '.join(str(a) for a in sorted(_ARITY[name]))} "
