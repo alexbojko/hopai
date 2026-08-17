@@ -31,6 +31,7 @@ project.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import sys
 import threading
@@ -128,6 +129,26 @@ class TestTheContract:
         assert not [name for name in dir(Rerank)
                     if name.startswith("rerank") or name.endswith(("_vector", "_fts",
                                                                    "_hybrid"))]
+
+    def test_the_class_docstring_states_the_contract(self):
+        """`from hopai.rerankers import Rerank; help(Rerank)` is how a
+        model learns this API, and the one line saying what a client must
+        RETURN lived only in the module docstring -- which help(Rerank)
+        never shows. Without it the reader knows a callable is accepted
+        and not what it owes back."""
+        doc = inspect.getdoc(Rerank)
+        assert "score(query: str, documents: list[str]) -> list[float]" in doc
+        assert "ONE FLOAT PER DOCUMENT, IN THE ORDER THE DOCUMENTS WERE GIVEN" in doc
+
+    def test_the_document_from_entry_shows_a_real_candidate(self):
+        """A model writes markedly better jq shown one concrete input
+        than described one in prose: the filter runs against the WHOLE
+        candidate dict, not just its properties, and that is a thing to
+        see rather than to be told."""
+        doc = inspect.getdoc(Rerank)
+        for key in ('"id": 7', '"properties"', '"similarity": 0.81',
+                    '"similarities"', '"boosts": {}'):
+            assert key in doc, f"the example candidate lost {key}"
 
     def test_no_documents_costs_no_provider_call(self):
         """An empty candidate list is a real case (a filter matched
@@ -414,6 +435,24 @@ class TestTheQueryAndDocuments:
         with pytest.raises(ValueError, match="document 0 is empty or whitespace"):
             _rerank(lambda q, d: [1.0]).score("q", ["  "])
 
+    @pytest.mark.parametrize("documents", ["a document", b"a document"])
+    def test_a_bare_string_is_one_document_not_a_list_of_characters(self, documents):
+        """A str is iterable, so `list(documents)` turned "a document"
+        into ten single-character documents and billed for all of them.
+        The complaint that came back -- "document 1 is empty or
+        whitespace" -- was about the SPACE, and named nothing a caller
+        could act on. _plain_scores() already guards exactly this on the
+        answer; the input had no guard at all."""
+        with pytest.raises(TypeError, match=r"a bare string is ONE document"):
+            _rerank(lambda q, d: [1.0]).score("q", documents)
+
+    def test_a_bare_string_costs_no_provider_call(self):
+        calls = []
+        rerank = _rerank(lambda q, d: calls.append(d) or [1.0] * len(d))
+        with pytest.raises(TypeError):
+            rerank.score("q", "abc")
+        assert calls == []
+
     def test_nothing_is_sent_when_a_document_is_invalid(self):
         """Validation happens before the call, like _clean_texts(): a
         batch about to be refused should never be paid for."""
@@ -518,6 +557,17 @@ class TestConstructorValidation:
         with pytest.raises(TypeError, match=r"the parameter is document_from=, not document="):
             Rerank(lambda q, d: [1.0], document=".properties.title")
 
+    @pytest.mark.parametrize("keyword", ["documents", "document_for", "doc_from",
+                                         "text_from", "document_text"])
+    def test_every_near_miss_reaches_the_same_answer(self, keyword):
+        """`document=` was answered by name and its four neighbours were
+        not, so the same mistake got the useful message or a bare list of
+        names depending on which word the caller reached for. Anything
+        naming a document or its text is reaching for this parameter."""
+        with pytest.raises(TypeError,
+                           match=rf"the parameter is document_from=, not {keyword}="):
+            Rerank(lambda q, d: [1.0], **{keyword: ".properties.title"})
+
     def test_another_unexpected_keyword_is_still_refused(self):
         with pytest.raises(TypeError, match=r"unexpected keyword argument\(s\) \['top_n'\]"):
             Rerank(lambda q, d: [1.0], document_from=".a", top_n=5)
@@ -528,6 +578,78 @@ class TestConstructorValidation:
         a jq filter."""
         with pytest.raises(TypeError):
             Rerank(lambda q, d: [1.0], ".properties.title")
+
+    def test_the_positional_form_gets_the_named_sentence_too(self):
+        """Every sibling takes its required second argument positionally
+        -- Near("summary", q), Boost("importance", 0.2),
+        Embedder(client, "text-embedding-3-small") -- so this is what a
+        reader of those writes. Python answers it with "takes 2
+        positional arguments but 3 were given", which names neither the
+        parameter nor why it is keyword-only."""
+        with pytest.raises(TypeError, match=r"document_from= is keyword-only"):
+            Rerank(lambda q, d: [1.0], ".properties.title")
+
+    def test_a_callable_filter_names_the_rewrite(self):
+        """`document_from=` READS like a hook, and Boost(key=...)
+        genuinely accepts one -- so "must be a non-empty jq filter
+        string" alone leaves the caller unsure whether hopai wants a
+        different function or a different kind of value."""
+        with pytest.raises(ValueError, match=r"document_from='\.properties\.title'"):
+            Rerank(lambda q, d: [1.0], document_from=lambda candidate: candidate["id"])
+
+    def test_the_required_sentinel_reads_as_required(self):
+        """`help(Rerank)` and inspect.signature are how a model learns
+        this API. A bare object() sentinel renders as
+        `document_from: str = <object object at 0x7f...>`, which states
+        the opposite of the truth about the one required parameter."""
+        signature = inspect.signature(Rerank.__init__)
+        assert repr(signature.parameters["document_from"].default) == "<required>"
+
+    def test_a_wrong_arity_callable_refuses_at_construction(self):
+        """Reported as a provider outage before the fix: "the reranker
+        call failed after 1 attempt(s) (TypeError: <lambda>() takes 1
+        positional argument but 2 were given) ... Catch RerankError and
+        re-run without rerank=" -- advice that would make a typo
+        permanent. The callable is the shape the notebooks use, so it is
+        the most likely first mistake."""
+        with pytest.raises(TypeError, match=r"cannot be called with \(query, documents\)"):
+            _rerank(lambda documents: [1.0] * len(documents))
+
+    def test_the_arity_refusal_names_the_contract(self):
+        """"Wrong number of arguments" without the contract leaves the
+        caller guessing which two, and in which order."""
+        with pytest.raises(TypeError, match=r"score\(query: str, documents: list\[str\]\) "
+                                            r"-> list\[float\]"):
+            _rerank(lambda query, documents, model: [1.0])
+
+    def test_a_callable_with_no_readable_signature_is_still_accepted(self):
+        """Silent when it cannot tell, never refusing on a guess: a
+        C-implemented callable or an SDK object has no arity to inspect,
+        and rejecting one we merely could not read would turn a working
+        client away."""
+        class Opaque:
+            def __call__(self, *args):
+                return [1.0] * len(args[1])
+
+            @property
+            def __signature__(self):
+                raise ValueError("no signature here")
+
+        assert _rerank(Opaque()).score("q", ["a"]) == [1.0]
+
+    def test_the_per_path_message_explains_the_case_that_happened(self):
+        """The "'false' is truthy in Python" sentence is the reason a
+        STRING is refused. Against per_path=1 it answers a question
+        nobody asked, which reads as the library talking about someone
+        else's mistake."""
+        with pytest.raises(TypeError) as string_case:
+            _rerank(lambda q, d: [1.0], per_path="false")
+        assert "'false' is truthy in Python" in str(string_case.value)
+
+        with pytest.raises(TypeError) as int_case:
+            _rerank(lambda q, d: [1.0], per_path=1)
+        assert "truthy in Python" not in str(int_case.value)
+        assert "one provider call per path" in str(int_case.value)
 
     @pytest.mark.parametrize("value", ["", "   ", None, 42, [".a"]])
     def test_a_blank_or_non_string_filter_refuses(self, value):
@@ -596,7 +718,8 @@ class TestConstructorValidation:
         """per_path=True multiplies the bill by the path count, so a
         repr that hid it would hide the thing worth noticing in a log."""
         assert repr(_rerank(lambda q, d: [1.0], per_path=True)) == (
-            "Rerank(function, candidates=50, per_path=True)")
+            "Rerank(<lambda>, document_from='.properties.title', candidates=50, "
+            "per_path=True)")
 
     def test_repr_names_the_provider_and_model(self):
         class Cohereish:
@@ -605,7 +728,26 @@ class TestConstructorValidation:
 
         client = _named("cohere.client_v2", Cohereish)()
         assert repr(_rerank(client, model="rerank-v3.5")) == (
-            "Rerank(cohere, model='rerank-v3.5', candidates=50)")
+            "Rerank(cohere, model='rerank-v3.5', document_from='.properties.title', "
+            "candidates=50)")
+
+    def test_repr_names_a_plain_callable_by_its_own_name(self):
+        """Without the fix every callable client reprs as `function`,
+        which identifies nothing -- and this repr is the `owner` prefix
+        of every runtime message the module raises, so a log full of
+        "Rerank(function, ...)" cannot say WHICH reranker failed."""
+        def relevance(query, documents):
+            return [1.0] * len(documents)
+
+        assert repr(_rerank(relevance)).startswith("Rerank(relevance, ")
+
+    def test_repr_carries_the_filter(self):
+        """`document_from` is the argument you stare at when a ranking
+        looks wrong, and it is the one this repr used to drop -- leaving
+        every error message about a document silent about the rule that
+        built it."""
+        rerank = _rerank(lambda q, d: [1.0], document_from=".properties.body")
+        assert "document_from='.properties.body'" in repr(rerank)
 
 
 class TestTheModelIsRequiredWhereItSelects:
@@ -844,6 +986,33 @@ class TestAsync:
         assert run(rerank.ascore("q", ["a", "b"])) == [0.5, 0.5]
         assert seen == ["q"]
 
+    def test_a_callable_object_with_an_async_call_is_async(self):
+        """`inspect.iscoroutinefunction(obj)` is False for an object
+        whose `__call__` is the `async def`, so `is_async` -- a PUBLIC
+        attribute -- reported the opposite of the truth, and ascore()
+        paid a thread to build a coroutine it then awaited anyway.
+        `embeddings._is_async_call()` exists for exactly this shape and
+        is imported rather than restated, like `_retryable` beside it."""
+        class AsyncCallable:
+            async def __call__(self, query, documents):
+                return [0.75 for _ in documents]
+
+        rerank = _rerank(AsyncCallable())
+        assert rerank.is_async is True
+        assert run(rerank.ascore("q", ["a", "b"])) == [0.75, 0.75]
+
+    def test_an_async_callable_object_refuses_sync_score(self):
+        """`is_async` is what score() reads to refuse BEFORE the call.
+        Reported as False, it called the client and got a coroutine back
+        -- caught by the second guard, but only after the round trip was
+        set up."""
+        class AsyncCallable:
+            async def __call__(self, query, documents):
+                return [1.0]
+
+        with pytest.raises(TypeError, match="this client's rerank call is async"):
+            _rerank(AsyncCallable()).score("q", ["a"])
+
     def test_an_async_native_client_is_awaited_and_repaired_by_index(self):
         """The reshaping cannot happen until the answer is awaited --
         which is why invoking and reading the answer are two functions
@@ -1073,6 +1242,44 @@ class TestDocuments:
         with pytest.raises(TypeError, match="evaluated to int"):
             rerank.build_documents([{"id": "1", "properties": {"year": 2014}}])
 
+    def test_the_type_advice_puts_the_default_before_tostring(self):
+        """The old advice ("add tostring, or a default such as `// \"\"`")
+        was two half-fixes that each break. Followed literally on a row
+        where the property is MISSING, `| tostring` manufactures the
+        string "null" and the reranker scores the WORD null -- a
+        confidently wrong ranking with nothing to see. `// ""` alone
+        produces an empty document, which the very next check refuses,
+        so that half walked the caller into a second error."""
+        rerank = self._build(".properties.year")
+        with pytest.raises(TypeError) as failure:
+            rerank.build_documents([{"id": "1", "properties": {"year": 2014}}])
+        message = str(failure.value)
+        assert '.properties.year // "unknown" | tostring' in message
+        assert 'the TEXT "null"' in message
+
+    def test_the_advised_rewrite_actually_works_on_a_missing_property(self):
+        """The advice is only advice if following it produces a
+        document: default first, then tostring, on the row that has no
+        such property at all."""
+        rerank = self._build('.properties.year // "unknown" | tostring')
+        assert rerank.build_documents(
+            [{"id": "1", "properties": {"year": 2014}}, {"id": "2", "properties": {}}]
+        ) == ["2014", "unknown"]
+
+    def test_one_candidate_is_answered_with_the_call_shape(self):
+        """`build_documents(candidate)` iterates the dict's KEYS, so the
+        filter ran against the string "id" and jq's own complaint --
+        "Cannot index string with string" -- blamed the filter for a
+        mistake in the call. Same class as a bare str reaching score()."""
+        rerank = self._build(".properties.title")
+        with pytest.raises(TypeError, match=r"candidates is a LIST of candidates"):
+            rerank.build_documents({"id": "7", "properties": {"title": "Raft"}})
+
+    def test_the_single_candidate_refusal_names_the_fix(self):
+        rerank = self._build(".properties.title")
+        with pytest.raises(TypeError, match=r"Pass \[candidate\]"):
+            rerank.build_documents({"id": "7", "properties": {"title": "Raft"}})
+
     def test_an_empty_document_refuses(self):
         """Never fall back to an empty document -- it scores that
         candidate against nothing and silently changes the ranking."""
@@ -1093,22 +1300,56 @@ class TestDocuments:
         with pytest.raises(ValueError, match="produced 0 outputs"):
             rerank.build_documents([{"id": "1", "properties": {}}])
 
-    def test_an_invalid_filter_refuses_when_it_is_compiled(self):
-        rerank = self._build(".properties.title +")
+    def test_zero_outputs_and_several_outputs_get_different_advice(self):
+        """One message served both branches and told a caller with NO
+        document to "wrap it in [...] | join(", ") so the filter says
+        which" -- nonsense for zero outputs, and zero is the commoner
+        case: a select() that matched nothing, `empty`, a path through a
+        key this row does not have."""
+        with pytest.raises(ValueError) as none_at_all:
+            self._build(".properties.tags[]").build_documents(
+                [{"id": "1", "properties": {"tags": []}}])
+        with pytest.raises(ValueError) as too_many:
+            self._build(".properties.tags[]").build_documents(
+                [{"id": "1", "properties": {"tags": ["a", "b"]}}])
+
+        assert "join" not in str(none_at_all.value)
+        assert '// "untitled"' in str(none_at_all.value)
+        assert "drop that candidate before reranking" in str(none_at_all.value)
+        assert "join" in str(too_many.value)
+
+    def test_an_invalid_filter_refuses_at_construction(self):
+        """`_bind()` refuses a client hopai cannot call on the line that
+        names it; the filter gets the same treatment. Left lazy,
+        `document_from='properties.title'` -- no leading dot, the single
+        most likely thing to write -- constructed fine and failed at
+        query time, a long way from the mistake."""
+        needs_jq()
         with pytest.raises(ValueError, match="is not a valid jq filter"):
-            rerank.build_documents([{"id": "1", "properties": {}}])
+            _rerank(lambda q, d: [1.0], document_from=".properties.title +")
+
+    def test_the_missing_dot_is_named(self):
+        """jq's own message for it is a parse error about an undefined
+        function (`properties/0 is not defined`), which does not mention
+        the dot the caller left off."""
+        needs_jq()
+        with pytest.raises(ValueError, match=r"jq paths start with a dot, e\.g\. "
+                                             r"'\.properties\.title'"):
+            _rerank(lambda q, d: [1.0], document_from="properties.title")
 
     def test_the_filter_is_compiled_once(self, monkeypatch):
         """Measured, not assumed: compiling costs ~2.4ms against ~30us
         to evaluate a row, so a compile per candidate would be 98% of
         the cost of building 50 documents and would grow with the
-        candidate count instead of being paid once."""
+        candidate count instead of being paid once. Patched BEFORE the
+        Rerank exists, because the one compile now happens in
+        __init__."""
         jq = needs_jq()
-        rerank = self._build(".properties.title")
         compiled = []
         real = jq.compile
         monkeypatch.setattr(
             jq, "compile", lambda program: compiled.append(program) or real(program))
+        rerank = self._build(".properties.title")
         candidates = [{"id": str(i), "properties": {"title": f"t{i}"}} for i in range(5)]
         assert rerank.build_documents(candidates) == [f"t{i}" for i in range(5)]
         rerank.build_documents(candidates)
@@ -1159,6 +1400,14 @@ class TestTheJqExtra:
         rerank = _rerank(lambda q, d: [1.0] * len(d))
         assert rerank.score("q", ["a"]) == [1.0]
 
+    def test_without_the_binding_even_a_broken_filter_constructs(self, monkeypatch):
+        """The eager compile is conditional on the binding being there.
+        Making it unconditional would refuse a filter it could not read,
+        and would break the promise above -- a score()-only Rerank on a
+        base install."""
+        monkeypatch.setitem(sys.modules, "jq", None)
+        assert _rerank(lambda q, d: [1.0], document_from="properties.title")
+
     def test_a_missing_binding_names_the_extra(self, monkeypatch):
         """`No module named 'jq'` tells a caller what is absent without
         telling them what to install -- the same reason mcp.py asks for
@@ -1175,7 +1424,34 @@ class TestUntrustedFilters:
     retrieval decision it is well placed to make, unlike an embedding,
     which it would have to invent. What it is not is an invitation to
     run arbitrary jq, and the gate for that lives in hopai.jqsafe, not
-    here: this module only decides WHEN to ask."""
+    here: this module only decides WHEN to ask.
+
+    THE SAFE BEHAVIOUR IS THE DEFAULT and `trusted=True` is the opt-in,
+    which is the polarity `allow_vectors=`, `all=` and `detach=` already
+    keep: in hopai the DANGEROUS thing is the thing you ask for."""
+
+    def test_the_default_is_the_safe_one(self, monkeypatch):
+        """The whole point of the flip. With safety spelled
+        `untrusted=True` it was opt-IN, so forgetting the flag on a
+        filter that arrived over the wire ran `env.HOME` and POSTed the
+        answer to a vendor. A forgotten flag must fail closed."""
+        jqsafe = pytest.importorskip("hopai.jqsafe")
+        needs_jq()
+        calls = []
+        monkeypatch.setattr(jqsafe, "validate",
+                            lambda program, **kwargs: calls.append(program))
+        _rerank(lambda q, d: [1.0], document_from=".properties.title").build_documents(
+            [{"id": "1", "properties": {"title": "Raft"}}])
+        assert calls == [".properties.title"]
+
+    def test_a_forgotten_flag_still_refuses_an_unsafe_filter(self):
+        """The same exfiltration test as below, with nothing passed at
+        all -- which is what the mistake actually looks like."""
+        jqsafe = pytest.importorskip("hopai.jqsafe")
+        needs_jq()
+        rerank = _rerank(lambda q, d: [1.0], document_from="env.DATABASE_URL")
+        with pytest.raises(jqsafe.UnsafeFilter):
+            rerank.build_documents([{"id": "1"}])
 
     def test_a_trusted_filter_is_not_validated(self, monkeypatch):
         """A human writing jq in their own Python process already runs
@@ -1188,8 +1464,17 @@ class TestUntrustedFilters:
         monkeypatch.setattr(jqsafe, "validate",
                             lambda *args, **kwargs: calls.append(args))
         _rerank(lambda q, d: [1.0], document_from=".properties.title").build_documents(
-            [{"id": "1", "properties": {"title": "Raft"}}])
+            [{"id": "1", "properties": {"title": "Raft"}}], trusted=True)
         assert calls == []
+
+    def test_trusted_true_really_gets_the_full_language(self):
+        """`trusted=True` is the escape hatch, so it has to actually
+        open: a filter the subset refuses must run when the caller says
+        the filter is their own."""
+        pytest.importorskip("hopai.jqsafe")
+        needs_jq()
+        rerank = _rerank(lambda q, d: [1.0], document_from='[range(3)] | tostring')
+        assert rerank.build_documents([{"id": "1"}], trusted=True) == ["[0,1,2]"]
 
     def test_an_untrusted_filter_is_validated(self, monkeypatch):
         jqsafe = pytest.importorskip("hopai.jqsafe")
@@ -1199,7 +1484,7 @@ class TestUntrustedFilters:
                             lambda program, **kwargs: calls.append((program, kwargs)))
         rerank = _rerank(lambda q, d: [1.0], document_from=".properties.title")
         rerank.build_documents([{"id": "1", "properties": {"title": "Raft"}}],
-                               untrusted=True, fields=["properties.title"])
+                               fields=["properties.title"])
         assert calls == [(".properties.title",
                           {"fields": ["properties.title"], "owner": "document_from"})]
 
@@ -1215,9 +1500,9 @@ class TestUntrustedFilters:
                             lambda program, **kwargs: calls.append(kwargs.get("fields")))
         rerank = _rerank(lambda q, d: [1.0], document_from=".properties.title")
         candidates = [{"id": "1", "properties": {"title": "Raft"}}]
-        rerank.build_documents(candidates, untrusted=True, fields=["properties.title"])
-        rerank.build_documents(candidates, untrusted=True, fields=["properties.title"])
-        rerank.build_documents(candidates, untrusted=True, fields=["properties.body"])
+        rerank.build_documents(candidates, fields=["properties.title"])
+        rerank.build_documents(candidates, fields=["properties.title"])
+        rerank.build_documents(candidates, fields=["properties.body"])
         assert calls == [["properties.title"], ["properties.body"]]
 
     def test_an_unsafe_filter_refuses_before_it_runs(self):
@@ -1229,7 +1514,7 @@ class TestUntrustedFilters:
         needs_jq()
         rerank = _rerank(lambda q, d: [1.0], document_from="env.DATABASE_URL")
         with pytest.raises(jqsafe.UnsafeFilter):
-            rerank.build_documents([{"id": "1"}], untrusted=True)
+            rerank.build_documents([{"id": "1"}], trusted=False)
 
 
 # ---------------------------------------------------------------------
@@ -1248,6 +1533,52 @@ class TestNoProviderIsImported:
                   if name.split(".")[0] in {"cohere", "voyageai",
                                             "sentence_transformers", "openai"}}
         assert leaked == set(), f"a provider package was imported: {sorted(leaked)}"
+
+
+class TestTheRenderedSignature:
+    """What `inspect.signature(Rerank)` and `help(Rerank)` report.
+
+    A model discovers this API by introspecting it, so the signature is
+    documentation, not a detail. `__init__` really takes `*misplaced`
+    and `**unexpected`, but both are refusal channels -- and rendered,
+    `*misplaced` advertises positional arguments to a reader whose first
+    question is whether `document_from` is one, which is the exact
+    confusion keyword-only exists to prevent."""
+
+    def test_the_refusal_channels_are_not_advertised(self):
+        rendered = str(inspect.signature(Rerank))
+        assert "misplaced" not in rendered and "unexpected" not in rendered
+
+    def test_document_from_reads_as_required_and_keyword_only(self):
+        """Two things a signature must not lie about: that the one
+        required argument is required, and that it cannot be passed
+        positionally."""
+        parameters = inspect.signature(Rerank).parameters
+        assert str(parameters["document_from"].default) == "<required>"
+        assert parameters["document_from"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_every_advertised_parameter_is_really_accepted(self):
+        """The override is hand-written, so it can drift from __init__.
+        A parameter advertised but not accepted is worse than none: it is
+        what a model would reach for first."""
+        advertised = [name for name in inspect.signature(Rerank).parameters
+                      if name != "client"]
+        real = inspect.signature(Rerank.__init__).parameters
+        assert [name for name in advertised if name not in real] == []
+
+    @pytest.mark.parametrize("call, expected", [
+        (lambda: Rerank(lambda query, documents: [1.0], ".a"),
+         "document_from= is keyword-only"),
+        (lambda: Rerank(lambda query, documents: [1.0], document=".a"),
+         "the parameter is document_from=, not document="),
+        (lambda: Rerank(lambda query, documents: [1.0], doc_from=".a"),
+         "the parameter is document_from=, not doc_from="),
+    ])
+    def test_the_channels_still_answer_by_name(self, call, expected):
+        """Hiding them from the signature must not disarm them -- the
+        whole reason they exist is to beat Python's generic message."""
+        with pytest.raises(TypeError, match=expected):
+            call()
 
 
 class TestRerankOnStartAndHop:

@@ -138,7 +138,7 @@ from typing import Any, Optional
 # without being named again here (naming them would only be an unused
 # import that a reader could mistake for a second copy).
 from .embeddings import (
-    _MAX_BACKOFF, _retry_after, _retryable,
+    _MAX_BACKOFF, _is_async_call, _retry_after, _retryable,
 )
 
 #: The second place hopai makes a network call, so -- as in
@@ -195,7 +195,35 @@ _DEFAULT_MAX_PATHS = 10
 #: `Rerank(client, document='...')` be answered with the parameter's
 #: real name instead of Python's "unexpected keyword argument", which
 #: names the mistake and not the fix.
-_REQUIRED = object()
+#:
+#: It carries a `__repr__` because the sentinel is PUBLIC through
+#: `help(Rerank)` and `inspect.signature`: a bare `object()` renders as
+#: `document_from: str = <object object at 0x7f...>`, which tells a model
+#: introspecting the signature the exact opposite of the truth -- that
+#: the one required parameter is optional, and that its default is some
+#: value it cannot name.
+class _Required:
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<required>"
+
+
+_REQUIRED = _Required()
+
+#: Said once, in the two places the same mistake arrives: `document=`
+#: (or any near-miss keyword) and a second POSITIONAL argument. Every
+#: sibling spec takes its required second argument positionally --
+#: `Near("summary", q)`, `Boost("importance", 0.2)`,
+#: `Embedder(client, "text-embedding-3-small")` -- so
+#: `Rerank(client, '.properties.title')` is what a reader of those
+#: writes, and Python's "takes 2 positional arguments but 3 were given"
+#: names neither the parameter nor why it is keyword-only.
+_DOCUMENT_FROM_IS_A_RULE = (
+    "the value is a jq filter EVALUATED once per candidate at execution time, not the "
+    "document itself. Nothing about the documents exists when you write the query. "
+    "e.g. document_from='.properties.title + \": \" + (.properties.summary // \"\")'"
+)
 
 
 class RerankError(RuntimeError):
@@ -369,6 +397,20 @@ class Rerank:
         Rerank(lambda query, documents: my_service.rank(query, documents),
                document_from='.properties.title')
 
+    ONE METHOD IS THE WHOLE CONTRACT, and every client above is only a
+    spelling of it:
+
+        score(query: str, documents: list[str]) -> list[float]
+
+    ONE FLOAT PER DOCUMENT, IN THE ORDER THE DOCUMENTS WERE GIVEN. A
+    shorter list, a longer one, or an answer sorted by relevance without
+    an index to put it back is refused rather than paired up -- a
+    mis-paired score is a plausible, confidently wrong ranking that
+    nothing reports. (Cohere's and Voyage's own answers ARE sorted by
+    relevance, which is why their `.index` is read; see
+    `_indexed_scores`.) Higher means more relevant; the scale is the
+    reranker's own and is never rescaled here.
+
     A RERANKER REQUIRES A TEXT QUERY, and that is what reranking IS
     rather than a gap to close later: a cross-encoder scores a query
     against a document by READING BOTH, and a bare embedding is not
@@ -382,11 +424,23 @@ class Rerank:
     document_from:  a jq filter, evaluated once per candidate at
                     execution time -- a RULE, not a document. It runs
                     against each candidate's JSON (the dict
-                    vector_search() already returns: id, properties,
-                    similarity, similarities, boosts -- plus `paths` at
-                    a traversal hop) and MUST evaluate to one non-empty
-                    string. Inline it at the call site; `document_from=doc`
-                    hides the only part a reader needs to see.
+                    vector_search() already returns) and MUST evaluate
+                    to one non-empty string. One whole candidate, so
+                    there is nothing left to guess about the shape:
+
+                        {"id": 7,
+                         "properties": {"title": "Raft",
+                                        "summary": "a consensus protocol"},
+                         "similarity": 0.81,
+                         "similarities": {"summary": 0.81},
+                         "boosts": {}}
+
+                    -- plus "paths" at a traversal hop. So
+                    '.properties.title' is "Raft" and
+                    '.properties.title + ": " + .properties.summary' is
+                    "Raft: a consensus protocol". Inline it at the call
+                    site; `document_from=doc` hides the only part a
+                    reader needs to see.
     candidates:     how many hits reach the reranker, before k/keep
                     truncates. An INPUT bound; k is the output bound,
                     and the two never overlap.
@@ -427,22 +481,37 @@ class Rerank:
     parent counts" semantics `test_fan_in_both_parents_preserved`
     exists to protect."""
 
-    def __init__(self, client: Any, *, document_from: str = _REQUIRED,
+    def __init__(self, client: Any, *misplaced, document_from: str = _REQUIRED,
                  candidates: int = _DEFAULT_CANDIDATES, per_path: bool = False,
                  max_paths: int = _DEFAULT_MAX_PATHS, model: Optional[str] = None,
                  batch_size: Optional[int] = None, retries: int = _DEFAULT_RETRIES,
                  backoff: float = _DEFAULT_BACKOFF, **unexpected):
+        # The filter stays keyword-only -- positionally it would sit
+        # where a model name reads naturally, and `Rerank(client,
+        # "rerank-v3.5")` would compile a model name as a jq filter. But
+        # every sibling spec DOES take its required second argument
+        # positionally, so the mistake is the expected one and deserves
+        # the same named sentence `document=` gets rather than Python's
+        # "takes 2 positional arguments but 3 were given".
+        if misplaced:
+            raise TypeError(
+                f"Rerank: document_from= is keyword-only -- pass it by name, "
+                f"document_from={misplaced[0]!r}, and not positionally where a model "
+                f"name reads naturally. It is keyword-only because {_DOCUMENT_FROM_IS_A_RULE}"
+            )
         # `document=` is the mistake worth answering by name: it is what
         # the parameter would be called if the value were a document,
         # and Python's own error for a misspelled keyword names the
-        # misspelling without ever naming the fix.
-        if "document" in unexpected:
+        # misspelling without ever naming the fix. `documents=`,
+        # `text_from=`, `doc_from=` are the SAME mistake reaching for the
+        # same parameter, so they are answered the same way rather than
+        # falling through to a list of names.
+        misnamed = sorted(name for name in unexpected
+                          if "doc" in name.lower() or "text" in name.lower())
+        if misnamed:
             raise TypeError(
-                "Rerank: the parameter is document_from=, not document= -- the value is a "
-                "jq filter EVALUATED once per candidate at execution time, not the "
-                "document itself. Nothing about the documents exists when you write the "
-                "query. e.g. document_from='.properties.title + \": \" + "
-                "(.properties.summary // \"\")'"
+                f"Rerank: the parameter is document_from=, not {misnamed[0]}= -- "
+                f"{_DOCUMENT_FROM_IS_A_RULE}"
             )
         if unexpected:
             raise TypeError(
@@ -454,6 +523,19 @@ class Rerank:
                 "\": \" + (.properties.summary // \"\")'. There is no default, because "
                 "guessing which property holds the text would rank against the wrong "
                 "words and report nothing"
+            )
+        # A callable is answered separately because the NAME invites it
+        # -- `document_from=make_document` reads like a hook -- and
+        # because `Boost(key=...)` genuinely accepts one, so the reader
+        # is not guessing wildly. Naming the rewrite is what turns "not
+        # a string" into something a caller can act on.
+        if callable(document_from):
+            raise ValueError(
+                f"Rerank: document_from= is a jq filter STRING, not a function -- got "
+                f"{getattr(document_from, '__name__', type(document_from).__name__)}. "
+                f"(Boost(key=...) does take a callable; this does not, because the "
+                f"filter text is what hopai quotes back in every error about a "
+                f"document.) e.g. document_from='.properties.title'"
             )
         if not isinstance(document_from, str) or not document_from.strip():
             raise ValueError(
@@ -472,10 +554,17 @@ class Rerank:
         # failure -- coercing would let it mean one provider call per
         # path, which is the expensive one.
         if not isinstance(per_path, bool):
+            # The "'false' is truthy" sentence is the reason a STRING is
+            # refused; against per_path=1 it explains a case that did not
+            # happen, which reads as the library answering someone else's
+            # question.
+            why = ("a string is not coerced here, because 'false' is truthy in Python and "
+                   "would silently select the per-path mode") if isinstance(per_path, str) \
+                else ("nothing is coerced here, because a truthy value would silently "
+                      "select the per-path mode")
             raise TypeError(
-                f"Rerank: per_path must be True or False, got {per_path!r} -- a string is "
-                f"not coerced here, because 'false' is truthy in Python and would silently "
-                f"select the per-path mode, which costs one provider call per path")
+                f"Rerank: per_path must be True or False, got {per_path!r} -- {why}, "
+                f"which costs one provider call per path")
         self.per_path = per_path
         if not isinstance(max_paths, int) or isinstance(max_paths, bool) or max_paths < 1:
             raise ValueError(
@@ -505,21 +594,50 @@ class Rerank:
         # be refused on the line that names it, not on the first query,
         # which may be a long way away and much later.
         self._invoke, self._shape, target = _bind(client, self.provider, model)
-        #: Whether the bound provider call is `async def`. Read in
-        #: score() to refuse BEFORE the call rather than after -- calling
-        #: it would build a coroutine nobody awaits.
-        self.is_async = inspect.iscoroutinefunction(target)
-        #: Compiled on first use, then reused. jq is an optional extra,
-        #: so compiling in __init__ would make a Rerank unconstructible
-        #: without it -- including one that only ever calls score() on
-        #: documents the caller built themselves.
+        #: Whether the bound provider call hands back something to await.
+        #: Read in score() to refuse BEFORE the call rather than after --
+        #: calling it would build a coroutine nobody awaits.
+        #:
+        #: `embeddings._is_async_call` and not `iscoroutinefunction`,
+        #: which reports False for a callable OBJECT whose `__call__` is
+        #: the `async def` -- ascore() still works there (it awaits the
+        #: awaitable the thread built), but it pays a thread it does not
+        #: need and the public attribute states the opposite of the truth.
+        self.is_async = _is_async_call(target)
+        #: The compiled filter. Compiled HERE when the jq binding is
+        #: present, for the reason _bind() refuses a bad client here:
+        #: 'properties.title' -- no leading dot, the single most likely
+        #: thing to write -- would otherwise construct fine and fail at
+        #: query time, a long way from the line that named it. It stays
+        #: lazy only when the extra is absent, so a Rerank that only ever
+        #: calls score() on documents the caller built themselves is
+        #: still constructible on a base install.
         self._program = None
         self._validated: set = set()
+        try:
+            import jq
+        except ImportError:
+            pass
+        else:
+            self._compile(jq)
 
     def __repr__(self) -> str:
-        parts = [self.provider or type(self.client).__name__]
+        """What this Rerank is, in the shape it was written.
+
+        Calibrated against `Near.__repr__`: the arguments that decide the
+        answer, none of the ones that do not. `__name__` before the type
+        name because a plain callable IS the client here -- `type(...)`
+        reports 'function' for every one of them, which identifies
+        nothing. `document_from` is included because it is the field you
+        stare at when a ranking looks wrong, and because this repr is the
+        `owner` prefix of every runtime message this module raises: the
+        filter that built the document is then quoted beside the
+        complaint about it."""
+        parts = [self.provider
+                 or getattr(self.client, "__name__", type(self.client).__name__)]
         if self.model:
             parts.append(f"model={self.model!r}")
+        parts.append(f"document_from={self.document_from!r}")
         parts.append(f"candidates={self.candidates}")
         if self.per_path:
             parts.append("per_path=True")
@@ -599,6 +717,16 @@ class Rerank:
             raise ValueError(
                 f"{owner}: the query is empty or whitespace, so every document would be "
                 f"scored against nothing")
+        # The same guard `_plain_scores()` puts on the ANSWER, missing
+        # here on the input: a str is iterable, so list("a document")
+        # silently becomes ten single-character documents -- and the
+        # complaint that comes back ("document 1 is empty or whitespace")
+        # is about the space, which names nothing a caller can act on.
+        if isinstance(documents, (str, bytes)):
+            raise TypeError(
+                f"{owner}: documents= is a single {type(documents).__name__} "
+                f"({documents!r}), and iterating it would score one CHARACTER per "
+                f"document -- a bare string is ONE document, so pass [document]")
         documents = list(documents)
         for index, document in enumerate(documents):
             if not isinstance(document, str):
@@ -709,32 +837,51 @@ class Rerank:
     # Documents: the rule, evaluated
     # -----------------------------------------------------------------
 
-    def build_documents(self, candidates: list, *, untrusted: bool = False,
+    def build_documents(self, candidates: list, *, trusted: bool = False,
                         fields=None) -> list:
         """Each candidate's document, by evaluating `document_from`
         against it.
 
-        `candidates` are the dicts the read path already produces --
-        {"id", "properties", "similarity", "similarities", "boosts"},
-        plus "paths" at a traversal hop. They are never mutated: a
-        candidate whose paths exceed `max_paths` is COPIED with the cap
-        applied, so the caller's own results still carry every path
-        after the reranker has been given a bounded view.
+        `candidates` is a LIST -- the dicts the read path already
+        produces, {"id", "properties", "similarity", "similarities",
+        "boosts"}, plus "paths" at a traversal hop. They are never
+        mutated: a candidate whose paths exceed `max_paths` is COPIED
+        with the cap applied, so the caller's own results still carry
+        every path after the reranker has been given a bounded view.
 
-        `untrusted=True` is for a filter that arrived from a model or
-        over the wire: it is validated against `hopai.jqsafe`'s total
-        subset first -- a grammar in which `env`, `$ENV`, `input` and
-        unbounded recursion do not parse at all -- optionally narrowed
-        to the paths in `fields=`. A human writing jq in their own
-        Python process gets the full language, because the subset would
-        restrict nothing they cannot already do.
+        THE SAFE BEHAVIOUR IS THE DEFAULT, and `trusted=True` is the
+        opt-in -- the polarity `allow_vectors=`, `all=` and `detach=`
+        already keep, where the DANGEROUS thing is the one you have to
+        ask for. The other way round (an `untrusted=True` you must
+        remember) fails open: forget it on a filter that arrived from a
+        model or over the wire and `env.HOME` runs, with the result
+        POSTed to a third party as a document.
+
+        By default the filter is held to `hopai.jqsafe`'s total subset
+        -- a grammar in which `env`, `$ENV`, `input` and unbounded
+        recursion do not parse at all -- optionally narrowed to the
+        paths in `fields=`. `trusted=True` gets the full language, and
+        is for a human writing jq in their own Python process: they
+        already run arbitrary code there, so the subset would restrict
+        nothing they cannot already do.
 
         A filter that errors, or evaluates to something other than one
         non-empty string, RAISES, naming the filter and the candidate.
         Falling back to an empty document would score that candidate
         against nothing and silently change the ranking -- exactly the
         answer nobody can see is wrong."""
-        program = self._compiled(untrusted, fields)
+        # The same class of mistake as a bare `str` reaching score(): one
+        # candidate is a dict, a dict iterates its KEYS, and the filter
+        # then fails on the string "id" with jq's own complaint --
+        # "Cannot index string with string" -- which blames the filter
+        # for the call shape.
+        if isinstance(candidates, (dict, str, bytes)):
+            raise TypeError(
+                f"{self!r}.build_documents(): candidates is a LIST of candidates, and "
+                f"this is one {type(candidates).__name__} -- iterating it yields its "
+                f"keys, not candidates, so the filter would run against the string 'id'. "
+                f"Pass [candidate]")
+        program = self._compiled(trusted, fields)
         documents = []
         for candidate in candidates:
             documents.append(_evaluate(program, self._capped(candidate),
@@ -754,30 +901,41 @@ class Rerank:
         capped["paths"] = paths[:self.max_paths]
         return capped
 
-    def _compiled(self, untrusted: bool, fields):
+    def _compiled(self, trusted: bool, fields):
         """The compiled filter, built once and reused.
 
         Measured, not assumed: compiling costs 1.6-2.4ms against tens of
         microseconds to evaluate one row, so a compile per candidate
         would be almost the entire cost of building 50 documents and
         would scale with the candidate count instead of being paid
-        once."""
-        if untrusted:
+        once. Normally it is already compiled by __init__; this path
+        only runs when the extra was absent at construction."""
+        if not trusted:
             self._validate(fields)
         if self._program is None:
-            jq = _jq()
-            try:
-                self._program = jq.compile(self.document_from)
-            except Exception as exc:
-                raise ValueError(
-                    f"Rerank: document_from={self.document_from!r} is not a valid jq "
-                    f"filter -- {exc}"
-                ) from exc
+            self._compile(_jq())
+        return self._program
+
+    def _compile(self, jq):
+        """Compile `document_from`, or refuse naming the filter.
+
+        Called from __init__ when the binding is importable, so the
+        refusal lands on the line that wrote the filter. jq's own message
+        for the most likely mistake ('properties.title', no leading dot)
+        is a parse error about a token, so the dot is spelled out here."""
+        try:
+            self._program = jq.compile(self.document_from)
+        except Exception as exc:
+            raise ValueError(
+                f"Rerank: document_from={self.document_from!r} is not a valid jq "
+                f"filter -- {exc}. jq paths start with a dot, e.g. "
+                f"'.properties.title'"
+            ) from exc
         return self._program
 
     def _validate(self, fields):
-        """Hold an untrusted filter to the safe subset, once per
-        (fields) it is asked about.
+        """Hold a filter to the safe subset, once per (fields) it is
+        asked about.
 
         Imported here rather than at module scope so this module stays
         importable -- and a trusted filter stays free -- whether or not
@@ -792,6 +950,43 @@ class Rerank:
         from . import jqsafe
         jqsafe.validate(self.document_from, fields=fields, owner="document_from")
         self._validated.add(key)
+
+
+#: What `inspect.signature(Rerank)` and `help(Rerank)` report.
+#:
+#: `__init__` really does take `*misplaced` and `**unexpected`, but both
+#: are REFUSAL CHANNELS -- they exist only so a mistake can be answered
+#: by name instead of by Python's generic message -- and neither is a
+#: parameter anyone may pass. Left in the rendered signature they say the
+#: opposite of the truth: `*misplaced` advertises positional arguments to
+#: a reader whose first question is whether `document_from` is one, which
+#: is the exact confusion the keyword-only rule exists to prevent.
+#:
+#: This matters more here than it would in most libraries: a model
+#: discovers this API by introspecting it, so the signature IS the
+#: documentation, and rule 2 says an LLM must get it right with no
+#: custom instructions. Overriding it keeps the refusals AND an honest
+#: contract; the alternative -- dropping the channels to clean up the
+#: signature -- would trade a dozen named errors for a tidier repr.
+Rerank.__signature__ = inspect.Signature([
+    inspect.Parameter("client", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Any),
+    inspect.Parameter("document_from", inspect.Parameter.KEYWORD_ONLY,
+                      default=_REQUIRED, annotation=str),
+    inspect.Parameter("candidates", inspect.Parameter.KEYWORD_ONLY,
+                      default=_DEFAULT_CANDIDATES, annotation=int),
+    inspect.Parameter("per_path", inspect.Parameter.KEYWORD_ONLY,
+                      default=False, annotation=bool),
+    inspect.Parameter("max_paths", inspect.Parameter.KEYWORD_ONLY,
+                      default=_DEFAULT_MAX_PATHS, annotation=int),
+    inspect.Parameter("model", inspect.Parameter.KEYWORD_ONLY,
+                      default=None, annotation=Optional[str]),
+    inspect.Parameter("batch_size", inspect.Parameter.KEYWORD_ONLY,
+                      default=None, annotation=Optional[int]),
+    inspect.Parameter("retries", inspect.Parameter.KEYWORD_ONLY,
+                      default=_DEFAULT_RETRIES, annotation=int),
+    inspect.Parameter("backoff", inspect.Parameter.KEYWORD_ONLY,
+                      default=_DEFAULT_BACKOFF, annotation=float),
+])
 
 
 def _jq():
@@ -828,6 +1023,20 @@ def _evaluate(program, candidate, filter_text: str) -> str:
             f"document_from={filter_text!r} failed on {where} -- {type(exc).__name__}: "
             f"{exc}. Refusing rather than scoring that candidate against an empty document"
         ) from exc
+    # Two different mistakes, and one message could only fit one of
+    # them. "Wrap it in [...] | join" is the fix for several outputs and
+    # nonsense for none -- and none is the COMMON case: `select(...)`
+    # that matched nothing, `empty`, `.properties.tags[]` over an empty
+    # list, a path through a key this row does not have.
+    if not outputs:
+        raise ValueError(
+            f"document_from={filter_text!r} produced 0 outputs for {where}, and a "
+            f"document is exactly one string -- a filter selects nothing when the row "
+            f"lacks the key, when a select() does not match, or when a list it "
+            f"iterates is empty. Give it a fallback (e.g. "
+            f"'.properties.title // \"untitled\"'), or drop that candidate before "
+            f"reranking"
+        )
     if len(outputs) != 1:
         raise ValueError(
             f"document_from={filter_text!r} produced {len(outputs)} outputs for {where}, "
@@ -836,10 +1045,21 @@ def _evaluate(program, candidate, filter_text: str) -> str:
         )
     document = outputs[0]
     if not isinstance(document, str):
+        # The default goes BEFORE tostring, and the order is the whole
+        # advice. `| tostring` alone manufactures the literal text
+        # "null" on any row where the property is missing, and the
+        # reranker then scores the word "null" -- a confidently wrong
+        # ranking with nothing to see, which is the failure this module
+        # exists to refuse. `// ""` alone produces an empty document,
+        # which the next check refuses -- so that half of the advice
+        # walked the caller into a second error.
         raise TypeError(
             f"document_from={filter_text!r} evaluated to {type(document).__name__} "
-            f"({document!r}) for {where}, not a string -- a reranker reads text; add "
-            f"tostring, or a default such as '// \"\"' if the property may be missing"
+            f"({document!r}) for {where}, not a string -- a reranker reads text. Put "
+            f"the default BEFORE the conversion, e.g. '.properties.year // \"unknown\" "
+            f"| tostring': `tostring` on a missing property yields the TEXT \"null\", "
+            f"which would be scored as a word, and '// \"\"' on its own leaves an empty "
+            f"document, which is refused too"
         )
     if not document.strip():
         raise ValueError(
@@ -915,6 +1135,7 @@ def _bind(client: Any, provider: Optional[str], model: Optional[str]) -> tuple:
     # 4. A plain callable, the same escape hatch Embedder and Boost have.
     if callable(client):
         _refuse_model(model, "a plain callable")
+        _check_arity(client)
 
         def invoke(query, documents):
             return client(query, list(documents))
@@ -926,6 +1147,39 @@ def _bind(client: Any, provider: Optional[str], model: Optional[str]) -> tuple:
         f"CrossEncoder (.predict), anything with .score(query, documents), or a callable "
         f"taking (query, list[str]) -> list[float]"
     )
+
+
+def _check_arity(client) -> None:
+    """A callable that cannot be called as score(query, documents),
+    refused where it was written.
+
+    The callable is the shape with no SDK behind it to be wrong about,
+    so `Rerank(lambda documents: ...)` is the likeliest first mistake --
+    it is also the shape the notebooks use, since CI runs them with no
+    network. Left to the query, it surfaced as
+    `RerankError: the reranker call failed ... Catch RerankError and
+    re-run without rerank=`, which reads as a provider outage and whose
+    advice would make a typo permanent.
+
+    `inspect.signature` inside a try, and SILENT when it cannot tell: a
+    C-implemented callable or an SDK object with no introspectable
+    signature has no arity to check, and refusing one we merely could
+    not read would reject a working client. Only a signature that says
+    NO is acted on."""
+    try:
+        signature = inspect.signature(client)
+    except (TypeError, ValueError):
+        return
+    try:
+        signature.bind("query", ["document"])
+    except TypeError:
+        raise TypeError(
+            f"Rerank: {getattr(client, '__name__', type(client).__name__)}"
+            f"{signature} cannot be called with (query, documents) -- a reranker is "
+            f"score(query: str, documents: list[str]) -> list[float], one float per "
+            f"document, in the order given. e.g. "
+            f"lambda query, documents: [my_service.rank(query, d) for d in documents]"
+        ) from None
 
 
 def _refuse_model(model: Optional[str], shape: str) -> None:
