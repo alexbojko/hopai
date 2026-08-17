@@ -179,6 +179,8 @@ make the errors worse and change nothing about what is accepted.
 from __future__ import annotations
 
 import re
+import sys
+from contextlib import contextmanager
 from typing import NamedTuple, Optional
 
 __all__ = ["UnsafeFilter", "validate", "paths_read", "is_total"]
@@ -1120,6 +1122,68 @@ def _read_paths(node) -> frozenset:
 # Public API
 # ---------------------------------------------------------------------
 
+#: Python frames each level of filter nesting can cost. The scanners and
+#: the parser recurse into each other, so one `(` is several frames, not
+#: one -- and under an INSTRUMENTED interpreter it is several more,
+#: because a coverage tracer, a profiler or a mutation harness wraps
+#: every call: mutmut routes each one through a trampoline, and that is
+#: where this was found (RecursionError out of
+#: mutmut/mutation/trampoline.py, on a filter this module refuses
+#: cleanly under a bare interpreter).
+#:
+#: Reserving generously is safe because the parser's recursion is
+#: bounded BY CONSTRUCTION -- it refuses past MAX_DEPTH -- so this
+#: number cannot licence a runaway; it only decides which of the two
+#: limits is reached first, and the answer must always be ours.
+_FRAMES_PER_LEVEL = 60
+
+#: Frames left over for _growth()/_read_paths(), which walk the tree the
+#: parser just built and so recurse to the same depth.
+_FRAME_SLACK = 200
+
+
+def _current_depth() -> int:
+    """How many frames are already on the stack below us."""
+    depth, frame = 0, sys._getframe()
+    while frame is not None:
+        depth += 1
+        frame = frame.f_back
+    return depth
+
+
+@contextmanager
+def _stack_headroom():
+    """Guarantee MAX_DEPTH is reachable before Python's own limit is.
+
+    MAX_DEPTH is a promise about the FILTER; RecursionError is about the
+    PROCESS. The frames already on the stack when validate() is called
+    are not ours -- a caller deep inside a web framework, a test runner,
+    or a mutation harness starts us far closer to the ceiling than a
+    caller at module scope. So the guard could be reached only AFTER
+    Python gave up, and RecursionError is not an UnsafeFilter: a caller
+    doing `except UnsafeFilter` crashes on a filter that is merely
+    silly, which is the exact failure this module's depth limit exists
+    to prevent.
+
+    Found by mutation testing, whose mutants tree runs the parser from a
+    deeper stack than pytest alone -- the promise had been true only for
+    shallow callers, and nothing said so.
+
+    The limit is raised only when it is already too low, and always put
+    back: this borrows stack for one parse of a filter bounded by
+    MAX_LENGTH, it does not lift a ceiling for the process."""
+    need = _current_depth() + MAX_DEPTH * _FRAMES_PER_LEVEL + _FRAME_SLACK
+    before = sys.getrecursionlimit()
+    if before >= need:
+        yield
+        return
+    sys.setrecursionlimit(need)
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(before)
+
+
 def _compile(program: str, owner: str):
     if not isinstance(program, str):
         raise TypeError(
@@ -1137,7 +1201,8 @@ def _compile(program: str, owner: str):
             f"character limit -- a document projection is a few fields joined together, "
             f"so this is a program"
         )
-    node = _Parser(_tokenize(program, owner), owner).program()
+    with _stack_headroom():
+        node = _Parser(_tokenize(program, owner), owner).program()
     growth = _growth(node)
     if growth > MAX_GROWTH:
         raise UnsafeFilter(

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sys
 import time
 
 import pytest
@@ -666,6 +667,43 @@ class TestLimits:
         with pytest.raises(UnsafeFilter) as refused:
             validate(program)
         assert str(MAX_DEPTH) in str(refused.value)
+
+    @pytest.mark.parametrize("frames", [0, 400, 800])
+    def test_the_depth_refusal_holds_from_a_DEEP_caller_stack(self, frames):
+        """MAX_DEPTH is a promise about the FILTER; RecursionError is
+        about the PROCESS, and the frames already on the stack when
+        validate() is called are not ours. A caller inside a web
+        framework, a test runner or a mutation harness starts far closer
+        to Python's ceiling, so without reserved headroom the guard is
+        reached only AFTER Python gives up -- and RecursionError is not
+        an UnsafeFilter, so `except UnsafeFilter` crashes on a filter
+        that is merely silly.
+
+        Mutation testing found this: its mutants tree runs the parser
+        from a deeper stack than pytest alone, and this exact filter
+        raised RecursionError there while passing here."""
+        program = "(" * (MAX_DEPTH + 5) + "." + ")" * (MAX_DEPTH + 5)
+
+        def deeper(n):
+            if n:
+                return deeper(n - 1)
+            with pytest.raises(UnsafeFilter):
+                validate(program)
+            return True
+
+        assert deeper(frames)
+
+    def test_the_recursion_limit_is_put_back(self):
+        """Headroom is borrowed for ONE parse of a MAX_LENGTH-bounded
+        filter, not lifted for the process: a validator that quietly
+        raised the ceiling and left it raised would turn someone else's
+        runaway recursion into a segfault instead of an exception."""
+        before = sys.getrecursionlimit()
+        with pytest.raises(UnsafeFilter):
+            validate("(" * (MAX_DEPTH + 5) + "." + ")" * (MAX_DEPTH + 5))
+        assert sys.getrecursionlimit() == before
+        validate(".properties.title")
+        assert sys.getrecursionlimit() == before
 
     def test_nested_interpolations_are_refused_by_the_scanner_too(self):
         """The parser's depth guard runs too late for these: measuring
