@@ -132,6 +132,33 @@ because of bugs, not taste:
   the internals it exists to check. Equivalent — and worth keeping for the day the
   construction changes.
 
+- **`hopai/jqsafe.py`'s depth counter wants THREE tests, not one, and the two that
+  pass are the load-bearing ones.** `_Parser.pipe()`'s `self.depth -= 1` has three
+  interesting mutations and a test asserting only that a too-deep filter is refused
+  catches none of them: `-= 2` lets sibling groups drive the counter negative so each
+  one buys a level (measured — 30 of them got an otherwise-refused chain ACCEPTED),
+  `+= 1` turns the bound into a budget for the whole filter so 60 shallow siblings are
+  refused, and seeding `_Parser.__init__`'s own `depth` at 1 silently costs a level at
+  the top-level entry. What kills all three is asserting the boundary from BOTH sides
+  (`MAX_DEPTH - 1` accepted, `MAX_DEPTH` refused) plus one wide-and-shallow filter that
+  must be accepted. Any new guard with a counter wants the same shape.
+
+- **`_current_depth()`'s `depth += 1` -> `+= 2` is equivalent for the property under
+  test.** It counts the frames already on the stack to compute how much recursion
+  headroom to reserve, so over-counting reserves MORE — the promise ("MAX_DEPTH is
+  reachable before RecursionError") still holds, in the conservative direction. The
+  only test that could distinguish them asserts the exact `sys.setrecursionlimit()`
+  value, which pins `_FRAMES_PER_LEVEL` — a tuning constant that is deliberately loose,
+  since an instrumented interpreter costs more frames per level. Pinning it would make
+  a correct re-tune a test failure.
+
+- **`_scan_paren()`'s `depth: int = 0` default is unreachable**: its one caller passes
+  `depth + 1`. Contrast `_scan_string()`, whose default IS used by two call sites —
+  that one is NOT resolved, and is not claimed as equivalent: no input distinguishing
+  it has been constructed, because the growth cap and the parser's own depth guard both
+  fire before the shifted bound can show. Left open rather than given a verdict it has
+  not earned.
+
 - **An argument passed to a call that raises before reading it is equivalent.**
   `json_api._SpecRerank.build_documents()` forwards `trusted=`/`fields=` on its
   `isinstance(candidates, (dict, str, bytes))` branch, and mutants blanking either

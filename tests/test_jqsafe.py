@@ -487,6 +487,31 @@ class TestErrorsNameTheFix:
         assert message.startswith("rerank.document_from: `length` cannot appear here (offset 3)")
         assert "end of the filter" not in message
 
+    def test_a_filter_that_stops_early_blames_the_end_and_says_where(self):
+        """`.a +` is a filter someone stopped typing. The token that
+        cannot appear is the END, which has no text of its own -- it is
+        given one, and an offset one past the last character, precisely
+        so this message reads like every other. Mutating that offset to
+        `base - len(src)` points at a NEGATIVE position, which is worse
+        than no offset: it looks like a location."""
+        with pytest.raises(UnsafeFilter) as refused:
+            validate(".a +", owner="rerank.document_from")
+        assert str(refused.value).startswith(
+            "rerank.document_from: `the end of the filter` cannot appear here (offset 4)")
+
+    def test_only_real_whitespace_is_skipped_between_tokens(self):
+        """The trivia skipper decides which characters are INVISIBLE,
+        so widening that set widens what parses. Mutated to treat `X`
+        as whitespace, `.a X + .b` is accepted -- a stray character
+        silently swallowed instead of refused, in the one module whose
+        job is to be exact about what the grammar admits. Asserted by
+        the character being NAMED, so a refusal that happens for some
+        unrelated reason does not pass for this."""
+        with pytest.raises(UnsafeFilter) as refused:
+            validate(".a X + .b", owner="rerank.document_from")
+        assert str(refused.value).startswith(
+            "rerank.document_from: `X` cannot appear here (offset 3)")
+
     def test_the_owner_names_the_option_the_filter_arrived_on(self):
         """The caller wrote `document_from=` or an MCP argument, not
         `jqsafe`. Naming the module in the message would point at the
@@ -914,6 +939,39 @@ class TestLimits:
         with pytest.raises(UnsafeFilter) as refused:
             validate(" + ".join(["(.a)"] * 30) + " + " + deep)
         assert str(MAX_DEPTH) in str(refused.value)
+
+    def test_the_depth_limit_sits_where_MAX_DEPTH_says_it_does(self):
+        """Both sides of the boundary, because only the boundary can see
+        where the counter STARTS. The parser's own `depth` default is
+        used by the top-level entry (the nested one passes its parent's
+        depth explicitly), so seeding it at 1 instead of 0 quietly costs
+        a level: every test that nests well past the limit still refuses
+        and still passes, while a filter the limit was written to allow
+        is turned away.
+
+        The accepted case is the load-bearing half. `39` is not a magic
+        number to keep in step with MAX_DEPTH by hand -- it is derived
+        from it, so raising the constant moves both assertions."""
+        deepest_allowed = "(" * (MAX_DEPTH - 1) + ".a" + ")" * (MAX_DEPTH - 1)
+        validate(deepest_allowed)                    # must not raise
+        with pytest.raises(UnsafeFilter) as refused:
+            validate("(" * MAX_DEPTH + ".a" + ")" * MAX_DEPTH)
+        assert str(MAX_DEPTH) in str(refused.value)
+
+    def test_a_wide_filter_is_not_a_deep_one(self):
+        """The other direction, and it needs saying separately: the
+        counter must come back down, not just fail to overshoot. Every
+        test above asserts that something IS refused, so a decrement
+        that went the WRONG WAY -- `self.depth -= 1` mutated to `+= 1`
+        -- passes all of them while turning the nesting bound into a
+        budget for the whole filter.
+
+        Sixty sibling groups nest exactly one level deep. Under that
+        mutation they are refused as "nests more than 40 deep", which
+        is a projection a caller is entitled to write being rejected by
+        a guard that miscounted. MAX_DEPTH bounds the parser's stack,
+        and width costs the stack nothing."""
+        validate(" + ".join(["(.a)"] * 60))          # must not raise
 
     @pytest.mark.parametrize("frames", [0, 400, 800])
     def test_the_depth_refusal_holds_from_a_DEEP_caller_stack(self, frames):
