@@ -189,10 +189,22 @@ jobs:
       # partial report. The RUNNER stopping is not: the report step never
       # runs, and honest partial evidence becomes a failed check.
       #
-      # So the budget has to clear mutmut's fixed cost AND stay inside what
-      # a runner will actually give us. 2100 does both, on the measurement
-      # above: thousands of mutants, and the report always renders.
-      MUTATION_BUDGET_SECONDS: "2100"
+      # Then 2100 was reclaimed too, at 1720s -- INSIDE its own budget, so
+      # `timeout` never fired. Measured across two runs the runner gave us
+      # 1720s once and ~2500s the next: not a limit to compute against,
+      # just eviction. And when it happens every later step is SKIPPED --
+      # render report, upsert comment, enforce coverage -- so the job goes
+      # red having produced 5770 mutants' worth of evidence it then threw
+      # away.
+      #
+      # 900 is chosen to FINISH rather than to maximise mutants: ~15
+      # minutes of mutation on top of ~3 of coverage, well inside what has
+      # been survivable, for a few thousand mutants of real evidence.
+      # Nothing here is worth a red check on an advisory job -- a smaller
+      # honest report every time beats a bigger one that usually vanishes,
+      # and the number can go up again the day someone wants a deeper
+      # sweep and is willing to re-run it.
+      MUTATION_BUDGET_SECONDS: "900"
 
     steps:
       - uses: actions/checkout@v4
