@@ -2618,10 +2618,17 @@ class TestWriteToolsLive:
         report = spec.call()
         assert report["dry_run"] is True and report["clean"] is False
         assert report["rules"] and report["rules"][0]["rows"]
-        # the prose summary too: it is what a model reads before the
+        # The prose summary too: it is what a model reads before the
         # rules array, and a mutant renaming the KEY dropped it in
-        # silence while every other assertion here still passed
-        assert report["summary"]
+        # silence while every other assertion here still passed.
+        # Asserted for its CONTENT, not merely for being truthy --
+        # `str(violations)` mutated to `str(None)` yields the string
+        # "None", which passes a truthiness check and tells a model
+        # deciding whether to enforce precisely nothing.
+        assert report["summary"].startswith("2 row(s) violate 2 schema rule(s):")
+        assert "e.g. id 1" in report["summary"]           # the missing email
+        assert "e.g. id 2" in report["summary"]           # the one typed wrong
+        assert "None" not in report["summary"]
 
         from sqlalchemy.exc import IntegrityError
         with pytest.raises(IntegrityError):

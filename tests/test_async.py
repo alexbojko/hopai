@@ -462,7 +462,7 @@ class TestVectors:
 
         assert run(body()) == ["edges.vec_rel"]
 
-    def test_stale_vectors_narrows_by_field_and_by_limit(self, async_fresh_graph):
+    def test_stale_vectors_narrows_by_field_by_limit_and_by_cursor(self, async_fresh_graph):
         """The case above calls stale_vectors() with NO arguments, so
         every argument AsyncGraph hands across the bridge is unasserted
         -- and each one only ever WIDENS the answer when it goes
@@ -470,7 +470,15 @@ class TestVectors:
         not ask about; dropping `limit` returns the whole backlog to a
         caller paging through it. Both are a bigger answer than was
         asked for, which is the shape of mistake nothing downstream
-        notices."""
+        notices.
+
+        `after` is the third and the one worth spelling out, because it
+        is not merely a wider answer: paging needs BOTH, since a row
+        that can never be filled in stays stale forever and `limit`
+        alone hands back the same leading rows on every call. Drop
+        `after` on the way across and the walk never advances -- an
+        embedding backfill that runs forever, re-reporting the rows it
+        already returned, with each page looking perfectly reasonable."""
         async def body():
             async_fresh_graph.define_vectors(
                 nodes=[Vector("summary", 3), Vector("title", 3)])
@@ -478,12 +486,14 @@ class TestVectors:
             await async_fresh_graph.add_nodes([{"id": 1, "type": "doc"},
                                                {"id": 2, "type": "doc"}])
             return (await async_fresh_graph.stale_vectors(node_fields=["summary"]),
-                    await async_fresh_graph.stale_vectors(node_fields=["summary"], limit=1))
+                    await async_fresh_graph.stale_vectors(node_fields=["summary"], limit=1),
+                    await async_fresh_graph.stale_vectors(node_fields=["summary"], after=1))
 
-        every, capped = run(body())
+        every, capped, walked = run(body())
         assert set(every["nodes"]) == {"summary"}          # not "title" as well
         assert sorted(every["nodes"]["summary"]["missing"]) == ["1", "2"]
         assert len(capped["nodes"]["summary"]["missing"]) == 1
+        assert walked["nodes"]["summary"]["missing"] == ["2"]     # the cursor moved
 
     def test_text_is_embedded_before_the_transaction_opens(self, async_fresh_graph):
         """The sync set_vectors() plans and then opens a transaction, so
