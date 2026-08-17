@@ -132,5 +132,16 @@ because of bugs, not taste:
   the internals it exists to check. Equivalent — and worth keeping for the day the
   construction changes.
 
+- **An argument passed to a call that raises before reading it is equivalent.**
+  `json_api._SpecRerank.build_documents()` forwards `trusted=`/`fields=` on its
+  `isinstance(candidates, (dict, str, bytes))` branch, and mutants blanking either
+  one there survive. `Rerank.build_documents()` raises the call-shape `TypeError`
+  as its FIRST statement, before `self._compiled(trusted, fields)` — the only
+  reader of either argument — so on that branch neither is read. The forwarding is
+  still right to write: the branch exists to borrow the base's refusal, and a
+  future base that validated first would need them. Note the shape of the proof —
+  "the callee cannot reach the read" — rather than the specific line, since the
+  same pattern recurs wherever one method delegates to another's guard clause.
+
 CI scopes mutation to the files a PR changed and caps it with a wall-clock budget; a
 full run over `hopai/` is thousands of mutants.

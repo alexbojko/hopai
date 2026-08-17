@@ -812,6 +812,42 @@ class TestSpecSuppliedReranking:
     the way refuse_vectors() is for `vector`, so everything here is a
     property of that one function."""
 
+    @staticmethod
+    def _model_client():
+        """A client the operator may pin a MODEL on. `Rerank` refuses
+        `model=` for a plain callable -- there is nothing to send it to
+        -- so the callable used everywhere else in this class leaves
+        `model` None on both sides of the comparison, and a constructor
+        call that dropped it would look identical. A client reporting a
+        provider module is what makes the field observable at all."""
+        class Cohereish:
+            def rerank(self, *, model, query, documents):
+                return {"results": [{"index": i, "relevance_score": 1.0}
+                                    for i, _ in enumerate(documents)]}
+        # A real cohere.ClientV2 reports 'cohere.…' the same way; setting
+        # __module__ is the design, not a trick around it.
+        Cohereish.__module__ = "cohere.client_v2"
+        return Cohereish()
+
+    def test_the_operators_model_survives_the_spec(self):
+        """`model` picks WHICH reranker runs and is priced per call, so
+        it is the operator's alone -- and it is the one operator-only
+        field the test below cannot hold, because its plain-callable
+        client makes `model` None on both sides. Dropped from
+        parse_rerank()'s constructor call, every spec-built reranker
+        silently calls the provider's default model instead of the one
+        the server was configured with."""
+        from hopai import Rerank, RerankPolicy
+        policy = RerankPolicy(
+            Rerank(self._model_client(), document_from=".properties.title",
+                   candidates=50, model="rerank-v3.5"),
+            fields=["properties.title", "properties.body"], max_candidates=100)
+        start, _ = spec_to_traversal(
+            {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                       "rerank": {"document_from": ".properties.body", "candidates": 20}}},
+            policy)
+        assert start.rerank.model == "rerank-v3.5"
+
     def test_a_rerank_spec_refuses_when_no_reranker_was_configured(self):
         """The client cannot travel in JSON -- it holds an API key and a
         socket -- so a spec asking to rerank with nothing configured has
@@ -821,6 +857,63 @@ class TestSpecSuppliedReranking:
             spec_to_traversal({"start": {"where": {"a": 1}, "near": {"field": "s", "text": "x"},
                                          "keep": 3, "rerank": {"document_from": ".id"}}})
         assert "RerankPolicy" in str(exc.value)
+
+    def test_aggregate_json_hands_the_policy_to_the_aggregation(self):
+        """aggregate_json() takes `rerank=` and forwards it in ONE
+        place. Drop it there and a spec asking to rerank is parsed,
+        accepted and then aggregated over whatever the retrieval stage
+        kept -- a number, silently computed over the wrong set of nodes,
+        which is the worst thing this library can return. Stubbed rather
+        than run: the forwarding is decided before any SQL and the point
+        is which specs `aggregate()` is handed."""
+        from hopai import Rerank, RerankPolicy
+        from hopai.json_api import aggregate_json
+        policy = RerankPolicy(
+            Rerank(lambda query, documents: [1.0] * len(documents),
+                   document_from=".properties.title", candidates=50),
+            fields=["properties.title"], max_candidates=100)
+        seen = {}
+
+        class StubGraph:
+            def aggregate(self, start, *hops, aggregates):
+                seen["start"] = start
+                return {"n": 0}
+
+        aggregate_json(StubGraph(), {
+            "start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                      "rerank": {"document_from": ".properties.title", "candidates": 20}},
+            "aggregates": {"n": {"fn": "count"}},
+        }, allow_vectors=True, rerank=policy)
+        assert seen["start"].rerank is not None
+        assert seen["start"].rerank.candidates == 20
+
+    def test_the_redacting_subclass_still_honours_trusted_and_fields(self):
+        """_SpecRerank rebuilds documents one candidate at a time so it
+        can name the failing row structurally, and every option has to
+        survive that detour. `trusted=True` is what turns the safe
+        subset OFF; dropped on the way to the base, a caller who asked
+        for the full language silently gets the narrowed one instead --
+        and `fields=` then refuses a filter the caller deliberately
+        allowed. Asserted through a filter reading a path OUTSIDE
+        `fields`, which is exactly the pair that disagrees."""
+        from hopai import Rerank, RerankPolicy
+        policy = RerankPolicy(
+            Rerank(lambda query, documents: [1.0] * len(documents),
+                   document_from=".properties.title", candidates=50),
+            fields=["properties.title", "properties.body"], max_candidates=100)
+        start, _ = spec_to_traversal(
+            {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                       "rerank": {"document_from": ".properties.body", "candidates": 20}}},
+            policy)
+        from hopai.jqsafe import UnsafeFilter
+        candidates = [{"id": "1", "properties": {"title": "t", "body": "b"}}]
+        # Narrowed to a field the filter does not read -> refused...
+        with pytest.raises(UnsafeFilter):
+            start.rerank.build_documents(candidates, fields=["properties.title"])
+        # ...unless the caller turned the subset off, which must reach
+        # the base through the per-candidate loop.
+        assert start.rerank.build_documents(
+            candidates, trusted=True, fields=["properties.title"]) == ["b"]
 
     def test_a_spec_overrides_the_filter_and_the_budget_and_nothing_else(self):
         """The whole trust boundary in one assertion: what a model sends
