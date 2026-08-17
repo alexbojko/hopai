@@ -112,6 +112,18 @@ sentence-transformers = ["sentence-transformers>=3.0"]
 embeddings = ["openai>=1.0", "cohere>=5.0", "voyageai>=0.2",
               "google-genai>=0.3", "sentence-transformers>=3.0"]
 
+# Reranking (hopai/rerankers.py). The dependency is `jq`, not a provider:
+# a Rerank's `document_from=` is a jq filter, and evaluating it needs
+# libjq's bindings. Reranker CLIENTS are matched by duck typing exactly
+# like embedding clients are, so this extra never names one -- install
+# `hopai[cohere]` or `hopai[voyageai]` alongside for the client itself.
+#
+# Optional because a graph that never reranks should not carry a CFFI
+# extension, and because the safe-subset validator (hopai/jqsafe.py) is
+# pure stdlib and works with or without it -- a filter can be REFUSED
+# without libjq present, only running one needs it.
+rerankers = ["jq>=1.6"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
