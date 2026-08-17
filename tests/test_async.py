@@ -61,88 +61,46 @@ async def _while_ticking(ticks: list, coro):
         await counter
 
 
-#: How much of an idle loop's throughput a call must leave behind it.
+#: How much of the loop's OWN throughput, in the same run, a provider
+#: call must leave behind it.
 #:
 #: `ticks > 0` -- what these tests asserted first -- is a test for TOTAL
 #: starvation and nothing else, and total starvation is not the only way
 #: to block a loop: a bounded 600ms stall inside a one-second call scores
 #: hundreds of ticks and passed every one of them. That is exactly how a
 #: 121ms document-building block lived here unnoticed (see
-#: hopai/rerankers.py on pruning). So the assertion is a RATIO against a
-#: baseline measured on the same machine in the same run, which is the
-#: only form that survives a loaded CI box: an absolute ticks/s would be
-#: either flaky or vacuous.
+#: hopai/rerankers.py on pruning).
 #:
-#: Half is deliberately generous. A free loop measured ~880-890 ticks/s
-#: here; the unpruned 100KB case measured ZERO during the block and ~20%
-#: over the call containing it, and 500KB measured lower still. Anything
-#: between 50% and 100% is ordinary scheduling noise, and nothing this
-#: library does should land there.
+#: THE BASELINE IS THE SAME RUN, NOT AN IDLE MEASUREMENT, and that is the
+#: fix for the obvious next problem. A ratio against ticks/s measured on
+#: an idle loop holds on a quiet box and fails on a busy one: under 2x
+#: nproc of competing load the ticker managed 261 ticks/s during a
+#: perfectly healthy provider call against an idle baseline of 785 --
+#: 33%, under any threshold worth setting. CI runs four Python versions
+#: in parallel on shared runners, so that IS the environment.
+#:
+#: So `_assert_free()` compares the ticks/s achieved DURING the provider
+#: calls with the ticks/s achieved during the rest of the very same call,
+#: milliseconds apart and under whatever load is in effect for both. A
+#: slow machine scales the two together and the ratio survives; a loop
+#: held on its thread does not, because the inside rate goes to zero
+#: while the outside rate does not.
+#:
+#: Half is deliberately generous for a comparison that measured ~1.0 in
+#: every healthy run, quiet or loaded, and 0.0 on a version that awaited
+#: the provider call inside the greenlet bridge.
 LOOP_FLOOR = 0.5
 
 
-#: How much longer than an idle loop's own worst pause a call may hold
-#: the thread in ONE stretch, and the floor below which the comparison
-#: stops being meaningful.
-#:
-#: The rate above is the right instrument for a window of known length
-#: -- a 200ms provider call -- and the wrong one for a call whose length
-#: is not fixed: a traversal spends most of itself in the database, so a
-#: 121ms block inside a 185ms call reads as 29% of idle while the same
-#: block inside a 1s call reads as 88%. Measured here, the step-wise
-#: path's rate swung between 33% and 69% run to run for that reason
-#: alone.
-#:
-#: The LONGEST GAP between ticks does not have that problem. It is how
-#: long, in one stretch, the loop was unavailable -- which is what
-#: "blocking" means -- and it is unaffected by how much awaiting
-#: happened either side. Measured on this path: 107ms unpruned against
-#: 8ms pruned, with an idle loop's own worst pause at 5ms.
-GAP_MULTIPLE = 5
-GAP_FLOOR = 0.030
-
-
-async def _profile(coro):
-    """(result, ticks/s, longest gap in seconds) while `coro` runs.
-
-    The gap is measured from the ticker's own timestamps rather than
-    from a count, because a count cannot tell 500 evenly spread ticks
-    from 500 ticks either side of a stall."""
-    stamps = [time.perf_counter()]
-    running = True
-
-    async def tick():
-        while running:
-            await asyncio.sleep(0.001)
-            stamps.append(time.perf_counter())
-
-    counter = asyncio.ensure_future(tick())
+async def _counted(ticks: list, coro):
+    """(result, (ticks, seconds)) for the WHOLE call, with `ticks` the
+    same counter the reranker client reads -- so the provider windows it
+    recorded can be subtracted from these totals and the rest of the
+    same run is what remains to compare against."""
     started = time.perf_counter()
-    try:
-        result = await coro
-    finally:
-        elapsed = time.perf_counter() - started
-        running = False
-        await counter
-    gaps = [after - before for before, after in zip(stamps, stamps[1:], strict=False)]
-    return result, len(gaps) / elapsed, max(gaps, default=elapsed)
-
-
-async def _idle_profile(seconds: float = 0.3):
-    """(ticks/s, longest gap) for a loop with nothing else to do.
-
-    Measured per test rather than hard-coded: `asyncio.sleep(0.001)`
-    resolves to the platform's timer granularity plus whatever else is
-    running on the box, so the only honest baseline is one taken next
-    to the measurement it is compared with."""
-    _, rate, gap = await _profile(asyncio.sleep(seconds))
-    return rate, gap
-
-
-async def _idle_rate(seconds: float = 0.3) -> float:
-    """Ticks per second a loop with nothing else to do achieves."""
-    rate, _ = await _idle_profile(seconds)
-    return rate
+    before = ticks[0]
+    result = await _while_ticking(ticks, coro)
+    return result, (ticks[0] - before, time.perf_counter() - started)
 
 
 class TestConstruction:
@@ -1036,7 +994,11 @@ class TestRerankingStaysOffTheLoop:
         progress, spans = [], []
 
         def answer(query, documents, started, before):
-            progress.append((ticks[0] - before) / (time.perf_counter() - started))
+            # RAW, not a rate: _assert_free() needs the provider window's
+            # ticks and seconds separately, so it can subtract both from
+            # the whole call's and get the rest of the same run to
+            # compare against.
+            progress.append((ticks[0] - before, time.perf_counter() - started))
             spans.append((started, time.perf_counter()))
             if per_call is not None:
                 per_call.append(query)
@@ -1069,17 +1031,29 @@ class TestRerankingStaysOffTheLoop:
         return rerank
 
     @staticmethod
-    def _assert_free(rerank, idle):
-        """Every provider call left the loop most of its throughput.
+    def _assert_free(rerank, whole):
+        """The loop ran as much other work DURING the provider calls as
+        it did during the rest of the same call.
 
-        A RATE against `idle`, not `> 0`: the old form passed on a
-        version that blocked the loop for 600ms, because 600ms of block
-        inside a longer call still lets a 1ms ticker score hundreds of
-        times. See LOOP_FLOOR."""
+        A rate, not `> 0`: the old form passed on a version that blocked
+        the loop for 600ms. Compared against the same run rather than
+        against an idle baseline, so a loaded machine scales both sides
+        -- see LOOP_FLOOR. `whole` is (ticks, seconds) for the whole
+        call, which the provider windows are subtracted from."""
         assert rerank.progress, "the reranker was never called"
-        assert all(rate > idle * LOOP_FLOOR for rate in rerank.progress), (
-            f"the loop managed {[round(r) for r in rerank.progress]} ticks/s during the "
-            f"reranker calls against an idle {idle:.0f} -- it is back on its thread")
+        total_ticks, total_seconds = whole
+        inside_ticks = sum(ticks for ticks, _ in rerank.progress)
+        inside_seconds = sum(seconds for _, seconds in rerank.progress)
+        outside_seconds = total_seconds - inside_seconds
+        assert inside_seconds > 0 and outside_seconds > 0, (
+            f"nothing to compare: {inside_seconds:.3f}s inside the provider calls, "
+            f"{outside_seconds:.3f}s outside them")
+        inside = inside_ticks / inside_seconds
+        outside = (total_ticks - inside_ticks) / outside_seconds
+        assert inside > outside * LOOP_FLOOR, (
+            f"the loop managed {inside:.0f} ticks/s during the reranker calls against "
+            f"{outside:.0f} ticks/s during the rest of the same call -- the provider "
+            f"call is back on its thread")
 
     def test_vector_search_does_not_hold_the_loop_while_it_reranks(self, async_fresh_graph):
         """Run inside run_sync() the scoring would sit on the event
@@ -1092,14 +1066,13 @@ class TestRerankingStaysOffTheLoop:
 
         async def body():
             await self._seeded(async_fresh_graph)
-            idle = await _idle_rate()
-            return await _while_ticking(ticks, async_fresh_graph.vector_search(
-                Near("summary", text="raft consensus"), k=1, rerank=rerank)), idle
+            return await _counted(ticks, async_fresh_graph.vector_search(
+                Near("summary", text="raft consensus"), k=1, rerank=rerank))
 
-        hits, idle = run(body())
+        hits, whole = run(body())
         assert [hit["id"] for hit in hits] == ["2"]
         assert hits[0]["rerank_score"] == 1.0
-        self._assert_free(rerank, idle)
+        self._assert_free(rerank, whole)
 
     def test_vector_search_many_issues_its_rerank_calls_concurrently(self, async_fresh_graph):
         """N queries mean N reranker calls -- a score is the (query,
@@ -1138,15 +1111,14 @@ class TestRerankingStaysOffTheLoop:
 
         async def body():
             await self._seeded(async_fresh_graph)
-            idle = await _idle_rate()
-            return await _while_ticking(ticks, async_fresh_graph.traverse(
+            return await _counted(ticks, async_fresh_graph.traverse(
                 Start(where={"type": "doc"}),
                 Hop(via={"kind": "cites"}, near=Near("summary", text="raft"), keep=1,
-                    rerank=rerank))), idle
+                    rerank=rerank)))
 
-        (result, idle) = run(body())
+        (result, whole) = run(body())
         assert sorted(node["id"] for node in result.nodes) == ["1", "2"]
-        self._assert_free(rerank, idle)
+        self._assert_free(rerank, whole)
 
     def test_a_reranked_step_survives_the_text_resolution(self, async_fresh_graph):
         """aresolve_spec_texts() rebuilds each step it resolves, and a
@@ -1230,13 +1202,12 @@ class TestRerankingStaysOffTheLoop:
 
         async def body():
             await self._seeded(async_fresh_graph)
-            idle = await _idle_rate()
-            return await _while_ticking(ticks, async_fresh_graph.vector_search(
-                Near("summary", text="raft consensus"), k=1, rerank=rerank)), idle
+            return await _counted(ticks, async_fresh_graph.vector_search(
+                Near("summary", text="raft consensus"), k=1, rerank=rerank))
 
-        hits, idle = run(body())
+        hits, whole = run(body())
         assert [hit["id"] for hit in hits] == ["2"]
-        self._assert_free(rerank, idle)
+        self._assert_free(rerank, whole)
 
     def test_a_synchronous_client_stays_off_the_loop_at_a_hop_too(self, async_fresh_graph):
         """The traversal driver has its own path to `ascore()`, so the
@@ -1248,15 +1219,14 @@ class TestRerankingStaysOffTheLoop:
 
         async def body():
             await self._seeded(async_fresh_graph)
-            idle = await _idle_rate()
-            return await _while_ticking(ticks, async_fresh_graph.traverse(
+            return await _counted(ticks, async_fresh_graph.traverse(
                 Start(where={"type": "doc"}),
                 Hop(via={"kind": "cites"}, near=Near("summary", text="raft"), keep=1,
-                    rerank=rerank))), idle
+                    rerank=rerank)))
 
-        (result, idle) = run(body())
+        (result, whole) = run(body())
         assert sorted(node["id"] for node in result.nodes) == ["1", "2"]
-        self._assert_free(rerank, idle)
+        self._assert_free(rerank, whole)
 
     def test_per_path_reranking_does_not_hold_the_loop(self, async_fresh_graph):
         """The other gap: `per_path=True` was covered only synchronously.
@@ -1274,15 +1244,14 @@ class TestRerankingStaysOffTheLoop:
 
         async def body():
             await self._seeded(async_fresh_graph)
-            idle = await _idle_rate()
-            return await _while_ticking(ticks, async_fresh_graph.traverse(
+            return await _counted(ticks, async_fresh_graph.traverse(
                 Start(where={"type": "doc"}),
                 Hop(via={"kind": "cites"}, near=Near("summary", text="raft"), keep=1,
-                    rerank=rerank))), idle
+                    rerank=rerank)))
 
-        (result, idle) = run(body())
+        (result, whole) = run(body())
         assert sorted(node["id"] for node in result.nodes) == ["1", "2"]
-        self._assert_free(rerank, idle)
+        self._assert_free(rerank, whole)
 
 
 class TestDocumentBuildingStaysOffTheLoop:
