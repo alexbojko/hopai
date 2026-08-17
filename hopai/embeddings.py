@@ -77,18 +77,45 @@ refused instead) or cache embeddings. EmbeddingError still keeps the
 provider's own exception as `__cause__`, so a caller who wants to
 classify differently than the heuristic above can.
 
-NOR DOES IT RUN ANYTHING ASYNCHRONOUSLY, and not merely because hopai
-is sync end to end. Reaching for a provider's async client HERE would
-break in exactly the application that wanted it: set_vectors() is a
-sync function, so awaiting inside it means asyncio.run(), and
-asyncio.run() raises RuntimeError when a loop is already running --
-which is the case in the async app the change was for. Async has to
-arrive at the Graph API and the SQLAlchemy engine together or not at
-all.
+ASYNC IS A SIBLING, NOT A REPLACEMENT: every embed_*() above has an
+aembed_*() twin (aembed_documents, aembed_query, aembed_queries), and
+they exist for exactly one caller -- hopai/asyncio.py's AsyncGraph,
+which resolves Near(text=...) and string set_vectors() rows BEFORE
+handing the query to AsyncSession/AsyncConnection.run_sync(). That
+ordering is the point (see asyncio.py's module docstring and issue
+#74): run_sync() bridges a greenlet on the event loop's OWN thread, so
+an ordinary blocking HTTP call made from inside it -- which is what
+embed_query() is -- stalls every other task on that loop for the
+length of the round trip. Awaiting aembed_query() first keeps the
+provider call off that thread entirely.
+
+This is safe where a naive addition would not have been: the earlier
+design note here was that a sync function awaiting internally needs
+asyncio.run(), which raises when a loop is already running. aembed_*()
+sidesteps that by being a coroutine itself, meant to be awaited by a
+caller that already has a loop -- it is never called from set_vectors()
+or embed_stale(), which stay entirely synchronous.
+
+A NATIVE ASYNC CLIENT (openai.AsyncOpenAI(), cohere.AsyncClientV2(), a
+plain `async def` callable, ...) is matched the same way as its sync
+counterpart -- module name plus attribute shape, `inspect.
+iscoroutinefunction` telling the async method of a client apart from
+its sync namesake -- and is awaited directly. A CLIENT WITH NO
+RECOGNIZED ASYNC SHAPE (a plain OpenAI() sync client, SentenceTransformer,
+...) falls back to `asyncio.to_thread()`. That fallback is legitimate
+HERE specifically because these are all socket-bound provider calls
+that release the GIL while blocked on I/O -- the same reasoning that
+does NOT extend to a CPU-bound C extension, which would leave the loop
+starved even off-thread. Retries, chunking, batching and validation are
+unchanged either way: the sync/async split is only about which
+primitive waits (time.sleep vs asyncio.sleep) and which thread the
+provider call runs on.
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import math
 import random
@@ -353,6 +380,12 @@ class Embedder:
         # key, so an unknown client takes _DEFAULT_BATCH either way.
         self.batch_size = batch_size or _BATCH_CAPS.get(self.provider or "", _DEFAULT_BATCH)
         self._call = _bind(client, self.provider, model)
+        # None means "no native async shape recognized" -- _aattempt()
+        # then wraps self._call in asyncio.to_thread() instead. Bound
+        # after _call, which is what raises for a missing model= --
+        # by the time this runs, model is already known valid for any
+        # provider that requires one.
+        self._acall = _bind_async(client, self.provider, model)
 
     def __repr__(self) -> str:
         parts = [self.provider or type(self.client).__name__]
@@ -375,8 +408,25 @@ class Embedder:
         provider round trip rather than N."""
         return self._run(texts, query=True)
 
-    def _attempt(self, chunk: list, query: bool, owner: str, done: int):
-        """One provider call, retried while the failure looks transient.
+    async def aembed_documents(self, texts: list) -> list:
+        """Async twin of embed_documents() -- see the module docstring
+        on why this exists (issue #74) and what it falls back to for a
+        sync-only client."""
+        return await self._arun(texts, query=False)
+
+    async def aembed_query(self, text: str) -> list:
+        """Async twin of embed_query()."""
+        return (await self._arun([text], query=True))[0]
+
+    async def aembed_queries(self, texts: list) -> list:
+        """Async twin of embed_queries()."""
+        return await self._arun(texts, query=True)
+
+    def _backoff(self, attempt: int, failure: BaseException, owner: str, attempts: int) -> float:
+        """The delay before retry number `attempt`, and the log line
+        explaining it -- shared by _attempt() and _aattempt() because
+        the decision is identical; only the primitive that waits on it
+        (time.sleep vs asyncio.sleep) differs between them.
 
         Full jitter (`random.uniform(0, window)`) rather than the exact
         doubling: a backfill that fans out over several fields fails at
@@ -386,6 +436,16 @@ class Embedder:
 
         `Retry-After` wins over the computed window when the provider
         sent one -- it is the only number here that is not a guess."""
+        window = min(self.backoff * (2 ** (attempt - 1)), _MAX_BACKOFF)
+        delay = _retry_after(failure)
+        if delay is None:
+            delay = random.uniform(0, window)
+        logger.warning("%s: %s: %s -- retrying in %.2fs (attempt %d of %d)",
+                       owner, type(failure).__name__, failure, delay, attempt + 1, attempts)
+        return delay
+
+    def _attempt(self, chunk: list, query: bool, owner: str, done: int):
+        """One provider call, retried while the failure looks transient."""
         attempts = self.retries + 1
         failure = None
         for attempt in range(attempts):
@@ -397,16 +457,32 @@ class Embedder:
                 # number twice and a wider bound is unreachable --
                 # unobservable to any test, which is how a retry count
                 # drifts from what the caller asked for.
-                window = min(self.backoff * (2 ** (attempt - 1)), _MAX_BACKOFF)
-                delay = _retry_after(failure)
-                if delay is None:
-                    delay = random.uniform(0, window)
-                logger.warning("%s: %s: %s -- retrying in %.2fs (attempt %d of %d)",
-                               owner, type(failure).__name__, failure, delay,
-                               attempt + 1, attempts)
-                time.sleep(delay)
+                time.sleep(self._backoff(attempt, failure, owner, attempts))
             try:
                 return self._call(chunk, query, self.dimensions)
+            except EmbeddingError:
+                raise
+            except Exception as exc:                      # provider-side failure
+                if not _retryable(exc):
+                    self._give_up(owner, done, attempt + 1, exc)
+                failure = exc
+        self._give_up(owner, done, attempts, failure)
+
+    async def _aattempt(self, chunk: list, query: bool, owner: str, done: int):
+        """Async twin of _attempt() -- same retry/backoff decision,
+        awaited rather than blocking. The call itself is the native
+        async binding when _bind_async() found one, or the sync
+        binding pushed to a thread otherwise (see the module
+        docstring's GIL note on why that fallback is safe here)."""
+        attempts = self.retries + 1
+        failure = None
+        for attempt in range(attempts):
+            if failure is not None:
+                await asyncio.sleep(self._backoff(attempt, failure, owner, attempts))
+            try:
+                if self._acall is not None:
+                    return await self._acall(chunk, query, self.dimensions)
+                return await asyncio.to_thread(self._call, chunk, query, self.dimensions)
             except EmbeddingError:
                 raise
             except Exception as exc:                      # provider-side failure
@@ -426,6 +502,17 @@ class Embedder:
             f"({type(exc).__name__}: {exc}) -- nothing was written"
         ) from exc
 
+    def _check_dimensions(self, owner: str, out: list) -> None:
+        if self.dimensions is None:
+            return
+        for index, vector in enumerate(out):
+            if len(vector) != self.dimensions:
+                raise EmbeddingError(
+                    f"{owner}: item {index} came back with {len(vector)} dimensions, "
+                    f"not the {self.dimensions} this field declares -- the model and "
+                    f"the field disagree; re-declare the field or change the model"
+                )
+
     def _run(self, texts, query: bool) -> list:
         # `query` is read only as `A if query else B` -- here and in every
         # binding _bind() returns -- so any falsy value is the document
@@ -439,14 +526,22 @@ class Embedder:
             logger.debug("%s: embedding %d text(s)", owner, len(chunk))
             raw = self._attempt(chunk, query, owner, len(out))
             out.extend(_as_vectors(raw, len(chunk), owner))
-        if self.dimensions is not None:
-            for index, vector in enumerate(out):
-                if len(vector) != self.dimensions:
-                    raise EmbeddingError(
-                        f"{owner}: item {index} came back with {len(vector)} dimensions, "
-                        f"not the {self.dimensions} this field declares -- the model and "
-                        f"the field disagree; re-declare the field or change the model"
-                    )
+        self._check_dimensions(owner, out)
+        return out
+
+    async def _arun(self, texts, query: bool) -> list:
+        """Async twin of _run() -- see aembed_documents()/aembed_query()/
+        aembed_queries()."""
+        owner = f"{self!r}.{'aembed_query' if query else 'aembed_documents'}"
+        cleaned = _clean_texts(list(texts), owner)
+        if not cleaned:
+            return []
+        out = []
+        for chunk in _chunks(cleaned, self.batch_size):
+            logger.debug("%s: embedding %d text(s)", owner, len(chunk))
+            raw = await self._aattempt(chunk, query, owner, len(out))
+            out.extend(_as_vectors(raw, len(chunk), owner))
+        self._check_dimensions(owner, out)
         return out
 
 
@@ -557,6 +652,112 @@ def _bind(client: Any, provider: Optional[str], model: Optional[str]):
         f"(LangChain) or get_text_embedding_batch+get_query_embedding "
         f"(LlamaIndex), or a callable taking list[str] -> list[list[float]]"
     )
+
+
+def _bind_async(client: Any, provider: Optional[str], model: Optional[str]):
+    """The native-async twin of _bind(), tried first by every
+    aembed_*() call (see Embedder._aattempt). Returns None -- not a
+    raised error -- when the client has no async shape hopai
+    recognizes; that is not a refusal, it is what makes the
+    asyncio.to_thread() fallback the caller falls back to instead of
+    raising, which is what keeps a sync-only client usable from async
+    code at all.
+
+    Matched by the same rule as _bind(): module name plus attribute
+    shape, never isinstance (see the module docstring on why). A
+    native vendor client's async method has the SAME name and the
+    SAME module root as its sync twin -- `openai.OpenAI().embeddings.
+    create` and `openai.AsyncOpenAI().embeddings.create` both live
+    under `openai...` -- so `inspect.iscoroutinefunction` is what
+    tells the two apart, not the module.
+
+    A plain callable can't be told apart from a sync one by shape at
+    all, so it is matched here ONLY when calling it returns a
+    coroutine (`inspect.iscoroutinefunction`); a callable that returns
+    something else takes the to_thread fallback like everything else
+    duck-typed sync."""
+    if provider == "openai" and hasattr(client, "embeddings"):
+        create = getattr(client.embeddings, "create", None)
+        if not inspect.iscoroutinefunction(create):
+            return None
+
+        async def acall(texts, query, dimensions):        # noqa: ARG001 -- no asymmetry
+            extra = {"dimensions": dimensions} if dimensions else {}
+            answer = await client.embeddings.create(model=model, input=texts, **extra)
+            return answer.data
+        return acall
+
+    if provider == "cohere" and hasattr(client, "embed"):
+        if not inspect.iscoroutinefunction(getattr(client, "embed", None)):
+            return None
+        documents, queries = _INPUT_TYPES["cohere"]
+
+        async def acall(texts, query, dimensions):        # noqa: ARG001
+            answer = await client.embed(texts=texts, model=model,
+                                        input_type=queries if query else documents,
+                                        embedding_types=["float"])
+            embeddings = getattr(answer, "embeddings", answer)
+            return getattr(embeddings, "float_", None) or getattr(
+                embeddings, "float", embeddings)
+        return acall
+
+    if provider == "voyageai" and hasattr(client, "embed"):
+        if not inspect.iscoroutinefunction(getattr(client, "embed", None)):
+            return None
+        documents, queries = _INPUT_TYPES["voyageai"]
+
+        async def acall(texts, query, dimensions):        # noqa: ARG001
+            answer = await client.embed(texts, model=model,
+                                        input_type=queries if query else documents)
+            return getattr(answer, "embeddings", answer)
+        return acall
+
+    if provider == "google" and hasattr(client, "aio"):
+        # google-genai's async surface lives under client.aio rather
+        # than a same-named coroutine, unlike the others -- the SDK's
+        # own split, not one hopai invented.
+        embed_content = getattr(getattr(client.aio, "models", None), "embed_content", None)
+        if not inspect.iscoroutinefunction(embed_content):
+            return None
+        documents, queries = _INPUT_TYPES["google"]
+
+        async def acall(texts, query, dimensions):
+            config = {"task_type": queries if query else documents}
+            if dimensions:
+                config["output_dimensionality"] = dimensions
+            answer = await client.aio.models.embed_content(model=model, contents=texts,
+                                                            config=config)
+            return [e.values for e in answer.embeddings]
+        return acall
+
+    # sentence-transformers has no async encode() -- falls through to
+    # the to_thread fallback. Local inference is CPU/GPU-bound rather
+    # than socket-bound, so the GIL-release argument for the fallback
+    # is weaker here than for a provider HTTP call; see the module
+    # docstring. It still beats blocking the loop directly.
+
+    # LangChain's async pair is 'a'-prefixed, same names otherwise.
+    if hasattr(client, "aembed_documents") and hasattr(client, "aembed_query"):
+        async def acall(texts, query, dimensions):        # noqa: ARG001
+            if query:
+                return [await client.aembed_query(text) for text in texts]
+            return await client.aembed_documents(list(texts))
+        return acall
+
+    # LlamaIndex's async pair, same 'a'-prefix convention.
+    if hasattr(client, "aget_text_embedding_batch") and hasattr(client, "aget_query_embedding"):
+        async def acall(texts, query, dimensions):        # noqa: ARG001
+            if query:
+                return [await client.aget_query_embedding(text) for text in texts]
+            return await client.aget_text_embedding_batch(list(texts))
+        return acall
+
+    if inspect.iscoroutinefunction(client):
+        async def acall(texts, query, dimensions):        # noqa: ARG001
+            return await client(list(texts))
+        return acall
+
+    return None
 
 
 def as_embedder(embed: Any) -> Embedder:

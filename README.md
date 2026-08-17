@@ -1290,6 +1290,11 @@ if called, pointing at the fix. See `hopai/asyncio.py` for the design
 (and the benchmark that checked it isn't `asyncio.to_thread()` wearing a
 different name before it was written).
 
+`Near(text=...)` and a text row in `set_vectors()` never block the loop
+either: the embedding call is awaited — through the client's own async
+API when it has one, `asyncio.to_thread()` otherwise — before the query
+reaches the database bridge above, on every method that can carry text.
+
 ## 📓 Runnable documentation
 
 Everything above, as nine notebooks you can execute against a throwaway
