@@ -137,6 +137,19 @@ supplies) -- but knowing the separator is at most MAX_LENGTH characters
 bounds the separator, not len(sep) * element_count, which is the
 product that grew.
 
+THE SAME RULE COVERS A SECOND AMPLIFIER, found while writing the first
+fix and left standing by exactly the same reasoning: jq's binary
+operators run over the CARTESIAN PRODUCT of their two streams, so
+`(.a,.b) + (.c,.d)` emits four values and `[.[] + .[]]` SQUARES an
+array's length. `.t | split("") | [.[]+.[]] | [.[]+.[]]` measured
+70,001 characters out of a TEN-character field while an arithmetic that
+knew only about sizes charged 2 per stage. Repetition is the whole
+family -- a separator per element, `map`'s body per element, the right
+of a pipe per value the left emitted, both sides of `+` per pair -- so
+_size() counts VALUES as well as characters, and a row-proportional
+count meeting a row-proportional size is reported as _UNBOUNDED rather
+than as a number, because the row squared is not a multiple of the row.
+
 WHAT WAS REJECTED, and why none of it is enough on its own:
 
   - A watchdog thread with a timeout. Measured above: it cannot fire
@@ -1388,12 +1401,6 @@ def _call_size(name: str, args: list, count: Optional[int]) -> _Size:
     return _Size(1, 0)                                 # every other allowed call shrinks
 
 
-def _growth(node) -> float:
-    """How many times its own input `node` may emit -- the number the
-    refusal names, or _UNBOUNDED when no number is the right answer."""
-    return _size(node).factor
-
-
 def _magnitude(number: int) -> str:
     """A number an error message can carry. Growth is a PRODUCT over
     pipe stages, so a filter inside MAX_LENGTH can reach hundreds of
@@ -1510,7 +1517,7 @@ def _read_paths(node) -> frozenset:
 #: limits is reached first, and the answer must always be ours.
 _FRAMES_PER_LEVEL = 60
 
-#: Frames left over for _growth()/_read_paths(), which walk the tree the
+#: Frames left over for _size()/_read_paths(), which walk the tree the
 #: parser just built and so recurse to the same depth.
 _FRAME_SLACK = 200
 
@@ -1579,15 +1586,16 @@ def _compile(program: str, owner: str):
     # parse error out of a layer below. See _UNENCODABLE_RE.
     found = _UNENCODABLE_RE.search(program)
     if found is not None:
-        nul = found.group() == "\x00"
+        what, why = (
+            ("a NUL byte",
+             "libjq reads the program as a C string, so the NUL ends it there and libjq "
+             "answers `unexpected end of file` on the half it saw")
+            if found.group() == "\x00" else
+            ("a lone surrogate",
+             "it cannot be encoded as UTF-8, so the filter never reaches libjq at all"))
         raise UnsafeFilter(
-            f"{owner}: the filter contains "
-            f"{'a NUL byte' if nul else 'a lone surrogate'} at offset {found.start()} -- "
-            + ("libjq reads the program as a C string, so the NUL ends it there and "
-               "libjq reports `unexpected end of file` on the half it saw"
-               if nul else
-               "it cannot be encoded as UTF-8, so the filter cannot reach libjq at all")
-            + ". Write the document projection in text, e.g. `.properties.title`"
+            f"{owner}: the filter contains {what} at offset {found.start()} -- {why}. "
+            f"Write the projection in text, e.g. `.properties.title`"
         )
     with _stack_headroom():
         node = _Parser(_tokenize(program, owner), owner).program()

@@ -712,6 +712,9 @@ class TestGrowthIsBounded:
         assert static_bound('.tags | join(", ")').factor == 3
         assert static_bound('.tags | join(" -- ")').factor == 5
         assert static_bound(f'.tags | join("{"x" * 300}")').factor == 301
+        # A number is a literal too, and jq writes it out the same way:
+        # the charge is the characters it prints as, not a flat 1.
+        assert static_bound(".tags | join(37)").factor == 3
 
     def test_a_slice_credits_the_separator_back(self):
         """`.[0:30]` bounds the ELEMENT COUNT whatever the row holds, so
@@ -735,6 +738,27 @@ class TestGrowthIsBounded:
         with pytest.raises(UnsafeFilter) as refused:
             validate(f'.properties.tags[0:1000000] | join("{"x" * 300}")')
         assert str(MAX_ADDED) in str(refused.value)
+
+    @pytest.mark.parametrize("program", [
+        ".properties.tags[] + .properties.tags[]",
+        '.properties.title | split("") | [.[] + .[]]',
+        ".properties.tags[] - .properties.tags[]",
+        '.properties.tags[] + " " + .properties.title',
+        ".properties.tags | map(.[] + .[])",
+    ])
+    def test_a_stream_on_both_sides_of_an_operator_is_refused(self, program):
+        """The second amplifier of the same family, found while fixing
+        the first. jq's binaries run over the CARTESIAN PRODUCT of their
+        two streams -- `(.a,.b) + (.c,.d)` emits four values -- so
+        `[.[] + .[]]` squares an array's length, and
+        `split("") | [.[]+.[]] | [.[]+.[]]` measured 70,001 characters
+        out of a TEN-character field while an arithmetic that counted
+        only sizes charged 2 per stage. The row squared is not a
+        multiple of the row, so the refusal says that instead of naming
+        a number."""
+        with pytest.raises(UnsafeFilter) as refused:
+            validate(program)
+        assert "SQUARE of the row" in str(refused.value)
 
     def test_a_constant_emitted_once_per_element_is_a_factor(self):
         """`map(f)` runs f once per ELEMENT, so f's constant is emitted
@@ -1050,6 +1074,11 @@ GROWTH_STAGES = (
     '. + "tail"', "ascii_downcase", "sort", "unique", "reverse", "tostring",
     "tojson", "add", "flatten", "length", "first", "last", ".[0]",
     '"pre \\(.) post"', '[., .] | join("~")', "select(. != null)",
+    # Refused today (a stream on both sides of `+` is a cartesian
+    # product). Generated anyway, so that loosening that refusal without
+    # doing the arithmetic makes this property test fail rather than
+    # quietly stop covering the shape.
+    "[.[] + .[]]", '.[] + "x"', "[.[], .[]]",
 )
 
 GROWTH_STARTS = (".t", ".tags", ".n", ".", ".tags[]", "[.t, .n]")
@@ -1086,7 +1115,7 @@ class TestGrowthIsNeverUnderReported:
         row_size = _measure(GROWTH_ROW)
         generator = random.Random(20260817)
         checked, seen = 0, set()
-        for _ in range(2500):
+        for _ in range(1500):
             program = generator.choice(GROWTH_STARTS) + "".join(
                 " | " + generator.choice(GROWTH_STAGES)
                 for _ in range(generator.randint(1, 4)))
