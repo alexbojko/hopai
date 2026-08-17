@@ -482,6 +482,57 @@ class TestErrorsNameTheFix:
             validate('split("a"; "g")')
         assert "at most one argument" in str(refused.value)
 
+    @pytest.mark.parametrize("program, offset, reason", [
+        (".a * 2", 3, "unbounded memory amplifier"),
+        (".a / 2", 3, "jq's `/` is splitting"),
+        (".a % 2", 3, "arithmetic beyond `+` and `-`"),
+        (".a; .b", 2, "separates the arguments of a multi-argument function"),
+        (":", 0, "appears only inside a slice"),
+        ("-1", 0, "a leading `-` is not in the subset"),
+    ])
+    def test_a_token_with_a_known_reason_gets_that_reason(self, program, offset, reason):
+        """The operators `_UNEXPECTED` names each have a DIFFERENT fix --
+        `*` says concatenate, `/` says `split`, `:` says slice -- and
+        that lookup is the whole point of the table. Without this the
+        suite only asserted THAT these are refused, so dropping the
+        lookup (every token falling through to the generic "cannot
+        appear here" text), looking the reason up under the wrong key,
+        or inverting the `why is None` test so the two messages swap
+        places all passed in silence. The `startswith` pins the rest of
+        the refusal's shape at the same time: the owner the caller
+        passed, the offset of the offending token, and the "this is not
+        in the subset" wording -- each of which has vanished under a
+        mutant while every test still went green."""
+        with pytest.raises(UnsafeFilter) as refused:
+            validate(program, owner="rerank.document_from")
+        message = str(refused.value)
+        assert message.startswith(
+            f"rerank.document_from: this is not in the subset (offset {offset}) -- "
+        )
+        assert reason in message
+        assert "cannot appear here" not in message
+
+    def test_a_token_with_no_known_reason_gets_the_generic_one(self):
+        """`]` is not in `_UNEXPECTED`, so it takes the other branch, and
+        a model that sent one needs to be told what a projection is built
+        FROM rather than nothing at all. Without this the generic branch
+        was unpinned: it could name no owner, no offset, no token, or --
+        with the `why is None` test inverted -- report a `None` reason,
+        and the suite still passed because it only checked that `]` was
+        refused. The reason is three adjacent literals, so the anchors
+        deliberately straddle their joins -- a substring sitting wholly
+        inside one piece leaves the other two free to be rewritten."""
+        with pytest.raises(UnsafeFilter) as refused:
+            validate(".a ]", owner="rerank.document_from")
+        message = str(refused.value)
+        assert message.startswith(
+            "rerank.document_from: `]` cannot appear here (offset 3) -- "
+            "the filter does not parse in the jq subset hopai accepts"
+        )
+        assert "accepts -- a document is built from properties" in message
+        assert message.endswith("string literals, `+`, `//` and the allowed functions")
+        assert "this is not in the subset" not in message
+
 
 class TestPathsRead:
     @pytest.mark.parametrize("program, expected", [

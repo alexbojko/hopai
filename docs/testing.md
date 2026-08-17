@@ -110,5 +110,27 @@ because of bugs, not taste:
   case-flip of a sentence neither class pins is the accepted remainder, not an
   oversight — check which of the two before re-opening this.
 
+- **`hopai/mcp.py`'s `build_parser()` argparse text is the same accepted remainder.**
+  A run reports ~60 survivors inside that one function, every one of them a
+  `help=` / `metavar=` / `description=` / `epilog=` / `prog=` string case-flipped,
+  XX-wrapped, or dropped to `None`. Argparse text has no behaviour behind it, and a
+  test asserting `--help` output verbatim would make every copy edit a test failure
+  while catching nothing a reader would not. What IS load-bearing there — that a flag
+  exists, its `default`, its `action`, and that it reaches `serve()` — is asserted by
+  `TestCommandLine` and `TestServeArguments` against the parsed namespace rather than
+  the help text. A `build_parser` survivor that changes a **default or an action** is
+  a real gap; one that only changes prose is not.
+
+- **`zip(..., strict=True)` mutants are equivalent where both sequences are built
+  one-per-element from the same list.** Two were checked rather than assumed.
+  `core._aggregate_with_session` zips `aggregates` against the result row, and the
+  select list is built by iterating `aggregates` itself — one column per key, so no
+  input can desynchronize them. `vectors.arerank_many` zips `grouped` against the
+  query texts, and both come one-per-element off the caller's own `queries` list.
+  In both, `strict=` guards a future construction error *inside* hopai, not any
+  caller input, so no test can distinguish `True` from `False` without monkeypatching
+  the internals it exists to check. Equivalent — and worth keeping for the day the
+  construction changes.
+
 CI scopes mutation to the files a PR changed and caps it with a wall-clock budget; a
 full run over `hopai/` is thousands of mutants.

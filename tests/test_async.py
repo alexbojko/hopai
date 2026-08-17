@@ -448,6 +448,29 @@ class TestVectors:
         assert got["nodes"]["1"]["summary"] == pytest.approx([1.0, 0.0, 0.0])
         assert dropped == ["nodes.vec_summary"]
 
+    def test_stale_vectors_narrows_by_field_and_by_limit(self, async_fresh_graph):
+        """The case above calls stale_vectors() with NO arguments, so
+        every argument AsyncGraph hands across the bridge is unasserted
+        -- and each one only ever WIDENS the answer when it goes
+        missing. Dropping `node_fields` reports fields the caller did
+        not ask about; dropping `limit` returns the whole backlog to a
+        caller paging through it. Both are a bigger answer than was
+        asked for, which is the shape of mistake nothing downstream
+        notices."""
+        async def body():
+            async_fresh_graph.define_vectors(
+                nodes=[Vector("summary", 3), Vector("title", 3)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1, "type": "doc"},
+                                               {"id": 2, "type": "doc"}])
+            return (await async_fresh_graph.stale_vectors(node_fields=["summary"]),
+                    await async_fresh_graph.stale_vectors(node_fields=["summary"], limit=1))
+
+        every, capped = run(body())
+        assert set(every["nodes"]) == {"summary"}          # not "title" as well
+        assert sorted(every["nodes"]["summary"]["missing"]) == ["1", "2"]
+        assert len(capped["nodes"]["summary"]["missing"]) == 1
+
     def test_text_is_embedded_before_the_transaction_opens(self, async_fresh_graph):
         """The sync set_vectors() plans and then opens a transaction, so
         the provider call is outside it by construction. This one cannot
@@ -1147,6 +1170,31 @@ class TestRerankingStaysOffTheLoop:
         starts, ends = zip(*rerank.spans, strict=True)
         assert len(rerank.spans) == 2 and max(starts) < min(ends), \
             "the reranker calls ran one after another, not together"
+
+    def test_the_batch_path_truncates_each_group_to_k(self, async_fresh_graph):
+        """`rerank=` deliberately widens the retrieval to `candidates`,
+        so `k` is the ONLY thing between the caller and the whole
+        widened candidate set. vector_search() forwards it straight to
+        rerank_hits(); vector_search_many() forwards it through a
+        SECOND function, and the case above asserts how many groups come
+        back but never how long one is. Drop `k` there and a `k=1`
+        search hands back every candidate -- `candidates` silently
+        become the output bound, the same defect the step-wise path
+        refuses `rerank=` without `keep=` to prevent."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        rerank = self._rerank(ticks)
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await async_fresh_graph.vector_search_many(
+                [Near("summary", text="raft"), Near("summary", text="paxos")], k=1,
+                rerank=rerank)
+
+        results = run(body())
+        # Two candidates are reachable per query -- both nodes carry a
+        # `summary` -- so an untruncated group is two long, not one.
+        assert [len(group) for group in results] == [1, 1]
 
     def test_a_step_wise_rerank_does_not_hold_the_loop_either(self, async_fresh_graph):
         """The traversal path has its own driver -- probe, score, pin --

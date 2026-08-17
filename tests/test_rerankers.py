@@ -328,6 +328,51 @@ class TestScoresArePairedByIndex:
         with pytest.raises(RerankError, match="top_n"):
             _rerank(client, model="m").score("q", ["a", "b", "c"])
 
+    def test_the_truncation_refusal_names_the_unscored_document(self):
+        """WHICH document went unscored, and how many did. The list is
+        built from the scores that are still None -- the ones nothing
+        came back for -- and inverting that test to `is not None` names
+        the documents the provider DID score instead: here it would
+        report 2 unscored starting at document 0, when the only document
+        without a score is 1. A caller reading that message goes looking
+        at the wrong candidate, and the count that tells them how much of
+        the answer is missing is wrong too. Matching only on "top_n"
+        cannot see any of it."""
+        class Cohereish:
+            def rerank(self, *, model, query, documents):
+                return _answer((2, 0.9), (0, 0.7))
+
+        client = _named("cohere.client_v2", Cohereish)()
+        with pytest.raises(RerankError) as raised:
+            _rerank(client, model="m").score("q", ["a", "b", "c"])
+        assert "leaving 1 unscored (document 1 first)" in str(raised.value)
+
+    def test_a_bad_indexed_score_names_the_rerank_and_the_document(self):
+        """The two halves of `_number(value, owner, where)` at the one
+        call site that knows WHICH document a score belongs to. Drop the
+        owner and the message opens "None:", so nothing says which
+        Rerank -- which model, which document_from -- produced it, and
+        this repr is the only place the filter that built the document is
+        quoted. Drop the `where` and it reads "None came back as str",
+        naming no document at all: with one bad score among many, there
+        is then nothing to look at. Neither loss is visible to a test
+        that matches only "where a relevance score was expected"."""
+        class Cohereish:
+            def rerank(self, *, model, query, documents):
+                # Best-first, so the unusable score arrives first and the
+                # document it belongs to is 1 rather than the 0 a missing
+                # `where` would coincidentally resemble.
+                return {"results": [{"index": 1, "relevance_score": "high"},
+                                    {"index": 0, "relevance_score": 0.5}]}
+
+        client = _named("cohere.client_v2", Cohereish)()
+        rerank = _rerank(client, model="m")
+        with pytest.raises(RerankError) as raised:
+            rerank.score("q", ["a", "b"])
+        message = str(raised.value)
+        assert message.startswith(f"{rerank!r}.score:")
+        assert "the score for document 1 came back as str" in message
+
     @pytest.mark.parametrize("index, sent", [(7, 1), (1, 1), (2, 2), (-1, 2)])
     def test_an_index_out_of_range_refuses(self, index, sent):
         """Both ends, because only the absurd one is obvious. `index ==
@@ -967,6 +1012,26 @@ class TestLogging:
             _rerank(_raises(TimeoutError("x"), times=99), retries=0).score("q", ["a"])
         assert any("reranker call failed" in record.getMessage() for record in caplog.records)
 
+    def test_the_give_up_log_says_what_the_provider_actually_said(self, caplog):
+        """"Fail loudly" is the whole point of _give_up, and a line
+        reading "(TimeoutError: None)" is not loud -- the class name
+        alone says a call timed out, not that the gateway answered 503,
+        which is the half that tells you whether to retry or to look at
+        your own config. Dropping the exception from the log's argument
+        list leaves the class name in place, so a test matching only
+        "reranker call failed" still passes while the one detail worth
+        logging is gone."""
+        boom = TimeoutError("upstream gateway said 503")
+        with caplog.at_level(logging.WARNING, logger="hopai.rerankers"), \
+                pytest.raises(RerankError) as raised:
+            _rerank(_raises(boom, times=99), retries=0).score("q", ["a"])
+        logged = [record.getMessage() for record in caplog.records
+                  if "reranker call failed" in record.getMessage()]
+        assert logged and "TimeoutError: upstream gateway said 503" in logged[0]
+        # The log line and the exception are raised from the one place so
+        # they can never disagree about the failure; both carry the text.
+        assert "TimeoutError: upstream gateway said 503" in str(raised.value)
+
     def test_every_provider_call_is_visible_at_debug(self, caplog):
         """"How many documents did that query cost" is the question a
         per-document bill makes people ask."""
@@ -1423,12 +1488,25 @@ class TestTheJqExtra:
     def test_a_missing_binding_names_the_extra(self, monkeypatch):
         """`No module named 'jq'` tells a caller what is absent without
         telling them what to install -- the same reason mcp.py asks for
-        the SDK by name."""
+        the SDK by name.
+
+        The sentence is a CONTRACT, not prose: it is the only thing a
+        base install ever says about `document_from=`, and it has to name
+        the parameter, why the binding is wanted, and the extra to
+        install -- as one uninterrupted run of text. So both halves are
+        held, and held so they cannot drift apart: the message OPENS on
+        the parameter, which a mangled or re-cased first literal cannot
+        do, and "extra -- pip install" spans the seam between the two
+        literals, which nothing can pad without breaking. Matching only
+        the extra's name leaves the whole first half unheld."""
         # None in sys.modules is Python's own "this import fails" hook,
         # so the real import machinery still runs -- no fake __import__.
         monkeypatch.setitem(sys.modules, "jq", None)
-        with pytest.raises(ImportError, match=r"pip install 'hopai\[rerankers\]'"):
+        with pytest.raises(ImportError) as raised:
             _rerank(lambda q, d: [1.0]).build_documents([{"id": "1"}])
+        message = str(raised.value)
+        assert message.startswith("document_from= is a jq filter")
+        assert "an optional extra -- pip install 'hopai[rerankers]'" in message
 
 
 class TestUntrustedFilters:
