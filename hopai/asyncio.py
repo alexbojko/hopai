@@ -33,6 +33,29 @@ bridged through a greenlet: the function bodies on the other end of
 every call below are unaware anything async is happening, and are the
 same functions the sync Graph calls directly.
 
+WHAT MAY BLOCK INSIDE run_sync(), AND WHAT MAY NOT -- the rule the
+greenlet design does NOT say out loud, and the one issue #74 was
+filed for. That "constant one OS thread" below is the EVENT LOOP'S
+thread. SQLAlchemy's database I/O yields back to the loop from inside
+the greenlet, which is the entire point of the bridge; an ARBITRARY
+blocking call in there has no such arrangement and simply holds the
+thread, stalling every other task in the process. So a call is safe
+inside run_sync() only if it RELEASES THE GIL while it waits.
+Socket I/O does. A CPU-bound C extension does not -- and for that one
+even a thread pool leaves the loop starved, so it does not belong on
+an async path at all. Anything else that later wants to run inside
+the bridge is decided by that question and nothing else.
+
+The embedding provider call was the first thing to fail it: every
+read path taking `text=` did a blocking HTTP round trip on the loop's
+thread. Hence the shape the read methods below now have -- resolve
+every embedding FIRST, awaited, then enter run_sync() with specs that
+already carry vectors. That is the same "plan, then open" move
+set_vectors() already made for row locks, with the plan step awaited;
+hopai/vectors.py's aresolve_*/aplan_* functions are the plan, and a
+call with no text= is handed back untouched, so nothing about the
+sync path or the emitted SQL changes.
+
 NEEDS AN ASYNC DRIVER. psycopg2 (hopai's base dependency) cannot run
 async -- use postgresql+psycopg://... (psycopg3; `pip install
 hopai[asyncio]`) or postgresql+asyncpg://.... greenlet itself needs no
@@ -180,28 +203,70 @@ class AsyncGraph:
 
     # -- reading ----------------------------------------------------
 
+    async def _embedded(self, start: Start, hops: list) -> tuple:
+        """(start, hops) with every Near(text=) already a vector.
+
+        Awaited HERE, before run_sync() below, because inside the
+        bridge the provider call runs on the event loop's own thread --
+        see the module docstring. Nothing is copied when there is no
+        text= to resolve: the very same Start and Hop objects go on to
+        the same sync function, which is what keeps a traversal without
+        text on exactly the path it was on before (issue #74)."""
+        from .vectors import aresolve_traversal_texts
+        return await aresolve_traversal_texts(self._sync, start, hops)
+
+    async def _lazy_vectors_loaded(self, conn) -> None:
+        """search()'s own first act, done here instead, because
+        resolving text needs the field declaration that call recovers.
+
+        A lazy handle keeps its declarations in the database until
+        something needs them (see Graph.in_graph()), and resolving text
+        outside run_sync() now needs them EARLIER than search() would
+        ask. Doing it here keeps the two in the same order; it is
+        idempotent, so search() finding a registry a moment later is
+        the ordinary case, and it is paid only when there is text.
+
+        Reachability, stated because it is not obvious: AsyncGraph's own
+        in_graph() builds a fresh Graph, which starts non-lazy, so today
+        this only ever finds a registry already in place. It is what
+        stops the async path being the one place that skips the step --
+        without it a lazy handle would be refused with "none are
+        defined ... but this call didn't go through [a search]", from
+        inside a search."""
+        from .vectors import _ensure_lazy_vectors
+        await conn.run_sync(lambda c: _ensure_lazy_vectors(self._sync, c))
+
     async def traverse(self, start: Start, *hops: Hop) -> Subgraph:
+        start, hops = await self._embedded(start, list(hops))
         async with AsyncSession(self._async_engine) as session:
             return await session.run_sync(
-                lambda s: self._sync._traverse_with_session(s, start, list(hops)))
+                lambda s: self._sync._traverse_with_session(s, start, hops))
 
     async def aggregate(self, start: Start, *hops: Hop, aggregates: dict) -> dict:
+        start, hops = await self._embedded(start, list(hops))
         async with AsyncSession(self._async_engine) as session:
             return await session.run_sync(
-                lambda s: self._sync._aggregate_with_session(s, start, list(hops), aggregates))
+                lambda s: self._sync._aggregate_with_session(s, start, hops, aggregates))
 
     async def vector_search(self, *near, target: str = "nodes", k: int = 10, where=None,
                             boost=None) -> list:
-        from .vectors import search
+        from .vectors import aresolve_near_texts, has_text, search
+        near = list(near)
         async with self._async_engine.connect() as conn:
+            if has_text(near):
+                await self._lazy_vectors_loaded(conn)
+                near = await aresolve_near_texts(self._sync, near, target, k)
             return await conn.run_sync(
-                lambda c: search(self._sync, list(near), target=target, k=k, where=where,
+                lambda c: search(self._sync, near, target=target, k=k, where=where,
                                  boost=boost, connection=c))
 
     async def vector_search_many(self, queries, target: str = "nodes", k: int = 10, where=None,
                                  boost=None) -> list:
-        from .vectors import search_many
+        from .vectors import aresolve_query_texts, has_text, search_many
         async with self._async_engine.connect() as conn:
+            if has_text(queries):
+                await self._lazy_vectors_loaded(conn)
+                queries = await aresolve_query_texts(self._sync, target, queries, k)
             return await conn.run_sync(
                 lambda c: search_many(self._sync, queries, target=target, k=k, where=where,
                                       boost=boost, connection=c))
@@ -232,9 +297,15 @@ class AsyncGraph:
         cannot, since the transaction is already open by the time
         run_sync() reaches into vectors.py. Planning here keeps the
         provider call off the row locks, which is the invariant, not a
-        preference."""
-        from .vectors import plan_vector_writes, set_vectors
-        plan = plan_vector_writes(self._sync, nodes, edges)
+        preference.
+
+        AWAITED, not merely hoisted: out of the transaction is not the
+        same as off the event loop. Called plainly in this `async def`
+        body -- which is what it was -- the round trip held the loop's
+        thread for its whole duration and stalled every other task in
+        the process (issue #74)."""
+        from .vectors import aplan_vector_writes, set_vectors
+        plan = await aplan_vector_writes(self._sync, nodes, edges)
         async with self._async_engine.begin() as conn:
             return await conn.run_sync(
                 lambda c: set_vectors(self._sync, connection=c, plan=plan))

@@ -1290,6 +1290,31 @@ if called, pointing at the fix. See `hopai/asyncio.py` for the design
 (and the benchmark that checked it isn't `asyncio.to_thread()` wearing a
 different name before it was written).
 
+**Embedding is awaited too.** Every path that takes `text=` — `Near(...,
+text=...)` on a `Start` or a `Hop`, `vector_search()`,
+`vector_search_many()`, a text-valued `set_vectors()` — resolves the
+embedding *before* it enters the bridge, so the provider round trip never
+runs on the event loop's thread. Pass the async client if you have one
+and it is awaited directly; pass the sync one and it runs in a worker
+thread, which still leaves the loop free:
+
+```python
+graph.define_vectors(nodes=[
+    Vector("summary", 1536,
+           embed=Embedder(openai.AsyncOpenAI(), model="text-embedding-3-small")),
+])
+hits = await graph.vector_search(Near("summary", text="how do nodes agree?"), k=10)
+```
+
+`openai.AsyncOpenAI()`, `cohere.AsyncClientV2()`, `voyageai.AsyncClient()`,
+`google.genai`'s `client.aio`, anything with `aembed_documents`/`aembed_query`
+(LangChain) or `aget_text_embedding_batch`/`aget_query_embedding`
+(LlamaIndex), and a plain `async def` taking `list[str]` are all
+recognized — by module name and attribute shape, so hopai still imports no
+provider package. `Embedder.is_async` says which of the two you have, and
+an async client handed to a *sync* `Graph` refuses by name rather than
+running a loop of its own.
+
 ## 📓 Runnable documentation
 
 Everything above, as nine notebooks you can execute against a throwaway

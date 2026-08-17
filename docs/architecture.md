@@ -147,11 +147,20 @@ of its own decisions about how: you construct the client, hopai calls one method
   retry and each final failure at WARNING; a retry that succeeded is not an error.
   `EmbeddingError` still carries the provider's exception as `__cause__` for a caller
   who wants to classify more precisely.
-- **Async has to arrive library-wide or not at all.** An async client used inside this
-  sync module means `asyncio.run()` inside `set_vectors()`, which raises
-  `RuntimeError: asyncio.run() cannot be called from a running event loop` — in exactly
-  the async application that motivated it. The Graph API and the SQLAlchemy engine have
-  to move together.
+- **Async arrived library-wide, so it arrived here too.** `aembed_query()`/
+  `aembed_queries()`/`aembed_documents()` are the awaited half of the three methods
+  above, and `AsyncGraph` resolves every text through them *before* it enters the
+  greenlet bridge (issue #74 — a blocking provider call inside `run_sync()` runs on the
+  event loop's own thread). What has not changed is the rule that made the old refusal
+  right: nothing here ever calls `asyncio.run()`, because that raises
+  `RuntimeError: asyncio.run() cannot be called from a running event loop` in exactly
+  the async application that motivated it. An async client reaching a *sync* call is
+  refused by name instead. `_abind()` recognizes one the same way `_bind()` recognizes
+  any client — module name plus attribute shape, no provider import: `AsyncOpenAI`,
+  `AsyncClientV2`, `google.genai`'s `client.aio`, `aembed_documents`/`aembed_query`,
+  `aget_text_embedding_batch`/`aget_query_embedding`, or a plain `async def`. A sync
+  client on an async path runs in `asyncio.to_thread()` — honest *here* because a
+  provider SDK blocked on a socket has released the GIL.
 - **Embedding always happens outside the transaction**, batched per field.
   `set_vectors()` validates and resolves every row before it takes a connection: an
   HTTP call inside an open transaction holds row locks for a network round trip, and a
@@ -275,6 +284,22 @@ setup calls with no concurrency to gain, and `AsyncGraph`'s wrapped `Graph` runs
 `run_sync()` spawns. `AsyncGraph.__getattr__` refuses these by name, pointing at a plain
 `Graph` on the same database, rather than letting the facade fail with SQLAlchemy's own
 `MissingGreenlet` outside the context that explains it.
+
+**What may block inside `run_sync()`, and what may not.** That constant one OS thread
+below is the *event loop's* thread. SQLAlchemy's database I/O yields back to the loop
+from inside the greenlet, which is the point of the bridge; an arbitrary blocking call
+in there has no such arrangement and simply holds the thread. So a call is safe inside
+`run_sync()` only if it **releases the GIL** while it waits — socket I/O does, a
+CPU-bound C extension does not (and for that one even a thread pool leaves the loop
+starved). The embedding provider call was the first thing to fail that test: every read
+path taking `text=` blocked the loop for the length of an HTTP round trip (issue #74).
+The fix is the shape `set_vectors()` already had for row locks — resolve first, then
+open — with the resolve step awaited: `traverse()`, `aggregate()`, `vector_search()`,
+`vector_search_many()` and `set_vectors()` await `vectors.py`'s `aresolve_*`/`aplan_*`
+helpers and hand `run_sync()` specs that already carry vectors. A call with no `text=`
+is handed back untouched (the same objects), so the sync path and the emitted SQL are
+unchanged. `tests/test_async.py::TestTheEventLoopKeepsRunning` is the measurement: an
+independent loop task made zero progress during a provider call before it.
 
 A throwaway benchmark (not committed) compared this design against `asyncio.to_thread()`
 — the shape a naive async wrapper defaults to, and the same one `LangChain`'s `ainvoke`

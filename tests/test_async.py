@@ -22,6 +22,8 @@ this suite needs nothing beyond the `asyncio` extra's async driver.
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 
 import pytest
 from sqlalchemy import event
@@ -33,6 +35,73 @@ from hopai.asyncio import AsyncGraph
 
 def run(coro):
     return asyncio.run(coro)
+
+
+async def _while_ticking(ticks: list, coro):
+    """Await `coro` alongside an independent task that counts, into
+    `ticks`, every time the event loop came back to it.
+
+    This is the measurement issue #74 asks for and the reason these
+    tests are not "probably fine": the counter is ordinary loop work,
+    so it advances only while the loop is free to run something other
+    than `coro`. A provider call that holds the loop's thread shows up
+    as a stretch where the count does not move at all."""
+    running = True
+
+    async def tick():
+        while running:
+            await asyncio.sleep(0.001)
+            ticks[0] += 1
+
+    counter = asyncio.ensure_future(tick())
+    try:
+        return await coro
+    finally:
+        running = False
+        await counter
+
+
+class _SlowClient:
+    """An embedding client that takes a visible amount of time, and
+    records what the rest of the loop got done while it was inside the
+    call.
+
+    Sync by default -- a `requests`/`httpx` client blocked on a socket,
+    which is what nearly every hopai user passes. `progress` is one
+    entry per provider call: the loop turns that happened during it.
+    Zero is what every path here scored before issue #74, because the
+    call ran on the event loop's own thread."""
+
+    PAUSE = 0.2
+
+    def __init__(self, ticks: list, dimensions: int = 3):
+        self.ticks = ticks
+        self.dimensions = dimensions
+        self.progress: list = []
+        self.threads: list = []
+        self.texts: list = []
+
+    def _answer(self, texts) -> list:
+        self.texts.extend(texts)
+        self.threads.append(threading.get_ident())
+        return [[1.0] + [0.0] * (self.dimensions - 1) for _ in texts]
+
+    def __call__(self, texts):
+        before = self.ticks[0]
+        time.sleep(self.PAUSE)                     # the provider round trip
+        self.progress.append(self.ticks[0] - before)
+        return self._answer(texts)
+
+
+class _SlowAsyncClient(_SlowClient):
+    """The same, as a plain `async def` -- what an async provider client
+    (openai.AsyncOpenAI and friends) looks like to _abind()."""
+
+    async def __call__(self, texts):
+        before = self.ticks[0]
+        await asyncio.sleep(self.PAUSE)
+        self.progress.append(self.ticks[0] - before)
+        return self._answer(texts)
 
 
 class TestConstruction:
@@ -400,6 +469,409 @@ class TestVectors:
     def test_define_vectors_without_migrate_still_passes_through(self, async_fresh_graph):
         result = async_fresh_graph.define_vectors(nodes=[Vector("summary", 3)])
         assert set(result["nodes"]) == {"summary"}
+
+
+class TestTheEventLoopKeepsRunning:
+    """Issue #74: AsyncGraph was async for the database and synchronous
+    for the network. Every read path taking text= embedded it INSIDE
+    SQLAlchemy's greenlet bridge -- which runs on the event loop's own
+    thread -- so a 200ms provider call stopped every other task in the
+    process for 200ms. set_vectors() did it without the bridge at all,
+    straight in its `async def` body.
+
+    Each test below runs the operation next to an independent loop task
+    and asserts that task got somewhere DURING the provider call. On
+    the code these were written against, every one of them scores
+    exactly zero: that is the measurement, not an assumption."""
+
+    #: Enough to make the point without making the suite slow: the
+    #: ticker runs every 1ms, so a 200ms call that frees the loop is
+    #: worth ~200 turns and one that holds it is worth 0. Asserting
+    #: "> 0" rather than a count keeps this about the loop being free,
+    #: not about scheduler timing.
+    DIMS = 3
+
+    async def _seeded(self, graph, client, edge_client=None):
+        """A graph with one vector field per target, a node and an edge
+        already embedded -- everything the reads below need, with the
+        provider calls it costs already spent (so only the read's own
+        embed is left to measure)."""
+        graph.define_vectors(nodes=[Vector("summary", self.DIMS, embed=client)],
+                             edges=[Vector("rel", self.DIMS,
+                                           embed=edge_client or client)])
+        await graph.migrate_vectors()
+        await graph.add_nodes([{"id": 1, "type": "doc"}, {"id": 2, "type": "doc"}])
+        await graph.add_edges([{"id": 9, "start_id": 1, "end_id": 2, "kind": "cites"}])
+        await graph.set_vectors(nodes=[{"id": 1, "summary": [1.0, 0.0, 0.0]},
+                                       {"id": 2, "summary": [1.0, 0.0, 0.0]}],
+                                edges=[{"id": 9, "rel": [1.0, 0.0, 0.0]}])
+        client.progress.clear()
+        client.texts.clear()
+
+    def test_a_traversal_does_not_hold_the_loop_while_it_embeds(self, async_fresh_graph):
+        """Start(near=Near(text=...)) -- the entry point issue #74 leads
+        with. Before the fix the embed ran inside session.run_sync(),
+        which is the loop's thread, and the ticker below never moved."""
+        ticks = [0]
+        client = _SlowClient(ticks)
+
+        async def body():
+            await self._seeded(async_fresh_graph, client)
+            return await _while_ticking(ticks, async_fresh_graph.traverse(
+                Start(near=Near("summary", text="raft consensus"), keep=1)))
+
+        result = run(body())
+        assert [node["id"] for node in result.nodes] == ["1"]
+        assert client.texts == ["raft consensus"]
+        assert client.progress and all(p > 0 for p in client.progress), \
+            "the loop made no progress during the embed -- it is still on its thread"
+
+    def test_a_hop_near_and_via_near_are_resolved_off_the_loop_too(self, async_fresh_graph):
+        """The other two call sites: a hop's node ranking and its edge
+        beam. They reach validate_nears() from different places in
+        _walk_matches(), so covering only Start would leave two thirds
+        of the traversal path still blocking."""
+        ticks = [0]
+        client = _SlowClient(ticks)
+
+        async def body():
+            await self._seeded(async_fresh_graph, client)
+            return await _while_ticking(ticks, async_fresh_graph.traverse(
+                Start(where={"type": "doc"}),
+                Hop(via_near=Near("rel", text="cites"), via_keep=1,
+                    near=Near("summary", text="raft consensus"), keep=1)))
+
+        result = run(body())
+        # Both endpoints of the one edge the beam followed.
+        assert sorted(node["id"] for node in result.nodes) == ["1", "2"]
+        assert [edge["id"] for edge in result.edges] == ["9"]
+        # One provider call per site, and the loop ran during both.
+        assert client.texts == ["cites", "raft consensus"]
+        assert len(client.progress) == 2 and all(p > 0 for p in client.progress)
+
+    def test_aggregate_does_not_hold_the_loop_while_it_embeds(self, async_fresh_graph):
+        """aggregate() shares _walk_matches() with traverse() but has
+        its own run_sync() call, so it needs its own resolution."""
+        ticks = [0]
+        client = _SlowClient(ticks)
+
+        async def body():
+            await self._seeded(async_fresh_graph, client)
+            return await _while_ticking(ticks, async_fresh_graph.aggregate(
+                Start(near=Near("summary", text="raft consensus"), keep=1),
+                aggregates={"n": Count()}))
+
+        assert run(body()) == {"n": 1}
+        assert client.progress and all(p > 0 for p in client.progress)
+
+    def test_vector_search_does_not_hold_the_loop_while_it_embeds(self, async_fresh_graph):
+        ticks = [0]
+        client = _SlowClient(ticks)
+
+        async def body():
+            await self._seeded(async_fresh_graph, client)
+            return await _while_ticking(ticks, async_fresh_graph.vector_search(
+                Near("summary", text="raft consensus"), k=1))
+
+        hits = run(body())
+        assert [hit["id"] for hit in hits] == ["1"]
+        assert client.progress and all(p > 0 for p in client.progress)
+
+    def test_vector_search_many_embeds_the_whole_batch_off_the_loop(self, async_fresh_graph):
+        """The batch path resolves every query's text in ONE provider
+        call per field -- the round trip vector_search_many() exists to
+        save. Awaiting it must not turn that back into N calls."""
+        ticks = [0]
+        client = _SlowClient(ticks)
+
+        async def body():
+            await self._seeded(async_fresh_graph, client)
+            return await _while_ticking(ticks, async_fresh_graph.vector_search_many(
+                [Near("summary", text="raft"), Near("summary", text="paxos")], k=1))
+
+        results = run(body())
+        assert len(results) == 2
+        assert client.texts == ["raft", "paxos"]
+        assert len(client.progress) == 1 and client.progress[0] > 0
+
+    def test_set_vectors_does_not_hold_the_loop_while_it_embeds(self, async_fresh_graph):
+        """Out of the transaction was never the same as off the loop:
+        plan_vector_writes() was already hoisted before begin() (which
+        must stay -- it is what keeps the round trip off the row locks)
+        and still ran on the loop's thread."""
+        ticks = [0]
+        client = _SlowClient(ticks)
+
+        async def body():
+            await self._seeded(async_fresh_graph, client)
+            await _while_ticking(ticks, async_fresh_graph.set_vectors(
+                nodes=[{"id": 1, "summary": "a paper about Raft"}]))
+            return await async_fresh_graph.get_vectors(node_ids=[1])
+
+        stored = run(body())
+        assert stored["nodes"]["1"]["summary"] == pytest.approx([1.0, 0.0, 0.0])
+        assert client.texts == ["a paper about Raft"]
+        assert client.progress and all(p > 0 for p in client.progress)
+
+    def test_a_sync_client_is_run_in_a_worker_thread(self, async_fresh_graph):
+        """The compatibility path, and the reason the tests above pass
+        for a client that cannot be awaited at all: asyncio.to_thread().
+        Legitimate here because a provider SDK blocked on a socket has
+        released the GIL -- the loop really does keep running -- and
+        the thread is the visible cost that makes an async client the
+        better answer."""
+        ticks = [0]
+        client = _SlowClient(ticks)
+
+        async def body():
+            await self._seeded(async_fresh_graph, client)
+            await _while_ticking(ticks, async_fresh_graph.vector_search(
+                Near("summary", text="raft consensus"), k=1))
+            return threading.get_ident()
+
+        loop_thread = run(body())
+        assert client.threads and all(t != loop_thread for t in client.threads)
+
+    def test_an_async_client_is_awaited_on_the_loops_own_thread(self, async_fresh_graph):
+        """The primary path. An `async def` client is awaited directly,
+        so it costs no thread at all -- which is the resource ceiling
+        this module's docstring chose the greenlet bridge to avoid.
+
+        It also fails LOUDLY before the fix rather than slowly: the old
+        code called the client inside run_sync() and got a coroutine
+        back, which EmbeddingError reported as an unusable answer."""
+        ticks = [0]
+        client = _SlowAsyncClient(ticks)
+
+        async def body():
+            await self._seeded(async_fresh_graph, client)
+            hits = await _while_ticking(ticks, async_fresh_graph.vector_search(
+                Near("summary", text="raft consensus"), k=1))
+            return hits, threading.get_ident()
+
+        hits, loop_thread = run(body())
+        assert [hit["id"] for hit in hits] == ["1"]
+        assert client.progress and all(p > 0 for p in client.progress)
+        assert client.threads == [loop_thread]
+
+
+class TestNoTextTakesNoNewPath:
+    """The negative half of issue #74, and the async twin of
+    test_defining_vectors_changes_no_near_less_query: resolving text
+    earlier must be invisible to every traversal that has none. Not
+    "equivalent" -- the SAME objects reach the same sync function, so
+    there is nothing for the SQL to differ about."""
+
+    def test_a_traversal_without_text_is_handed_the_very_same_spec(
+            self, async_graph, monkeypatch):
+        """Identity, not equality: a rebuilt-but-equal Start would pass
+        an == check while proving nothing about the path taken."""
+        from hopai.core import Graph
+
+        seen = {}
+        original = Graph._traverse_with_session
+
+        def record(self, session, start, hops):
+            seen["start"], seen["hops"] = start, hops
+            return original(self, session, start, hops)
+
+        monkeypatch.setattr(Graph, "_traverse_with_session", record)
+        start, hop = Start(where={"type": "leaf"}), Hop(via={"kind": "knows"})
+        run(async_graph.traverse(start, hop))
+        assert seen["start"] is start
+        assert seen["hops"] == [hop] and seen["hops"][0] is hop
+
+    def test_a_vector_valued_near_never_reaches_the_embedder(self, async_fresh_graph):
+        """A Near carrying floats is already resolved, so declaring an
+        embedder on the field must not make the async path call it --
+        that would be a provider bill (and a round trip) for a query
+        that asked for none."""
+        calls = []
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[
+                Vector("summary", 2, embed=lambda texts: calls.append(texts) or [[1.0, 0.0]])])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1}])
+            await async_fresh_graph.set_vectors(nodes=[{"id": 1, "summary": [1.0, 0.0]}])
+            await async_fresh_graph.traverse(
+                Start(near=Near("summary", [1.0, 0.0]), keep=1))
+            await async_fresh_graph.vector_search(Near("summary", [1.0, 0.0]), k=1)
+            await async_fresh_graph.vector_search_many([Near("summary", [1.0, 0.0])], k=1)
+
+        run(body())
+        assert calls == []
+
+    def test_a_vector_carrying_near_beside_a_text_one_is_left_alone(
+            self, async_fresh_graph):
+        """A multivector query may mix the two. Only the text half is
+        embedded -- resolving "everything in the list" would re-embed a
+        vector the caller supplied, which is not text and cannot be."""
+        embedded = []
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[
+                Vector("summary", 2, embed=lambda texts: embedded.extend(texts)
+                       or [[1.0, 0.0] for _ in texts]),
+                Vector("title", 2),          # no embedder: never asked for one
+            ])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1}])
+            await async_fresh_graph.set_vectors(
+                nodes=[{"id": 1, "summary": [1.0, 0.0], "title": [1.0, 0.0]}])
+            return await async_fresh_graph.vector_search(
+                Near("summary", text="raft"), Near("title", [1.0, 0.0]), k=1)
+
+        assert [hit["id"] for hit in run(body())] == ["1"]
+        assert embedded == ["raft"]
+
+    def test_a_multivector_batch_resolves_only_its_text(self, async_fresh_graph):
+        """vector_search_many() takes a LIST of queries, each of which
+        may itself be a list -- so "does this need a provider" has to
+        look one level deeper than a single search does."""
+        embedded = []
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[
+                Vector("summary", 2, embed=lambda texts: embedded.extend(texts)
+                       or [[1.0, 0.0] for _ in texts]),
+                Vector("title", 2),
+            ])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1}])
+            await async_fresh_graph.set_vectors(
+                nodes=[{"id": 1, "summary": [1.0, 0.0], "title": [1.0, 0.0]}])
+            return await async_fresh_graph.vector_search_many(
+                [[Near("summary", text="raft"), Near("title", [1.0, 0.0])]], k=1)
+
+        assert [hit["id"] for hit in run(body())[0]] == ["1"]
+        assert embedded == ["raft"]
+
+    def test_a_batch_with_no_text_is_handed_back_as_it_came(self, async_graph):
+        """The resolver's own fast path, asserted on identity: called
+        with nothing to embed it must return the caller's list, not a
+        rebuilt copy of it -- which is what makes "no text, no new
+        path" true for the batch search as well."""
+        from hopai.vectors import aresolve_query_texts
+
+        async_graph.define_vectors(nodes=[Vector("summary", 2)])
+        queries = [Near("summary", [1.0, 0.0])]
+        assert run(aresolve_query_texts(async_graph._sync, "nodes", queries, 1)) is queries
+
+    def test_declaring_vectors_changes_no_near_less_query(self, async_graph):
+        """The pinned sync invariant, asserted through AsyncGraph's own
+        pass-through builder: a traversal with no near= must compile to
+        byte-identical SQL whether or not fields are declared."""
+        from sqlalchemy.dialects import postgresql
+
+        from hopai import Graph
+
+        def sql(graph):
+            return str(graph.build_query(Start(where={"type": "leaf"}), [Hop(hops=(1, 3))])
+                       .compile(dialect=postgresql.dialect()))
+
+        plain = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline")
+        async_graph.define_vectors(nodes=[Vector("summary", 3)])
+        assert sql(async_graph) == sql(plain)
+
+
+class TestTheSameRefusalsInTheSameOrder:
+    """Resolving text a step earlier moves WHERE a refusal is raised
+    from, so each one has to keep saying the same thing. The caller
+    labels ("Start", "hop 0 (...)", "... via_near") are built in
+    core.py for the sync path and re-derived in vectors.py's
+    _near_sites() for the async one; without these, the two are free to
+    drift and an async user gets told to fix a different hop."""
+
+    def _defined(self, graph):
+        graph.define_vectors(nodes=[Vector("summary", 3)], edges=[Vector("rel", 3)])
+
+    @pytest.mark.parametrize("spec", [
+        lambda: (Start(near=Near("nope", text="q"), keep=1), []),
+        lambda: (Start(), [Hop(near=Near("nope", text="q"), keep=1)]),
+        lambda: (Start(), [Hop(via_near=Near("nope", text="q"), via_keep=1)]),
+    ])
+    def test_an_unknown_field_names_the_same_place_either_way(
+            self, async_fresh_graph, async_admin_graph, spec):
+        self._defined(async_fresh_graph)
+        self._defined(async_admin_graph)
+        start, hops = spec()
+        with pytest.raises(ValueError) as sync_failure:
+            async_admin_graph.traverse(start, *hops)
+        with pytest.raises(ValueError) as async_failure:
+            run(async_fresh_graph.traverse(start, *hops))
+        assert str(async_failure.value) == str(sync_failure.value)
+        assert "no vector field 'nope'" in str(async_failure.value)
+
+    def test_a_field_without_an_embedder_names_the_same_place_either_way(
+            self, async_fresh_graph, async_admin_graph):
+        """The refusal a caller actually hits: the field exists, the
+        query is text, and nothing was declared to embed it."""
+        self._defined(async_fresh_graph)
+        self._defined(async_admin_graph)
+        start = Start(near=Near("summary", text="q"), keep=1)
+        with pytest.raises(ValueError) as sync_failure:
+            async_admin_graph.traverse(start)
+        with pytest.raises(ValueError) as async_failure:
+            run(async_fresh_graph.traverse(start))
+        assert str(async_failure.value) == str(sync_failure.value)
+        assert "declares no embedder" in str(async_failure.value)
+
+    def test_a_lazy_handle_still_recovers_its_fields_before_resolving(
+            self, async_fresh_graph, async_admin_graph):
+        """Resolving text outside run_sync() needs the field
+        declaration EARLIER than search() would have asked for it, so
+        the async path loads a lazy handle's registry first. Without
+        that step a search on one is refused by name for the wrong
+        reason -- "none are defined ... this call didn't go through [a
+        search]", from inside a search.
+
+        The lazy state is built by hand because AsyncGraph.in_graph()
+        does not produce one today (it builds a fresh Graph, which
+        starts non-lazy) -- Graph.in_graph() does, and this is the
+        check search() itself makes on every call."""
+        async def body():
+            async_admin_graph.define_vectors(nodes=[Vector("summary", 3)])
+            async_admin_graph.migrate_vectors()
+            # Forget the declaration the way a fresh in_graph() handle
+            # has never had it.
+            async_fresh_graph._sync._vectors = None
+            async_fresh_graph._sync._vectors_lazy = True
+            await async_fresh_graph.vector_search(Near("summary", text="q"), k=1)
+
+        with pytest.raises(ValueError) as failure:
+            run(body())
+        # Recovered from the database, so the refusal is the real one:
+        # load_vectors() cannot restore embed=, which is a policy, not a
+        # shape. "needs vector fields" here would mean the field was
+        # never found at all.
+        assert "declares no embedder" in str(failure.value)
+
+    def test_a_meaningless_k_is_refused_before_anything_is_embedded(
+            self, async_fresh_graph):
+        """_check_k runs before the provider on the sync path too. A
+        call that cannot succeed must not cost a round trip first."""
+        calls = []
+        async_fresh_graph.define_vectors(nodes=[
+            Vector("summary", 2, embed=lambda texts: calls.append(texts) or [[1.0, 0.0]])])
+        with pytest.raises(ValueError, match="k must be a positive integer"):
+            run(async_fresh_graph.vector_search(Near("summary", text="a"), k=0))
+        with pytest.raises(ValueError, match="k must be a positive integer"):
+            run(async_fresh_graph.vector_search_many([Near("summary", text="a")], k=0))
+        assert calls == []
+
+    def test_a_batch_about_to_be_refused_is_never_embedded(self, async_fresh_graph):
+        """Shape first, provider second -- validate_nears()' own order,
+        which the async path has to keep from one step further out.
+        Two Nears on one field is refused; embedding them first would
+        spend a provider call to reach the same error."""
+        calls = []
+        async_fresh_graph.define_vectors(nodes=[
+            Vector("summary", 2, embed=lambda texts: calls.append(texts) or [[1.0, 0.0]])])
+        with pytest.raises(ValueError, match="two Near specs"):
+            run(async_fresh_graph.vector_search(
+                Near("summary", text="a"), Near("summary", text="b"), k=1))
+        assert calls == []
 
 
 class TestOutOfScope:

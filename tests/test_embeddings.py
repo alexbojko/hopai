@@ -15,13 +15,21 @@ module state is what broke its baseline twice already in this project.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
+import threading
 
 import pytest
 
 import hopai.embeddings as embeddings_module
 from hopai.embeddings import Embedder, EmbeddingError
+
+
+def run(coro):
+    """No pytest-asyncio, same as tests/test_async.py -- a one-line
+    asyncio.run() wrapper is the whole requirement."""
+    return asyncio.run(coro)
 
 
 def _named(module: str, cls):
@@ -979,6 +987,493 @@ class TestBatchSizeEdges:
         embedder = Embedder(lambda texts: [[1.0] for _ in texts], batch_size=1)
         assert embedder.batch_size == 1
         assert embedder.embed_documents(["a", "b"]) == [[1.0], [1.0]]
+
+
+class TestAsyncDispatch:
+    """_abind() is _bind()'s twin for clients that can be awaited, and
+    it recognizes them the same way: module name plus attribute shape,
+    never isinstance, still no provider import (issue #74). What differs
+    is the second half of each test -- a native client is async when its
+    own method is a coroutine function, and the duck-typed protocols say
+    so by name.
+
+    Every fake below is the ASYNC form of a fake TestNativeClients or
+    TestProtocols already has, so the two halves cannot drift apart."""
+
+    def test_a_plain_async_callable_is_awaited(self, calls):
+        async def client(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0] for _ in texts]
+
+        embedder = Embedder(client)
+        assert embedder.is_async
+        assert run(embedder.aembed_documents(["a", "b"])) == [[1.0, 0.0], [1.0, 0.0]]
+        assert run(embedder.aembed_query("q")) == [1.0, 0.0]
+        assert calls == [["a", "b"], ["q"]]
+
+    def test_a_callable_object_with_an_async_call_is_awaited(self):
+        """`iscoroutinefunction(instance)` is False -- it is the OBJECT's
+        own __call__ that is the `async def`. Without that second look,
+        a client written as a class (which is how anything holding a
+        session is written) falls back to a worker thread."""
+        class Client:
+            async def __call__(self, texts):
+                return [[2.0] for _ in texts]
+
+        embedder = Embedder(Client())
+        assert embedder.is_async
+        assert run(embedder.aembed_documents(["a"])) == [[2.0]]
+
+    def test_openai_async_is_recognized_and_given_its_model(self, calls):
+        class Embeddings:
+            async def create(self, model, input, **kwargs):
+                calls.append(model)
+                return type("R", (), {"data": [
+                    type("D", (), {"embedding": [1.0]})() for _ in input]})()
+
+        class AsyncOpenAIish:
+            embeddings = Embeddings()
+
+        embedder = Embedder(_named("openai._client", AsyncOpenAIish)(),
+                            model="text-embedding-3-small")
+        assert embedder.is_async
+        assert run(embedder.aembed_documents(["a"])) == [[1.0]]
+        assert calls == ["text-embedding-3-small"]
+
+    def test_cohere_async_still_sends_its_two_input_types(self, calls):
+        """The asymmetry is the thing that fails silently, so the async
+        adapter needs the same assertion the sync one has: getting it
+        wrong raises nothing and just costs recall forever."""
+        class AsyncCohereish:
+            async def embed(self, texts, model, input_type, embedding_types):
+                calls.append(input_type)
+                return type("R", (), {"embeddings": type("E", (), {
+                    "float_": [[1.0, 0.0]] * len(texts)})()})()
+
+        embedder = Embedder(_named("cohere.client_v2", AsyncCohereish)(), model="embed-v4.0")
+        run(embedder.aembed_documents(["a"]))
+        run(embedder.aembed_query("q"))
+        assert calls == ["search_document", "search_query"]
+
+    def test_voyage_async_still_sends_its_two_input_types(self, calls):
+        class AsyncVoyageish:
+            async def embed(self, texts, model, input_type):
+                calls.append(input_type)
+                return type("R", (), {"embeddings": [[1.0]] * len(texts)})()
+
+        embedder = Embedder(_named("voyageai.client", AsyncVoyageish)(), model="voyage-3")
+        run(embedder.aembed_documents(["a"]))
+        run(embedder.aembed_query("q"))
+        assert calls == ["document", "query"]
+
+    def test_google_is_awaited_through_its_aio_surface(self, calls):
+        """google-genai keeps async on client.aio rather than in a
+        second client class, so this is the one provider where both
+        bindings match the same object -- and the async one has to look
+        somewhere else entirely to find it."""
+        class AsyncModels:
+            async def embed_content(self, model, contents, config):
+                calls.append(("async", config["task_type"],
+                              config.get("output_dimensionality")))
+                return type("R", (), {"embeddings": [
+                    type("V", (), {"values": [1.0]})() for _ in contents]})()
+
+        class Models:
+            def embed_content(self, model, contents, config):
+                calls.append(("sync", config["task_type"]))
+                return type("R", (), {"embeddings": [
+                    type("V", (), {"values": [9.0]})() for _ in contents]})()
+
+        class Googleish:
+            models = Models()
+            aio = type("Aio", (), {"models": AsyncModels()})()
+
+        embedder = Embedder(_named("google.genai", Googleish)(),
+                            model="gemini-embedding-001", dimensions=1)
+        assert embedder.is_async
+        assert run(embedder.aembed_query("q")) == [1.0]
+        assert embedder.embed_documents(["a"]) == [[9.0]]
+        # Each half reached its own surface: the async one must not
+        # quietly answer from the sync one, or the loop stalls again.
+        # dimensions= travels with it -- Google truncates on request,
+        # and an async adapter that dropped it would return the model's
+        # full width and fail the field's own check instead.
+        assert calls == [("async", "RETRIEVAL_QUERY", 1), ("sync", "RETRIEVAL_DOCUMENT")]
+
+    def test_the_langchain_async_protocol_is_preferred(self, calls):
+        """Every LangChain Embeddings carries both pairs; the base class
+        implements the `a` half by running the sync one in an executor.
+        Preferring aembed_* is what lets an integration that really is
+        async be really async."""
+        class LangChainish:
+            def embed_documents(self, texts):
+                calls.append("sync")
+                return [[0.1] for _ in texts]
+
+            def embed_query(self, text):
+                calls.append("sync")
+                return [0.1]
+
+            async def aembed_documents(self, texts):
+                calls.append(("async", "documents"))
+                return [[0.2] for _ in texts]
+
+            async def aembed_query(self, text):
+                calls.append(("async", "query"))
+                return [0.3]
+
+        embedder = Embedder(LangChainish())
+        assert run(embedder.aembed_documents(["a"])) == [[0.2]]
+        assert run(embedder.aembed_query("q")) == [0.3]
+        assert calls == [("async", "documents"), ("async", "query")]
+
+    def test_the_llamaindex_async_protocol_is_accepted(self, calls):
+        class LlamaIndexish:
+            def get_text_embedding_batch(self, texts): ...
+            def get_query_embedding(self, text): ...
+
+            async def aget_text_embedding_batch(self, texts):
+                calls.append(("async", "documents"))
+                return [[0.4] for _ in texts]
+
+            async def aget_query_embedding(self, text):
+                calls.append(("async", "query"))
+                return [0.5]
+
+        embedder = Embedder(LlamaIndexish())
+        assert run(embedder.aembed_documents(["a"])) == [[0.4]]
+        assert run(embedder.aembed_query("q")) == [0.5]
+        assert calls == [("async", "documents"), ("async", "query")]
+
+    def test_a_method_returning_an_awaitable_is_awaited_too(self):
+        """Detection reads `async def`, which is what every provider
+        writes -- but a wrapper handing back a Future is spelled `def`
+        and cannot be told apart without calling it. The protocols say
+        what they are by NAME, so this one is recognized and the answer
+        is awaited on its way out."""
+        class Wrapper:
+            def aembed_documents(self, texts):
+                future = asyncio.get_running_loop().create_future()
+                future.set_result([[7.0] for _ in texts])
+                return future
+
+            def aembed_query(self, text):
+                future = asyncio.get_running_loop().create_future()
+                future.set_result([7.0])
+                return future
+
+        embedder = Embedder(Wrapper())
+        assert run(embedder.aembed_query("q")) == [7.0]
+
+    def test_a_sentence_transformer_is_not_async(self):
+        """It runs the model in this process -- no socket, nothing to
+        await. It is also an nn.Module and therefore CALLABLE, so
+        without an explicit stop the plain-callable branch would get a
+        look at it and could match on an unrelated __call__."""
+        class SentenceTransformerish:
+            def encode(self, texts):
+                return [[1.0] for _ in texts]
+
+            def tokenize(self, text): ...
+
+            async def __call__(self, texts):        # nn.Module.__call__
+                raise AssertionError("encode() is the entry point, not __call__")
+
+        assert not Embedder(SentenceTransformerish()).is_async
+
+    def test_a_sync_client_of_the_same_shape_is_not_reported_as_async(self):
+        """The half that keeps the fallback honest: `is_async` decides
+        between awaiting the client and paying for a worker thread, so
+        a SYNC client reported as async would be awaited and crash. The
+        module name and the attribute are identical to the async fakes
+        above -- only `async def` is not."""
+        class Embeddings:
+            def create(self, model, input, **kwargs):
+                return type("R", (), {"data": [
+                    type("D", (), {"embedding": [1.0]})() for _ in input]})()
+
+        class OpenAIish:
+            embeddings = Embeddings()
+
+        class Cohereish:
+            def embed(self, texts, model, input_type, embedding_types):
+                return type("R", (), {"embeddings": [[1.0]] * len(texts)})()
+
+        assert not Embedder(_named("openai.resources", OpenAIish)(), model="m").is_async
+        assert not Embedder(_named("cohere.client_v2", Cohereish)(), model="m").is_async
+        assert not Embedder(lambda texts: [[1.0]]).is_async
+
+
+class TestASyncClientStillWorksOnTheAsyncPath:
+    """The compatibility path (issue #74): asyncio.to_thread(), so a
+    caller who passes the sync client they already had still gets a loop
+    that breathes. Legitimate for THIS work and not in general -- a
+    provider SDK blocked on a socket has released the GIL."""
+
+    def test_a_sync_client_runs_in_a_worker_thread(self):
+        seen = []
+        embedder = Embedder(lambda texts: seen.append(threading.get_ident())
+                            or [[1.0] for _ in texts])
+
+        async def body():
+            return await embedder.aembed_documents(["a"]), threading.get_ident()
+
+        result, loop_thread = run(body())
+        assert result == [[1.0]]
+        assert seen and seen[0] != loop_thread
+
+    def test_an_async_client_costs_no_thread(self):
+        """The primary path, and the reason it is the primary one: a
+        thread per in-flight call is exactly the ceiling hopai/asyncio.py
+        chose the greenlet bridge to avoid."""
+        seen = []
+
+        async def client(texts):
+            seen.append(threading.get_ident())
+            return [[1.0] for _ in texts]
+
+        async def body():
+            await Embedder(client).aembed_documents(["a"])
+            return threading.get_ident()
+
+        assert seen == [run(body())]
+
+    def test_the_thread_carries_the_same_refusals(self):
+        """The fallback runs _run(), so everything that path checks is
+        checked here too -- rather than a second, thinner validation
+        nobody noticed was missing."""
+        with pytest.raises(ValueError, match=r"embed_query: item 0 is empty"):
+            run(Embedder(lambda texts: [[1.0]]).aembed_query("  "))
+        with pytest.raises(EmbeddingError, match="asked for 2 embedding"):
+            run(Embedder(lambda texts: [[1.0]]).aembed_documents(["a", "b"]))
+
+
+class TestTheAsyncPathIsTheSameCall:
+    """aembed_* is embed_* with the provider awaited -- not a second
+    implementation with its own rules. Anything that could drift
+    silently gets an assertion here."""
+
+    def test_it_batches_to_the_same_cap(self, calls):
+        async def client(texts):
+            calls.append(len(texts))
+            return [[1.0] for _ in texts]
+
+        assert len(run(Embedder(client, batch_size=2).aembed_documents(
+            ["a", "b", "c"]))) == 3
+        assert calls == [2, 1]
+
+    def test_embedding_nothing_calls_nothing(self, calls):
+        async def client(texts):
+            calls.append(texts)
+            return [[1.0]]
+
+        assert run(Embedder(client).aembed_documents([])) == []
+        assert calls == []
+
+    def test_aembed_query_returns_one_vector_not_a_list_of_one(self):
+        async def client(texts):
+            return [[1.0, 2.0]]
+
+        assert run(Embedder(client).aembed_query("q")) == [1.0, 2.0]
+
+    def test_aembed_queries_is_the_query_side_of_the_asymmetry(self, calls):
+        class LangChainish:
+            async def aembed_documents(self, texts):
+                calls.append("documents")
+                return [[0.1] for _ in texts]
+
+            async def aembed_query(self, text):
+                calls.append("query")
+                return [0.2]
+
+        assert run(Embedder(LangChainish()).aembed_queries(["a", "b"])) == [[0.2], [0.2]]
+        assert calls == ["query", "query"]
+
+    def test_the_declared_dimensions_are_checked(self):
+        async def client(texts):
+            return [[1.0, 2.0] for _ in texts]
+
+        with pytest.raises(EmbeddingError, match="came back with 2 dimensions"):
+            run(Embedder(client, dimensions=3).aembed_documents(["a"]))
+
+    def test_every_provider_call_is_logged_with_its_size(self, caplog):
+        async def client(texts):
+            return [[1.0] for _ in texts]
+
+        with caplog.at_level(logging.DEBUG, logger="hopai.embeddings"):
+            run(Embedder(client, batch_size=2).aembed_documents(["a", "b", "c"]))
+        assert [r.getMessage() for r in caplog.records] == [
+            "Embedder(function).embed_documents: embedding 2 text(s)",
+            "Embedder(function).embed_documents: embedding 1 text(s)"]
+
+
+@pytest.fixture()
+def awaited(monkeypatch) -> list:
+    """Every async backoff, without spending it -- the async twin of
+    the `slept` fixture."""
+    waits = []
+
+    async def record(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(embeddings_module.asyncio, "sleep", record)
+    return waits
+
+
+def _araises(exc, times: int, then=None):
+    """The async twin of _raises(): fails `times` times, then answers."""
+    state = {"calls": 0}
+
+    async def call(texts):
+        state["calls"] += 1
+        if state["calls"] <= times:
+            raise exc
+        return then if then is not None else [[1.0, 0.0] for _ in texts]
+    call.state = state
+    return call
+
+
+class TestAsyncRetry:
+    """One retry POLICY, spent two ways. The numbers -- which failures
+    are worth retrying, the doubling window, the cap, full jitter,
+    Retry-After winning -- are shared with the sync path by construction
+    (Embedder._wait_before_retry); these say the async loop really uses
+    them, since a copy that drifted would be invisible to TestRetry."""
+
+    def test_a_transient_failure_is_retried_and_succeeds(self, awaited):
+        client = _araises(TimeoutError("upstream"), times=2)
+        assert run(Embedder(client).aembed_documents(["a"])) == [[1.0, 0.0]]
+        assert client.state["calls"] == 3
+        assert len(awaited) == 2
+
+    def test_a_terminal_failure_is_not_retried(self, awaited):
+        class AuthenticationError(Exception):
+            pass
+
+        client = _araises(AuthenticationError("bad key"), times=99)
+        with pytest.raises(EmbeddingError, match="after 1 attempt"):
+            run(Embedder(client).aembed_documents(["a"]))
+        assert client.state["calls"] == 1
+        assert awaited == []
+
+    def test_the_backoff_window_doubles_and_is_capped(self, awaited):
+        client = _araises(TimeoutError("upstream"), times=4)
+        run(Embedder(client, retries=4, backoff=100.0).aembed_documents(["a"]))
+        assert len(awaited) == 4
+        assert all(wait <= 30.0 for wait in awaited), awaited
+
+    def test_retry_after_wins_over_the_computed_backoff(self, awaited):
+        class RateLimit(Exception):
+            response = type("R", (), {"headers": {"Retry-After": "7"},
+                                      "status_code": 429})()
+
+        client = _araises(RateLimit("slow down"), times=1)
+        run(Embedder(client, retries=1, backoff=0.5).aembed_documents(["a"]))
+        assert awaited == [7.0]
+
+    def test_the_wait_is_awaited_not_slept(self, awaited, monkeypatch):
+        """The point of the whole exercise: a retry that called
+        time.sleep() would hold the event loop for the backoff as well
+        as for the call."""
+        def refuse(_delay):
+            raise AssertionError("time.sleep() on the async path holds the loop")
+
+        monkeypatch.setattr(embeddings_module.time, "sleep", refuse)
+        client = _araises(TimeoutError("upstream"), times=1)
+        run(Embedder(client, retries=1).aembed_documents(["a"]))
+        assert len(awaited) == 1
+
+    def test_every_retry_is_logged_with_its_wait(self, awaited, caplog):
+        client = _araises(TimeoutError("upstream"), times=1)
+        with caplog.at_level(logging.WARNING, logger="hopai.embeddings"):
+            run(Embedder(client, retries=1).aembed_documents(["a"]))
+        assert len(caplog.records) == 1
+        message = caplog.records[0].getMessage()
+        assert message.startswith("Embedder(function).embed_documents: ")
+        assert "retrying in" in message and "attempt 2 of 2" in message
+        assert "TimeoutError: upstream" in message
+
+    def test_a_spent_call_reports_how_far_it_got(self, awaited, caplog):
+        client = _araises(TimeoutError("upstream"), times=99)
+        with caplog.at_level(logging.WARNING, logger="hopai.embeddings"), \
+                pytest.raises(EmbeddingError, match=r"after 3 attempt\(s\)"):
+            run(Embedder(client, retries=2).aembed_documents(["a"]))
+        assert any(r.getMessage() == (
+            "Embedder(function).embed_documents: provider call failed after 0 embedded, "
+            "3 attempt(s) (TimeoutError: upstream)") for r in caplog.records)
+
+    def test_our_own_refusals_are_never_retried(self, awaited):
+        client = _araises(TimeoutError("x"), times=0, then=[[1.0], [2.0]])
+        with pytest.raises(EmbeddingError, match="asked for 1 embedding"):
+            run(Embedder(client, retries=3).aembed_documents(["a"]))
+        assert awaited == []
+
+    def test_an_embedding_error_raised_inside_the_call_is_not_retried(self, awaited):
+        """The refusal a binding itself raises -- an async-only client
+        met by a sync call, say -- reaches the retry loop from INSIDE,
+        where a blanket `except Exception` would swallow it and try
+        twice more before reporting "the provider call failed"."""
+        client = _araises(EmbeddingError("this client cannot answer"), times=99)
+        with pytest.raises(EmbeddingError, match="^this client cannot answer$"):
+            run(Embedder(client, retries=3).aembed_documents(["a"]))
+        assert client.state["calls"] == 1
+        assert awaited == []
+
+
+class TestTheTwoHalvesMeetTheWrongWay:
+    """An async client on a sync call, and a client that speaks only
+    async. Both are a working client reached through the wrong half of
+    the API, so both must say which half to use -- hopai never starts an
+    event loop of its own to paper over it."""
+
+    def test_an_async_client_on_a_sync_call_names_the_fix(self):
+        async def client(texts):
+            return [[1.0]]
+
+        with pytest.raises(EmbeddingError, match="async embedding client") as failure:
+            Embedder(client).embed_documents(["a"])
+        assert "AsyncGraph" in str(failure.value)
+        assert "aembed_documents" in str(failure.value)
+
+    def test_a_native_async_client_is_refused_before_its_answer_is_read(self):
+        """Caught on the RAW answer rather than where the vectors are
+        read out of it: an adapter reaching into a coroutine reports
+        "'coroutine' object has no attribute 'data'", which names
+        nothing the caller can act on."""
+        class Embeddings:
+            async def create(self, model, input, **kwargs): ...
+
+        class AsyncOpenAIish:
+            embeddings = Embeddings()
+
+        with pytest.raises(EmbeddingError, match="async embedding client"):
+            Embedder(_named("openai._client", AsyncOpenAIish)(),
+                     model="m").embed_documents(["a"])
+
+    def test_an_async_only_client_is_accepted_not_refused_at_construction(self):
+        """A client with only the `a` half of a protocol is a working
+        async client, not a mistyped one. Refusing it at construction --
+        which is what "not an embedding client hopai recognizes" would
+        do -- would put it out of AsyncGraph's reach as well."""
+        class AsyncOnly:
+            async def aembed_documents(self, texts):
+                return [[1.0] for _ in texts]
+
+            async def aembed_query(self, text):
+                return [1.0]
+
+        embedder = Embedder(AsyncOnly())
+        assert embedder.is_async
+        assert run(embedder.aembed_documents(["a"])) == [[1.0]]
+        with pytest.raises(EmbeddingError, match="async embedding client"):
+            embedder.embed_documents(["a"])
+
+    def test_an_unrecognized_client_is_still_refused_at_construction(self):
+        """The async fallback must not widen _bind()'s refusal: an
+        object with neither half of anything is still a mistake worth
+        catching at the line that made it."""
+        with pytest.raises(TypeError, match="is not an embedding client hopai recognizes"):
+            Embedder(object())
 
 
 class TestNoProviderIsImported:
