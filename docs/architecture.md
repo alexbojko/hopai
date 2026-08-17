@@ -269,12 +269,16 @@ side are unaware anything async is happening.
 
 Schema and constraint declaration — `create_schema()`, `enforce_schema()`,
 `define_constraints()`, `save_schema()`/`load_schema()`, `infer_schema()`,
-`schema_violations()`, `add_networkx()` — has no async override. These are one-time
-setup calls with no concurrency to gain, and `AsyncGraph`'s wrapped `Graph` runs on
-`AsyncEngine.sync_engine`, a facade only safe to execute against *inside* a greenlet
-`run_sync()` spawns. `AsyncGraph.__getattr__` refuses these by name, pointing at a plain
-`Graph` on the same database, rather than letting the facade fail with SQLAlchemy's own
-`MissingGreenlet` outside the context that explains it.
+`schema_violations()`, `add_networkx()`, `load_vectors()` — has no async override. These
+are one-time setup calls with no concurrency to gain, and `AsyncGraph`'s wrapped `Graph`
+runs on `AsyncEngine.sync_engine`, a facade only safe to execute against *inside* a
+greenlet `run_sync()` spawns. `AsyncGraph.__getattr__` refuses these by name, pointing at
+a plain `Graph` on the same database, rather than letting the facade fail with
+SQLAlchemy's own `MissingGreenlet` outside the context that explains it.
+`embed_stale()` gets the same refusal for a different reason: it is a bulk backfill that
+opens its own transaction PER PAGE rather than resolving everything and opening one, so
+it cannot take the `aplan_vector_writes()` treatment issue #74 gave every other write
+without a second, divergent backfill implementation.
 
 A throwaway benchmark (not committed) compared this design against `asyncio.to_thread()`
 — the shape a naive async wrapper defaults to, and the same one `LangChain`'s `ainvoke`
@@ -287,6 +291,23 @@ each `AsyncSession.run_sync()` call's own setup (session open/close, greenlet sp
 paid serially on the one event-loop thread. The case for this design is the resource
 ceiling a thread-pool wrapper eventually hits in a real server, not a guaranteed speed
 win — see `hopai/asyncio.py`'s module docstring for the numbers.
+
+The bridge only covers *database* I/O — SQLAlchemy's own calls yield back to the loop
+from inside the greenlet, but an arbitrary blocking call made from `fn` does not, and
+just holds the one event-loop thread until it returns. An embedding provider's HTTP call
+is exactly that: reachable from `Near(text=...)` on every read path and from a text row
+in `set_vectors()` (issue #74). `hopai/embeddings.py`'s `Embedder` grew an `aembed_*()`
+twin of every `embed_*()` method for this — native async when the client has one
+(`openai.AsyncOpenAI()` and siblings, matched by the same module-name-plus-shape rule as
+the sync client, `inspect.iscoroutinefunction` telling a client's async method apart from
+its sync namesake of the same name) and `asyncio.to_thread()` otherwise, since a provider
+SDK blocked on a socket releases the GIL (the same reasoning does **not** extend to a
+CPU-bound C extension, which a thread pool would leave the loop starved for anyway).
+`AsyncGraph.traverse()`/`aggregate()`/`vector_search()`/`vector_search_many()` await
+`vectors.py`'s `aresolve_*()` helpers and `set_vectors()` awaits `aplan_vector_writes()`
+— all of it *before* `run_sync()`/`begin()` runs, so every `Near`/row `fn` ever sees
+already carries a plain vector and the sync functions below make no provider call of
+their own.
 
 ## Multi-graph
 

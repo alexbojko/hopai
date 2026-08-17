@@ -15,6 +15,7 @@ module state is what broke its baseline twice already in this project.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 
@@ -979,6 +980,369 @@ class TestBatchSizeEdges:
         embedder = Embedder(lambda texts: [[1.0] for _ in texts], batch_size=1)
         assert embedder.batch_size == 1
         assert embedder.embed_documents(["a", "b"]) == [[1.0], [1.0]]
+
+
+class TestAsync:
+    """aembed_documents()/aembed_query()/aembed_queries() -- issue #74.
+    AsyncGraph awaits these to keep a provider's HTTP call off the
+    event loop's own thread; this class is the DB-free half of that
+    guarantee, exercising Embedder in isolation the same way the rest
+    of this file does for the sync methods."""
+
+    def test_a_plain_callable_falls_back_to_a_thread(self, calls):
+        """No native async shape -- the sync callable runs, but off the
+        calling thread, which is what a caller awaiting from a real
+        event loop needs: the loop is free while this call is in
+        flight. Asserted by which thread it ran on, since a passing
+        result alone would not tell a to_thread call apart from one
+        made directly on the loop."""
+        import threading
+
+        loop_thread = threading.get_ident()
+
+        def sync_client(texts):
+            calls.append(threading.get_ident())
+            return [[1.0, 0.0] for _ in texts]
+
+        embedder = Embedder(sync_client)
+        assert embedder._acall is None
+        result = asyncio.run(embedder.aembed_documents(["a"]))
+        assert result == [[1.0, 0.0]]
+        assert calls == [calls[0]]                 # ran exactly once
+        assert calls[0] != loop_thread
+
+    def test_a_plain_async_callable_is_awaited_directly(self, calls):
+        async def async_client(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0] for _ in texts]
+
+        embedder = Embedder(async_client)
+        assert embedder._acall is not None
+        assert asyncio.run(embedder.aembed_documents(["a", "b"])) == [[1.0, 0.0], [1.0, 0.0]]
+        assert calls == [["a", "b"]]
+
+    def test_aembed_query_returns_one_vector_not_a_list_of_one(self):
+        async def async_client(texts):
+            return [[1.0, 2.0]]
+
+        assert asyncio.run(Embedder(async_client).aembed_query("q")) == [1.0, 2.0]
+
+    def test_aembed_queries_batches_like_the_sync_side(self, calls):
+        async def async_client(texts):
+            calls.append(list(texts))
+            return [[1.0] for _ in texts]
+
+        embedder = Embedder(async_client)
+        assert asyncio.run(embedder.aembed_queries(["q1", "q2"])) == [[1.0], [1.0]]
+        assert calls == [["q1", "q2"]]
+
+    def test_openai_async_client_is_matched_by_coroutine_shape(self, calls):
+        """openai.OpenAI and openai.AsyncOpenAI share a module root and
+        an attribute name (`embeddings.create`) -- only whether the
+        method is itself a coroutine function tells them apart."""
+        class AsyncEmbeddings:
+            async def create(self, model, input, **kwargs):
+                calls.append((model, list(input), kwargs))
+                return type("R", (), {"data": [
+                    type("D", (), {"embedding": [1.0, 0.0]})() for _ in input]})()
+
+        class AsyncOpenAIish:
+            embeddings = AsyncEmbeddings()
+
+        embedder = Embedder(_named("openai.resources", AsyncOpenAIish)(),
+                            model="text-embedding-3-small")
+        assert embedder._acall is not None
+        assert asyncio.run(embedder.aembed_documents(["a"])) == [[1.0, 0.0]]
+        assert calls == [("text-embedding-3-small", ["a"], {})]
+
+    def test_openai_sync_client_has_no_acall_and_still_falls_back(self, calls):
+        """The sync OpenAI client from TestNativeClients -- passed to
+        an async caller, it must still answer, just off-thread."""
+        class Embeddings:
+            def create(self, model, input, **kwargs):
+                calls.append("sync-create")
+                return type("R", (), {"data": [
+                    type("D", (), {"embedding": [1.0]})() for _ in input]})()
+
+        class OpenAIish:
+            embeddings = Embeddings()
+
+        embedder = Embedder(_named("openai.resources", OpenAIish)(), model="m")
+        assert embedder._acall is None
+        assert asyncio.run(embedder.aembed_documents(["a"])) == [[1.0]]
+        assert calls == ["sync-create"]
+
+    def test_cohere_async_sends_its_two_input_types(self, calls):
+        class AsyncCohereish:
+            async def embed(self, texts, model, input_type, embedding_types):
+                calls.append(input_type)
+                floats = [[1.0, 0.0]] * len(texts)
+                return type("R", (), {
+                    "embeddings": type("E", (), {"float_": floats})()})()
+
+        embedder = Embedder(_named("cohere.client_v2", AsyncCohereish)(), model="embed-v4.0")
+        assert embedder._acall is not None
+        asyncio.run(embedder.aembed_documents(["a"]))
+        asyncio.run(embedder.aembed_query("q"))
+        assert calls == ["search_document", "search_query"]
+
+    def test_voyage_async_sends_its_two_input_types(self, calls):
+        class AsyncVoyageish:
+            async def embed(self, texts, model, input_type):
+                calls.append(input_type)
+                return type("R", (), {"embeddings": [[1.0, 0.0]] * len(texts)})()
+
+        embedder = Embedder(_named("voyageai.client", AsyncVoyageish)(), model="voyage-3")
+        assert embedder._acall is not None
+        asyncio.run(embedder.aembed_documents(["a"]))
+        asyncio.run(embedder.aembed_query("q"))
+        assert calls == ["document", "query"]
+
+    def test_google_async_lives_under_aio(self, calls):
+        """google-genai's async surface is client.aio.models, not a
+        same-named coroutine like the others -- the SDK's own split."""
+        class AsyncModels:
+            async def embed_content(self, model, contents, config):
+                calls.append(config["task_type"])
+                return type("R", (), {"embeddings": [
+                    type("V", (), {"values": [1.0, 0.0]})() for _ in contents]})()
+
+        class Aio:
+            models = AsyncModels()
+
+        class Models:
+            def embed_content(self, model, contents, config):
+                raise AssertionError("the sync path must not be reached from aembed_*")
+
+        class Googleish:
+            aio = Aio()
+            models = Models()
+
+        embedder = Embedder(_named("google.genai", Googleish)(), model="gemini-embedding-001")
+        assert embedder._acall is not None
+        asyncio.run(embedder.aembed_documents(["a"]))
+        asyncio.run(embedder.aembed_query("q"))
+        assert calls == ["RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY"]
+
+    def test_google_sync_client_has_no_aio_and_falls_back(self, calls):
+        class Models:
+            def embed_content(self, model, contents, config):
+                calls.append(config["task_type"])
+                return type("R", (), {"embeddings": [
+                    type("V", (), {"values": [1.0]})() for _ in contents]})()
+
+        class Googleish:
+            models = Models()
+
+        embedder = Embedder(_named("google.genai", Googleish)(), model="m")
+        assert embedder._acall is None
+        assert asyncio.run(embedder.aembed_documents(["a"])) == [[1.0]]
+
+    def test_google_aio_with_a_sync_embed_content_still_falls_back(self, calls):
+        """`aio` present is not enough on its own -- only a coroutine
+        embed_content() counts as the async shape; anything else takes
+        the to_thread fallback like a client with no `aio` at all."""
+        class SyncAioModels:
+            def embed_content(self, model, contents, config):
+                raise AssertionError("must not be reached -- this is the .aio path")
+
+        class Aio:
+            models = SyncAioModels()
+
+        class Models:
+            def embed_content(self, model, contents, config):
+                calls.append(config["task_type"])
+                return type("R", (), {"embeddings": [
+                    type("V", (), {"values": [1.0]})() for _ in contents]})()
+
+        class Googleish:
+            aio = Aio()
+            models = Models()
+
+        embedder = Embedder(_named("google.genai", Googleish)(), model="m")
+        assert embedder._acall is None
+        assert asyncio.run(embedder.aembed_documents(["a"])) == [[1.0]]
+
+    def test_google_async_dimensions_are_passed_through(self, calls):
+        class AsyncModels:
+            async def embed_content(self, model, contents, config):
+                calls.append(config)
+                return type("R", (), {"embeddings": [
+                    type("V", (), {"values": [1.0, 0.0]})() for _ in contents]})()
+
+        class Aio:
+            models = AsyncModels()
+
+        class Models:
+            def embed_content(self, model, contents, config):
+                raise AssertionError("must not be reached -- this is the sync path")
+
+        class Googleish:
+            aio = Aio()
+            models = Models()               # the real SDK has both
+
+        embedder = Embedder(_named("google.genai", Googleish)(), model="m", dimensions=2)
+        asyncio.run(embedder.aembed_documents(["a"]))
+        assert calls == [{"task_type": "RETRIEVAL_DOCUMENT", "output_dimensionality": 2}]
+
+    def test_langchain_async_pair_is_matched(self, calls):
+        class LangChainish:
+            def embed_documents(self, texts):
+                raise AssertionError("the sync method must not be reached from aembed_*")
+
+            def embed_query(self, text):
+                raise AssertionError("the sync method must not be reached from aembed_*")
+
+            async def aembed_documents(self, texts):
+                calls.append(("documents", list(texts)))
+                return [[0.1, 0.2] for _ in texts]
+
+            async def aembed_query(self, text):
+                calls.append(("query", text))
+                return [0.9, 0.9]
+
+        embedder = Embedder(LangChainish())
+        assert embedder._acall is not None
+        assert asyncio.run(embedder.aembed_documents(["a"])) == [[0.1, 0.2]]
+        assert asyncio.run(embedder.aembed_query("q")) == [0.9, 0.9]
+        assert calls == [("documents", ["a"]), ("query", "q")]
+
+    def test_langchain_sync_only_falls_back(self):
+        class LangChainish:
+            def embed_documents(self, texts):
+                return [[0.1, 0.2] for _ in texts]
+
+            def embed_query(self, text):
+                return [0.9, 0.9]
+
+        embedder = Embedder(LangChainish())
+        assert embedder._acall is None
+        assert asyncio.run(embedder.aembed_documents(["a"])) == [[0.1, 0.2]]
+
+    def test_llamaindex_async_pair_is_matched(self, calls):
+        class LlamaIndexish:
+            def get_text_embedding_batch(self, texts):
+                raise AssertionError("the sync method must not be reached from aembed_*")
+
+            def get_query_embedding(self, text):
+                raise AssertionError("the sync method must not be reached from aembed_*")
+
+            async def aget_text_embedding_batch(self, texts):
+                calls.append(("documents", list(texts)))
+                return [[0.3, 0.4] for _ in texts]
+
+            async def aget_query_embedding(self, text):
+                calls.append(("query", text))
+                return [0.5, 0.6]
+
+        embedder = Embedder(LlamaIndexish())
+        assert embedder._acall is not None
+        assert asyncio.run(embedder.aembed_documents(["a"])) == [[0.3, 0.4]]
+        assert asyncio.run(embedder.aembed_query("q")) == [0.5, 0.6]
+
+    def test_sentence_transformers_has_no_async_encode_and_falls_back(self):
+        """No sentence-transformers model ships an async encode(), so
+        every one takes the to_thread fallback -- still correct, just
+        off-thread rather than never blocking at all (see the module
+        docstring's note on CPU-bound work)."""
+        class SentenceTransformerish:
+            def tokenize(self, text): ...
+            def encode(self, texts): return [[1.0, 0.0] for _ in texts]
+
+        embedder = Embedder(SentenceTransformerish())
+        assert embedder._acall is None
+        assert asyncio.run(embedder.aembed_query("q")) == [1.0, 0.0]
+
+    def test_empty_text_is_refused_before_the_provider_is_awaited(self, calls):
+        async def async_client(texts):
+            calls.append(list(texts))
+            return [[1.0] for _ in texts]
+
+        with pytest.raises(ValueError, match="empty or whitespace"):
+            asyncio.run(Embedder(async_client).aembed_documents(["a", "   "]))
+        assert calls == []
+
+    def test_embedding_nothing_awaits_nothing(self, calls):
+        async def async_client(texts):
+            calls.append(list(texts))
+            return [[1.0] for _ in texts]
+
+        assert asyncio.run(Embedder(async_client).aembed_documents([])) == []
+        assert calls == []
+
+    def test_dimension_mismatch_is_refused_the_same_way_as_sync(self):
+        async def async_client(texts):
+            return [[1.0, 2.0, 3.0] for _ in texts]
+
+        embedder = Embedder(async_client, dimensions=2)
+        with pytest.raises(EmbeddingError, match="came back with 3 dimensions"):
+            asyncio.run(embedder.aembed_documents(["a"]))
+
+
+@pytest.fixture()
+def aslept(monkeypatch) -> list:
+    """The async twin of `slept` -- every backoff asyncio.sleep() would
+    take, recorded instead of actually waited on."""
+    waits = []
+
+    async def fake_sleep(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(embeddings_module.asyncio, "sleep", fake_sleep)
+    return waits
+
+
+class TestAsyncRetry:
+    """The retry/backoff DECISION (_backoff()) is shared with the sync
+    path and already covered by TestRetry; this checks only what is
+    different when it runs through _aattempt() -- asyncio.sleep instead
+    of time.sleep, and the native-async-vs-to_thread call itself."""
+
+    def test_a_transient_failure_is_retried_and_succeeds(self, aslept):
+        client = _raises(TimeoutError("upstream"), times=2)
+        assert asyncio.run(Embedder(client).aembed_documents(["a"])) == [[1.0, 0.0]]
+        assert client.state["calls"] == 3
+        assert len(aslept) == 2
+
+    def test_a_terminal_failure_is_not_retried(self, aslept):
+        class AuthenticationError(Exception):
+            pass
+
+        client = _raises(AuthenticationError("bad key"), times=99)
+        with pytest.raises(EmbeddingError, match="after 1 attempt"):
+            asyncio.run(Embedder(client).aembed_documents(["a"]))
+        assert client.state["calls"] == 1
+        assert aslept == []
+
+    def test_retries_are_exhausted_and_the_count_is_reported(self, aslept):
+        client = _raises(TimeoutError("upstream"), times=99)
+        with pytest.raises(EmbeddingError, match=r"after 3 attempt\(s\)"):
+            asyncio.run(Embedder(client, retries=2).aembed_documents(["a"]))
+        assert client.state["calls"] == 3
+
+    def test_our_own_refusals_are_never_retried(self, aslept):
+        """EmbeddingError from _as_vectors means the provider answered
+        with something unusable, which asking again cannot fix -- the
+        async twin of TestRetry's same-named test."""
+        async def short_answer(texts):
+            return [[1.0]]                      # one vector for two texts
+
+        with pytest.raises(EmbeddingError, match="asked for 2 embedding"):
+            asyncio.run(Embedder(short_answer, retries=3).aembed_documents(["a", "b"]))
+        assert aslept == []
+
+    def test_native_async_failures_are_retried_too(self, aslept, calls):
+        """The retry loop wraps whichever call _aattempt() makes --
+        native async included, not just the to_thread fallback."""
+        async def flaky(texts):
+            calls.append(1)
+            if len(calls) <= 2:
+                raise TimeoutError("upstream")
+            return [[1.0] for _ in texts]
+
+        assert asyncio.run(Embedder(flaky, retries=2).aembed_documents(["a"])) == [[1.0]]
+        assert len(calls) == 3
+        assert len(aslept) == 2
 
 
 class TestNoProviderIsImported:

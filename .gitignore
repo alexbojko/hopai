@@ -224,3 +224,6 @@ mutants/
 dist/
 build/
 *.egg-info/
+
+# Claude Code local session/worktree state -- not part of the source tree
+.claude/
