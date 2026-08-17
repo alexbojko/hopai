@@ -4,7 +4,7 @@ name = "hopai"
 # has been released yet; the first release PR sets this to 0.0.1. While
 # the project is below 1.0 every `feat:` and `fix:` bumps the PATCH, so
 # 0.0.x stays a series where anything may change. See CLAUDE.md.
-version = "0.0.1"
+version = "0.1.0"
 description = "A knowledge graph in the PostgreSQL you already run: multi-hop traversal, ingestion and real constraints, with Python, JSON and Cypher interfaces -- no graph database required."
 readme = "README.md"
 requires-python = ">=3.10"

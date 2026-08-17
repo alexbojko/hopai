@@ -206,7 +206,7 @@ from .vectors import Boost, Near, Vector, parse_boost, parse_near
 # hopai.__version__ silently drifts from the released version. There is
 # no "python" extra-file type -- the python strategy only auto-updates a
 # file literally named version.py.
-__version__ = "0.0.1"  # x-release-please-version
+__version__ = "0.1.0"  # x-release-please-version
 
 __all__ = [
     "Graph", "AsyncGraph", "Subgraph", "Start", "Hop",
