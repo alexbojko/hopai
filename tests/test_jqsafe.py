@@ -176,10 +176,18 @@ class TestTheAllowedSubset:
         therefore an empty program on 1.7 -- libjq answers "Top-level
         program not given" -- while a to-end-of-line reader sees
         `.properties.title`. Refusing the backslash is what keeps this
-        module's comment rule identical to every jq's."""
+        module's comment rule identical to every jq's.
+
+        The owner is asserted, not just the reason: comments are skipped
+        by _skip_trivia() from TWO call sites -- the tokenizer and the
+        interpolation scanner -- and the tokenizer's is the one that
+        reaches this refusal. Passing it the wrong owner (or none)
+        leaves the message reading `None: a backslash inside a comment`,
+        which names no option a caller could go and fix."""
         with pytest.raises(UnsafeFilter) as refused:
-            validate("# c \\\n.properties.title")
-        assert "backslash inside a comment" in str(refused.value)
+            validate("# c \\\n.properties.title", owner="rerank.document_from")
+        assert str(refused.value).startswith(
+            "rerank.document_from: a backslash inside a comment (offset 4)")
 
 
 class TestForbiddenConstructs:
@@ -441,6 +449,43 @@ class TestErrorsNameTheFix:
         message = str(refused.value)
         assert message.startswith("document_from: `env` is not available (offset 0)")
         assert ".properties.title" in message
+
+    @pytest.mark.parametrize("program, offset", [("..", 0), (".a | ..", 5),
+                                                 ('.properties | ..', 14)])
+    def test_recursive_descent_is_named_wherever_it_appears(self, program, offset):
+        """`..` is refused either way -- drop the tokenizer's check and
+        the parser still rejects the two bare `.` tokens it decays into
+        -- so a test asserting only THAT it raises passes against a
+        broken check. What is lost is the whole message: "`..`
+        (recursive descent)" and the rewrite become "`.` cannot appear
+        here", and a model told that learns nothing about why walking
+        the row to an unbounded depth is the problem.
+
+        Parametrized over the position because the tokenizer scans from
+        an INDEX: `src.startswith("..")` without it asks whether the
+        PROGRAM begins with `..`, which is true for the first case here
+        and false for every other place a filter can put it."""
+        with pytest.raises(UnsafeFilter) as refused:
+            validate(program, owner="rerank.document_from")
+        message = str(refused.value)
+        assert message.startswith(
+            f"rerank.document_from: `..` (recursive descent) is not in the subset "
+            f"(offset {offset}) -- ")
+        assert "unbounded depth" in message
+        assert message.endswith("Name the properties you want, e.g. `.properties.title`")
+
+    def test_a_stray_function_name_is_the_token_the_refusal_blames(self):
+        """The refusal has to name the token that is actually wrong.
+        `while self.at("name", "and")` mutated to `self.at("name")`
+        treats EVERY name as the `and` operator, so `.a length` gets
+        consumed as a binary operator with nothing after it and the
+        message blames "the end of the filter" -- pointing past the
+        problem at a place the caller cannot fix."""
+        with pytest.raises(UnsafeFilter) as refused:
+            validate(".a length", owner="rerank.document_from")
+        message = str(refused.value)
+        assert message.startswith("rerank.document_from: `length` cannot appear here (offset 3)")
+        assert "end of the filter" not in message
 
     def test_the_owner_names_the_option_the_filter_arrived_on(self):
         """The caller wrote `document_from=` or an MCP argument, not
@@ -848,6 +893,26 @@ class TestLimits:
         program = "(" * (MAX_DEPTH + 5) + "." + ")" * (MAX_DEPTH + 5)
         with pytest.raises(UnsafeFilter) as refused:
             validate(program)
+        assert str(MAX_DEPTH) in str(refused.value)
+
+    def test_siblings_cannot_buy_extra_depth_for_what_follows_them(self):
+        """The depth counter must come back DOWN by exactly what it went
+        up. The case above nests in one unbroken chain, so a decrement
+        that overshoots still refuses it and the test passes -- which is
+        how `self.depth -= 1` mutated to `-= 2` survived the whole
+        suite.
+
+        Sibling groups are what expose it: each `(.a)` enters pipe()
+        once and leaves once, so an overshooting decrement drives the
+        counter NEGATIVE, and every sibling buys one more level for
+        whatever comes after. Thirty of them in front of an otherwise
+        refused chain got it accepted. That is the nesting bound -- the
+        thing standing between a model-supplied filter and the parser's
+        own stack -- made arbitrarily large by a prefix that is itself
+        entirely legal."""
+        deep = "(" * (MAX_DEPTH + 2) + ".a" + ")" * (MAX_DEPTH + 2)
+        with pytest.raises(UnsafeFilter) as refused:
+            validate(" + ".join(["(.a)"] * 30) + " + " + deep)
         assert str(MAX_DEPTH) in str(refused.value)
 
     @pytest.mark.parametrize("frames", [0, 400, 800])
