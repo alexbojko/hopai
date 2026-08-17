@@ -328,14 +328,23 @@ class TestScoresArePairedByIndex:
         with pytest.raises(RerankError, match="top_n"):
             _rerank(client, model="m").score("q", ["a", "b", "c"])
 
-    def test_an_index_out_of_range_refuses(self):
+    @pytest.mark.parametrize("index, sent", [(7, 1), (1, 1), (2, 2), (-1, 2)])
+    def test_an_index_out_of_range_refuses(self, index, sent):
+        """Both ends, because only the absurd one is obvious. `index ==
+        len(documents)` is the boundary the `<` exists for and a `<=`
+        waves through -- one past the end reaches `scores[index]` as a
+        bare IndexError, a crash where a RerankError names what the
+        provider did. `-1` is the worse half: Python indexes it from the
+        END, so it would quietly overwrite the LAST document's score and
+        still satisfy the count check -- the confident mis-pairing this
+        whole function exists to prevent, reported by nothing."""
         class Cohereish:
             def rerank(self, *, model, query, documents):
-                return _answer((7, 0.9))
+                return _answer((index, 0.9))
 
         client = _named("cohere.client_v2", Cohereish)()
-        with pytest.raises(RerankError, match="points at document 7"):
-            _rerank(client, model="m").score("q", ["a"])
+        with pytest.raises(RerankError, match=f"points at document {index}"):
+            _rerank(client, model="m").score("q", ["a", "b"][:sent])
 
     def test_two_results_for_one_document_refuse(self):
         """Whichever won, some document would silently keep no score at

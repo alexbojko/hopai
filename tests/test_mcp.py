@@ -1896,6 +1896,30 @@ class TestServeArguments:
         assert registered["rerank_fields"] == ["properties.title"]
         assert registered["max_candidates"] == 64
 
+    def test_the_permission_defaults_are_the_closed_ones(self, monkeypatch):
+        """build_server() carries its OWN copy of every permission
+        default and forwards it to tools(), so the posture of a server
+        started with no flags is decided here and nowhere else. Flipping
+        `allow_ddl` or `allow_mutations` to True hands an unconfigured
+        model DDL and DELETE; flipping `read_only` the other way makes a
+        server that was asked for nothing silently refuse every write.
+        Both survived every other test in this file, because the only
+        one that calls build_server() with no options asserts its
+        instructions -- and it needs the real SDK, so mutmut skips it.
+        Asserted through the forwarding call, which needs neither."""
+        from hopai.mcp import build_server
+
+        registered = {}
+        monkeypatch.setattr("hopai.mcp._sdk", lambda: (
+            lambda *a, **kw: None, type("T", (), {}), 2))
+        monkeypatch.setattr("hopai.mcp.tools",
+                            lambda graph, **kw: registered.update(kw) or [])
+        build_server(offline())
+        assert registered["read_only"] is False
+        assert registered["allow_ddl"] is False
+        assert registered["allow_mutations"] is False
+        assert registered["strict_schema"] is False
+
     def test_a_published_field_list_with_no_reranker_refuses(self):
         """A knob with nothing behind it is worse than a missing one: an
         operator who published a list and never noticed the reranker was

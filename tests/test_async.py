@@ -29,7 +29,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 import hopai.asyncio as asyncio_module
-from hopai import Boost, Count, CypherError, Hop, Near, Start, Unique, Vector
+from hopai import Boost, Count, CypherError, Hop, Near, Start, Sum, Unique, Vector
 from hopai.asyncio import AsyncGraph
 
 
@@ -182,6 +182,54 @@ class TestSameAnswerAsSync:
         assert {n["id"] for n in async_result.nodes} == {"1", "3"}
         assert sync_result.nodes == async_result.nodes
         assert sync_result.edges == async_result.edges
+
+    def test_a_reranked_aggregate_counts_the_survivors_either_way(
+            self, async_fresh_graph, async_admin_graph):
+        """aggregate() is the second caller of the rerank driver and
+        threads the pins through a DIFFERENT statement builder, so the
+        case above does not cover it: drop `pins=` here and the aggregate
+        silently runs over whatever cosine alone kept -- a number with
+        nothing wrong-looking about it, which is the worst thing this
+        library can return.
+
+        `Sum("rank")` rather than `Count()` on purpose. `keep=1` leaves
+        exactly one node with or without the pins, so a count is 1 either
+        way and sees nothing; the rank says WHICH one, and `far` -- the
+        worst cosine and the best document -- is the only answer a real
+        rerank produces."""
+        pytest.importorskip("jq")
+        from hopai import Rerank
+
+        def seed(g):
+            g.define_vectors(nodes=[Vector("summary", 3, embed=lambda t: [[1.0, 0.0, 0.0]
+                                                                          for _ in t])])
+
+        def spec():
+            return (Start(where={"type": "doc"}),
+                    Hop(via={"kind": "cites"}, near=Near("summary", text="q"), keep=1,
+                        rerank=Rerank(lambda query, documents: [1.0 if d == "far" else 0.0
+                                                                for d in documents],
+                                      document_from=".properties.name", candidates=5)))
+
+        async def body():
+            seed(async_fresh_graph)
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([
+                {"id": 1, "type": "doc", "name": "seed"},
+                {"id": 2, "name": "near", "rank": 10}, {"id": 3, "name": "far", "rank": 20}])
+            await async_fresh_graph.set_vectors(nodes=[
+                {"id": 2, "summary": [1.0, 0.0, 0.0]}, {"id": 3, "summary": [-1.0, 0.0, 0.0]}])
+            await async_fresh_graph.add_edges([
+                {"start_id": 1, "end_id": 2, "kind": "cites"},
+                {"start_id": 1, "end_id": 3, "kind": "cites"}])
+            return await async_fresh_graph.aggregate(
+                *spec(), aggregates={"n": Count(), "rank": Sum("rank")})
+
+        async_result = run(body())
+        assert async_result == {"n": 1, "rank": 20}          # `far`, not `near`
+        seed(async_admin_graph)
+        assert async_admin_graph.aggregate(
+            *spec(), aggregates={"n": Count(), "rank": Sum("rank")}) == async_result
 
     def test_cypher_traverse(self, graph, async_graph):
         query = "MATCH (a {type: 'leaf'})-[:knows]->(b) RETURN a, b"
