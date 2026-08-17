@@ -88,7 +88,16 @@ dev = ["pytest>=8.0", "pytest-cov>=5.0", "networkx>=3.0", "pydantic>=2.0", "ruff
 # suite should not require a Jupyter stack. jupyterlab is left out too; nbclient
 # executes them headlessly and `pip install jupyterlab` is the reader's call.
 notebooks = ["nbclient>=0.10", "nbformat>=5.9", "ipykernel>=6.29",
-             "networkx>=3.0", "pydantic>=2.0"]
+             "networkx>=3.0", "pydantic>=2.0",
+             # 10_reranking.ipynb EVALUATES a document_from filter, so it
+             # needs the binding the `rerankers` extra carries. This list
+             # is what a notebook RUN needs, which is not the same set as
+             # `dev` -- putting jq only there passed the test job and
+             # failed the notebook job, on a notebook that had run clean
+             # locally because the local environment happened to have
+             # both. A notebook demonstrating an optional extra has to
+             # name that extra here.
+             "jq>=1.6"]
 # Building the documentation site (mkdocs.yml). Separate from `notebooks`
 # because the two do opposite things: `notebooks` EXECUTES them against a
 # database, while the site only renders the outputs already committed --
