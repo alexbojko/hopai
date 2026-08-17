@@ -39,6 +39,7 @@ import time
 import pytest
 
 import hopai.rerankers as rerankers_module
+from hopai import Hop, Near, Start
 from hopai.rerankers import Rerank, RerankError
 
 
@@ -1247,3 +1248,73 @@ class TestNoProviderIsImported:
                   if name.split(".")[0] in {"cohere", "voyageai",
                                             "sentence_transformers", "openai"}}
         assert leaked == set(), f"a provider package was imported: {sorted(leaked)}"
+
+
+class TestRerankOnStartAndHop:
+    """`rerank=` on a traversal spec, refused where the caller wrote it.
+
+    These live here rather than beside the Near tests because they are
+    the rerank feature's spec surface: hop.py holds the structural half
+    of the rule (is there anything to rerank, is the query readable, do
+    the two numbers agree) and rerankers.py holds the rest. A refusal
+    that arrived at execution time instead would name a step the caller
+    is no longer looking at."""
+
+    @staticmethod
+    def _rerank(**kwargs):
+        return Rerank(lambda query, documents: [0.0] * len(documents),
+                      document_from=".properties.title", **kwargs)
+
+    def test_a_rerank_seeds_and_a_hop_beam_both_build(self):
+        """The two places rerank= is allowed. If this stops constructing,
+        every refusal below is testing a spec nobody can write."""
+        Start(near=Near("bio", text="sql"), rerank=self._rerank(candidates=50), keep=10)
+        Hop(via={"kind": "cites"}, near=Near("summary", text="raft"),
+            rerank=self._rerank(candidates=50), keep=10)
+
+    @pytest.mark.parametrize("spec", [Start, Hop])
+    def test_rerank_without_near_is_refused(self, spec):
+        """A reranker REORDERS a candidate list; it cannot produce one.
+        Allowing it alone would send a provider call over a set nothing
+        ranked -- billed, slow, and changing nothing."""
+        with pytest.raises(ValueError, match="rerank= reorders the candidates near= ranks"):
+            spec(rerank=self._rerank())
+
+    @pytest.mark.parametrize("spec", [Start, Hop])
+    def test_a_raw_vector_query_with_rerank_is_refused(self, spec):
+        """A reranker scores a query against a document by READING both,
+        and a list of floats is not something a cross-encoder can read.
+        This is what reranking is, not a gap -- so it refuses rather than
+        growing a second way to supply the query, which could disagree
+        with the first silently."""
+        with pytest.raises(ValueError, match="rerank= needs the query as TEXT"):
+            spec(near=Near("bio", [0.1, 0.2]), rerank=self._rerank(), keep=5)
+
+    def test_the_raw_vector_refusal_names_the_text_rewrite(self):
+        """CLAUDE.md's rule: the message names the FIX. Without the
+        rewrite spelled out, a caller has to guess that `text=` exists
+        and that the field's own embed= will resolve it."""
+        with pytest.raises(ValueError, match=r'Near\(.bio., text="\.\.\."\)'):
+            Start(near=Near("bio", [0.1, 0.2]), rerank=self._rerank(), keep=5)
+
+    def test_candidates_below_keep_is_refused(self):
+        """Reranking a pool no bigger than what survives it cannot change
+        which rows come back. Clamping silently would hide that the two
+        numbers in the caller's own query disagree -- the same judgement
+        `all=True` with a filter already makes."""
+        with pytest.raises(ValueError, match="reranks fewer candidates than keep=10 keeps"):
+            Start(near=Near("bio", text="sql"), rerank=self._rerank(candidates=5), keep=10)
+
+    def test_candidates_equal_to_keep_is_allowed(self):
+        """The boundary is `<`, not `<=`: reranking exactly as many as
+        you keep still reorders them, which changes the seed set a hop
+        walks from even though it changes no membership."""
+        Start(near=Near("bio", text="sql"), rerank=self._rerank(candidates=10), keep=10)
+
+    def test_a_multivector_near_refuses_if_any_field_carries_a_vector(self):
+        """One text= field does not make the query readable: the refusal
+        has to see every Near, or a two-field query would rerank against
+        whichever one happened to be first."""
+        with pytest.raises(ValueError, match="rerank= needs the query as TEXT"):
+            Start(near=[Near("bio", text="sql"), Near("summary", [0.1, 0.2])],
+                  rerank=self._rerank(), keep=5)

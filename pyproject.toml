@@ -74,7 +74,15 @@ dev = ["pytest>=8.0", "pytest-cov>=5.0", "networkx>=3.0", "pydantic>=2.0", "ruff
        # tests/test_mcp.py skips the SDK-backed classes without it, and
        # a suite that silently stops testing the server is how the
        # schema-override in _register() would rot unnoticed.
-       "mcp>=1.10"]
+       "mcp>=1.10",
+       # Same reasoning, and it was already costing us: the tests that
+       # hold jqsafe.py's two claims -- that the subset is real jq, and
+       # that everything it accepts terminates -- both importorskip on
+       # `jq`, so without it here CI ran neither and reported
+       # rerankers.py at 87% while it is 98% with the binding present.
+       # A validator whose differential test silently stops running is
+       # exactly the rot this extra exists to prevent.
+       "jq>=1.6"]
 # Only for executing notebooks/ -- see scripts/run_notebooks.py. Deliberately
 # NOT part of `dev`: the notebooks are documentation, and running the test
 # suite should not require a Jupyter stack. jupyterlab is left out too; nbclient

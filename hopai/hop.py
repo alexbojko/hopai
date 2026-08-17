@@ -76,6 +76,55 @@ def _validate_boost(owner: str, near, boost) -> None:
         )
 
 
+def _validate_rerank(owner: str, near, keep, rerank, k_name: str = "keep") -> None:
+    """The three ways a rerank= cannot mean anything, refused where the
+    caller wrote it rather than three layers down at execution.
+
+    Structural only, like _validate_near_k above: whether the field
+    exists and whether the jq filter parses are checked where the Graph
+    and the subset are in scope.
+    """
+    if rerank is None:
+        return
+
+    # A reranker REORDERS a ranked candidate list; it cannot produce one.
+    # Same judgement as boost= above and as a Near inside where=: the
+    # thing that ranks and the thing that filters are different jobs.
+    if near is None:
+        raise ValueError(
+            f"{owner}: rerank= reorders the candidates near= ranks -- on its own it has "
+            f"nothing to reorder, because a reranker scores a list it is given rather than "
+            f"choosing one. Add near=, or drop rerank="
+        )
+
+    # A reranker reads the query. A raw vector is not something a
+    # cross-encoder can read, and no implementation makes it one -- so
+    # this is what reranking IS, not a gap to close later. Refused rather
+    # than papered over with a second way to supply the query, because
+    # two sources for one query can disagree silently.
+    for one in (near if isinstance(near, (list, tuple)) else [near]):
+        if getattr(one, "text", None) is None:
+            field = getattr(one, "field", "?")
+            raise ValueError(
+                f"{owner}: rerank= needs the query as TEXT, but Near({field!r}, ...) was "
+                f"given a raw vector -- a reranker scores a query against a document by "
+                f"reading both, and there is nothing to read in a list of floats. Write "
+                f"Near({field!r}, text=\"...\") and the field's own embed= turns it into "
+                f"the vector, so the ranking and the reranking see the same query"
+            )
+
+    # Reranking a pool no larger than what survives it cannot reorder
+    # anything that matters. Clamping silently would hide that the two
+    # numbers in the caller's own query disagree.
+    candidates = getattr(rerank, "candidates", None)
+    if keep is not None and isinstance(candidates, int) and candidates < keep:
+        raise ValueError(
+            f"{owner}: rerank=Rerank(candidates={candidates}) reranks fewer candidates than "
+            f"{k_name}={keep} keeps, so the reranking cannot change which rows survive. "
+            f"Raise candidates above {k_name}, or lower {k_name}"
+        )
+
+
 @dataclass
 class Start:
     """The seed set a traversal begins from.
@@ -89,8 +138,17 @@ class Start:
     for hybrid retrieval. A boost reorders; it never changes which
     nodes qualify.
 
+    rerank: a Rerank(...) that re-scores the seed candidates by READING
+    them against the query, before any Hop walks. `near` picks
+    `rerank.candidates` seeds cheaply, the reranker reorders them, and
+    `keep` truncates -- so the walk starts from a better-chosen set
+    and everything downstream is unaware it happened. Needs `near`
+    with `text=`: a reranker reads the query, and a raw vector is not
+    something it can read. See hopai/rerankers.py.
+
     A traversal returns a SUBGRAPH, not a ranking: the similarity
-    scores and their order do not survive into the result. Use
+    scores and their order do not survive into the result -- and
+    neither do rerank scores, for the same reason. Use
     vector_search() when you need the scores themselves. See
     hopai/vectors.py.
     """
@@ -99,10 +157,12 @@ class Start:
     near: Optional[Any] = None
     keep: Optional[int] = None
     boost: Optional[Any] = None
+    rerank: Optional[Any] = None
 
     def __post_init__(self):
         _validate_near_k("Start", self.near, self.keep)
         _validate_boost("Start", self.near, self.boost)
+        _validate_rerank("Start", self.near, self.keep, self.rerank)
 
 
 @dataclass
@@ -139,9 +199,17 @@ class Hop:
     boost:      Boost(property, weight) terms added to the node
                 ranking `near` creates. Reorders; never changes which
                 nodes qualify. Edge beams have no boost term.
+    rerank:     a Rerank(...) that re-scores the nodes THIS hop reached,
+                by reading them against the query, before the next hop
+                walks. This is the step-wise beam: a candidate here is
+                not a row but a node plus how it was reached, so
+                `document_from` may also read `.paths` -- which exists
+                at a hop and not at a Start, since a seed has no
+                provenance. Needs `near` with `text=`.
 
     Similarity scores do not survive into the result -- a traversal
-    returns a subgraph, not a ranking. Use vector_search() for scores.
+    returns a subgraph, not a ranking -- and neither do rerank scores.
+    Use vector_search() for scores.
     """
     where: Optional[Any] = None
     via: Optional[Any] = None
@@ -154,6 +222,7 @@ class Hop:
     via_near: Optional[Any] = None
     via_keep: Optional[int] = None
     boost: Optional[Any] = None
+    rerank: Optional[Any] = None
 
     def __post_init__(self):
         self.min_hops, self.max_hops = _normalize_hops(self.hops)
@@ -163,3 +232,4 @@ class Hop:
         _validate_near_k("Hop", self.via_near, self.via_keep,
                          near_name="via_near", k_name="via_keep")
         _validate_boost("Hop", self.near, self.boost)
+        _validate_rerank("Hop", self.near, self.keep, self.rerank)

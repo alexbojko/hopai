@@ -103,6 +103,11 @@ ACCEPTED = (
     ".properties.title // .properties.name // \"untitled\"",
     "# what this filter is for\n.properties.title",
     ".properties.tags | first(.[])",
+    # A string INSIDE an interpolation: the scanner that finds the
+    # closing `)` has to skip it the way jq does, or the `)` inside the
+    # nested string would end the interpolation early.
+    '"title: \\(.properties.title + " (draft)")"',
+    "[.properties.title, .properties.summary] | .[0]",
 )
 
 
@@ -314,6 +319,10 @@ class TestForbiddenConstructs:
         ".a.b[",
         '"unclosed',
         '"\\(.a"',
+        '"\\(.a',
+        "}",
+        "and .a",
+        ".a | or .b",
         ".a +",
         "(.a",
         ".a == .b == .c",
@@ -472,6 +481,13 @@ class TestPathsRead:
         -- as if it were a row property -- would let an allowlist for `c`
         pass a filter that actually reads `a` and `b`."""
         assert paths_read("(.a + .b).c") == frozenset({"a", "b"})
+
+    def test_a_path_after_a_derived_value_adds_nothing_new(self):
+        """`[.a, .b] | .[0]` walks into an array this filter BUILT, not
+        into the row. Attributing `.[0]` to the row -- or crashing on a
+        context that no longer names a property -- would both be wrong;
+        the reads are the two fields that went into the array."""
+        assert paths_read("[.a, .b] | .[0]") == frozenset({"a", "b"})
 
 
 class TestTheFieldAllowlist:
