@@ -159,21 +159,33 @@ read.** When a design question comes up, these decide it, in order:
   (`python scripts/run_notebooks.py`). A change to a public API means re-running
   them with `--save` and reading the output diff — a stale notebook is a broken
   build, not a cosmetic lag.
-- **The documentation site has no sources of its own.** `mkdocs.yml` publishes
-  `README.md` and `notebooks/` through symlinks in `docs/`, so editing either one
-  *is* editing the site — there is never a second copy to keep in step, and adding
-  one is the defect. CI builds it with `--strict` on every PR; **Read the Docs**
-  publishes it at <https://hopai.readthedocs.io/> (`.readthedocs.yaml`), built
-  **from the release tag** — so the published site describes the version that is
-  on PyPI rather than whatever landed on `main`. Nothing in this repository
-  pushes the site, so there is no deploy credential; the release-only rule lives
-  in an RTD Automation Rule matching tags, not in a workflow.
+- **The documentation site has three tiers, each with its own drift guard.**
+  `README.md` and `notebooks/` publish through symlinks in `docs/` — editing
+  either one *is* editing the site, and neither may gain a second copy anywhere
+  else. `docs/reference/*.md` are real files holding the guide prose (semantics,
+  invariants, the exact wording of a refusal) that belongs in neither a notebook
+  nor a docstring — a deliberate second place, kept honest by review rather than
+  execution, and it must not re-narrate what a notebook already runs; link to the
+  notebook instead of copying its example. `docs/api/*.md` are real files too,
+  but hold no prose of their own — each is a `mkdocstrings` directive
+  (`::: hopai.<module>`, `members:` curated to what `hopai/__init__.py` exports
+  as public) that renders straight from the library's own docstrings and
+  signatures at build time, so that tier is structurally unable to drift from
+  the code no matter how stale the page on disk looks; `pip install -e ".[docs]"`
+  is what makes `hopai` itself importable for it. CI builds the whole site with
+  `--strict` on every PR; **Read the Docs** publishes it at
+  <https://hopai.readthedocs.io/> (`.readthedocs.yaml`), built **from the release
+  tag** — so the published site describes the version that is on PyPI rather than
+  whatever landed on `main`. Nothing in this repository pushes the site, so there
+  is no deploy credential; the release-only rule lives in an RTD Automation Rule
+  matching tags, not in a workflow.
   Links written *inside* notebooks are invisible to `--strict` (mkdocs-jupyter
   hands MkDocs finished HTML), so `scripts/mkdocs_hooks.py` rewrites them and
   `scripts/check_docs_links.py` fails the build if one stops resolving.
-  **A new notebook must be added to `mkdocs.yml`'s `nav`.** It reaches the site
-  on its own through the symlink, but an unlisted page is built and then left out
-  of the navigation — reachable only by URL. MkDocs calls that INFO, so
+  **A new notebook, reference page or API module must be added to `mkdocs.yml`'s
+  `nav`.** It reaches the site on its own (through the symlink, or by living
+  under `docs/`), but an unlisted page is built and then left out of the
+  navigation — reachable only by URL. MkDocs calls that INFO, so
   `validation.nav.omitted_files: warn` promotes it to a `--strict` failure.
 - Comments explain *why*, citing the bug or trade-off. Match that for non-obvious code;
   skip it for mechanical changes.
@@ -222,4 +234,5 @@ print(Mutator(g).delete_nodes_statement({"type": "draft"})
 | [notebooks/README.md](notebooks/README.md) | The ten runnable notebooks, how they are executed in CI, and how to regenerate their outputs |
 | [docs/testing.md](docs/testing.md) | Fixtures, the database-free suite, coverage gate, mutmut config and its fork-safety quirks |
 | [docs/releasing.md](docs/releasing.md) | release-please, PyPI trusted publishing, and the traps already hit |
-| [README.md](README.md) | The user-facing API |
+| [docs/reference/](docs/reference/) | The guide prose behind every public call — semantics, invariants, exact refusal wording — one page per topic |
+| [README.md](README.md) | The user-facing pitch, quick start, and the index into everything else |
