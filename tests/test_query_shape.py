@@ -826,11 +826,21 @@ class TestSpecSuppliedReranking:
         """The whole trust boundary in one assertion: what a model sends
         decides WHAT is ranked and HOW MUCH is spent, and every field
         that holds a credential or picks a model stays the operator's.
-        Without this a spec could swap the client."""
-        from hopai import Rerank
+        Without this a spec could swap the client.
+
+        Every operator-only setting is spelled with a NON-DEFAULT value,
+        `backoff` included: one dropped from parse_rerank()'s
+        constructor call reverts that policy to the library default on
+        every spec-built reranker, and a retry schedule quietly becoming
+        somebody else's is exactly the kind of silent difference nothing
+        else in this suite would notice."""
+        from hopai import Rerank, RerankPolicy
         client = lambda query, documents: [1.0] * len(documents)      # noqa: E731
-        policy = rerank_policy(client=client, document_from=".properties.title",
-                               candidates=50)
+        policy = RerankPolicy(
+            Rerank(client, document_from=".properties.title", candidates=50,
+                   per_path=False, max_paths=3, batch_size=7,
+                   retries=0, backoff=3.25),
+            fields=["properties.title", "properties.body"], max_candidates=100)
         start, _ = spec_to_traversal(
             {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
                        "rerank": {"document_from": ".properties.body", "candidates": 20}}},
@@ -840,6 +850,41 @@ class TestSpecSuppliedReranking:
         assert start.rerank.candidates == 20
         assert start.rerank.client is client
         assert (start.rerank.retries, start.rerank.model) == (0, None)
+        assert (start.rerank.per_path, start.rerank.max_paths) == (False, 3)
+        assert (start.rerank.batch_size, start.rerank.backoff) == (7, 3.25)
+
+    def test_an_aggregation_spec_carries_the_reranker_through(self):
+        """spec_to_aggregation() reaches the parser only by handing the
+        policy on. Dropped, an aggregate spec's `rerank` is measured
+        against no policy at all -- so a spec that traverse_json()
+        accepts refuses here, and the reranking an operator configured
+        never reaches the step whose nodes are counted."""
+        start, _, aggregates = spec_to_aggregation(
+            {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                       "rerank": {"document_from": ".properties.body", "candidates": 20}},
+             "aggregates": {"n": {"fn": "count"}}},
+            rerank_policy())
+        assert start.rerank.document_from == ".properties.body"
+        assert start.rerank.candidates == 20
+        assert set(aggregates) == {"n"}
+
+    def test_candidates_exactly_at_the_ceiling_is_allowed_and_one_over_is_not(self):
+        """The boundary from both sides. `max_candidates` is the number
+        the operator wrote down as payable, and the refusal itself says
+        "ask for at most" that number -- so refusing it would name the
+        very value it had just rejected. Only a test AT the ceiling can
+        tell `>` from `>=`."""
+        start, _ = spec_to_traversal(
+            {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                       "rerank": {"candidates": 100}}},
+            rerank_policy(max_candidates=100))
+        assert start.rerank.candidates == 100
+        with pytest.raises(ValueError) as exc:
+            spec_to_traversal(
+                {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                           "rerank": {"candidates": 101}}},
+                rerank_policy(max_candidates=100))
+        assert "101" in str(exc.value) and "100" in str(exc.value)
 
     def test_a_spec_that_names_neither_key_inherits_the_operators_own(self):
         start, _ = spec_to_traversal(
@@ -889,13 +934,22 @@ class TestSpecSuppliedReranking:
     def test_an_unknown_rerank_key_refuses_rather_than_being_ignored(self):
         """`top_n` is what LanceDB calls this and what a model reaches
         for; ignoring it would silently rerank a different number of
-        candidates than the call asked for."""
+        candidates than the call asked for.
+
+        The refusal has to say WHERE, exactly as the position test below
+        does: a spec may carry a `rerank` on `start` and on every hop,
+        so "unknown keys ['top_n']" with no owner tells a model a key is
+        wrong without telling it which object to fix -- and an owner
+        label recased is the same loss, since it no longer matches
+        anything in the spec the model wrote."""
         with pytest.raises(ValueError) as exc:
             spec_to_traversal(
                 {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
                            "rerank": {"top_n": 5}}},
                 rerank_policy())
-        assert "top_n" in str(exc.value) and "candidates" in str(exc.value)
+        message = str(exc.value)
+        assert "top_n" in message and "candidates" in message
+        assert '"start.rerank"' in message
 
     def test_a_hop_rerank_is_named_by_its_position(self):
         """Three hops each carrying a filter, and a refusal that said
@@ -1001,6 +1055,11 @@ class TestSpecSuppliedReranking:
         with pytest.raises(RerankError) as exc:
             asyncio.run(rerank.ascore("q", ["a document"]))
         assert "DEADBEEF" not in str(exc.value) and "server-side failure" in str(exc.value)
+        # Which reranking stage died: a traversal can carry one filter
+        # per step, so a message naming none (or `document_from=None`)
+        # says only that "the reranker" failed somewhere.
+        assert str(exc.value).startswith("rerank=(document_from='.properties.title'): "
+                                         "the reranking provider call failed")
 
     def test_the_async_path_still_scores_when_the_provider_works(self):
         """The guard changes failures only -- a wrapper that swallowed
@@ -1080,6 +1139,16 @@ class TestASpecSuppliedFilterNeverQuotesTheRow:
         assert self.SECRET not in message
         assert ".properties.title | tonumber" in message and "id='7'" in message
         assert "tonumber" in message and "//" in message          # names the fix
+        # Anchored across the JOINS between adjacent string literals:
+        # each part is mutated on its own, so a fragment sitting wholly
+        # inside one survives its neighbour being recased or XX-wrapped
+        # while looking like it covered the message.
+        assert ("-- jq itself failed on that row -- most often a type mismatch, such as "
+                "adding text to a number or asking tonumber() of something that is not "
+                "one. The underlying") in message
+        assert message.endswith(
+            "Guard every field the row may not have, e.g. "
+            "'(.properties.title // \"\") + \": \" + (.properties.summary // \"\")'")
 
     def test_a_non_string_document_is_refused_without_repring_it(self):
         """_evaluate()'s own message reprs the value -- here a number
@@ -1088,8 +1157,19 @@ class TestASpecSuppliedFilterNeverQuotesTheRow:
                             fields=["properties.title", "properties.pin"])
         with pytest.raises(ValueError) as exc:
             rerank.build_documents([self.candidate(pin=90210)])
-        assert "90210" not in str(exc.value)
-        assert "not a string" in str(exc.value) and "id='7'" in str(exc.value)
+        message = str(exc.value)
+        assert "90210" not in message
+        assert "not a string" in message and "id='7'" in message
+        # Both outer edges of the message, pinned where the literals
+        # join: `tostring` AFTER the default is the whole fix here, and
+        # a fix a model cannot read costs it the retry the guard was
+        # supposed to save.
+        assert message.startswith(
+            "document_from='.properties.pin' could not build a document for candidate "
+            "id='7' -- it evaluated to something that is not a string. The underlying")
+        assert message.endswith(
+            "Put the default BEFORE the conversion, e.g. "
+            "'.properties.year // \"unknown\" | tostring'")
 
     def test_a_filter_selecting_nothing_still_names_the_fix(self):
         """The common case, and the one with no row data in it either
@@ -1099,8 +1179,19 @@ class TestASpecSuppliedFilterNeverQuotesTheRow:
         rerank = self.built('.properties.title | select(. == "no")')
         with pytest.raises(ValueError) as exc:
             rerank.build_documents([self.candidate()])
-        assert "no document at all" in str(exc.value)
-        assert "untitled" in str(exc.value)
+        message = str(exc.value)
+        assert "no document at all" in message
+        assert "untitled" in message
+        # Straddling every join in this branch: the reason into the
+        # sentence that follows it, the whole "why you are not being
+        # told more" clause into the fix, and the fix out to the end.
+        assert "-- it produced no document at all, or more than one. The underlying" in message
+        assert ("The underlying error is not repeated here, because it quotes that row's "
+                "own values and this document is posted to a reranking provider. Give it "
+                "a fallback") in message
+        assert message.endswith(
+            "Give it a fallback (e.g. '.properties.title // \"untitled\"'), or wrap "
+            "several outputs into one (e.g. '[.properties.tags[]] | join(\", \")')")
 
     def test_an_unsafe_filter_still_reports_itself(self):
         """The guard catches ValueError, and UnsafeFilter IS one --
@@ -1128,6 +1219,12 @@ class TestASpecSuppliedFilterNeverQuotesTheRow:
             rerank.score("a query", ["a document"])
         assert "DEADBEEF" not in str(exc.value) and "401" not in str(exc.value)
         assert "server-side failure" in str(exc.value)
+        # What the caller is still meant to learn: WHICH reranking
+        # stage died. A traversal carries one filter per step, so
+        # `document_from=None` here would leave an operator reading a
+        # server log with nothing to grep for.
+        assert str(exc.value).startswith("rerank=(document_from='.properties.title'): "
+                                         "the reranking provider call failed")
 
     def test_a_working_reranker_is_untouched_by_any_of_it(self):
         """The guard must change failures only. If it changed the
@@ -1349,6 +1446,51 @@ class TestToolSchema:
         blob = json.dumps(self.offgraph().tool_schemas())
         assert "rerank" not in blob
 
+    @staticmethod
+    def _named_anywhere(schema: dict) -> set:
+        """Every name a model can fill in, nested included -- the walker
+        tests/test_vectors.py uses for `vector`, plus the $defs keys
+        themselves, since a $def is reached BY NAME through $ref."""
+        found = set()
+
+        def walk(node):
+            if isinstance(node, dict):
+                for name, child in (node.get("properties") or {}).items():
+                    found.add(name)
+                    walk(child)
+                for key in ("items", "additionalProperties", "anyOf", "oneOf", "allOf"):
+                    walk(node.get(key))
+                for name, child in (node.get("$defs") or {}).items():
+                    found.add(name)
+                    walk(child)
+            elif isinstance(node, list):
+                for child in node:
+                    walk(child)
+
+        walk(schema.get("parameters", schema))
+        return found
+
+    def test_the_search_tool_drops_rerank_at_its_top_level_too(self):
+        """On a flat search `rerank` sits BESIDE `near` rather than
+        inside a step, so the loop that strips the traversal tools never
+        reaches it -- without_rerank() needs its own top-level branch,
+        and the test above cannot see this one because a bare graph
+        publishes no search tool at all (no declared vectors, no tool).
+
+        Without the branch, a bare Graph advertises `rerank` on
+        search_graph_by_meaning while vector_search_json() with no
+        policy refuses that key BY NAME: a parameter whose handler
+        rejects every use of it, the defect CLAUDE.md names. Walked over
+        the whole schema rather than grepped, so descriptions stay free
+        to discuss reranking in prose."""
+        from hopai import Vector
+        graph = self.offgraph()
+        graph.define_vectors(nodes=[Vector("summary", 3)])
+        tools = graph.tool_schemas()
+        assert any(tool["name"] == "search_graph_by_meaning" for tool in tools)
+        for tool in tools:
+            assert "rerank" not in self._named_anywhere(tool), tool["name"]
+
     def test_rerank_true_keeps_it_for_a_caller_that_has_one(self):
         """hopai.mcp builds ON these schemas rather than beside them, so
         the parameter has to survive long enough for serve(rerank=) to
@@ -1366,7 +1508,14 @@ class TestToolSchema:
         sentences instead of the published field list and the real
         ceiling it was handed. A truthy non-bool selecting a WEAKER
         behaviour than the caller asked for is the defect the
-        invariants name."""
+        invariants name.
+
+        The refusal names the TYPE that arrived, because that is what
+        tells the caller which of their arguments went where: reporting
+        a fixed "NoneType" would describe a call nobody made. Asserted
+        with its negative half -- the class name turns up elsewhere in
+        the sentence, so only "got RerankPolicy" plus "no NoneType"
+        pins the interpolation itself."""
         from hopai import Rerank, RerankPolicy
         policy = RerankPolicy(Rerank(lambda query, documents: [0.0] * len(documents),
                                      document_from=".properties.title"),
@@ -1379,6 +1528,8 @@ class TestToolSchema:
         # core.py must not import the MCP front end to borrow it.
         assert "rerank= is True or False" in message
         assert "hopai.mcp.serve(rerank=" in message and "traverse_json" in message
+        assert "got RerankPolicy. A Graph" in message
+        assert "NoneType" not in message
 
     @pytest.mark.parametrize("truthy", [1, "true", ["yes"]])
     def test_no_truthy_value_stands_in_for_the_bool(self, truthy):
