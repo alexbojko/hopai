@@ -448,6 +448,20 @@ class TestVectors:
         assert got["nodes"]["1"]["summary"] == pytest.approx([1.0, 0.0, 0.0])
         assert dropped == ["nodes.vec_summary"]
 
+    def test_drop_vectors_drops_the_edge_fields_it_was_asked_for(self, async_fresh_graph):
+        """Every call in this file passes `node_fields=` only, so the
+        `edge_fields` argument could be dropped on the way across the
+        bridge and nothing would notice (issue #69). Asked for an EDGE
+        field alone, so a forwarding that loses it drops nothing and
+        returns an empty list rather than quietly doing the node side."""
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3)],
+                                             edges=[Vector("rel", 3)])
+            await async_fresh_graph.migrate_vectors()
+            return await async_fresh_graph.drop_vectors(edge_fields=["rel"])
+
+        assert run(body()) == ["edges.vec_rel"]
+
     def test_stale_vectors_narrows_by_field_and_by_limit(self, async_fresh_graph):
         """The case above calls stale_vectors() with NO arguments, so
         every argument AsyncGraph hands across the bridge is unasserted

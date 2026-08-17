@@ -331,20 +331,41 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+        # BEST-EFFORT ON PURPOSE. Posting the comment is a convenience:
+        # the same report is already in $GITHUB_STEP_SUMMARY and uploaded
+        # as the quality-report artifact, so a failed API call loses a
+        # copy, not the evidence. It used to `set -e` on any gh failure,
+        # which meant one GitHub blip turned a green suite, a finished
+        # mutation run and a rendered report into a red check -- AND
+        # skipped `Enforce coverage threshold` below, so the cosmetic
+        # step could suppress the real gate. A ::warning:: says the
+        # comment is missing without pretending the code is broken.
         run: |
           set -euo pipefail
+          MISSING="the report is in the job summary and the quality-report artifact"
           # One comment per PR: find the previous one by its marker and
           # PATCH it, else POST. The body goes through json.dumps so no
           # markdown character can corrupt the payload.
           python -c "import json;print(json.dumps({'body': open('comment.md').read()}))" > payload.json
-          EXISTING=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            --jq '.[] | select(.body | startswith("<!-- hopai-pr-report -->")) | .id' | head -n1)
+          # gh's output is captured whole and narrowed afterwards, NOT
+          # piped into `head -n1`: head closes the pipe as soon as it has
+          # its line, and a --paginate still writing at that moment dies
+          # of SIGPIPE, which pipefail then reports as a failed step. The
+          # narrowing still has to happen -- --paginate applies --jq per
+          # PAGE, so two pages could each yield an id if the marker ever
+          # appears twice, and a two-line id would build a broken URL.
+          FOUND=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq 'first(.[] | select(.body | startswith("<!-- hopai-pr-report -->")) | .id) // empty') \
+            || { echo "::warning::could not list PR comments; ${MISSING}"; exit 0; }
+          EXISTING=$(printf '%s\n' "${FOUND}" | head -n1)
           if [ -n "${EXISTING}" ]; then
-            gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING}" --input payload.json >/dev/null
-            echo "updated sticky comment ${EXISTING}"
+            gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING}" --input payload.json >/dev/null \
+              && echo "updated sticky comment ${EXISTING}" \
+              || echo "::warning::could not update sticky comment ${EXISTING}; ${MISSING}"
           else
-            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" --input payload.json >/dev/null
-            echo "created sticky comment"
+            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" --input payload.json >/dev/null \
+              && echo "created sticky comment" \
+              || echo "::warning::could not create the sticky comment; ${MISSING}"
           fi
 
       - uses: actions/upload-artifact@v4
@@ -359,7 +380,13 @@ jobs:
           if-no-files-found: ignore
 
       - name: Enforce coverage threshold
-        # Last, so the comment is already posted when this fails.
+        # Last, so the comment is already posted when this fails -- but
+        # `always()` so that ordering cannot become a dependency. Without
+        # it a step above failing SKIPS this one, and the job goes red
+        # for that failure while the number this job exists to check went
+        # unread. The gate is what decides the check; everything above it
+        # is reporting.
+        if: always()
         run: |
           set -euo pipefail
           PERCENT=$(python -c "
