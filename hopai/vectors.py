@@ -910,6 +910,26 @@ async def aresolve_queries(graph, target: str, queries: list, k, caller: str) ->
     return await _aresolve_query_texts(graph, target, _as_query_list(queries, caller), caller)
 
 
+def _resolved_spec(owner, **changes):
+    """dataclasses.replace(), with `rerank` re-attached AFTER the copy
+    has been validated -- the one thing aresolve_spec_texts() below
+    cannot do with a plain replace().
+
+    Start/Hop validate on construction, and one of those rules is that
+    a rerank= needs the query as TEXT (hop.py's _validate_rerank) --
+    which is precisely what this copy has just resolved away, since
+    Near._with_vector() hands back floats and no text. Rebuilding
+    without the rerank and putting it back keeps that rule where it
+    belongs, on the line the caller wrote, instead of the async path
+    re-deciding it against a spec it resolved itself. The original spec
+    has already passed it."""
+    if owner.rerank is None:
+        return replace(owner, **changes)
+    rebuilt = replace(owner, **changes, rerank=None)
+    rebuilt.rerank = owner.rerank
+    return rebuilt
+
+
 async def aresolve_spec_texts(graph, start, hops: list) -> tuple:
     """Every Near(text=) in a Start/Hop chain -- start.near, each hop's
     near and via_near -- embedded before AsyncGraph.traverse()/
@@ -998,13 +1018,16 @@ async def aresolve_spec_texts(graph, start, hops: list) -> tuple:
                for one in items]
         return out if isinstance(original, (list, tuple)) else out[0]
 
-    new_start = (replace(start, near=resolve("nodes", start.near, start_norm))
+    # _resolved_spec(), not replace(): a step carrying rerank= would be
+    # refused by its own constructor for the text this copy has just
+    # resolved away. See that function.
+    new_start = (_resolved_spec(start, near=resolve("nodes", start.near, start_norm))
                  if has_text(start_norm) else start)
     new_hops = []
     for i, hop in enumerate(hops):
         near_norm, via_norm = hop_norms[i]
         if has_text(near_norm) or has_text(via_norm):
-            new_hops.append(replace(
+            new_hops.append(_resolved_spec(
                 hop,
                 near=resolve("nodes", hop.near, near_norm),
                 via_near=resolve("edges", hop.via_near, via_norm),
@@ -1431,11 +1454,16 @@ def _format_hit(row, nears: list, boosts: list) -> dict:
 
 
 def _prepare_search_query(graph, near, target: str, k: Optional[int], where: Any,
-                          boost) -> tuple:
+                          boost, candidates: Optional[int] = None) -> tuple:
     """(nears, boosts, query) for vector_search()'s single statement --
     build_search_query() is the public, query-only view of this;
     search() needs the resolved nears/boosts too, to key `similarities`/
     `boosts` by name rather than by their SQL column position.
+
+    `candidates` is the ROW LIMIT when a Rerank is in play, and `k` is
+    still what everything else is validated against: the two are
+    different bounds -- input and output -- and collapsing them would
+    make a rerank silently change which refusals a search produces.
 
     The caller label stays a literal "vector_search()" at each call
     below, not a parameter -- TestVectorCallerNamesArePinned reads
@@ -1465,7 +1493,8 @@ def _prepare_search_query(graph, near, target: str, k: Optional[int], where: Any
         .where(combined.isnot(None), *_thresholds(inner, nears))
         .order_by(similarity.desc(), inner.c._id)
     )
-    return nears, boosts, (query if k is None else query.limit(k))
+    rows = k if candidates is None else candidates
+    return nears, boosts, (query if rows is None else query.limit(rows))
 
 
 def build_search_query(graph, near, target: str = "nodes", k: Optional[int] = 10,
@@ -1552,12 +1581,22 @@ def _raise_if_unmigrated(graph, target: str, field_names: list, conn,
     ) from exc
 
 
-def search(graph, near, target: str = "nodes", k: Optional[int] = 10, where: Any = None,
-           boost=None, connection=None) -> list:
+def search_candidates(graph, near, target: str = "nodes", k: Optional[int] = 10,
+                      where: Any = None, boost=None, connection=None, rerank=None) -> list:
+    """The rows one search fetches, BEFORE any reranking: `k` of them
+    normally, `rerank.candidates` when a Rerank is in play.
+
+    Split out of search() because the provider call must happen with
+    nothing open, and on the async path the connection belongs to
+    AsyncGraph across a run_sync() bridge that runs on the event loop's
+    own THREAD -- so an async caller takes these rows, lets the bridge
+    close, and awaits the scoring itself. Same reason set_vectors()
+    resolves its embeddings before it takes a connection."""
     with _read_connection(graph, connection) as conn:
         _ensure_lazy_vectors(graph, conn)
-        nears, boosts, query = _prepare_search_query(graph, near, target=target, k=k, where=where,
-                                                     boost=boost)
+        nears, boosts, query = _prepare_search_query(
+            graph, near, target=target, k=k, where=where, boost=boost,
+            candidates=None if rerank is None else rerank.candidates)
         try:
             rows = conn.execute(query).mappings().all()
         except ProgrammingError as exc:
@@ -1565,6 +1604,24 @@ def search(graph, near, target: str = "nodes", k: Optional[int] = 10, where: Any
                                  "vector_search()")
             raise
     return [_format_hit(row, nears, boosts) for row in rows]
+
+
+def search(graph, near, target: str = "nodes", k: Optional[int] = 10, where: Any = None,
+           boost=None, connection=None, rerank=None, rerank_query: Optional[str] = None) -> list:
+    """One search, reranked when a Rerank is given.
+
+    `rerank_query` is the text the reranker scores against. It is
+    normally derived from the Near right here, but the async path has
+    to derive it BEFORE it embeds -- `Near._with_vector()` hands back a
+    spec carrying floats and no text -- so it passes the text it
+    already read rather than letting this look for one that is gone."""
+    if rerank is not None and rerank_query is None:
+        rerank_query = rerank_query_text(near, rerank, k, "vector_search()")
+    hits = search_candidates(graph, near, target=target, k=k, where=where, boost=boost,
+                             connection=connection, rerank=rerank)
+    if rerank is None:
+        return hits
+    return rerank_hits(hits, rerank, rerank_query, k)
 
 
 # ---------------------------------------------------------------------
@@ -1599,7 +1656,7 @@ def _as_query_list(queries, caller: str) -> list:
 
 
 def _prepare_search_many_query(graph, queries, target: str, k: Optional[int], where: Any,
-                               boost) -> tuple:
+                               boost, candidates: Optional[int] = None) -> tuple:
     """(parsed, template, boosts, query) for vector_search_many()'s
     single statement -- build_search_many_query() is the public,
     query-only view of this; search_many() needs `template`/`boosts`
@@ -1696,7 +1753,11 @@ def _prepare_search_many_query(graph, queries, target: str, k: Optional[int], wh
         .where(combined.isnot(None), *_thresholds(inner, template))
         .order_by(similarity.desc(), inner.c._id)
     )
-    per_query = (per_query if k is None else per_query.limit(k)).lateral("hits")
+    # `candidates` is PER QUERY, exactly where `k` sits -- inside the
+    # LATERAL. One statement still serves every query; each just hands
+    # back a wider list for its own reranker call to narrow.
+    rows = k if candidates is None else candidates
+    per_query = (per_query if rows is None else per_query.limit(rows)).lateral("hits")
     query = select(queries_values.c.q.label("q"), *per_query.c).select_from(
         queries_values.join(per_query, literal(True))
     )
@@ -1728,15 +1789,16 @@ def build_search_many_query(graph, queries, target: str = "nodes", k: Optional[i
     return query
 
 
-def search_many(graph, queries, target: str = "nodes", k: Optional[int] = 10,
-                where: Any = None, boost=None, connection=None) -> list:
-    """Results per query, in the order the queries were given -- an
-    empty list for a query nothing matched, so index i always answers
-    query i."""
+def search_many_candidates(graph, queries, target: str = "nodes", k: Optional[int] = 10,
+                           where: Any = None, boost=None, connection=None, rerank=None) -> list:
+    """The rows the one statement fetches per query, BEFORE any
+    reranking -- search_candidates()' batch twin, split for the same
+    reason: the provider calls happen with the connection closed."""
     with _read_connection(graph, connection) as conn:
         _ensure_lazy_vectors(graph, conn)
         parsed, template, boosts, query = _prepare_search_many_query(
-            graph, queries, target=target, k=k, where=where, boost=boost)
+            graph, queries, target=target, k=k, where=where, boost=boost,
+            candidates=None if rerank is None else rerank.candidates)
         grouped: dict = {str(i): [] for i in range(len(parsed))}
         try:
             rows = conn.execute(query).mappings().all()
@@ -1749,6 +1811,141 @@ def search_many(graph, queries, target: str = "nodes", k: Optional[int] = 10,
                               template, boosts)
             grouped[row["q"]].append(hit)
     return [grouped[str(i)] for i in range(len(parsed))]
+
+
+def search_many(graph, queries, target: str = "nodes", k: Optional[int] = 10,
+                where: Any = None, boost=None, connection=None, rerank=None,
+                rerank_queries: Optional[list] = None) -> list:
+    """Results per query, in the order the queries were given -- an
+    empty list for a query nothing matched, so index i always answers
+    query i.
+
+    `rerank=` is PER CALL, where `boost=` already sits, and it produces
+    N reranker calls: one call cannot serve two queries, because every
+    rerank API takes `query` (singular) and the score IS the
+    (query, document) relationship. They run SEQUENTIALLY here and
+    concurrently on the async path (arerank_many) -- this call exists to
+    turn N round trips into one, and N sequential provider calls would
+    hand that back."""
+    if rerank is not None and rerank_queries is None:
+        rerank_queries = rerank_query_texts(queries, rerank, k, "vector_search_many()")
+    grouped = search_many_candidates(graph, queries, target=target, k=k, where=where,
+                                     boost=boost, connection=connection, rerank=rerank)
+    if rerank is None:
+        return grouped
+    return [rerank_hits(hits, rerank, query, k)
+            for hits, query in zip(grouped, rerank_queries, strict=True)]
+
+
+# ---------------------------------------------------------------------
+# Reranking a fetched candidate list
+#
+# The stage that must NOT run with a connection open. Everything here
+# happens after the SQL round trip has closed, for the reason
+# set_vectors() resolves its embeddings before it takes a connection: a
+# provider call inside an open transaction holds a snapshot -- and on
+# the write path row locks -- for a network round trip, and a provider
+# dying halfway leaves that transaction open behind it.
+#
+# The result is ADDITIVE. A hit gains `rerank_score` and the list is
+# ordered by it; `similarity` keeps the value the retrieval stage gave
+# it rather than being overwritten, so a caller can see what the
+# reranker actually changed. Without rerank= nothing here runs and the
+# results are byte-identical to before it existed.
+# ---------------------------------------------------------------------
+
+def rerank_query_text(near, rerank, k, caller: str, k_name: str = "k") -> Optional[str]:
+    """The text this Rerank scores against, plus the refusals that go
+    with asking for one.
+
+    hop.py's `_validate_rerank` is IMPORTED rather than restated: the
+    three ways a rerank= cannot mean anything (nothing to reorder, a
+    query that cannot be read, two numbers that disagree) are one rule,
+    and a second copy is how a Start refusal and a vector_search()
+    refusal drift into disagreeing about the same query."""
+    if rerank is None:
+        return None
+    from .hop import _validate_rerank
+    _validate_rerank(caller, near, k, rerank, k_name=k_name)
+    # _validate_rerank has just proved every Near carries text -- that is
+    # what makes this an assert rather than a second check. A raw-vector
+    # Near never reaches here.
+    texts = [one.text for one in (near if isinstance(near, (list, tuple)) else [near])]
+    if not texts:
+        # `near=[]` is not None, so _validate_rerank's "nothing to
+        # reorder" test does not see it -- but an empty near ranks
+        # nothing either, and that is the same refusal.
+        raise ValueError(
+            f"{caller}: rerank= reorders the candidates near= ranks, and near=[] is empty "
+            f"-- pass a Near(...) to rank by, or drop rerank="
+        )
+    assert all(text is not None for text in texts), texts
+    unique = list(dict.fromkeys(texts))
+    if len(unique) > 1:
+        # A multivector query is ONE question asked of several fields, so
+        # it has one query string. Picking the first would rerank against
+        # a query the caller never asked -- a plausible, confidently
+        # wrong ranking, which is the answer this library refuses to
+        # produce quietly.
+        raise ValueError(
+            f"{caller}: rerank= scores ONE query against each document, but the Near specs "
+            f"carry {len(unique)} different texts ({unique[0]!r} and {unique[1]!r}) -- there "
+            f"is no single query to score with. Give every Near the same text=, or drop "
+            f"rerank= and rank on similarity alone"
+        )
+    return unique[0]
+
+
+def rerank_query_texts(queries, rerank, k, caller: str) -> Optional[list]:
+    """One query text per entry of vector_search_many()'s queries."""
+    if rerank is None:
+        return None
+    return [rerank_query_text(one, rerank, k, caller)
+            for one in _as_query_list(queries, caller)]
+
+
+def _reranked(hits: list, scores: list, k: Optional[int]) -> list:
+    """The hits with `rerank_score` attached, ordered by it, truncated
+    to k.
+
+    `similarity` is left exactly as the retrieval stage set it: dropping
+    a stage's input score is never the more useful answer, and a caller
+    tuning a hybrid query needs to see what the reranker moved. The
+    tiebreak is the id, so two identical scores never come back in a
+    different order for the same graph."""
+    ranked = [{**hit, "rerank_score": float(score)}
+              for hit, score in zip(hits, scores, strict=True)]
+    ranked.sort(key=lambda hit: (-hit["rerank_score"], hit["id"]))
+    return ranked if k is None else ranked[:k]
+
+
+def rerank_hits(hits: list, rerank, query: str, k: Optional[int]) -> list:
+    """One candidate list, reranked. The connection is already closed."""
+    if not hits:
+        # No documents, no provider call: an empty request is billed by
+        # some providers and refused by others, and neither is an answer.
+        return hits
+    return _reranked(hits, rerank.score(query, rerank.build_documents(hits)), k)
+
+
+async def arerank_hits(hits: list, rerank, query: str, k: Optional[int]) -> list:
+    """rerank_hits(), awaited -- the provider call never on the loop."""
+    if not hits:
+        return hits
+    return _reranked(hits, await rerank.ascore(query, rerank.build_documents(hits)), k)
+
+
+async def arerank_many(grouped: list, rerank, queries: list, k: Optional[int]) -> list:
+    """vector_search_many()'s N reranker calls, CONCURRENTLY.
+
+    One provider call cannot serve two queries -- the score is the
+    (query, document) relationship and every rerank API takes `query`
+    singular -- but this call exists to turn N round trips into one, and
+    issuing N provider calls one after another would hand the whole
+    saving straight back."""
+    return list(await asyncio.gather(*(
+        arerank_hits(hits, rerank, query, k)
+        for hits, query in zip(grouped, queries, strict=True))))
 
 
 # ---------------------------------------------------------------------

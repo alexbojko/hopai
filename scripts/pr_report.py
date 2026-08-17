@@ -254,6 +254,15 @@ def render_mutation(stats: dict, found: list, note: str, attempted: bool = False
                   + ", ".join(f"**{count} {name}**" for name, count in odd.items())
                   + "."]
 
+    # Mutants mutmut generated but never reached a verdict on. A run
+    # stopped by its budget exports a `total` with every count at zero,
+    # and the difference is the whole story: "0 killed, 0 survived" is
+    # not a clean sweep, it is nothing having run. Reporting it as one
+    # ("every mutant was caught") is the same silently-different-answer
+    # this project refuses everywhere else, and it is worse here because
+    # a reader takes it as evidence the tests are strong.
+    unchecked = total - killed - len(found) - sum(odd.values())
+
     if found:
         # Folded by default: on a large PR this is the longest thing in
         # the comment, and it is reference material for whoever triages
@@ -264,8 +273,14 @@ def render_mutation(stats: dict, found: list, note: str, attempted: bool = False
         lines += ["", "Each row is the source before → after the mutation. "
                   "`mutmut show <mutant>` prints the surrounding hunk; "
                   "CLAUDE.md has the triage rule.", "", "</details>"]
-    elif total:
+    elif total and unchecked <= 0:
         lines += ["", "No survivors — every mutant on the changed lines was caught."]
+
+    if unchecked > 0:
+        lines += ["", f"⚠️ **{unchecked} of {total} mutant(s) never reached a verdict** — "
+                  f"neither killed nor survived. That is a harness that stopped, not a "
+                  f"suite that caught everything: treat this run as **no evidence** about "
+                  f"the changed lines rather than as a pass. See the job log."]
     return "\n".join(lines)
 
 

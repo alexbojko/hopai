@@ -4,4 +4,4 @@ The JSON front end — same keys as Python, JSON in and out — and the ready-ma
 
 ::: hopai.json_api
     options:
-      members: [traverse_json, spec_to_traversal, TRAVERSE_TOOL_SCHEMA, aggregate_json, spec_to_aggregation, AGGREGATE_TOOL_SCHEMA, vector_search_json, VECTOR_SEARCH_TOOL_SCHEMA]
+      members: [traverse_json, spec_to_traversal, TRAVERSE_TOOL_SCHEMA, aggregate_json, spec_to_aggregation, AGGREGATE_TOOL_SCHEMA, vector_search_json, VECTOR_SEARCH_TOOL_SCHEMA, RerankPolicy, parse_rerank]

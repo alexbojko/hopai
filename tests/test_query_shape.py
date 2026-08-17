@@ -154,6 +154,52 @@ class TestQueryStructure:
         sql = norm(offline_graph.build_query(Start(), [Hop(via={"kind": "knows"}, hops=(1, 3))]))
         assert sql.count("properties @> CAST") >= 2
 
+    def test_no_pins_emits_byte_identical_sql(self, offline_graph):
+        """Step-wise reranking threads an optional `pins` through the
+        whole walk. A traversal with no rerank= passes None, and None
+        must add NOTHING -- the same promise
+        test_defining_vectors_changes_no_near_less_query makes for
+        declared vector fields. Without this, every existing query plan
+        would be up for renegotiation the moment reranking landed."""
+        start, hops = Start(where={"type": "person"}), [Hop(hops=(1, 3)), Hop(optional=True)]
+        assert (norm(offline_graph.build_query(start, hops))
+                == norm(offline_graph.build_query(start, hops, pins=None)))
+        # The aggregate path shares _walk_matches and so shares the
+        # promise; optional= is dropped only because aggregation refuses
+        # it for reasons of its own.
+        plain = [Hop(hops=(1, 3)), Hop()]
+        assert (norm(offline_graph.build_aggregate_query(start, plain, {"n": Count()}))
+                == norm(offline_graph.build_aggregate_query(start, plain, {"n": Count()},
+                                                            pins=None)))
+
+    def test_pinning_narrows_the_step_it_names_and_nothing_else(self, offline_graph):
+        """Pinning is an `id IN (...)` on the SEED and on `match_i`, and
+        each step gets only its own list. A pin leaking onto the wrong
+        step would silently traverse from nodes the reranker dropped."""
+        sql = norm(offline_graph.build_query(
+            Start(where={"type": "person"}),
+            [Hop(via={"kind": "knows"}), Hop()], pins={-1: [1, 2], 1: [9]}), literal_binds=True)
+        assert "nodes.id IN (1, 2)" in sql
+        assert "walk_1.to_id IN (9)" in sql
+        # hop 0 was not pinned, so its match keeps the shape it had: the
+        # only `walk_0.to_id IN` left is hop_edges_0's own subquery
+        # against match_0, never a literal id list.
+        assert "walk_0.to_id IN (SELECT match_0.node_id" in sql
+        assert "walk_0.to_id IN (9)" not in sql
+        assert "walk_0.to_id IN (1, 2)" not in sql
+
+    def test_a_pinned_step_still_reports_its_edges_from_the_walk(self, offline_graph):
+        """The whole safety argument for re-running an ORDINARY
+        traversal with survivors pinned: `hop_edges_i` still derives
+        from `full_walk` joined against `match_i`, so multi-hop edge
+        reconstruction and dead-end pruning are untouched. If pinning
+        ever started reporting edges from the pinned id list itself,
+        this is what would notice."""
+        sql = norm(offline_graph.build_query(Start(), [Hop(hops=(1, 3))], pins={0: [4, 5]}))
+        assert "hop_edges_0 AS" in sql
+        assert "unnest(walk_0.local_edges)" in sql
+        assert "walk_0.to_id IN (SELECT match_0.node_id" in sql
+
 
 class TestCustomSchema:
     def test_custom_table_and_column_names_are_used(self):
@@ -740,6 +786,548 @@ class TestHopValidationEdges:
 # JSON API
 # ---------------------------------------------------------------------
 
+def rerank_policy(**options):
+    """A RerankPolicy over a client that touches no network: the
+    operator's Rerank, the properties it publishes, and its ceiling.
+
+    `score(query, documents) -> [float]` is the whole reranker contract,
+    so a plain function IS a client here -- which is also what keeps
+    these tests off a provider."""
+    from hopai import Rerank
+    from hopai.json_api import RerankPolicy
+    return RerankPolicy(
+        Rerank(options.pop("client", None) or (lambda query, documents: [1.0] * len(documents)),
+               document_from=options.pop("document_from", ".properties.title"),
+               candidates=options.pop("candidates", 50),
+               retries=options.pop("retries", 0)),
+        fields=options.pop("fields", ["properties.title", "properties.body"]),
+        max_candidates=options.pop("max_candidates", 100),
+    )
+
+
+class TestSpecSuppliedReranking:
+    """`rerank` is the one spec key whose value is CODE -- a jq filter
+    that a model may write and that hopai then runs over rows and posts
+    to a third party. parse_rerank() is the single site that gates it,
+    the way refuse_vectors() is for `vector`, so everything here is a
+    property of that one function."""
+
+    @staticmethod
+    def _model_client():
+        """A client the operator may pin a MODEL on. `Rerank` refuses
+        `model=` for a plain callable -- there is nothing to send it to
+        -- so the callable used everywhere else in this class leaves
+        `model` None on both sides of the comparison, and a constructor
+        call that dropped it would look identical. A client reporting a
+        provider module is what makes the field observable at all."""
+        class Cohereish:
+            def rerank(self, *, model, query, documents):
+                return {"results": [{"index": i, "relevance_score": 1.0}
+                                    for i, _ in enumerate(documents)]}
+        # A real cohere.ClientV2 reports 'cohere.…' the same way; setting
+        # __module__ is the design, not a trick around it.
+        Cohereish.__module__ = "cohere.client_v2"
+        return Cohereish()
+
+    def test_the_operators_model_survives_the_spec(self):
+        """`model` picks WHICH reranker runs and is priced per call, so
+        it is the operator's alone -- and it is the one operator-only
+        field the test below cannot hold, because its plain-callable
+        client makes `model` None on both sides. Dropped from
+        parse_rerank()'s constructor call, every spec-built reranker
+        silently calls the provider's default model instead of the one
+        the server was configured with."""
+        from hopai import Rerank, RerankPolicy
+        policy = RerankPolicy(
+            Rerank(self._model_client(), document_from=".properties.title",
+                   candidates=50, model="rerank-v3.5"),
+            fields=["properties.title", "properties.body"], max_candidates=100)
+        start, _ = spec_to_traversal(
+            {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                       "rerank": {"document_from": ".properties.body", "candidates": 20}}},
+            policy)
+        assert start.rerank.model == "rerank-v3.5"
+
+    def test_a_rerank_spec_refuses_when_no_reranker_was_configured(self):
+        """The client cannot travel in JSON -- it holds an API key and a
+        socket -- so a spec asking to rerank with nothing configured has
+        to be told what to pass rather than quietly not reranking, which
+        would be a different answer with no signal."""
+        with pytest.raises(ValueError) as exc:
+            spec_to_traversal({"start": {"where": {"a": 1}, "near": {"field": "s", "text": "x"},
+                                         "keep": 3, "rerank": {"document_from": ".id"}}})
+        assert "RerankPolicy" in str(exc.value)
+
+    def test_aggregate_json_hands_the_policy_to_the_aggregation(self):
+        """aggregate_json() takes `rerank=` and forwards it in ONE
+        place. Drop it there and a spec asking to rerank is parsed,
+        accepted and then aggregated over whatever the retrieval stage
+        kept -- a number, silently computed over the wrong set of nodes,
+        which is the worst thing this library can return. Stubbed rather
+        than run: the forwarding is decided before any SQL and the point
+        is which specs `aggregate()` is handed."""
+        from hopai import Rerank, RerankPolicy
+        from hopai.json_api import aggregate_json
+        policy = RerankPolicy(
+            Rerank(lambda query, documents: [1.0] * len(documents),
+                   document_from=".properties.title", candidates=50),
+            fields=["properties.title"], max_candidates=100)
+        seen = {}
+
+        class StubGraph:
+            def aggregate(self, start, *hops, aggregates):
+                seen["start"] = start
+                return {"n": 0}
+
+        aggregate_json(StubGraph(), {
+            "start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                      "rerank": {"document_from": ".properties.title", "candidates": 20}},
+            "aggregates": {"n": {"fn": "count"}},
+        }, allow_vectors=True, rerank=policy)
+        assert seen["start"].rerank is not None
+        assert seen["start"].rerank.candidates == 20
+
+    def test_the_redacting_subclass_still_honours_trusted_and_fields(self):
+        """_SpecRerank rebuilds documents one candidate at a time so it
+        can name the failing row structurally, and every option has to
+        survive that detour. `trusted=True` is what turns the safe
+        subset OFF; dropped on the way to the base, a caller who asked
+        for the full language silently gets the narrowed one instead --
+        and `fields=` then refuses a filter the caller deliberately
+        allowed. Asserted through a filter reading a path OUTSIDE
+        `fields`, which is exactly the pair that disagrees."""
+        from hopai import Rerank, RerankPolicy
+        policy = RerankPolicy(
+            Rerank(lambda query, documents: [1.0] * len(documents),
+                   document_from=".properties.title", candidates=50),
+            fields=["properties.title", "properties.body"], max_candidates=100)
+        start, _ = spec_to_traversal(
+            {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                       "rerank": {"document_from": ".properties.body", "candidates": 20}}},
+            policy)
+        from hopai.jqsafe import UnsafeFilter
+        candidates = [{"id": "1", "properties": {"title": "t", "body": "b"}}]
+        # Narrowed to a field the filter does not read -> refused...
+        with pytest.raises(UnsafeFilter):
+            start.rerank.build_documents(candidates, fields=["properties.title"])
+        # ...unless the caller turned the subset off, which must reach
+        # the base through the per-candidate loop.
+        assert start.rerank.build_documents(
+            candidates, trusted=True, fields=["properties.title"]) == ["b"]
+
+    def test_a_spec_overrides_the_filter_and_the_budget_and_nothing_else(self):
+        """The whole trust boundary in one assertion: what a model sends
+        decides WHAT is ranked and HOW MUCH is spent, and every field
+        that holds a credential or picks a model stays the operator's.
+        Without this a spec could swap the client.
+
+        Every operator-only setting is spelled with a NON-DEFAULT value,
+        `backoff` included: one dropped from parse_rerank()'s
+        constructor call reverts that policy to the library default on
+        every spec-built reranker, and a retry schedule quietly becoming
+        somebody else's is exactly the kind of silent difference nothing
+        else in this suite would notice."""
+        from hopai import Rerank, RerankPolicy
+        client = lambda query, documents: [1.0] * len(documents)      # noqa: E731
+        policy = RerankPolicy(
+            Rerank(client, document_from=".properties.title", candidates=50,
+                   per_path=False, max_paths=3, batch_size=7,
+                   retries=0, backoff=3.25),
+            fields=["properties.title", "properties.body"], max_candidates=100)
+        start, _ = spec_to_traversal(
+            {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                       "rerank": {"document_from": ".properties.body", "candidates": 20}}},
+            policy)
+        assert isinstance(start.rerank, Rerank)
+        assert start.rerank.document_from == ".properties.body"
+        assert start.rerank.candidates == 20
+        assert start.rerank.client is client
+        assert (start.rerank.retries, start.rerank.model) == (0, None)
+        assert (start.rerank.per_path, start.rerank.max_paths) == (False, 3)
+        assert (start.rerank.batch_size, start.rerank.backoff) == (7, 3.25)
+
+    def test_an_aggregation_spec_carries_the_reranker_through(self):
+        """spec_to_aggregation() reaches the parser only by handing the
+        policy on. Dropped, an aggregate spec's `rerank` is measured
+        against no policy at all -- so a spec that traverse_json()
+        accepts refuses here, and the reranking an operator configured
+        never reaches the step whose nodes are counted."""
+        start, _, aggregates = spec_to_aggregation(
+            {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                       "rerank": {"document_from": ".properties.body", "candidates": 20}},
+             "aggregates": {"n": {"fn": "count"}}},
+            rerank_policy())
+        assert start.rerank.document_from == ".properties.body"
+        assert start.rerank.candidates == 20
+        assert set(aggregates) == {"n"}
+
+    def test_candidates_exactly_at_the_ceiling_is_allowed_and_one_over_is_not(self):
+        """The boundary from both sides. `max_candidates` is the number
+        the operator wrote down as payable, and the refusal itself says
+        "ask for at most" that number -- so refusing it would name the
+        very value it had just rejected. Only a test AT the ceiling can
+        tell `>` from `>=`."""
+        start, _ = spec_to_traversal(
+            {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                       "rerank": {"candidates": 100}}},
+            rerank_policy(max_candidates=100))
+        assert start.rerank.candidates == 100
+        with pytest.raises(ValueError) as exc:
+            spec_to_traversal(
+                {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                           "rerank": {"candidates": 101}}},
+                rerank_policy(max_candidates=100))
+        assert "101" in str(exc.value) and "100" in str(exc.value)
+
+    def test_a_spec_that_names_neither_key_inherits_the_operators_own(self):
+        start, _ = spec_to_traversal(
+            {"start": {"near": {"field": "s", "text": "x"}, "keep": 3, "rerank": {}}},
+            rerank_policy(document_from=".properties.title", candidates=50))
+        assert (start.rerank.document_from, start.rerank.candidates) == (".properties.title", 50)
+
+    def test_a_filter_outside_the_safe_subset_refuses(self):
+        """`env` returns the process environment and the filter's OUTPUT
+        IS THE DOCUMENT, which is POSTed to a reranking vendor -- so
+        this exact filter is one-line exfiltration of every credential
+        the process holds. It does not parse in hopai.jqsafe's subset,
+        and parse_rerank() is where that subset is applied."""
+        from hopai.jqsafe import UnsafeFilter
+        with pytest.raises(UnsafeFilter) as exc:
+            spec_to_traversal(
+                {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                           "rerank": {"document_from": "env.DATABASE_URL"}}},
+                rerank_policy())
+        assert "`env` is not available" in str(exc.value)
+
+    def test_a_filter_reading_an_unpublished_property_refuses_naming_the_published_ones(self):
+        """`.properties.ssn` parses perfectly in the safe subset, so the
+        grammar alone is not a defence: what stops it is the operator's
+        published list, and the refusal has to name that list or a model
+        cannot write a filter that would be accepted."""
+        from hopai.jqsafe import UnsafeFilter
+        with pytest.raises(UnsafeFilter) as exc:
+            spec_to_traversal(
+                {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                           "rerank": {"document_from": ".properties.ssn"}}},
+                rerank_policy(fields=["properties.title"]))
+        assert "properties.ssn" in str(exc.value) and "properties.title" in str(exc.value)
+
+    def test_candidates_over_the_ceiling_refuses_naming_it(self):
+        """Named, never clamped -- the same judgement `candidates < keep`
+        gets. A reranker is billed per document, so silently serving 100
+        where 500 was asked for hides the disagreement exactly where it
+        costs money."""
+        with pytest.raises(ValueError) as exc:
+            spec_to_traversal(
+                {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                           "rerank": {"candidates": 500}}},
+                rerank_policy(max_candidates=100))
+        assert "500" in str(exc.value) and "100" in str(exc.value)
+
+    def test_an_unknown_rerank_key_refuses_rather_than_being_ignored(self):
+        """`top_n` is what LanceDB calls this and what a model reaches
+        for; ignoring it would silently rerank a different number of
+        candidates than the call asked for.
+
+        The refusal has to say WHERE, exactly as the position test below
+        does: a spec may carry a `rerank` on `start` and on every hop,
+        so "unknown keys ['top_n']" with no owner tells a model a key is
+        wrong without telling it which object to fix -- and an owner
+        label recased is the same loss, since it no longer matches
+        anything in the spec the model wrote."""
+        with pytest.raises(ValueError) as exc:
+            spec_to_traversal(
+                {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                           "rerank": {"top_n": 5}}},
+                rerank_policy())
+        message = str(exc.value)
+        assert "top_n" in message and "candidates" in message
+        assert '"start.rerank"' in message
+
+    def test_a_hop_rerank_is_named_by_its_position(self):
+        """Three hops each carrying a filter, and a refusal that said
+        only "rerank" would leave a model guessing which one to fix."""
+        from hopai.jqsafe import UnsafeFilter
+        with pytest.raises(UnsafeFilter) as exc:
+            spec_to_traversal(
+                {"start": {"where": {"a": 1}},
+                 "hops": [{}, {"near": {"field": "s", "text": "x"}, "keep": 2,
+                               "rerank": {"document_from": ".properties.ssn"}}]},
+                rerank_policy())
+        assert str(exc.value).startswith("hops[1].rerank.document_from")
+
+    def test_the_operators_own_filter_is_held_to_the_list_they_published(self):
+        """Refused where both were written, not on the first query that
+        inherits the template: a policy whose own filter reads outside
+        its own allowlist would make every spec naming no
+        `document_from` refuse for a reason the caller did not cause."""
+        from hopai.jqsafe import UnsafeFilter
+        with pytest.raises(UnsafeFilter):
+            rerank_policy(document_from=".properties.secret",
+                          fields=["properties.title"])
+
+    def test_a_policy_publishing_nothing_refuses(self):
+        """There is no "everything" spelling on purpose. Defaulting to
+        the whole row would put `.properties.ssn` one accepted filter
+        away from a vendor, and an operator who never thought about it
+        would never find out."""
+        from hopai import Rerank
+        from hopai.json_api import RerankPolicy
+        template = Rerank(lambda query, documents: [1.0], document_from=".properties.title")
+        with pytest.raises(ValueError) as exc:
+            RerankPolicy(template)
+        assert "properties.title" in str(exc.value)
+
+    @pytest.mark.parametrize("spec, expected", [
+        ("just rerank it", TypeError),                  # a string, not an object
+        ({"document_from": 42}, ValueError),            # not a filter
+        ({"document_from": "   "}, ValueError),         # nothing to evaluate
+        ({"candidates": 0}, ValueError),                # nothing to rerank
+        ({"candidates": True}, ValueError),             # a bool IS an int in Python
+        ({"candidates": "20"}, ValueError),             # a JSON number that arrived as text
+    ])
+    def test_a_malformed_rerank_spec_refuses_by_shape(self, spec, expected):
+        """Checked, never coerced -- the rule CLAUDE.md states for
+        all=/detach=/replace=, applied where the same tool-call failures
+        arrive: `candidates: true` is 1 to Python (one candidate, which
+        can reorder nothing) and `"20"` is a JSON type error, not a
+        number to read."""
+        with pytest.raises(expected):
+            spec_to_traversal(
+                {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
+                           "rerank": spec}},
+                rerank_policy())
+
+    @pytest.mark.parametrize("fields, expected", [
+        ("properties.title", TypeError),                # one path, not a list of them
+        ([], ValueError),                               # publishes nothing
+        ([42], TypeError),                              # not a path
+        (["  "], TypeError),                            # nor is whitespace
+    ])
+    def test_a_malformed_field_list_refuses_where_it_was_written(self, fields, expected):
+        """A bare string is the likely mistake and the dangerous one:
+        it iterates into characters, so `fields="properties.title"` would
+        publish paths named `p`, `r`, `o`... and refuse every real
+        filter with a list of letters."""
+        with pytest.raises(expected):
+            rerank_policy(fields=fields)
+
+    def test_a_template_that_is_not_a_rerank_refuses(self):
+        from hopai.json_api import RerankPolicy
+        with pytest.raises(TypeError, match="must be a Rerank"):
+            RerankPolicy(lambda query, documents: [1.0], fields=["properties.title"])
+
+    @pytest.mark.parametrize("ceiling", [0, True, "100"])
+    def test_a_malformed_ceiling_refuses(self, ceiling):
+        with pytest.raises(ValueError, match="max_candidates"):
+            rerank_policy(max_candidates=ceiling)
+
+    def test_one_candidate_is_still_a_list_of_candidates(self):
+        """The base's own call-shape refusal, which must survive the
+        guard: a dict iterates its KEYS, so building documents from one
+        candidate would run the filter against the string 'id' and
+        blame the filter for the call."""
+        from hopai.json_api import parse_rerank
+        rerank = parse_rerank({}, rerank_policy(), "start.rerank")
+        with pytest.raises(TypeError, match="Pass \\[candidate\\]"):
+            rerank.build_documents({"id": "7", "properties": {"title": "Raft"}})
+
+    def test_the_async_path_hides_the_provider_too(self):
+        """hopai/asyncio.py awaits ascore(), so a leak fixed only in
+        score() would come straight back on the async read path -- which
+        is the one an MCP server over HTTP would eventually reach."""
+        import asyncio
+
+        from hopai import RerankError
+        from hopai.json_api import parse_rerank
+
+        async def explode(query, documents):
+            raise RuntimeError("401 for key sk-live-DEADBEEF")
+
+        rerank = parse_rerank({}, rerank_policy(client=explode), "start.rerank")
+        with pytest.raises(RerankError) as exc:
+            asyncio.run(rerank.ascore("q", ["a document"]))
+        assert "DEADBEEF" not in str(exc.value) and "server-side failure" in str(exc.value)
+        # Which reranking stage died: a traversal can carry one filter
+        # per step, so a message naming none (or `document_from=None`)
+        # says only that "the reranker" failed somewhere.
+        assert str(exc.value).startswith("rerank=(document_from='.properties.title'): "
+                                         "the reranking provider call failed")
+
+    def test_the_async_path_still_scores_when_the_provider_works(self):
+        """The guard changes failures only -- a wrapper that swallowed
+        the answer would pass every leak test above."""
+        import asyncio
+
+        from hopai.json_api import parse_rerank
+
+        async def score(query, documents):
+            return [float(len(d)) for d in documents]
+
+        rerank = parse_rerank({}, rerank_policy(client=score), "start.rerank")
+        assert asyncio.run(rerank.ascore("q", ["abc"])) == [3.0]
+
+    def test_a_flat_search_reranks_at_the_top_level(self):
+        """`rerank` sits beside `near` on a search spec rather than
+        inside a step, because a flat search has ONE ranked list and one
+        place to reorder it -- and the policy has to reach
+        Graph.vector_search(), or the tool would advertise reranking and
+        quietly return similarity order."""
+        from hopai.json_api import vector_search_json
+        graph = TestToolSchema.offgraph()
+        seen = {}
+        graph.vector_search = lambda *near, **options: seen.update(options) or []
+        vector_search_json(graph, {"near": {"field": "s", "text": "x"}, "k": 3,
+                                   "rerank": {"document_from": ".properties.body"}},
+                           rerank=rerank_policy())
+        assert seen["rerank"].document_from == ".properties.body"
+
+    def test_a_search_spec_refuses_reranking_with_nothing_configured(self):
+        """Refused before the query is built, not after: a spec asking
+        for a stage that cannot run must not first spend a round trip."""
+        from hopai.json_api import vector_search_json
+        with pytest.raises(ValueError, match="RerankPolicy"):
+            vector_search_json(TestToolSchema.offgraph(),
+                               {"near": {"field": "s", "text": "x"}, "rerank": {}})
+
+    def test_a_template_over_its_own_ceiling_refuses(self):
+        """A spec naming no `candidates` inherits the template's, so
+        this configuration would make every default call refuse for a
+        reason that is the operator's rather than the caller's."""
+        with pytest.raises(ValueError) as exc:
+            rerank_policy(candidates=200, max_candidates=100)
+        assert "200" in str(exc.value) and "100" in str(exc.value)
+
+
+class TestASpecSuppliedFilterNeverQuotesTheRow:
+    """MEASURED: 3 of 5 jq runtime type errors quote the offending value
+    verbatim (`string ("SSN-123-45-6789") cannot be parsed as a
+    number`), and two of _evaluate()'s own repr the value the filter
+    produced. `fields=` decides what a filter may READ, so this is not a
+    privilege escalation -- it is a row value taking a route out of the
+    process that nobody chose, into a tool result and whatever logs the
+    far side keeps. A Rerank written in Python keeps jq's own message;
+    one parse_rerank() built does not."""
+
+    SECRET = "SSN-123-45-6789"
+
+    def candidate(self, **extra) -> dict:
+        return {"id": "7", "properties": {"title": self.SECRET, **extra},
+                "similarity": 0.5, "similarities": {}, "boosts": {}}
+
+    def built(self, document_from: str, **options):
+        from hopai.json_api import parse_rerank
+        return parse_rerank({"document_from": document_from},
+                            rerank_policy(**options), "start.rerank")
+
+    def test_a_jq_runtime_error_names_the_filter_and_the_candidate_and_nothing_else(self):
+        """`tonumber` on text is the measured case. Without the guard
+        the tool result carries the row's own value; with it, a model
+        still learns which filter failed on which candidate and how to
+        fix it."""
+        rerank = self.built(".properties.title | tonumber")
+        with pytest.raises(ValueError) as exc:
+            rerank.build_documents([self.candidate()])
+        message = str(exc.value)
+        assert self.SECRET not in message
+        assert ".properties.title | tonumber" in message and "id='7'" in message
+        assert "tonumber" in message and "//" in message          # names the fix
+        # Anchored across the JOINS between adjacent string literals:
+        # each part is mutated on its own, so a fragment sitting wholly
+        # inside one survives its neighbour being recased or XX-wrapped
+        # while looking like it covered the message.
+        assert ("-- jq itself failed on that row -- most often a type mismatch, such as "
+                "adding text to a number or asking tonumber() of something that is not "
+                "one. The underlying") in message
+        assert message.endswith(
+            "Guard every field the row may not have, e.g. "
+            "'(.properties.title // \"\") + \": \" + (.properties.summary // \"\")'")
+
+    def test_a_non_string_document_is_refused_without_repring_it(self):
+        """_evaluate()'s own message reprs the value -- here a number
+        that is the row's, not the filter's."""
+        rerank = self.built(".properties.pin",
+                            fields=["properties.title", "properties.pin"])
+        with pytest.raises(ValueError) as exc:
+            rerank.build_documents([self.candidate(pin=90210)])
+        message = str(exc.value)
+        assert "90210" not in message
+        assert "not a string" in message and "id='7'" in message
+        # Both outer edges of the message, pinned where the literals
+        # join: `tostring` AFTER the default is the whole fix here, and
+        # a fix a model cannot read costs it the retry the guard was
+        # supposed to save.
+        assert message.startswith(
+            "document_from='.properties.pin' could not build a document for candidate "
+            "id='7' -- it evaluated to something that is not a string. The underlying")
+        assert message.endswith(
+            "Put the default BEFORE the conversion, e.g. "
+            "'.properties.year // \"unknown\" | tostring'")
+
+    def test_a_filter_selecting_nothing_still_names_the_fix(self):
+        """The common case, and the one with no row data in it either
+        way -- so the guard must not flatten every failure into one
+        message: "give it a fallback" is the fix here and nonsense for
+        a type error."""
+        rerank = self.built('.properties.title | select(. == "no")')
+        with pytest.raises(ValueError) as exc:
+            rerank.build_documents([self.candidate()])
+        message = str(exc.value)
+        assert "no document at all" in message
+        assert "untitled" in message
+        # Straddling every join in this branch: the reason into the
+        # sentence that follows it, the whole "why you are not being
+        # told more" clause into the fix, and the fix out to the end.
+        assert "-- it produced no document at all, or more than one. The underlying" in message
+        assert ("The underlying error is not repeated here, because it quotes that row's "
+                "own values and this document is posted to a reranking provider. Give it "
+                "a fallback") in message
+        assert message.endswith(
+            "Give it a fallback (e.g. '.properties.title // \"untitled\"'), or wrap "
+            "several outputs into one (e.g. '[.properties.tags[]] | join(\", \")')")
+
+    def test_an_unsafe_filter_still_reports_itself(self):
+        """The guard catches ValueError, and UnsafeFilter IS one --
+        flattening it would replace "`env` is not available, read a
+        property instead" with a message about a candidate, which
+        blames the row for the filter."""
+        from hopai.jqsafe import UnsafeFilter
+        rerank = self.built(".properties.title")
+        with pytest.raises(UnsafeFilter) as exc:
+            rerank.build_documents([self.candidate()], fields=["properties.other"])
+        assert "properties.other" in str(exc.value)
+
+    def test_a_spent_provider_failure_never_quotes_the_provider(self):
+        """An SDK exception's repr can carry the configuration it was
+        constructed with, API key included, and RerankError quotes it
+        verbatim so a Python caller can debug. A Python caller is inside
+        the trust boundary; the far side of a tool call is not."""
+        from hopai import RerankError
+
+        def explode(query, documents):
+            raise RuntimeError("401 Unauthorized for key sk-live-DEADBEEF")
+
+        rerank = self.built(".properties.title", client=explode)
+        with pytest.raises(RerankError) as exc:
+            rerank.score("a query", ["a document"])
+        assert "DEADBEEF" not in str(exc.value) and "401" not in str(exc.value)
+        assert "server-side failure" in str(exc.value)
+        # What the caller is still meant to learn: WHICH reranking
+        # stage died. A traversal carries one filter per step, so
+        # `document_from=None` here would leave an operator reading a
+        # server log with nothing to grep for.
+        assert str(exc.value).startswith("rerank=(document_from='.properties.title'): "
+                                         "the reranking provider call failed")
+
+    def test_a_working_reranker_is_untouched_by_any_of_it(self):
+        """The guard must change failures only. If it changed the
+        documents or the scores, every one of the tests above would
+        still pass and the feature would be broken."""
+        rerank = self.built(".properties.title", client=lambda q, d: [len(x) for x in d])
+        assert rerank.build_documents([self.candidate()]) == [self.SECRET]
+        assert rerank.score("q", ["abc"]) == [3.0]
+
+
 class TestJsonSpecTranslation:
     def test_full_spec(self):
         start, hops = spec_to_traversal({
@@ -833,6 +1421,51 @@ class TestToolSchema:
         assert set(properties["hops"]["items"]["properties"]) == _HOP_KEYS - {"label"}
         assert set(properties["start"]["properties"]) == _START_KEYS - {"label"}
 
+    def test_the_search_schema_advertises_the_keys_its_parser_reads(self):
+        """The same derivation test_advertises_the_keys_the_parser_reads
+        makes for a traversal, for the flat search -- which had none, so
+        `rerank` could have reached _SEARCH_KEYS with nothing advertising
+        it. No omissions here at all: `label` groups nothing in a flat
+        result and "vector" lives one level down inside the near spec,
+        which tests/test_vectors.py pins."""
+        from hopai import VECTOR_SEARCH_TOOL_SCHEMA
+        from hopai.json_api import _SEARCH_KEYS
+        assert set(VECTOR_SEARCH_TOOL_SCHEMA["parameters"]["properties"]) == _SEARCH_KEYS
+
+    def test_the_rerank_spec_shows_a_whole_candidate_and_a_worked_filter(self):
+        """`document_from` is the one parameter whose value is CODE, and
+        a model writes markedly better jq shown a concrete candidate
+        than told about one in prose. So the description has to carry
+        the whole shape a filter runs against AND one filter that works
+        on it -- a description that only said "a jq filter over the
+        candidate" is what left a model guessing whether `.title` or
+        `.properties.title` is the path.
+
+        Pinned as a parsable object rather than as a sentence, so the
+        prose around it stays free to reword: what must survive is that
+        the example is a real candidate with the keys the read path
+        actually produces."""
+        spec = TRAVERSE_TOOL_SCHEMA["parameters"]["$defs"]["rerank"]["properties"]
+        description = spec["document_from"]["description"]
+        example = json.loads(description[description.index("{"):description.rindex("}") + 1])
+        assert set(example) == {"id", "properties", "similarity", "similarities", "boosts"}
+        assert "title" in example["properties"]
+        # The worked filter, and the guard that keeps a missing property
+        # from producing no document at all.
+        assert ".properties.title" in description and '// ""' in description
+        # `.paths` is hop-only, and "you have to know that" is the kind
+        # of gap this library treats as a defect.
+        assert "paths" in description and "never on `start`" in description
+
+    def test_the_rerank_spec_says_which_bound_candidates_is(self):
+        """`candidates` and `keep`/`k` are the two numbers most easily
+        confused, and LanceDB's own API confuses them (a `top_n` on the
+        reranker beside the query's `.limit()`). The description has to
+        say which end it bounds, or a model sets it to the answer size
+        and reranks a pool it cannot reorder."""
+        spec = TRAVERSE_TOOL_SCHEMA["parameters"]["$defs"]["rerank"]["properties"]
+        assert "INPUT bound" in spec["candidates"]["description"]
+
     def test_direction_enum_matches_what_hop_accepts(self):
         for direction in TRAVERSE_TOOL_SCHEMA["parameters"]["properties"]["hops"]["items"] \
                 ["properties"]["direction"]["enum"]:
@@ -882,9 +1515,13 @@ class TestToolSchema:
     def test_tool_schemas_without_a_schema_are_the_constants_uncoupled(self):
         """Schema stays optional: no schema means the static definitions,
         equal but never SHARED -- an integration mutating its copy must
-        not corrupt the module constants every other caller reads."""
+        not corrupt the module constants every other caller reads.
+
+        `rerank=True` here so the comparison is against the constants as
+        written; the default strips `rerank`, which the two tests below
+        pin separately."""
         from hopai import INGEST_TOOL_SCHEMA, MUTATE_TOOL_SCHEMA
-        tools = self.offgraph().tool_schemas()
+        tools = self.offgraph().tool_schemas(rerank=True)
         assert tools == [TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA,
                          MUTATE_TOOL_SCHEMA]
         tools[0]["description"] = "vandalized"
@@ -892,14 +1529,147 @@ class TestToolSchema:
         assert TRAVERSE_TOOL_SCHEMA["description"] != "vandalized"
         assert INGEST_TOOL_SCHEMA["parameters"]["properties"]
 
+    def test_a_bare_graph_does_not_advertise_rerank(self):
+        """A Graph holds no reranker -- the client is the operator's and
+        arrives via serve(rerank=) or traverse_json(rerank=Policy) -- so
+        a spec carrying `rerank` against one is refused BY NAME. A schema
+        offering a parameter its handler rejects every time is the defect
+        CLAUDE.md names, and it is the judgement that already keeps the
+        vector-search tool out of this list for a graph with no vectors."""
+        blob = json.dumps(self.offgraph().tool_schemas())
+        assert "rerank" not in blob
+
+    @staticmethod
+    def _named_anywhere(schema: dict) -> set:
+        """Every name a model can fill in, nested included -- the walker
+        tests/test_vectors.py uses for `vector`, plus the $defs keys
+        themselves, since a $def is reached BY NAME through $ref."""
+        found = set()
+
+        def walk(node):
+            if isinstance(node, dict):
+                for name, child in (node.get("properties") or {}).items():
+                    found.add(name)
+                    walk(child)
+                for key in ("items", "additionalProperties", "anyOf", "oneOf", "allOf"):
+                    walk(node.get(key))
+                for name, child in (node.get("$defs") or {}).items():
+                    found.add(name)
+                    walk(child)
+            elif isinstance(node, list):
+                for child in node:
+                    walk(child)
+
+        walk(schema.get("parameters", schema))
+        return found
+
+    def test_the_search_tool_drops_rerank_at_its_top_level_too(self):
+        """On a flat search `rerank` sits BESIDE `near` rather than
+        inside a step, so the loop that strips the traversal tools never
+        reaches it -- without_rerank() needs its own top-level branch,
+        and the test above cannot see this one because a bare graph
+        publishes no search tool at all (no declared vectors, no tool).
+
+        Without the branch, a bare Graph advertises `rerank` on
+        search_graph_by_meaning while vector_search_json() with no
+        policy refuses that key BY NAME: a parameter whose handler
+        rejects every use of it, the defect CLAUDE.md names. Walked over
+        the whole schema rather than grepped, so descriptions stay free
+        to discuss reranking in prose."""
+        from hopai import Vector
+        graph = self.offgraph()
+        graph.define_vectors(nodes=[Vector("summary", 3)])
+        tools = graph.tool_schemas()
+        assert any(tool["name"] == "search_graph_by_meaning" for tool in tools)
+        for tool in tools:
+            assert "rerank" not in self._named_anywhere(tool), tool["name"]
+
+    def test_rerank_true_keeps_it_for_a_caller_that_has_one(self):
+        """hopai.mcp builds ON these schemas rather than beside them, so
+        the parameter has to survive long enough for serve(rerank=) to
+        fill in its published fields and ceiling. Stripping it
+        unconditionally would leave that surface with nothing to
+        configure."""
+        blob = json.dumps(self.offgraph().tool_schemas(rerank=True))
+        assert "rerank" in blob
+
+    def test_a_policy_where_a_bool_belongs_is_refused_not_swallowed(self):
+        """`rerank` is CHECKED, not coerced -- the `all="false"` rule.
+        A RerankPolicy is truthy, so tool_schemas(rerank=policy) was
+        tool_schemas(True) exactly: the policy silently discarded and
+        the model shown the abstract "the application may cap this"
+        sentences instead of the published field list and the real
+        ceiling it was handed. A truthy non-bool selecting a WEAKER
+        behaviour than the caller asked for is the defect the
+        invariants name.
+
+        The refusal names the TYPE that arrived, because that is what
+        tells the caller which of their arguments went where: reporting
+        a fixed "NoneType" would describe a call nobody made. Asserted
+        with its negative half -- the class name turns up elsewhere in
+        the sentence, so only "got RerankPolicy" plus "no NoneType"
+        pins the interpolation itself."""
+        from hopai import Rerank, RerankPolicy
+        policy = RerankPolicy(Rerank(lambda query, documents: [0.0] * len(documents),
+                                     document_from=".properties.title"),
+                              fields=["properties.title"], max_candidates=120)
+        with pytest.raises(TypeError) as refused:
+            self.offgraph().tool_schemas(rerank=policy)
+        message = str(refused.value)
+        # It names where a policy DOES belong: a Graph cannot publish
+        # one's fields or ceiling -- that rewrite is hopai.mcp's, and
+        # core.py must not import the MCP front end to borrow it.
+        assert "rerank= is True or False" in message
+        assert "hopai.mcp.serve(rerank=" in message and "traverse_json" in message
+        assert "got RerankPolicy. A Graph" in message
+        assert "NoneType" not in message
+
+    @pytest.mark.parametrize("truthy", [1, "true", ["yes"]])
+    def test_no_truthy_value_stands_in_for_the_bool(self, truthy):
+        """The string "true" arriving where a JSON boolean was meant is
+        an ordinary tool-call failure, and every one of these used to
+        mean rerank=True by accident."""
+        with pytest.raises(TypeError, match="rerank= is True or False"):
+            self.offgraph().tool_schemas(rerank=truthy)
+
+    def test_the_rerank_object_says_document_from_may_be_left_out(self):
+        """Served, `candidates` ends "Leave it out to use this server's
+        default of N" (hopai.mcp writes it in) and `document_from` had
+        no such sentence -- and the object has no "required" list, so a
+        model reads the one with no note as mandatory and writes a
+        filter where inheriting the application's own was both correct
+        and safer. The sentence has to live HERE, in the static text
+        both surfaces share; test_mcp.py pins that the server's own
+        rewrite does not lose it."""
+        spec = TRAVERSE_TOOL_SCHEMA["parameters"]["$defs"]["rerank"]
+        assert "required" not in spec
+        assert "NEITHER KEY BELOW IS REQUIRED" in spec["description"]
+        assert "Leave it out" in spec["properties"]["document_from"]["description"]
+
+    def test_the_rerank_object_states_the_step_rule_for_candidates(self):
+        """`candidates` used to say only "at least keep/k". On a
+        traversal step it has to be MORE than `keep` -- equality is a
+        billed no-op there, because the order is discarded -- so a model
+        following the old sentence wrote a call that refuses."""
+        description = TRAVERSE_TOOL_SCHEMA["parameters"]["$defs"]["rerank"][
+            "properties"]["candidates"]["description"]
+        assert "MORE than `keep`" in description
+        assert "at least `k`" in description
+
     def test_tool_schemas_change_descriptions_only(self):
         """The parsers accept exactly what they accepted before, so the
         parameters sections must be byte-identical to the constants --
-        the schema is presentation here, not grammar."""
+        the DECLARED SCHEMA is presentation here, not grammar.
+
+        Read with rerank=True, because that is the claim: summarizing a
+        graph's vocabulary changes descriptions and nothing else. The one
+        grammar difference tool_schemas() makes is taking `rerank` off
+        when the caller has no reranker, which is a different decision
+        and is pinned by its own two tests above."""
         graph = self.offgraph()
         self.declare(graph)
         from hopai import INGEST_TOOL_SCHEMA, MUTATE_TOOL_SCHEMA
-        for tool, constant in zip(graph.tool_schemas(),
+        for tool, constant in zip(graph.tool_schemas(rerank=True),
                                   (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA,
                                    INGEST_TOOL_SCHEMA, MUTATE_TOOL_SCHEMA), strict=True):
             assert tool["parameters"] == constant["parameters"]

@@ -162,17 +162,49 @@ jobs:
       # waiting on: past this the run is stopped and whatever it finished
       # is reported as partial.
       #
-      # Raised from 900 because the budget is not spent on mutants
-      # alone. Before the first one, mutmut runs the whole suite for a
-      # baseline and again under tracing to map tests to lines, and that
-      # cost grows with the suite -- at ~1400 tests it consumed the old
-      # budget outright and the run reported zero checked, which reads
-      # like a clean sweep and is the opposite. The per-mutant cost is
-      # small by comparison (thousands checked inside the same budget
-      # once the baseline is paid), so headroom buys mutants, not
-      # waiting. If this is exhausted again the report now says so by
-      # name rather than blaming `also_copy`.
-      MUTATION_BUDGET_SECONDS: "1800"
+      # Raised from 900, then from 1800, and the reason is the same both
+      # times: the budget is not spent on mutants alone. Before the first
+      # one mutmut runs the whole suite for a baseline and again under
+      # tracing to map tests to lines, and that fixed cost grows with the
+      # suite -- at ~1400 tests it consumed 900s outright, and at ~2600 it
+      # consumed 1800s, each time reporting zero checked.
+      #
+      # MEASURED rather than guessed this time: at the 9-file scope of a
+      # large PR, the first mutant verdict arrives 321s in on a quiet
+      # developer machine. CI reached none inside 1800s, so a runner is
+      # several times slower than that -- tracing is the expensive half,
+      # and it slows every test in the suite at once. 3600 buys real
+      # mutants on a runner instead of only paying the entry fee.
+      #
+      # It is a budget, not a target: the report already distinguishes
+      # "stopped early, here is what it checked" from "checked nothing",
+      # so a partial run is honest evidence and only a zero run is not.
+      #
+      # Then 3600 turned out to be too long, and the failure mode is worth
+      # writing down because it is the opposite of the one above. mutmut
+      # DID work -- 7223 of 10775 mutants, 6924 killed, 297 survived -- and
+      # the job still went red, because the runner was reclaimed at ~42
+      # minutes ("received a shutdown signal") before `timeout` could stop
+      # mutmut itself. mutmut stopping is handled: exit 124 renders a
+      # partial report. The RUNNER stopping is not: the report step never
+      # runs, and honest partial evidence becomes a failed check.
+      #
+      # Then 2100 was reclaimed too, at 1720s -- INSIDE its own budget, so
+      # `timeout` never fired. Measured across two runs the runner gave us
+      # 1720s once and ~2500s the next: not a limit to compute against,
+      # just eviction. And when it happens every later step is SKIPPED --
+      # render report, upsert comment, enforce coverage -- so the job goes
+      # red having produced 5770 mutants' worth of evidence it then threw
+      # away.
+      #
+      # 900 is chosen to FINISH rather than to maximise mutants: ~15
+      # minutes of mutation on top of ~3 of coverage, well inside what has
+      # been survivable, for a few thousand mutants of real evidence.
+      # Nothing here is worth a red check on an advisory job -- a smaller
+      # honest report every time beats a bigger one that usually vanishes,
+      # and the number can go up again the day someone wants a deeper
+      # sweep and is willing to re-run it.
+      MUTATION_BUDGET_SECONDS: "900"
 
     steps:
       - uses: actions/checkout@v4
@@ -299,20 +331,41 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+        # BEST-EFFORT ON PURPOSE. Posting the comment is a convenience:
+        # the same report is already in $GITHUB_STEP_SUMMARY and uploaded
+        # as the quality-report artifact, so a failed API call loses a
+        # copy, not the evidence. It used to `set -e` on any gh failure,
+        # which meant one GitHub blip turned a green suite, a finished
+        # mutation run and a rendered report into a red check -- AND
+        # skipped `Enforce coverage threshold` below, so the cosmetic
+        # step could suppress the real gate. A ::warning:: says the
+        # comment is missing without pretending the code is broken.
         run: |
           set -euo pipefail
+          MISSING="the report is in the job summary and the quality-report artifact"
           # One comment per PR: find the previous one by its marker and
           # PATCH it, else POST. The body goes through json.dumps so no
           # markdown character can corrupt the payload.
           python -c "import json;print(json.dumps({'body': open('comment.md').read()}))" > payload.json
-          EXISTING=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            --jq '.[] | select(.body | startswith("<!-- hopai-pr-report -->")) | .id' | head -n1)
+          # gh's output is captured whole and narrowed afterwards, NOT
+          # piped into `head -n1`: head closes the pipe as soon as it has
+          # its line, and a --paginate still writing at that moment dies
+          # of SIGPIPE, which pipefail then reports as a failed step. The
+          # narrowing still has to happen -- --paginate applies --jq per
+          # PAGE, so two pages could each yield an id if the marker ever
+          # appears twice, and a two-line id would build a broken URL.
+          FOUND=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq 'first(.[] | select(.body | startswith("<!-- hopai-pr-report -->")) | .id) // empty') \
+            || { echo "::warning::could not list PR comments; ${MISSING}"; exit 0; }
+          EXISTING=$(printf '%s\n' "${FOUND}" | head -n1)
           if [ -n "${EXISTING}" ]; then
-            gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING}" --input payload.json >/dev/null
-            echo "updated sticky comment ${EXISTING}"
+            gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING}" --input payload.json >/dev/null \
+              && echo "updated sticky comment ${EXISTING}" \
+              || echo "::warning::could not update sticky comment ${EXISTING}; ${MISSING}"
           else
-            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" --input payload.json >/dev/null
-            echo "created sticky comment"
+            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" --input payload.json >/dev/null \
+              && echo "created sticky comment" \
+              || echo "::warning::could not create the sticky comment; ${MISSING}"
           fi
 
       - uses: actions/upload-artifact@v4
@@ -327,7 +380,13 @@ jobs:
           if-no-files-found: ignore
 
       - name: Enforce coverage threshold
-        # Last, so the comment is already posted when this fails.
+        # Last, so the comment is already posted when this fails -- but
+        # `always()` so that ordering cannot become a dependency. Without
+        # it a step above failing SKIPS this one, and the job goes red
+        # for that failure while the number this job exists to check went
+        # unread. The gate is what decides the check; everything above it
+        # is reporting.
+        if: always()
         run: |
           set -euo pipefail
           PERCENT=$(python -c "

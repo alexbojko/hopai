@@ -19,6 +19,14 @@ updates, real constraints and vector search, through a Python API, a JSON
 one, and a Cypher subset, so an LLM agent and a human developer can both use
 it with nothing new to learn.
 
+> **Early and moving.** hopai is pre-1.0 (`0.0.x`). Every `feat`/`fix`
+> release may change an interface — a method signature, a JSON key, a
+> refusal's exact wording — without a deprecation cycle; pin a version if
+> that would break you. Schema migrations don't exist yet either:
+> `drop_schema()` + `create_schema()` is the upgrade path for now. See the
+> [changelog](https://github.com/alexbojko/hopai/blob/main/CHANGELOG.md)
+> before bumping.
+
 ## ⚡ Quick start
 
 ```bash
@@ -95,6 +103,26 @@ similarity instead of only filtering by property. See
 [Vector search](https://hopai.readthedocs.io/en/latest/reference/vector-search/)
 in the table below.
 
+**Reranking is the third stage** — retrieve wide and cheap with the cosine
+above, then actually read each candidate against the query before keeping
+`k`. It attaches to a flat search and to a traversal step alike:
+
+```python
+import cohere
+from hopai import Rerank
+
+reader = Rerank(cohere.ClientV2(), model="rerank-v3.5",
+                document_from='.properties.title + ": " + .properties.summary',
+                candidates=50)                                # pool the reranker sees
+
+graph.vector_search(Near("summary", "distributed consensus"), rerank=reader, k=10)
+```
+
+No provider package imported here either — a Cohere/Voyage client, a
+`sentence-transformers` `CrossEncoder`, or a plain callable all work. See
+[Reranking](https://hopai.readthedocs.io/en/latest/reference/reranking/) in
+the table below.
+
 Every one of these compiles through the same query builder, so the SQL, the
 semantics and the invariants are identical no matter which front end wrote
 the call. The ["Learn more"](#-learn-more) table below is where each one's
@@ -122,6 +150,11 @@ full reference lives.
   some text, then walk the graph from there, in one call. Exact cosine
   similarity on plain `real[]` columns, no pgvector, multivector queries,
   and a field-level `embed=` so you can hand it text instead of floats.
+- 🎯 **Reranking, including inside the walk** — `Rerank(client,
+  document_from='<jq>')` adds a third retrieval stage to a search *and* to
+  a traversal step, where a candidate is a node plus how it was reached. A
+  model may write the projection: it's validated against a total jq subset
+  in which `env` doesn't parse.
 - 🧪 **Tested like it matters** — an 85% coverage gate and mutation testing
   in CI, and real benchmark numbers in `benchmarks/`.
 
@@ -180,6 +213,7 @@ tier of this table that is structurally unable to go stale:
 | Traversal: direction, hop count, `OPTIONAL` | [`02_traversal`](notebooks/02_traversal.ipynb) | [Traversal](https://hopai.readthedocs.io/en/latest/reference/traversal/) |
 | Aggregation | [`03_aggregation`](notebooks/03_aggregation.ipynb) | [Aggregation](https://hopai.readthedocs.io/en/latest/reference/aggregation/) |
 | Vector search, hybrid ranking, text-to-vector embedding | [`09_vector_search`](notebooks/09_vector_search.ipynb) | [Vector search](https://hopai.readthedocs.io/en/latest/reference/vector-search/) |
+| Reranking — the third retrieval stage, including step-wise | [`10_reranking`](notebooks/10_reranking.ipynb) | [Reranking](https://hopai.readthedocs.io/en/latest/reference/reranking/) |
 | The JSON interface | [`04_json_and_cypher`](notebooks/04_json_and_cypher.ipynb) | [JSON interface](https://hopai.readthedocs.io/en/latest/reference/json-interface/) |
 | Cypher as input syntax | [`04_json_and_cypher`](notebooks/04_json_and_cypher.ipynb) | [Cypher](https://hopai.readthedocs.io/en/latest/reference/cypher/) |
 | What this doesn't do (yet), and why each refusal is a refusal | — | [Limits](https://hopai.readthedocs.io/en/latest/reference/limits/) |

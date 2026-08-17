@@ -109,7 +109,7 @@ markdown_extensions:
 nav:
   - Overview: index.md
   - Notebooks:
-      - All nine: notebooks/README.md
+      - All ten: notebooks/README.md
       - 01 · Quick start: notebooks/01_quickstart.ipynb
       - 02 · Traversal: notebooks/02_traversal.ipynb
       - 03 · Aggregation: notebooks/03_aggregation.ipynb
@@ -119,6 +119,7 @@ nav:
       - 07 · Many graphs: notebooks/07_many_graphs.ipynb
       - 08 · Under the hood: notebooks/08_under_the_hood.ipynb
       - 09 · Vector search: notebooks/09_vector_search.ipynb
+      - 10 · Reranking: notebooks/10_reranking.ipynb
   - Reference:
       - Schema: reference/schema.md
       - Many graphs, one database: reference/multi-graph.md
@@ -130,6 +131,7 @@ nav:
       - Traversal, direction and OPTIONAL: reference/traversal.md
       - Aggregation: reference/aggregation.md
       - Vector search: reference/vector-search.md
+      - Reranking: reference/reranking.md
       - The JSON interface: reference/json-interface.md
       - Cypher as input syntax: reference/cypher.md
       - What this doesn't do (yet): reference/limits.md
@@ -143,6 +145,7 @@ nav:
       - hopai.constraints: api/constraints.md
       - hopai.schema: api/schema.md
       - hopai.vectors: api/vectors.md
+      - hopai.rerankers: api/rerankers.md
       - hopai.embeddings: api/embeddings.md
       - hopai.cypher: api/cypher.md
       - hopai.json_api: api/json_api.md

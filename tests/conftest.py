@@ -190,21 +190,62 @@ def write_engine(engine):
     eng.dispose()
 
 
+def _vector_columns():
+    """The vec_* columns currently attached to the shared Node/Edge
+    tables, as {table: {name: column}}."""
+    from hopai.models import Edge, Node
+    from hopai.vectors import VECTOR_COLUMN_PREFIX
+    return {table: {name: column for name, column in table.c.items()
+                    if name.startswith(VECTOR_COLUMN_PREFIX)}
+            for table in (Node, Edge)}
+
+
 @pytest.fixture()
 def fresh_graph(write_engine):
     """An empty graph with hopai's own schema, rebuilt for every test.
 
     Constraints are schema-level and outlive a TRUNCATE, so tests that
     declare them would leak into the next test. Dropping the schema is
-    the only isolation that actually holds."""
+    the only isolation that actually holds.
+
+    THE SAME IS TRUE OF vec_* COLUMNS, one level up: define_vectors()
+    attaches them to the shared SQLAlchemy Table metadata, which is
+    process-global, and create_schema() above emits every column ever
+    attached. Dropping the SCHEMA does not undo that -- so a field one
+    test declared is silently CREATED for every later test, and a test
+    that needs a declared-but-never-migrated column cannot reach that
+    state at all.
+
+    Within one pytest run this is invisible, because such tests declare
+    a name nothing else uses. It stops being invisible the moment the
+    suite runs TWICE IN ONE PROCESS, which is exactly what mutmut does:
+    the second pass inherits the first pass's columns, four tests in
+    TestSearchRefusalsNameTheRightFixLive stop raising, and mutmut's
+    baseline fails -- so it aborts before checking a single mutant and
+    every PR reports mutation as though nothing needed triage. That was
+    live on main; see the pr_report fix that made it visible.
+
+    So the fixture restores the attachment set it was given. It removes
+    only what the test ADDED, never what it inherited, so a module that
+    legitimately declares vectors at import time is untouched."""
     from hopai import Graph
 
+    before = _vector_columns()
     with write_engine.begin() as conn:
         conn.execute(text(f"DROP SCHEMA IF EXISTS {WRITE_SCHEMA} CASCADE"))
         conn.execute(text(f"CREATE SCHEMA {WRITE_SCHEMA}"))
     graph = Graph(write_engine)
     graph.create_schema()
-    return graph
+    yield graph
+
+    # `_columns.remove()` is SQLAlchemy-private because removing a column
+    # from a live Table is not a thing an application does -- but a test
+    # process that reuses the metadata is not an application, and there
+    # is no public inverse of append_column().
+    for table, kept in before.items():
+        for name, column in list(table.c.items()):
+            if name.startswith("vec_") and name not in kept:
+                table._columns.remove(column)
 
 
 @pytest.fixture()

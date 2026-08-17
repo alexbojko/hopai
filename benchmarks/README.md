@@ -85,6 +85,59 @@ the main README) and the restructuring itself would touch every boost
 call site — a real optimization if `Boost` is ever profiled at that
 scale, not a correctness concern either way.
 
+## Building reranker documents
+
+```bash
+python bench_documents.py           # no database, no network, no arguments
+```
+
+Nothing here measured `Rerank.build_documents()`, which is why a 121ms
+event-loop block lived in the reranking path with a green suite in front
+of it. This measures µs/row against **row size** — the axis that was
+invisible — and reports both the CPU cost and how long the event loop
+went without its thread while the build ran.
+
+The cost was never the filter's. `document_from` is evaluated through
+`program.input_value(candidate)`, and `input_value` marshals the
+**whole candidate** into jq's value representation before the filter
+reads a field of it. So the price was proportional to the *candidate*,
+not to the *projection*: `.properties.title` (60 characters out) cost
+the same as `.properties.field_0` on the same 100KB row, because both
+handed jq 100KB. `fields=` narrows what a filter may **read**; it never
+narrowed what jq was **handed**.
+
+Recorded during development (jq 1.12, one core, 50 candidates,
+`.properties.title`), before pruning against after:
+
+| KB per row | before | after | build held the loop, before → after |
+| ---: | ---: | ---: | --- |
+| 1 | 40 µs/row | 10 µs/row | 2.2 ms → 0.7 ms |
+| 10 | 327 µs/row | 10 µs/row | 15.5 ms → 0.7 ms |
+| 100 | 2879 µs/row | 13 µs/row | 146 ms → 0.7 ms |
+| 500 | 15685 µs/row | 21 µs/row | 719 ms → 1.4 ms |
+
+The transferable number is **`us_per_kb`**: the slope against payload,
+**31.4 before and 0.02 after**. A run where it climbs back toward 25–30
+is the regression this file exists to catch — `build_documents()` now
+hands jq only the paths `jqsafe.paths_read()` says the filter reads
+(`hopai/rerankers.py`'s `_projection_paths`/`_pruned`), and anything
+that widens what is handed over puts the slope back.
+
+`longest_gap_ms` in the same run is the least ambiguous of the three
+loop numbers: how long, in one stretch, a 1ms ticker did not get the
+thread. At 500KB it *equalled the build* — 719 ms, 0 ticks/s against an
+idle 970 — total starvation, the signature of a `time.sleep` rather than
+of a slow function. That is precisely what `ticks > 0` in
+`tests/test_async.py` could not distinguish from scheduling noise, and
+why those tests now compare against an idle baseline ratio instead.
+
+One knob to know about before running this at scale: `build_documents()`
+refuses above **`MAX_DOCUMENTS` (5000)**. `candidates=` bounds the
+*nodes* a step offers, but `per_path=True` bills one document per
+(node, route) and the route count is the graph's answer, not an option's
+— `candidates=500` over nodes reached 200 ways measured **4.64 s** of
+document building before a single provider call.
+
 ## Comparing against Neo4j and Apache AGE
 
 These require separate running instances this repo doesn't set up for

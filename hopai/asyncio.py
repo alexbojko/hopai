@@ -51,6 +51,15 @@ embeddings.py). By the time fn runs, every Near/row it sees already
 carries a plain vector, so the sync functions below make no provider
 call of their own and need no changes to stay correct.
 
+RERANKING IS THE SECOND NETWORK CALL ON THE READ PATH (issue #73) and
+lands in exactly the same trap, from the other end: it scores rows the
+database has already returned. So every rerank below is awaited AFTER
+the connection block has closed and OUTSIDE run_sync() -- the SQL
+fetches `rerank.candidates` rows, the bridge closes, and only then
+does the provider see them. A reranked traversal has its own driver
+(_rerank_pins() below), which is the same shape once per reranked
+step: probe through the bridge, score outside it.
+
 NEEDS AN ASYNC DRIVER. psycopg2 (hopai's base dependency) cannot run
 async -- use postgresql+psycopg://... (psycopg3; `pip install
 hopai[asyncio]`) or postgresql+asyncpg://.... greenlet itself needs no
@@ -122,6 +131,17 @@ _NEEDS_SYNC_GRAPH = frozenset({
     # sync facade outside the greenlet bridge, same MissingGreenlet trap
     # as every other admin call in this list.
     "load_vectors",
+    # graphs() is the one that FELL OUT of this list rather than never
+    # being considered for it, which is why it is worth a comment of its
+    # own: it opens self.engine.connect() directly (core.py), so on an
+    # AsyncGraph it reaches the async engine's sync facade outside the
+    # bridge and raises SQLAlchemy's MissingGreenlet -- from a call that
+    # looks, and is spelled, exactly like the admin calls above. Nothing
+    # exercised its absence, so nothing said it was gone;
+    # TestOutOfScope now derives its parametrization from this set so a
+    # name added here cannot skip its own test, and a name missing from
+    # here cannot pass by not being listed.
+    "graphs",
     # embed_stale() (issue #74's own review) walks a whole field in
     # PAGES, each its OWN embed call and its OWN transaction -- the
     # opposite of "resolve everything, then open one transaction" every
@@ -213,45 +233,125 @@ class AsyncGraph:
 
     # -- reading ----------------------------------------------------
 
+    async def _rerank_pins(self, start: Start, hops: list, plan: dict) -> dict:
+        """Graph._rerank_pins(), with the provider call AWAITED.
+
+        The probe and the hydration go through run_sync() -- they are
+        ordinary SQL -- and the scoring does not: inside the bridge it
+        would run on the event loop's own thread and stall every other
+        task for the length of the round trip, which is issue #74's
+        finding applied to the second network call on the read path.
+        The session is closed before the await for the reason the sync
+        driver closes it: a provider round trip must never happen with a
+        transaction open.
+
+        Serial by nature, and that is not a shortcut taken here: hop
+        N+1's candidates ARE hop N's survivors, so there is nothing to
+        gather.
+
+        Everything except the await is the sync driver's, imported
+        rather than restated -- which document each candidate becomes,
+        how a node scores across its paths, and how many survive are
+        one set of rules, and a second copy is how the two paths drift
+        into pinning different nodes for the same query."""
+        from .core import _rerank_documents, _rerank_steps, _rerank_survivors
+
+        pins: dict = {}
+        for index, spec in _rerank_steps(start, hops):
+            async with AsyncSession(self._async_engine) as session:
+                candidates = await session.run_sync(
+                    lambda s, i=index: self._sync._rerank_probe(s, start, hops, i, pins))
+            units = _rerank_documents(candidates, spec.rerank)
+            if not units:
+                pins[index] = []
+                continue
+            documents = spec.rerank.build_documents([candidate for _, candidate in units])
+            scores = await spec.rerank.ascore(plan[index], documents)
+            pins[index] = _rerank_survivors(units, scores, spec.keep)
+        return pins
+
+    async def _reranked(self, start: Start, hops: list) -> tuple:
+        """(start, hops, pins) -- every provider call on the traversal
+        path made, awaited, before anything opens.
+
+        Both network calls on this path in one place and in this order,
+        because the order is the whole point. aresolve_spec_texts()
+        embeds every Near(text=) before run_sync() ever runs (issue
+        #74); _rerank_pins() then scores, also awaited, with nothing
+        open (issue #73).
+
+        The rerank plan is read from the specs AS WRITTEN, BEFORE they
+        are resolved: `Near._with_vector()` hands back a spec carrying
+        floats and no text, and the reranker's query is that text.
+        Reversing these two lines loses it."""
+        from .core import rerank_plan
+        from .vectors import aresolve_spec_texts
+
+        plan = rerank_plan(start, hops)
+        start, hops = await aresolve_spec_texts(self._sync, start, hops)
+        pins = await self._rerank_pins(start, hops, plan) if plan else None
+        return start, hops, pins
+
     async def traverse(self, start: Start, *hops: Hop) -> Subgraph:
         from .core import validate_optional_positions
-        from .vectors import aresolve_spec_texts
         # Shape checks the sync build_query() would raise on BEFORE it
         # ever reaches a Near -- run here too, so a chain that is about
-        # to be refused is never embedded first (issue #74's own review;
-        # see validate_optional_positions()'s docstring).
+        # to be refused is never embedded (or reranked) first (issue
+        # #74's own review; see validate_optional_positions()'s
+        # docstring).
         validate_optional_positions(list(hops))
-        start, hops = await aresolve_spec_texts(self._sync, start, list(hops))
+        start, hops, pins = await self._reranked(start, list(hops))
         async with AsyncSession(self._async_engine) as session:
             return await session.run_sync(
-                lambda s: self._sync._traverse_with_session(s, start, hops))
+                lambda s: self._sync._traverse_with_session(s, start, hops, pins=pins))
 
     async def aggregate(self, start: Start, *hops: Hop, aggregates: dict) -> dict:
         from .core import validate_aggregate_spec
-        from .vectors import aresolve_spec_texts
         validate_aggregate_spec(list(hops), aggregates)
-        start, hops = await aresolve_spec_texts(self._sync, start, list(hops))
+        start, hops, pins = await self._reranked(start, list(hops))
         async with AsyncSession(self._async_engine) as session:
             return await session.run_sync(
-                lambda s: self._sync._aggregate_with_session(s, start, hops, aggregates))
+                lambda s: self._sync._aggregate_with_session(s, start, hops, aggregates,
+                                                             pins=pins))
 
     async def vector_search(self, *near, target: str = "nodes", k: int = 10, where=None,
-                            boost=None) -> list:
-        from .vectors import aresolve_near, search
-        nears = await aresolve_near(self._sync, target, list(near), k, "vector_search()")
+                            boost=None, rerank=None) -> list:
+        from .vectors import arerank_hits, aresolve_near, rerank_query_text, search_candidates
+        near = list(near)
+        # Read (and validate) the reranker's query BEFORE the embedding
+        # resolves it away: Near._with_vector() hands back floats and no
+        # text. The sync search() derives it in the same place, before
+        # it fetches anything.
+        query = rerank_query_text(near, rerank, k, "vector_search()")
+        nears = await aresolve_near(self._sync, target, near, k, "vector_search()")
         async with self._async_engine.connect() as conn:
-            return await conn.run_sync(
-                lambda c: search(self._sync, nears, target=target, k=k, where=where,
-                                 boost=boost, connection=c))
+            hits = await conn.run_sync(
+                lambda c: search_candidates(self._sync, nears, target=target, k=k, where=where,
+                                            boost=boost, connection=c, rerank=rerank))
+        # Outside the connection block AND outside run_sync(): the
+        # scoring is a provider round trip, and inside the bridge it
+        # would run on the loop's own thread (issue #74).
+        if rerank is None:
+            return hits
+        return await arerank_hits(hits, rerank, query, k)
 
     async def vector_search_many(self, queries, target: str = "nodes", k: int = 10, where=None,
-                                 boost=None) -> list:
-        from .vectors import aresolve_queries, search_many
+                                 boost=None, rerank=None) -> list:
+        from .vectors import (
+            arerank_many, aresolve_queries, rerank_query_texts, search_many_candidates,
+        )
+        texts = rerank_query_texts(queries, rerank, k, "vector_search_many()")
         queries = await aresolve_queries(self._sync, target, queries, k, "vector_search_many()")
         async with self._async_engine.connect() as conn:
-            return await conn.run_sync(
-                lambda c: search_many(self._sync, queries, target=target, k=k, where=where,
-                                      boost=boost, connection=c))
+            grouped = await conn.run_sync(
+                lambda c: search_many_candidates(self._sync, queries, target=target, k=k,
+                                                 where=where, boost=boost, connection=c,
+                                                 rerank=rerank))
+        if rerank is None:
+            return grouped
+        # CONCURRENTLY: this call exists to turn N round trips into one,
+        # and N sequential provider calls would hand that straight back.
+        return await arerank_many(grouped, rerank, texts, k)
 
     async def get_vectors(self, node_ids=None, edge_ids=None, node_fields=None,
                           edge_fields=None) -> dict:
