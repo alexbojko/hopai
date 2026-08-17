@@ -1071,17 +1071,32 @@ reranked step is probed, reranked, and then re-run as the *ordinary*
 traversal with its survivors pinned.
 
 **`candidates` bounds the input, `k`/`keep` bounds the output**, and they
-never overlap. Reranking cannot promote a candidate it never saw, so
-pruning early is unrecoverable — prune wrong at hop 1 and hop 2 never
-sees the right nodes, which is the argument for a generous `candidates`
-at early steps. It costs: a flat search stays one statement plus one
-reranker call; a reranked traversal adds a probe and a hydration per
-reranked step, and those provider calls are **serial** (hop N+1's
-candidates are whatever hop N left). `vector_search_many(rerank=)` takes
-one `Rerank` per call and, on `AsyncGraph`, issues its N calls
-concurrently.
+never overlap — which is what the refusals below keep true. In a
+traversal a reranked step has to say how many rows survive it (`keep=`)
+and has to rerank strictly more than that: a subgraph discards the
+order, so truncation is the only thing left for a reranker to change,
+and `candidates == keep` bills every document for a guaranteed no-op. A
+flat search keeps the order, so there `candidates == k` is a real
+reordering and only a `candidates` below `k` refuses. Reranking cannot
+promote a candidate it never saw, so pruning early is unrecoverable —
+prune wrong at hop 1 and hop 2 never sees the right nodes, which is the
+argument for a generous `candidates` at early steps.
 
-Five things refuse rather than approximate:
+It costs: a flat search stays one statement plus one reranker call; a
+reranked traversal adds a probe and a hydration per reranked step, and
+those provider calls are **serial** (hop N+1's candidates are whatever
+hop N left). Inside a walk, one document is built per distinct node,
+quoting up to `max_paths` (default 10) of the routes that reached it;
+`per_path=True` builds one document per *(node, route)* and takes the
+**max** over them, which multiplies the provider bill by the number of
+routes and is opt-in for exactly that reason.
+[10 · Reranking](notebooks/10_reranking.ipynb) runs both and prints what
+the reranker was handed. `vector_search_many(rerank=)` takes one
+`Rerank` for the whole call, applied to every query — one reranker call
+per query, since a score is the (query, document) relationship and one
+call cannot serve two; sequential on `Graph`, concurrent on `AsyncGraph`.
+
+Seven things refuse rather than approximate:
 
 - **a raw-vector `Near` with `rerank=`** — a reranker scores a query
   against a document by reading both, and a list of floats is not
@@ -1090,9 +1105,17 @@ Five things refuse rather than approximate:
   from the field's own `embed=`, so both stages see the same query.
 - **`rerank=` with no `near=`** — a reranker reorders a ranked list, it
   does not create one.
-- **`candidates` below `k`/`keep`** — reranking a pool smaller than what
-  survives it changes nothing, and clamping would hide that the query's
+- **`rerank=` with no `keep=`** on a `Start` or `Hop` — with no
+  truncation the reranker's order is discarded and `candidates` quietly
+  becomes the bound instead, so the same query would return a different
+  subgraph than it does without `rerank=`.
+- **`candidates` not above `keep`** at a step (and below `k` on a flat
+  search) — reranking a pool no larger than what survives it cannot
+  change which rows survive, and clamping would hide that the query's
   own numbers disagree.
+- **`per_path=True` at a `Start`** — a seed was reached by nothing, so
+  there is exactly one document per node either way; the mode belongs to
+  a `Hop`.
 - **`.paths` read at a `Start`** — a seed has no provenance, and `null`
   there would quietly change every document.
 - **a spent provider call** — `RerankError`, never a silent fall back to
@@ -1116,13 +1139,18 @@ parses either — which matters, since libjq holds the GIL and `abort()`s
 on memory exhaustion, so neither a hang nor an OOM can be caught
 in-process. `validate(fields=[...])` / `build_documents(..., fields=[...])`
 add the operator's allowlist of readable paths on top, so
-`.properties.ssn` refuses by name. A human writing jq in their own
-process gets the full language (`build_documents(..., trusted=True)`) —
-they already run arbitrary code there.
+`.properties.ssn` refuses by name. **Every query validates**: there is no
+`trusted=` on `Rerank`, so a filter that reaches `vector_search(rerank=)`
+or a `Start`/`Hop` is held to the subset whoever wrote it.
+`trusted=True` is a parameter of `build_documents()` alone — the preview
+call that builds documents without spending a provider call — for a human
+checking a filter in their own process, where they already run arbitrary
+code and the subset would restrict nothing real.
 
 [10 · Reranking](notebooks/10_reranking.ipynb) runs all of this against a
 real database, with a deterministic stand-in reranker so it works
-offline.
+offline. Over MCP the client is the operator's and a model supplies only
+the filter and the budget — see [MCP server](#-mcp-server) below.
 
 ## 🤖 The JSON interface
 
@@ -1161,6 +1189,28 @@ traverse_json(graph, {
 })
 ```
 
+Reranking travels as JSON too — but the **client does not**, since it
+holds an API key and an open socket. A spec names only the filter and
+the budget; the reranker itself comes from your side of the call:
+
+```python
+from hopai import Rerank, RerankPolicy, traverse_json
+
+traverse_json(graph, {
+    "start": {"near": {"field": "summary", "text": "distributed consensus"},
+              "keep": 10,
+              "rerank": {"document_from": ".properties.title", "candidates": 50}},
+}, rerank=RerankPolicy(Rerank(client, document_from=".properties.title",
+                              candidates=50),
+                       fields=["properties.title", "properties.summary"],
+                       max_candidates=100))
+```
+
+`fields` is the allowlist that `document_from` may read — the filter's
+output is posted to a vendor — and `max_candidates` the ceiling it may
+spend; both refuse rather than clamp. Without a `RerankPolicy`, a spec
+naming `rerank` refuses instead of ignoring it.
+
 `hopai.TRAVERSE_TOOL_SCHEMA` is a ready-to-use JSON Schema for wiring
 this into an LLM function-calling definition directly, alongside
 `AGGREGATE_TOOL_SCHEMA`, `INGEST_TOOL_SCHEMA`, `MUTATE_TOOL_SCHEMA` and
@@ -1179,7 +1229,12 @@ tools = graph.tool_schemas()   # traverse / aggregate / ingest / mutate,
 ```
 
 That is every front end, `mutate_graph` included — hand over the subset
-you actually want the model to have.
+you actually want the model to have. `tool_schemas()` leaves `rerank`
+out of the traversal and aggregation definitions unless you ask for it
+(`tool_schemas(rerank=True)`), so a model is offered the parameter only
+where there is a `RerankPolicy` to serve it — the module-level
+`TRAVERSE_TOOL_SCHEMA`/`AGGREGATE_TOOL_SCHEMA` constants do carry it,
+because the parsers read it and the two are tested against each other.
 
 ## 🗣️ Cypher as input syntax
 
@@ -1355,6 +1410,14 @@ tool a model cannot see is one it cannot be talked into calling.
 Every graph in the database is served unless `--graph` narrows it, and
 **search by meaning takes text, never vectors** — you supply the embedding
 function, so no tool has anywhere for a model to put invented floats.
+
+**Reranking there is the operator's**, like the embedder and for the same
+reason — a client holding an API key cannot travel in a tool call, so it
+is `serve(rerank=…, rerank_fields=[…], max_candidates=…)` from Python,
+with no flag. A model chooses only `document_from` (within the published
+`rerank_fields`) and `candidates` (within the ceiling, which refuses
+rather than clamps). With no reranker configured, no tool advertises the
+parameter at all.
 
 📖 **[Full guide](https://hopai.readthedocs.io/en/latest/mcp/)** — client
 setup, every tool, every flag, and troubleshooting.

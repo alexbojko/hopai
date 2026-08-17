@@ -1358,6 +1358,60 @@ class TestToolSchema:
         blob = json.dumps(self.offgraph().tool_schemas(rerank=True))
         assert "rerank" in blob
 
+    def test_a_policy_where_a_bool_belongs_is_refused_not_swallowed(self):
+        """`rerank` is CHECKED, not coerced -- the `all="false"` rule.
+        A RerankPolicy is truthy, so tool_schemas(rerank=policy) was
+        tool_schemas(True) exactly: the policy silently discarded and
+        the model shown the abstract "the application may cap this"
+        sentences instead of the published field list and the real
+        ceiling it was handed. A truthy non-bool selecting a WEAKER
+        behaviour than the caller asked for is the defect the
+        invariants name."""
+        from hopai import Rerank, RerankPolicy
+        policy = RerankPolicy(Rerank(lambda query, documents: [0.0] * len(documents),
+                                     document_from=".properties.title"),
+                              fields=["properties.title"], max_candidates=120)
+        with pytest.raises(TypeError) as refused:
+            self.offgraph().tool_schemas(rerank=policy)
+        message = str(refused.value)
+        # It names where a policy DOES belong: a Graph cannot publish
+        # one's fields or ceiling -- that rewrite is hopai.mcp's, and
+        # core.py must not import the MCP front end to borrow it.
+        assert "rerank= is True or False" in message
+        assert "hopai.mcp.serve(rerank=" in message and "traverse_json" in message
+
+    @pytest.mark.parametrize("truthy", [1, "true", ["yes"]])
+    def test_no_truthy_value_stands_in_for_the_bool(self, truthy):
+        """The string "true" arriving where a JSON boolean was meant is
+        an ordinary tool-call failure, and every one of these used to
+        mean rerank=True by accident."""
+        with pytest.raises(TypeError, match="rerank= is True or False"):
+            self.offgraph().tool_schemas(rerank=truthy)
+
+    def test_the_rerank_object_says_document_from_may_be_left_out(self):
+        """Served, `candidates` ends "Leave it out to use this server's
+        default of N" (hopai.mcp writes it in) and `document_from` had
+        no such sentence -- and the object has no "required" list, so a
+        model reads the one with no note as mandatory and writes a
+        filter where inheriting the application's own was both correct
+        and safer. The sentence has to live HERE, in the static text
+        both surfaces share; test_mcp.py pins that the server's own
+        rewrite does not lose it."""
+        spec = TRAVERSE_TOOL_SCHEMA["parameters"]["$defs"]["rerank"]
+        assert "required" not in spec
+        assert "NEITHER KEY BELOW IS REQUIRED" in spec["description"]
+        assert "Leave it out" in spec["properties"]["document_from"]["description"]
+
+    def test_the_rerank_object_states_the_step_rule_for_candidates(self):
+        """`candidates` used to say only "at least keep/k". On a
+        traversal step it has to be MORE than `keep` -- equality is a
+        billed no-op there, because the order is discarded -- so a model
+        following the old sentence wrote a call that refuses."""
+        description = TRAVERSE_TOOL_SCHEMA["parameters"]["$defs"]["rerank"][
+            "properties"]["candidates"]["description"]
+        assert "MORE than `keep`" in description
+        assert "at least `k`" in description
+
     def test_tool_schemas_change_descriptions_only(self):
         """The parsers accept exactly what they accepted before, so the
         parameters sections must be byte-identical to the constants --

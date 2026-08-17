@@ -184,8 +184,8 @@ from .hop import Hop, Start
 from .ingest import INGEST_TOOL_SCHEMA, IngestResult
 from .json_api import (
     AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, VECTOR_SEARCH_TOOL_SCHEMA,
-    aggregate_json, spec_to_aggregation, spec_to_traversal, traverse_json,
-    vector_search_json,
+    RerankPolicy, aggregate_json, parse_rerank, spec_to_aggregation, spec_to_traversal,
+    traverse_json, vector_search_json,
 )
 from .embeddings import Embedder, EmbeddingError
 from .models import Edge, Node
@@ -224,7 +224,15 @@ __all__ = [
     "Vector", "Near", "Boost", "parse_near", "parse_boost", "vector_search_json",
     "VECTOR_SEARCH_TOOL_SCHEMA",
     "Embedder", "EmbeddingError",
-    "Rerank", "RerankError",
+    # RerankPolicy is named BY every refusal that asks for one ("Pass
+    # rerank=RerankPolicy(Rerank(client, document_from='...'),
+    # fields=[...])"), and parse_rerank's own docstring calls itself
+    # public -- while `from hopai import RerankPolicy` raised
+    # ImportError. An error naming an unimportable symbol is the "you
+    # have to know that..." defect, and every sibling parser
+    # (parse_near, parse_boost, parse_filter, parse_aggregate) is
+    # already here.
+    "Rerank", "RerankError", "RerankPolicy", "parse_rerank",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",
 ]

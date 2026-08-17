@@ -147,7 +147,7 @@ def _rerank_documents(candidates: list, rerank) -> list:
     return expanded
 
 
-def _rerank_survivors(units: list, scores: list, keep: Optional[int]) -> list:
+def _rerank_survivors(units: list, scores: list, keep: int) -> list:
     """The ids that survive one reranked step, best first.
 
     A node's score is the MAX over its documents -- not the sum, not the
@@ -158,17 +158,21 @@ def _rerank_survivors(units: list, scores: list, keep: Optional[int]) -> list:
     surviving parent is still reported, because the walk is re-run
     normally afterwards and derives its edges the way it always did.
 
-    `keep=None` keeps them all, and the step is still narrowed: the
-    probe fetched `rerank.candidates` of them, which is the input bound
-    doing its job. Reordering alone changes nothing downstream, since a
-    traversal is a subgraph rather than a ranking."""
+    `keep` is an int here and never None: a traversal is a subgraph
+    rather than a ranking, so reordering alone changes nothing
+    downstream, and hop.py's _validate_rerank refuses a reranked step
+    with no `keep=` for exactly that reason. It used to be optional and
+    that was the bug -- with nothing to truncate by, the probe's own
+    `rerank.candidates` became the survivor set, so a reranker that
+    scored every candidate identically still deleted four of six reached
+    nodes."""
     best: dict = {}
     for (node_id, _), score in zip(units, scores, strict=True):
         value = float(score)
         if node_id not in best or value > best[node_id]:
             best[node_id] = value
     ranked = sorted(best, key=lambda node_id: (-best[node_id], str(node_id)))
-    return ranked if keep is None else ranked[:keep]
+    return ranked[:keep]
 
 
 def rerank_plan(start: Start, hops: list) -> dict:
@@ -192,6 +196,24 @@ def rerank_plan(start: Start, hops: list) -> dict:
     plan = {}
     for index, spec in steps:
         owner = _step_owner(index, hops)
+        if index < 0 and spec.rerank.per_path:
+            # The same reason `.paths` refuses here, one attribute over:
+            # per_path=True means "one provider call per (node, path)",
+            # and a seed has no path -- nothing reached it. So the mode
+            # is not merely cheap at a Start, it is the DEFAULT with a
+            # different name, and _rerank_documents() falls straight
+            # through to it. A knob the options discard is not "no
+            # knob" (CLAUDE.md's node_label_key=None case): the caller
+            # asked for per-path scoring and got per-node scoring, with
+            # nothing said.
+            raise ValueError(
+                f"{owner}: rerank=Rerank(per_path=True) scores one document per (node, "
+                f"path), but a seed has no provenance -- nothing reached it, so there is "
+                f"exactly one document per node here and per_path=True is the default "
+                f"under another name. It is a Hop's mode, where a node can read "
+                f"differently depending on the route that found it. Move the rerank= to "
+                f"the Hop that reaches these nodes, or drop per_path=True from this one"
+            )
         if index < 0 and _reads_paths(spec.rerank.document_from, unknown=False):
             # A seed has no provenance -- nothing reached it -- so
             # `.paths` there would be `null` and every document would
@@ -1037,7 +1059,34 @@ class Graph:
 
         Only descriptions differ from the module constants; the
         `parameters` sections are identical, because what the parsers
-        accept has not changed -- this is presentation, not grammar."""
+        accept has not changed -- this is presentation, not grammar.
+
+        `rerank` is a BOOL and nothing else -- see the refusal below."""
+        # Checked, not coerced, for the reason `all`/`detach`/`replace`
+        # are, and with the same failure mode: a RerankPolicy is truthy,
+        # so tool_schemas(rerank=policy) used to be tool_schemas(True)
+        # exactly -- the policy silently discarded and the model shown
+        # the abstract "the application may cap this" sentences instead
+        # of the published fields and the real ceiling it was handed.
+        # A truthy non-bool selecting a WEAKER behaviour than the caller
+        # asked for is the `all="false"` defect verbatim.
+        #
+        # It refuses rather than accepting the policy because the
+        # rewrite that turns one into schema text is hopai.mcp's
+        # _with_rerank(), and core.py must not import the MCP front end
+        # (it asks for an optional SDK by name). A second copy of that
+        # rewrite here would be a second place for the published-field
+        # and ceiling wording to rot out of step with the server's.
+        if not isinstance(rerank, bool):
+            raise TypeError(
+                f"Graph.tool_schemas(): rerank= is True or False -- whether the caller "
+                f"HAS a reranker to configure -- got {type(rerank).__name__}. A Graph "
+                f"holds no reranker and cannot publish a policy's fields or its ceiling; "
+                f"that rewrite belongs to the serving layer. Pass rerank=True here and "
+                f"give the policy to hopai.mcp.serve(rerank=..., rerank_fields=...), "
+                f"which does exactly that, or to traverse_json(spec, rerank=policy) if "
+                f"you are parsing specs yourself"
+            )
         import copy
 
         from .ingest import INGEST_TOOL_SCHEMA

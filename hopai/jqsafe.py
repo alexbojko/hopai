@@ -24,9 +24,19 @@ package (CFFI bindings to libjq), not assumed:
     credential the application holds. The filter's OUTPUT is posted to a
     third-party reranker API, so this is a one-line exfiltration of a
     database password to a vendor.
-  - `def f: f; f` is a non-terminating program that holds the GIL. A
-    watchdog thread cannot even print, SIGINT is ignored, and only
-    SIGKILL ends the process. There is NO in-process timeout that works.
+  - `def f: f; f` is a non-terminating program, and WITHIN A SINGLE
+    EVALUATION the binding hands the GIL back to nobody: a watchdog
+    thread cannot even print, SIGINT is ignored, and only SIGKILL ends
+    the process. There is NO in-process timeout that works. The scope
+    is the whole of the claim and is measured: across MANY short
+    evaluations the binding does release the GIL between them (another
+    thread got 5,284,436 iterations over 0.90s of small evaluations
+    against 184,711 during one 0.90s evaluation, 29x), which is why
+    rerankers.py can say a worker thread recovers ~15% of the loop
+    while this module says a runaway filter is uninterruptible. One
+    evaluation has no boundary to hand it back at -- so the subset must
+    be total, and (see the growth section below) size-bounded, because
+    nothing downstream can stop an evaluation once it has started.
   - `[range(100000000)]` makes libjq call abort() -- SIGABRT, not a
     Python MemoryError -- so it cannot be caught either.
 
@@ -85,23 +95,54 @@ one node and doubles a string, and `(.+.)|(.+.)|(.+.)|...` doubles once
 per stage, so a 60-character program could ask for 2**10 times the row.
 So every accepted program also carries a statically computed growth
 factor -- how many times its own input it may emit -- and anything above
-MAX_GROWTH is refused with that number in the message. Concatenation is
-the only amplifier left once `*` is gone, and it is now bounded.
+MAX_GROWTH is refused with that number in the message.
 
 That factor COMPOSES because there are no variable bindings: with `as
 $x` absent, no subexpression can name a value from an enclosing context,
 so `map(f)` really is f applied elementwise and cannot smuggle the whole
-document into each element. The one construct that broke the arithmetic
-was `join`, which emits its separator once per ELEMENT -- `.tags |
-join("\\(.)")` measured 9,899 characters out of a 50-element array,
-quadratic in the row rather than linear in it. Hence _LITERAL_ARGUMENT:
-a separator (and a needle) comes from the program text, whose length is
-already capped.
+document into each element.
+
+AND CONCATENATION IS NOT THE ONLY AMPLIFIER, which is what the first
+version of that arithmetic got wrong and what cost this module its
+"unreachable" hang. A CONSTANT WRITTEN ONCE PER ELEMENT IS A FACTOR,
+NOT A CONSTANT: `join(sep)` puts its separator between every pair of
+elements, and `split("")` manufactures one element per CHARACTER of any
+published field, so
+
+    .properties.title | split("") | join("<311 characters>")
+
+emits 311 characters for every character of a title. Six of those
+stages fit inside MAX_LENGTH; `join` charged as `1 + growth(argument)`
+-- 2, whatever the separator's length -- called that 2**6 = 64 and
+ACCEPTED it, while the row was multiplied by 311**6, about 9e14. Live
+through the MCP `traverse_graph` tool, a 235-character variant turned
+20 titles of 7-8 characters into 1,084,831 bytes POSTed to a provider;
+with three stages and a 250-character separator, ONE document built
+from a FOUR-character title ran past 45 seconds inside libjq under a
+700MB rlimit before it was killed from outside -- no exception, no
+abort(), and a SIGALRM handler installed beforehand never ran, because
+one evaluation hands the GIL back to nobody. That is the `def f: f; f`
+hang this docstring calls unreachable, reached by a program in the
+subset. Nothing that MEASURES the finished document can help: the
+document does not exist yet, and the process is inside libjq. So the
+charge for a separator is now len(sep) as a MULTIPLIER -- an array of n
+elements is at least n characters of JSON, so n is bounded by the input
+and the separators alone are at most len(sep) times it.
+
+_LITERAL_ARGUMENT is still necessary and was never sufficient. It pins
+the separator to program text so that len(sep) is a number this module
+can READ (`.tags | join("\\(.)")` measured 9,899 characters out of a
+50-element array, and no static analysis can bound a separator the row
+supplies) -- but knowing the separator is at most MAX_LENGTH characters
+bounds the separator, not len(sep) * element_count, which is the
+product that grew.
 
 WHAT WAS REJECTED, and why none of it is enough on its own:
 
-  - A watchdog thread with a timeout. Measured above: it cannot fire.
-    The GIL is held by libjq, which never yields.
+  - A watchdog thread with a timeout. Measured above: it cannot fire
+    against the case it is for. libjq yields the GIL between
+    evaluations and never inside one, and one evaluation that does not
+    return is the whole of the problem.
   - A subprocess per row with rlimits and a scrubbed environment. It
     would work, and it is the wrong shape for this library: a fork+exec
     per candidate row on the ranking path, plus SIGABRT handling, plus a
@@ -178,6 +219,7 @@ make the errors worse and change nothing about what is accepted.
 
 from __future__ import annotations
 
+import math
 import re
 import sys
 from contextlib import contextmanager
@@ -207,6 +249,15 @@ MAX_DEPTH = 40
 #: handful of fields, growth 3 or 4) and far below anything that
 #: threatens memory.
 MAX_GROWTH = 64
+
+#: Characters an accepted filter may add REGARDLESS of the row -- the
+#: `extra` term of _size(). Every one of them is program text, which
+#: MAX_LENGTH already bounds, and the multiplier cap already licenses
+#: MAX_GROWTH copies of the row; so a filter needing more than the two
+#: multiplied together is not writing a literal out, it is multiplying
+#: one by an element count (`.[0:1000000] | join("<300 characters>")`),
+#: which is the same product MAX_GROWTH exists to bound.
+MAX_ADDED = MAX_LENGTH * MAX_GROWTH
 
 #: The functions a filter may call, with the arities jq gives them.
 #: Calls are by literal name only -- see the module docstring on why
@@ -256,10 +307,17 @@ _ARITY = {
 #:
 #: Not a style rule: `join` emits its separator ONCE PER ELEMENT, so
 #: `.tags | join("\(.)")` is quadratic in the row rather than linear in
-#: it -- measured at 9,899 characters out of a 50-element array, and it
-#: is the one hole in the growth analysis, which counts factors of the
-#: input and not products with the element count. Pinning the separator
-#: to program text bounds that term by MAX_LENGTH. The others are here
+#: it -- measured at 9,899 characters out of a 50-element array.
+#: Pinning the separator to program text is what lets _size() READ its
+#: length and charge len(sep) as a multiplier; a separator the row
+#: supplies has no length this module can know.
+#:
+#: WHAT IT DOES NOT DO, because the comment here used to claim it did:
+#: it bounds the SEPARATOR by MAX_LENGTH, never len(sep) * element
+#: count. That product is the whole amplifier -- `split("") |
+#: join("<311 characters>")` multiplies a field by 311 with a separator
+#: well inside every limit on this page -- and it is bounded by the
+#: multiplier in _size(), not here. The others are here
 #: because a computed needle (`has(.k)`, `split(.sep)`) is the same
 #: invisible-to-the-allowlist argument that keeps `getpath` out, and
 #: because a separator or a prefix in a document projection is a
@@ -287,6 +345,18 @@ _KEYWORD_LITERALS = frozenset({"true", "false", "null"})
 _WORD_OPERATORS = frozenset({"and", "or"})
 
 _COMPARISONS = frozenset({"==", "!=", "<", "<=", ">", ">="})
+
+#: Characters that never reach libjq as themselves. The binding hands
+#: jq a UTF-8 encoding of the program, and both of these break BEFORE
+#: any of the analysis on this page applies: a NUL ends the C string, so
+#: libjq compiles the half it saw and reports `unexpected end of file`
+#: on a filter this module called safe, and a lone surrogate cannot be
+#: encoded at all (UnicodeEncodeError out of the binding, which is not
+#: an UnsafeFilter either). Refusing them here keeps the promise that
+#: what this module accepts, `jq.compile()` accepts -- and keeps the
+#: caller's answer a refusal that names the fix rather than a raw parse
+#: error from a layer below.
+_UNENCODABLE_RE = re.compile("[\x00\ud800-\udfff]")
 
 _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _NUMBER_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
@@ -491,8 +561,49 @@ def _scan_string(src: str, i: int, base: int, owner: str, depth: int = 0):
             if len(digits) != 4 or any(c not in _HEX for c in digits):
                 _refuse(owner, base + i, "`\\u` needs exactly four hex digits",
                         "write the character itself, or a complete escape like `\\u00e9`")
-            text.append(chr(int(digits, 16)))
+            code = int(digits, 16)
+            start = i
             i += 6
+            if 0xD800 <= code <= 0xDBFF:
+                # A high surrogate is HALF a character, and jq demands
+                # the other half immediately: libjq answers `Invalid
+                # \\uXXXX\\uXXXX surrogate pair escape` for both
+                # `"\\ud83d"` and `"\\ud83dx"`. Combining the pair the
+                # way libjq does is not decoration either -- it is what
+                # makes `."\\ud83d\\ude00"` the field named by ONE
+                # emoji here and in libjq, rather than two lone
+                # surrogates the field allowlist would never match.
+                low = src[i + 2:i + 6] if src[i:i + 2] == "\\u" else ""
+                if len(low) != 4 or any(c not in _HEX for c in low) \
+                        or not 0xDC00 <= int(low, 16) <= 0xDFFF:
+                    _refuse(owner, base + start,
+                            f"`\\u{digits}` is half of a surrogate pair",
+                            "libjq refuses a lone surrogate outright, so hopai must too "
+                            "-- write the character itself, or both halves "
+                            "(`\\ud83d\\ude00`)")
+                code = 0x10000 + ((code - 0xD800) << 10) + (int(low, 16) - 0xDC00)
+                i += 6
+            elif 0xDC00 <= code <= 0xDFFF:
+                # libjq ACCEPTS this one and quietly yields U+FFFD, so
+                # the differential test on compilability cannot see it.
+                # Refused anyway: a replacement character is content the
+                # row never held, which is the same reason `implode` and
+                # `@base64d` are out -- and a validator that built the
+                # lone surrogate instead would hand back a str that
+                # cannot be encoded to UTF-8 at all.
+                _refuse(owner, base + start,
+                        f"`\\u{digits}` is a lone low surrogate",
+                        "libjq turns it into U+FFFD, a character the row never contained "
+                        "-- write the character itself")
+            elif code == 0:
+                # `"\\u0000"` compiles, and then the NUL travels into a
+                # document POSTed to a vendor and truncates it at the
+                # first C string that touches it. Refused for the same
+                # reason as a raw NUL in the source (see _compile).
+                _refuse(owner, base + start, "`\\u0000` puts a NUL byte in the document",
+                        "a NUL ends a C string, so everything after it is lost wherever "
+                        "the document is read -- drop it")
+            text.append(chr(code))
             continue
         if nxt in _ESCAPES:
             text.append(_ESCAPES[nxt])
@@ -988,47 +1099,309 @@ class _Parser:
 
 # ---------------------------------------------------------------------
 # Growth. Totality bounds how MANY values a filter emits; this bounds
-# how BIG they get. Every factor is "output size / input size", worst
-# case, and it composes the way the operators do: a pipe multiplies,
-# concatenation and comma add, `//` takes whichever side runs.
+# how BIG they get.
+#
+# THE MEASURE, stated once because everything below is arithmetic in it:
+# a value's size is the number of characters in its compact JSON text,
+# and _size() answers, summed over every value the filter emits,
+#
+#     out <= factor * in + extra
+#
+# `factor` counts multiples of THE ROW -- the term that has to stay
+# small, because the row is the one thing whose size an attacker
+# chooses. `extra` counts characters that come out of the PROGRAM's own
+# text, which MAX_LENGTH already bounds, so it gets its own much larger
+# ceiling (MAX_ADDED). Two numbers rather than one because a multiplier
+# and a constant behave differently under composition, and collapsing
+# them is what went wrong.
+#
+# IT COMPOSES the way the operators do -- a pipe multiplies, `+` and `,`
+# add, `//` takes whichever side runs. The pipe is where the two terms
+# meet: running `g` after `f` gives
+#
+#     out <= g.factor * (f.factor * in + f.extra) + g.extra
+#
+# so a later stage MULTIPLIES an earlier stage's constant.
+#
+# THE RULE THAT WAS MISSING, and the whole of the bug: A CONSTANT
+# EMITTED ONCE PER VALUE IS A MULTIPLIER, NOT A CONSTANT. Every place
+# the subset repeats something -- `join`'s separator between elements,
+# `map(f)`'s body per element, the right of a pipe per value the left
+# emitted, a literal in a string per interpolated value, both sides of
+# `+` over the cartesian product of their streams -- multiplies program
+# text by a count that comes from the ROW. Two counts bound those:
+#
+#   ELEMENTS. An array of n elements is at least n characters of JSON,
+#   so n <= in. `join(sep)` therefore costs `1 + len(sep)`, a
+#   MULTIPLIER, where it used to cost `1 + growth(sep)` = 2 for every
+#   literal separator however long -- which is what let
+#
+#       .properties.title | split("") | join("<311 characters>")
+#
+#   report 2 while multiplying a title by 311 (`split("")` manufactures
+#   one element per character), and six of those stages fit inside
+#   MAX_LENGTH: reported 64, real 311**6, about 9e14.
+#
+#   VALUES. A filter emitting n values emits at least n characters, so
+#   the same bound applies to a stream: after `.tags[]`, everything
+#   downstream runs once per tag. jq's binary operators run over the
+#   CARTESIAN PRODUCT of their two streams -- `(.a,.b) + (.c,.d)` emits
+#   four values -- so `[.[] + .[]]` SQUARES an array's length, and
+#   `.t | split("") | [.[]+.[]] | [.[]+.[]]` measured 70,001 characters
+#   out of a ten-character field while the old arithmetic charged 2 per
+#   stage. A product of the row with itself is not a multiple of the row
+#   at all: _UNBOUNDED is what the arithmetic answers there, because
+#   there is no honest number and picking a large one would be a lie in
+#   kind rather than in degree.
+#
+# A SLICE IS THE CREDIT, and the reason `extra` is tracked at all:
+# `.[0:30]` bounds the element count to 30 whatever the row holds, so a
+# `join` after it costs at most 29 * len(sep) CHARACTERS -- program text
+# that stays program text. That is what keeps the ordinary truncation
+# idiom `split(" ") | .[0:30] | join(" ")` at a factor of 4 while the
+# same shape without the slice pays for its separator.
+#
+# EVERY UNKNOWN ROUNDS UP: an element count nothing bounds is None, a
+# value count nothing bounds is None, and both are then charged as "as
+# many as the input has characters".
 # ---------------------------------------------------------------------
 
-def _growth(node) -> int:
+#: A filter whose output is a PRODUCT of the row with itself rather than
+#: a multiple of it -- see VALUES above. It propagates through every
+#: rule here (a bigger factor is still bigger after multiplying, adding
+#: or taking a max) and is reported with its own sentence, because "N
+#: times its own input" is the wrong SHAPE of answer for it.
+_UNBOUNDED = math.inf
+
+
+class _Size(NamedTuple):
+    """What a subexpression can emit.
+
+    `factor` and `extra` bound the total characters of JSON it produces:
+    `out <= factor * in + extra`, summed over every value. `count`
+    bounds how many ELEMENTS each of those values holds, and `outputs`
+    how many values there are -- None for either means "bounded only by
+    the input", which is the case the two multipliers above charge for.
+    Both are upper bounds and both may be rounded up freely; rounding
+    DOWN is the bug."""
+    factor: float
+    extra: int
+    count: Optional[int] = None
+    outputs: Optional[int] = 1
+
+
+_UNBOUNDED_SIZE = _Size(_UNBOUNDED, 0, None, None)
+
+#: Calls that hand back the same value, or the same elements reordered
+#: or thinned -- so a slice's bound on the element count survives them.
+#: `flatten` and `add` are deliberately absent: both can raise the
+#: element count above what the slice allowed.
+_COUNT_KEPT = frozenset({
+    "arrays", "empty", "map", "numbers", "objects", "reverse", "select",
+    "sort", "strings", "unique", "values",
+})
+
+
+def _literal_length(node) -> int:
+    """Characters a literal argument contributes when it is EMITTED --
+    `join`'s separator. _LITERAL_ARGUMENT is what guarantees there is a
+    number here to read at all."""
+    if node[0] == "num":
+        return len(node[1])
+    return sum(len(part) for part in node[1] if isinstance(part, str))
+
+
+def _sliced(step, count: Optional[int]) -> Optional[int]:
+    """The element bound a slice leaves behind. A slice never ADDS
+    elements, so an unusable one (open-ended, or counting from the end)
+    keeps whatever bound was already there rather than losing it."""
+    _, low, high = step
+    if high is None or high < 0 or (low is not None and low < 0):
+        return count
+    bound = max(high - (low or 0), 0)
+    return bound if count is None else min(count, bound)
+
+
+def _paired(size: _Size, other: _Size) -> _Size:
+    """`size`, emitted once per value `other` produced.
+
+    This is the one rule the growth analysis was missing, in the one
+    place every construct that repeats something goes through. A KNOWN
+    number of repetitions leaves a constant a constant; an unknown one
+    is bounded by `other`'s own size -- every value is at least one
+    character of it -- which turns the constant into a multiplier. And
+    a row-proportional COUNT meeting a row-proportional SIZE is the row
+    squared, which no factor describes."""
+    if size.factor == _UNBOUNDED or other.factor == _UNBOUNDED:
+        return _UNBOUNDED_SIZE
+    if other.outputs is not None:
+        return _Size(size.factor * other.outputs, size.extra * other.outputs)
+    if size.factor:
+        return _UNBOUNDED_SIZE
+    return _Size(size.extra * other.factor, size.extra * other.extra)
+
+
+def _both(left: Optional[int], right: Optional[int]) -> Optional[int]:
+    """A count over a cartesian product: unknown if either side is."""
+    return None if left is None or right is None else left * right
+
+
+def _concat(left: _Size, right: _Size) -> _Size:
+    """Two streams concatenated pairwise -- `+`, and equally the pieces
+    of an interpolated string, which is the same operation with a
+    literal on one side."""
+    first, second = _paired(left, right), _paired(right, left)
+    return _Size(first.factor + second.factor, first.extra + second.extra,
+                 None, _both(left.outputs, right.outputs))
+
+
+def _size(node, count: Optional[int] = None) -> _Size:
+    """The bound on `node`'s output, given that its INPUT holds at most
+    `count` elements (None = only the input's own size bounds it)."""
     kind = node[0]
     if kind == "path":
-        return 1 if node[1] is None else _growth(node[1])
+        base, steps = node[1], node[2]
+        size = _Size(1, 0, count) if base is None else _size(base, count)
+        count, outputs = size.count, size.outputs
+        for step in steps:
+            if step[0] == "slice":
+                count = _sliced(step, count)
+            elif step[0] == "iterate":
+                # `.[]` turns elements into VALUES: the element bound
+                # becomes the output count, and each value's own element
+                # count is no longer known.
+                outputs, count = _both(outputs, count), None
+            elif step[0] != "optional":
+                # A field or an index yields a value whose element count
+                # nothing here knows -- and navigating never grows what
+                # it navigates into.
+                count = None
+        return _Size(size.factor, size.extra, count, outputs)
     if kind == "pipe":
-        return _growth(node[1]) * _growth(node[2])
+        left = _size(node[1], count)
+        right = _size(node[2], left.count)
+        if _UNBOUNDED in (left.factor, right.factor):
+            # Explicitly, because `_UNBOUNDED * 0` is not a number and a
+            # stage with no factor of its own (`... | "constant"`) would
+            # otherwise turn the answer into NaN, which compares False
+            # against every limit on this page.
+            return _UNBOUNDED_SIZE
+        outputs = _both(left.outputs, right.outputs)
+        repeated = _paired(_Size(0, right.extra), left)
+        return _Size(left.factor * right.factor + repeated.factor,
+                     right.factor * left.extra + repeated.extra,
+                     right.count, outputs)
     if kind == "paren":
-        return _growth(node[1])
+        return _size(node[1], count)
     if kind == "array":
-        return 1 if node[1] is None else _growth(node[1])
+        if node[1] is None:
+            return _Size(0, 2, 0)                      # `[]`
+        inner = _size(node[1], count)
+        commas = _paired(_Size(0, 1), inner)           # one per value collected
+        return _Size(inner.factor + commas.factor, inner.extra + commas.extra + 2,
+                     inner.outputs)
     if kind == "str":
-        return 1 + sum(_growth(part) for part in node[1] if not isinstance(part, str))
+        size = _Size(0, 2)                             # the quotes
+        for part in node[1]:
+            if isinstance(part, str):
+                size = _concat(size, _Size(0, len(part)))
+                continue
+            # An interpolated NON-string is rendered as JSON, and
+            # escaping can double it.
+            inner = _size(part, count)
+            size = _concat(size, _Size(2 * inner.factor, 2 * inner.extra,
+                                       None, inner.outputs))
+        return size
     if kind == "bin":
-        operator, left, right = node[1], node[2], node[3]
-        if operator in ("+", ","):
-            return _growth(left) + _growth(right)
+        operator = node[1]
+        left, right = _size(node[2], count), _size(node[3], count)
+        if operator == ",":
+            # Two streams end to end rather than a product: the sizes
+            # add, and so do the value counts.
+            outputs = None if left.outputs is None or right.outputs is None \
+                else left.outputs + right.outputs
+            return _Size(left.factor + right.factor, left.extra + right.extra,
+                         None, outputs)
+        if operator == "+":
+            return _concat(left, right)
         if operator == "-":
-            return _growth(left)                       # never grows its left side
+            # `a - b` never grows its left side, but it still runs once
+            # per pair, so the left is repeated per value on the right.
+            return _paired(left, right)._replace(
+                count=left.count, outputs=_both(left.outputs, right.outputs))
         if operator == "//":
-            return max(_growth(left), _growth(right))
-        return 1                                       # comparisons yield a boolean
+            # Only one side runs, so this is a choice and not a product.
+            return _Size(max(left.factor, right.factor),
+                         max(left.extra, right.extra), None,
+                         _both(left.outputs, right.outputs))
+        boolean = _paired(_Size(0, 5), left)           # `true` / `false`
+        return _paired(boolean, right)._replace(outputs=_both(left.outputs,
+                                                              right.outputs))
     if kind == "call":
-        name, args = node[1], node[2]
-        # An argument is a PARAMETER, not something appended per element,
-        # so it does not add to the factor -- except where the function
-        # emits it (`join`) or emits its output (`map`, `first`, `last`).
-        # Charging every argument made `... | ltrimstr("x") | join(", ")`
-        # look like 4x growth and put ordinary projections near the cap.
-        if name in ("map", "first", "last") and args:
-            return _growth(args[0])
-        if name == "join":
-            return 1 + _growth(args[0])                # one separator per element
-        if name in ("tostring", "tojson"):
-            return 2                                   # escaping can double a string
-        return 1                                       # every other allowed call shrinks
-    return 1                                           # num, lit
+        return _call_size(node[1], node[2], count)
+    return _Size(0, len(node[1]))                      # num, lit: their own text
+
+
+def _call_size(name: str, args: list, count: Optional[int]) -> _Size:
+    """A call's bound. An argument is a PARAMETER, not something
+    appended per element, so it costs nothing -- except where the
+    function EMITS it (`join`) or emits its output (`map`, `first`,
+    `last`). Charging every argument made `... | ltrimstr("x") |
+    join(", ")` look like 4x growth and put ordinary projections near
+    the cap."""
+    if name == "join":
+        separator = _literal_length(args[0]) if args else 0
+        if count is None:
+            # One separator per element, and an array of n elements is
+            # at least n characters of input -- so the separators alone
+            # are at most len(sep) times the input. THIS is the term
+            # that used to be a flat +1 and let a 311-character
+            # separator multiply a row by 311 for a reported cost of 2.
+            return _Size(1 + separator, 2)
+        # A slice bounded the elements, so the separators are a constant
+        # the program wrote out rather than a multiple of the row.
+        return _Size(1, max(count - 1, 0) * separator + 2)
+    if name == "map" and args:
+        # `map(f)` is `[.[] | f]`: f runs once per element, so f's
+        # CONSTANT is emitted once per element and the element count is
+        # bounded by the input -- the same arithmetic as join's
+        # separator. The +1 is the array's own commas. The count
+        # survives: map is elementwise and cannot add elements.
+        inner = _size(args[0], None)
+        if inner.factor == _UNBOUNDED:
+            return _UNBOUNDED_SIZE
+        return _Size(inner.factor + inner.extra + 1, inner.extra + 2, count)
+    if name in ("first", "last") and args:
+        return _size(args[0], None)._replace(count=None, outputs=1)
+    if name == "split":
+        # `split("")` is the element factory the whole amplifier is
+        # built on: "abcd" (6 characters of JSON) becomes
+        # ["a","b","c","d"] (16), and the ratio approaches 4 as the
+        # string grows -- three characters of framing per element, one
+        # element per character. Charging 1 for it would leave the
+        # nesting `split("") | map(split(""))` free.
+        return _Size(4, 4)
+    if name in ("tostring", "tojson"):
+        return _Size(2, 2)                             # escaping can double a string
+    if name in _COUNT_KEPT:
+        return _Size(1, 0, count)
+    return _Size(1, 0)                                 # every other allowed call shrinks
+
+
+def _growth(node) -> float:
+    """How many times its own input `node` may emit -- the number the
+    refusal names, or _UNBOUNDED when no number is the right answer."""
+    return _size(node).factor
+
+
+def _magnitude(number: int) -> str:
+    """A number an error message can carry. Growth is a PRODUCT over
+    pipe stages, so a filter inside MAX_LENGTH can reach hundreds of
+    digits, and printing those would bury the sentence that names the
+    fix."""
+    if number < 10 ** 9:
+        return f"{number:,}"
+    return f"about 10^{len(str(number)) - 1}"
 
 
 # ---------------------------------------------------------------------
@@ -1201,15 +1574,51 @@ def _compile(program: str, owner: str):
             f"character limit -- a document projection is a few fields joined together, "
             f"so this is a program"
         )
+    # Before the tokenizer, because these two never reach libjq AS
+    # THEMSELVES and the refusal has to come from here rather than as a
+    # parse error out of a layer below. See _UNENCODABLE_RE.
+    found = _UNENCODABLE_RE.search(program)
+    if found is not None:
+        nul = found.group() == "\x00"
+        raise UnsafeFilter(
+            f"{owner}: the filter contains "
+            f"{'a NUL byte' if nul else 'a lone surrogate'} at offset {found.start()} -- "
+            + ("libjq reads the program as a C string, so the NUL ends it there and "
+               "libjq reports `unexpected end of file` on the half it saw"
+               if nul else
+               "it cannot be encoded as UTF-8, so the filter cannot reach libjq at all")
+            + ". Write the document projection in text, e.g. `.properties.title`"
+        )
     with _stack_headroom():
         node = _Parser(_tokenize(program, owner), owner).program()
-    growth = _growth(node)
-    if growth > MAX_GROWTH:
+        size = _size(node)
+    if size.factor == _UNBOUNDED:
+        # No multiple of the row bounds this one, so it gets a sentence
+        # rather than a number: `[.[] + .[]]` squares an array's length
+        # because jq's binaries run over the cartesian product of their
+        # two streams, and stages of it square the square.
         raise UnsafeFilter(
-            f"{owner}: this filter can emit {growth} times its own input, over the "
-            f"{MAX_GROWTH}x limit -- repeated concatenation doubles at every step, so a "
-            f"short filter can ask for more memory than the process has. Build the "
-            f"document from the fields you need, joined once"
+            f"{owner}: this filter's output grows with the SQUARE of the row, not with "
+            f"the row -- an operator with a STREAM on both sides (`.tags[] + .tags[]`, "
+            f"or a `+` after `.[]`) runs once per pair, so an n-element array emits n*n "
+            f"values. Build the document from one value per candidate, e.g. "
+            f"`[.properties.tags[]] | join(\", \")`"
+        )
+    if size.factor > MAX_GROWTH:
+        raise UnsafeFilter(
+            f"{owner}: this filter can emit {_magnitude(size.factor)} times its own "
+            f"input, over the {MAX_GROWTH}x limit -- repeated concatenation doubles at "
+            f"every step, and a `join` separator is written once per element while "
+            f"`split(\"\")` makes one element per character, so a short filter can ask "
+            f"for more memory than the process has. Build the document from the fields "
+            f"you need, joined once"
+        )
+    if size.extra > MAX_ADDED:
+        raise UnsafeFilter(
+            f"{owner}: this filter adds {_magnitude(size.extra)} characters to every "
+            f"document whatever the row holds, over the {MAX_ADDED} character limit -- a "
+            f"separator repeated across a slice this long is program text multiplied by "
+            f"the slice, not a document. Shorten the separator, or the slice"
         )
     return node
 

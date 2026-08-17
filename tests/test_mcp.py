@@ -586,6 +586,25 @@ class TestToolSchemas:
         assert "`.properties.title`, `.properties.abstract`" in description
         assert "reading anything else refuses" in description
 
+    def test_both_rerank_keys_say_what_leaving_them_out_means(self):
+        """The rendered object has no "required" list, so each key has
+        to say for itself. `candidates` already ended "Leave it out to
+        use this server's default of N"; `document_from` said nothing,
+        which reads as mandatory -- and a model that writes its own
+        filter rather than inheriting the operator's is both more likely
+        to be refused by the published-field allowlist and more likely
+        to rank on the wrong words. The sentence is written once in
+        json_api's static text; this pins that _with_rerank()'s two
+        rewrites do not drop it on the way out."""
+        parameters = named(offline(), **reranking(candidates=40))[
+            "traverse_graph"].parameters
+        spec = parameters["$defs"]["rerank"]
+        assert "required" not in spec
+        for key in ("document_from", "candidates"):
+            assert "Leave it out" in spec["properties"][key]["description"], key
+        # Exactly one, not the static sentence plus the server's.
+        assert spec["properties"]["candidates"]["description"].count("Leave it out") == 1
+
     def test_the_candidates_description_names_this_servers_ceiling(self):
         """A ceiling a model cannot see is a refusal it can only
         discover by tripping over it."""

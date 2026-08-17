@@ -107,9 +107,47 @@ async surface (hopai/asyncio.py). So every call has an awaitable twin.
 `ascore()` awaits an awaitable client directly -- `cohere.AsyncClientV2()`,
 an async callable -- and runs a sync one in `asyncio.to_thread`, which
 is legitimate for socket I/O because provider SDKs release the GIL
-while blocked on it. jq itself runs inline: a realistic filter is ~30us
-per row, 1.7ms for 50 candidates, and a thread would buy nothing
-against a C extension holding the GIL anyway.
+while blocked on it.
+
+jq itself runs inline, and what makes that defensible is THE PRUNING
+BELOW rather than a claim that jq is cheap. Measured (jq 1.12, one
+core, `.properties.title` over 50 candidates), the unpruned cost was
+~42us per row PLUS ~25us per KB of candidate payload -- because
+`input_value()` marshals the WHOLE candidate into jq's value
+representation, so a `properties` bag holding a document body was
+converted in full to read one title out of it. That is proportional to
+the ROW, not to the projection: a 100KB row cost 2.6ms and 50 of them
+held the loop's thread for 121ms with the ticker scoring ZERO, the
+signature of a `time.sleep` rather than of a slow function. So
+`build_documents()` now hands jq only the paths the filter reads
+(`jqsafe.paths_read()`), which removes the per-KB term entirely and
+leaves the fixed ~10-20us per row -- 0.5-1ms for 50 candidates,
+independent of how much text the rows carry.
+
+A THREAD IS STILL NOT THE ANSWER, but not for the reason once written
+here ("a C extension holding the GIL"), which was true at one
+granularity and false at the other. THE BINDING RELEASES THE GIL
+BETWEEN EVALUATIONS AND NOT WITHIN ONE, so both of these hold at the
+same time and neither is a caveat on the other:
+
+  - jqsafe.py is right that a runaway filter (`def f: f; f`) can be
+    interrupted by NOTHING -- no watchdog thread, no signal, only
+    SIGKILL. That is ONE evaluation, and inside one there is no
+    boundary to hand the GIL back at. It is why that module refuses
+    such filters structurally rather than by timeout, and nothing here
+    softens it.
+  - a BATCH of small evaluations -- which is precisely what building 50
+    documents is -- hands it back 50 times. Measured against an idle
+    loop of 778 ticks/s, building 50 unpruned 100KB documents inline
+    scored 0 ticks/s (0%) and the same build through
+    `asyncio.to_thread` scored 110 (14%). A thread is not nothing here;
+    it is 14%.
+
+14% is not the difference between blocking and not: a starved loop that
+limps is still a starved loop, and it would cost a thread hop per step
+plus a second place for the filter's refusals to surface from. Removing
+the work is worth more than moving it, which is what pruning does; what
+remains is bounded by MAX_DOCUMENTS below rather than left to grow.
 
 WHAT THIS DELIBERATELY DOES NOT DO: fuse (above), cache (an
 application's job, as with embeddings), or carry its own `top_n`.
@@ -218,6 +256,27 @@ _DEFAULT_CANDIDATES = 50
 #: silent server-side truncation if you are not.
 _DEFAULT_MAX_PATHS = 10
 
+#: How many documents ONE reranker call may be built from, and the one
+#: number in this module that exists because of a MULTIPLIER rather than
+#: a preference.
+#:
+#: `candidates` bounds the NODES a step offers. Under `per_path=True`
+#: the documents are (node, route) pairs, so the count is |routes|,
+#: which the GRAPH decides and no option here bounds: a high fan-in node
+#: contributes one document per way it was reached. `candidates=500`
+#: over rows reached 200 ways is 100,000 documents -- measured at 4.64s
+#: of document building, before the provider has been called at all,
+#: and on the async path all of it on the event loop's own thread.
+#:
+#: 5000 is deliberately far above anything a real query asks for: the
+#: defaults here (50 candidates, 10 paths) are 500, and 5000 is five
+#: calls at the 1000-document batch cap both supported providers
+#: document. It refuses rather than truncating, because dropping
+#: documents drops the routes a node scored on and changes the ranking
+#: with nothing to see -- rule 4, and the same judgement `max_paths`
+#: makes VISIBLY for the per-document case.
+MAX_DOCUMENTS = 5000
+
 #: `document_from` has no honest default, and a sentinel is what lets
 #: `Rerank(client, document='...')` be answered with the parameter's
 #: real name instead of Python's "unexpected keyword argument", which
@@ -251,6 +310,13 @@ _DOCUMENT_FROM_IS_A_RULE = (
     "document itself. Nothing about the documents exists when you write the query. "
     "e.g. document_from='.properties.title + \": \" + (.properties.summary // \"\")'"
 )
+
+
+#: `_paths` before anything has asked for it. A distinct object rather
+#: than None, because `_WHOLE_ROW` IS None -- "do not prune" and "not
+#: worked out yet" are two different answers and conflating them would
+#: recompute the parse on every candidate of every query.
+_UNCOMPUTED = object()
 
 
 class RerankError(RuntimeError):
@@ -478,7 +544,9 @@ class Rerank:
     max_paths:      how many paths one document may quote. A visible cap
                     rather than a silent truncation. Not consulted under
                     per_path=True, where a document carries exactly one
-                    path by construction.
+                    path by construction -- there the paths become
+                    DOCUMENTS instead, which is what MAX_DOCUMENTS
+                    bounds.
     model:          required for providers that take one, refused for
                     those that do not -- the judgement Embedder makes,
                     for the same reason: a silently chosen model is a
@@ -506,7 +574,16 @@ class Rerank:
     as before. per_path=True takes the MAX and not the sum or the mean,
     so one strong route is enough to keep a node -- the same "any valid
     parent counts" semantics `test_fan_in_both_parents_preserved`
-    exists to protect."""
+    exists to protect.
+
+    AND IT IS THE ONE MULTIPLIER HERE, so it is bounded: `candidates`
+    counts NODES, per_path=True bills (node, route) pairs, and how many
+    routes reach a node is the graph's answer rather than an option's.
+    `MAX_DOCUMENTS` (5000) is where that refuses -- naming the number,
+    both knobs and the fix -- because a 100,000-document step measured
+    4.64s of document building before a single provider call, and
+    truncating instead would drop the routes a node scored on and
+    change the ranking with nothing to see."""
 
     def __init__(self, client: Any, *misplaced, document_from: str = _REQUIRED,
                  candidates: int = _DEFAULT_CANDIDATES, per_path: bool = False,
@@ -641,6 +718,11 @@ class Rerank:
         #: still constructible on a base install.
         self._program = None
         self._validated: set = set()
+        #: The paths `document_from` reads, or `_WHOLE_ROW`. Computed on
+        #: first use rather than here: `_projection_paths()` needs
+        #: `hopai.jqsafe`, and __init__ must stay constructible for a
+        #: caller who only ever calls score() on their own documents.
+        self._paths = _UNCOMPUTED
         try:
             import jq
         except ImportError:
@@ -715,9 +797,13 @@ class Rerank:
         set_vectors() makes for embeddings. A synchronous client runs in
         `asyncio.to_thread`, which is legitimate for exactly this: the
         provider SDK is blocked on a socket and releases the GIL while
-        it waits. (It would NOT be legitimate for jq, which holds the
-        GIL throughout -- so document building stays inline, where it
-        costs microseconds.)"""
+        it waits. (Document building stays inline, and that is now a
+        measurement rather than a claim about the GIL: pruning took the
+        per-KB term out of it, so a build is tens of microseconds a row
+        and bounded by MAX_DOCUMENTS. jq's binding does release the GIL
+        between evaluations, so a thread would recover ~15% of the loop
+        across a batch -- which is not the difference between blocking
+        and not. See the module docstring.)"""
         owner, documents = self._prepare(query, documents, "ascore")
         if not documents:
             return []
@@ -908,12 +994,59 @@ class Rerank:
                 f"this is one {type(candidates).__name__} -- iterating it yields its "
                 f"keys, not candidates, so the filter would run against the string 'id'. "
                 f"Pass [candidate]")
+        candidates = list(candidates)
+        self._bound(len(candidates))
         program = self._compiled(trusted, fields)
+        paths = self._projection()
         documents = []
         for candidate in candidates:
-            documents.append(_evaluate(program, self._capped(candidate),
-                                       self.document_from))
+            capped = self._capped(candidate)
+            view = None if paths is _WHOLE_ROW or not isinstance(capped, dict) \
+                else _pruned(capped, paths)
+            documents.append(_evaluate(program, capped, self.document_from, view))
         return documents
+
+    def _bound(self, documents: int) -> None:
+        """Refuse a call that would build more documents than
+        MAX_DOCUMENTS.
+
+        HERE and not at construction, because the number is not knowable
+        at construction: `candidates` bounds the NODES, and under
+        `per_path=True` the documents are (node, route) pairs whose
+        count the graph decides. This is the one place that sees the
+        real total, on both drivers and both front ends.
+
+        It refuses instead of truncating for the reason every other
+        refusal in this module does: the documents that fell off the end
+        are routes a node would have scored on, so the ranking would
+        differ with nothing to show for it."""
+        if documents <= MAX_DOCUMENTS:
+            return
+        per_path = (
+            f" -- per_path=True builds one document per (node, route), so a step whose "
+            f"nodes were reached many ways multiplies candidates={self.candidates} by a "
+            f"number the GRAPH decides, not by max_paths={self.max_paths}"
+        ) if self.per_path else (
+            f" -- candidates={self.candidates} is the input bound, and it is above the "
+            f"limit on its own"
+        )
+        raise ValueError(
+            f"{self!r}.build_documents(): {documents} documents for one reranker call, "
+            f"over the {MAX_DOCUMENTS} limit{per_path}. Lower candidates=, or drop "
+            f"per_path=False's opt-in, or rerank a later step where fewer nodes survive. "
+            f"Refusing rather than truncating, because the documents that fell off the "
+            f"end are routes a node would have scored on")
+
+    def _projection(self):
+        """The paths `document_from` reads, computed once.
+
+        Cached beside `_program` and for the same reason: it is one
+        parse of a filter bounded by `jqsafe.MAX_LENGTH`, and paying it
+        per candidate would put it back on the query path this exists to
+        take work off."""
+        if self._paths is _UNCOMPUTED:
+            self._paths = _projection_paths(self.document_from)
+        return self._paths
 
     def _capped(self, candidate):
         """The candidate a document is built from, with `paths` bounded.
@@ -1032,7 +1165,115 @@ def _jq():
     return jq
 
 
-def _evaluate(program, candidate, filter_text: str) -> str:
+#: What `_projection_paths()` answers when the filter's reads cannot be
+#: enumerated -- a bare `.`, or anything `jqsafe` will not parse. Not
+#: None, because None is a legitimate answer nowhere here and a caller
+#: reading `paths is None` as "no paths" would prune to `{}`.
+_WHOLE_ROW = None
+
+
+def _projection_paths(document_from: str):
+    """The paths a filter reads, or `_WHOLE_ROW` when it must be handed
+    the candidate entire.
+
+    THE PERFORMANCE FIX, and the reason it is safe. `input_value()`
+    marshals whatever it is given into jq's own value representation, so
+    the cost of building one document was proportional to the CANDIDATE
+    -- ~25us per KB of it -- rather than to the projection: measured,
+    `.properties.title` cost exactly as much as `.properties.body` on a
+    row whose body was 100KB, because both handed jq the same 100KB.
+    Fifty such rows held the event loop's thread for 121ms with an
+    independent ticker scoring zero. `fields=` narrows what a filter may
+    READ; it never narrowed what jq was HANDED.
+
+    So the filter is asked what it reads, and only that is handed over.
+    `jqsafe.paths_read()` is the same answer the `fields=` allowlist is
+    enforced on, which is what makes this sound rather than an
+    optimization on top of a guess: it OVER-reports by design, and an
+    over-reported path only means a bigger view than necessary. It is
+    also already differentially tested against libjq's own behaviour
+    (`TestPathsReadAgreesWithWhatLibjqRuns` runs every accepted program
+    against a row of per-field sentinels and asserts nothing reaches the
+    output that was not reported) -- which is precisely the property
+    pruning needs.
+
+    CORRECT AND SLOW BEATS FAST AND WRONG, so every case the analysis
+    cannot see through declines to prune:
+
+      - a filter reading `.` gets the whole row;
+      - a filter `jqsafe` cannot parse at all -- which is every
+        `trusted=True` filter using the full language -- gets the whole
+        row, since there is then no reported set to trust;
+      - and `_pruned()` below stops descending the moment the value it
+        would descend into is not an object."""
+    from . import jqsafe
+    try:
+        read = jqsafe.paths_read(document_from)
+    except Exception:
+        # Deliberately bare: a filter outside the subset is not this
+        # function's to refuse -- build_documents() has already run
+        # _validate() on it when it matters, and a trusted one is
+        # allowed to be unparseable here. The only answer this owes is
+        # "I cannot see it", which is the whole row.
+        return _WHOLE_ROW
+    if "." in read:
+        return _WHOLE_ROW
+    # Shortest first, then drop anything beneath a path already kept:
+    # `properties` and `properties.title` together are just `properties`,
+    # and the prefix rule is the one _within() already uses.
+    kept: list = []
+    for path in sorted(read, key=lambda p: (p.count("."), p)):
+        if not any(path == held or path.startswith(held + ".") for held in kept):
+            kept.append(path)
+    return tuple(kept)
+
+
+def _pruned(value, paths):
+    """`value`, reduced to what `paths` can reach.
+
+    A copy, never a mutation, and never a DEFAULT: a key the row does
+    not have stays absent rather than becoming null, because
+    `.properties.title // "untitled"` and `Required` both read those two
+    as different things.
+
+    Three rules carry the correctness, and each is the conservative side
+    of a case the analysis cannot see:
+
+      - A non-object is returned WHOLE. `.properties.tags[0].name` is
+        reported as `properties.tags.name` (an index is not a segment),
+        so the walk arrives at a LIST with `name` still to go: it keeps
+        the list entire. Same for a string, where jq's own "Cannot index
+        string" is the answer that must survive.
+      - A dotted path is AMBIGUOUS -- `."a.b"` and `.a.b` are both
+        reported as `a.b` -- so both readings are kept when both exist.
+        Over-keeping is free; picking one would build a document from
+        `null`.
+      - A key kept WHOLE wins over the same key kept partially, so
+        `properties` and `properties.title` cannot fight over one slot.
+
+    Keys come back in the ROW's order, not the paths' -- jq preserves
+    object key order, and a reconstructed object could otherwise print
+    differently under `tojson`. (It cannot actually reach `tojson`:
+    consuming an object is a read, so its own path would have been
+    reported and it would have been copied whole. Ordering it correctly
+    costs one dict comprehension and removes the question.)"""
+    if not isinstance(value, dict):
+        return value
+    kept: dict = {}
+    deeper: dict = {}
+    for path in paths:
+        if path in value:                    # a property name containing dots
+            kept[path] = value[path]
+        head, dot, rest = path.partition(".")
+        if dot and head in value:
+            deeper.setdefault(head, []).append(rest)
+    for head, rest in deeper.items():
+        if head not in kept:                 # a whole copy already covers it
+            kept[head] = _pruned(value[head], rest)
+    return {key: kept[key] for key in value if key in kept}
+
+
+def _evaluate(program, candidate, filter_text: str, view=None) -> str:
     """One candidate's document.
 
     `.all()` and not `.first()`: a filter emitting several outputs
@@ -1040,12 +1281,29 @@ def _evaluate(program, candidate, filter_text: str) -> str:
     taking the first silently picks one. A filter emitting none
     ('empty', or a path through a missing list) has produced no document
     at all. Both refuse, naming the candidate, because the alternative
-    is a provider call about the wrong text or about nothing."""
+    is a provider call about the wrong text or about nothing.
+
+    `view` is what jq is HANDED -- the pruned candidate when
+    `_projection_paths()` could see what the filter reads, the candidate
+    itself otherwise. `candidate` is still what every message NAMES, so
+    the id in a refusal is the row's own and not the view's.
+
+    A FAILURE IS RE-RUN AGAINST THE WHOLE CANDIDATE before it is
+    reported, and that is not belt-and-braces: jq QUOTES the offending
+    value into its error text (`object ({"a":1,...}) and number (1)
+    cannot be added`), so a message built from the view could name a
+    smaller object than the caller has in front of them. Re-running
+    costs the unpruned price exactly once, on a path that is about to
+    raise anyway -- and it makes the error, message included,
+    byte-identical to the one this function raised before pruning
+    existed."""
     where = f"candidate id={candidate.get('id')!r}" if isinstance(candidate, dict) \
         else f"candidate {candidate!r}"
     try:
-        outputs = program.input_value(candidate).all()
+        outputs = program.input_value(candidate if view is None else view).all()
     except Exception as exc:
+        if view is not None:
+            return _evaluate(program, candidate, filter_text)
         raise ValueError(
             f"document_from={filter_text!r} failed on {where} -- {type(exc).__name__}: "
             f"{exc}. Refusing rather than scoring that candidate against an empty document"

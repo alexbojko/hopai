@@ -131,6 +131,17 @@ _NEEDS_SYNC_GRAPH = frozenset({
     # sync facade outside the greenlet bridge, same MissingGreenlet trap
     # as every other admin call in this list.
     "load_vectors",
+    # graphs() is the one that FELL OUT of this list rather than never
+    # being considered for it, which is why it is worth a comment of its
+    # own: it opens self.engine.connect() directly (core.py), so on an
+    # AsyncGraph it reaches the async engine's sync facade outside the
+    # bridge and raises SQLAlchemy's MissingGreenlet -- from a call that
+    # looks, and is spelled, exactly like the admin calls above. Nothing
+    # exercised its absence, so nothing said it was gone;
+    # TestOutOfScope now derives its parametrization from this set so a
+    # name added here cannot skip its own test, and a name missing from
+    # here cannot pass by not being listed.
+    "graphs",
     # embed_stale() (issue #74's own review) walks a whole field in
     # PAGES, each its OWN embed call and its OWN transaction -- the
     # opposite of "resolve everything, then open one transaction" every

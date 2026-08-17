@@ -28,12 +28,27 @@ from __future__ import annotations
 
 import contextlib
 import json
+import random
 import sys
 import time
 
 import pytest
 
-from hopai.jqsafe import MAX_DEPTH, MAX_GROWTH, MAX_LENGTH, UnsafeFilter, is_total, paths_read, validate
+from hopai.jqsafe import (
+    MAX_ADDED, MAX_DEPTH, MAX_GROWTH, MAX_LENGTH, UnsafeFilter, is_total, paths_read,
+    validate,
+)
+from hopai.jqsafe import _Parser, _size, _tokenize
+
+
+def static_bound(program: str):
+    """What jqsafe PROMISES about a program's size: `_size()`'s
+    `out <= factor * in + extra`, in characters of compact JSON.
+
+    Reached through the parser rather than through validate() because
+    the interesting cases are the ones validate() refuses -- the number
+    in the refusal is the claim being checked."""
+    return _size(_Parser(_tokenize(program, "test"), "test").program())
 
 #: Every construct the subset admits, in the spellings a document
 #: projection actually uses. Shared by the allowed-constructs tests, the
@@ -116,6 +131,12 @@ ACCEPTED = (
     # TestACommentCannotSmuggleCodeIntoAnInterpolation.
     '"title: \\(.properties.title # which field\n)"',
     '"\\(.properties.title) # not a comment, string text"',
+    # A surrogate PAIR, which libjq combines into one character. The
+    # halves are refused on their own (TestCharactersThatNeverReachLibjq);
+    # the pair has to keep working, and has to mean the same character
+    # here as it does in libjq or the field allowlist matches nothing.
+    '."\\ud83d\\ude00"',
+    '.properties.summary | split(" ") | .[0:30] | join(" ")',
 )
 
 
@@ -638,6 +659,92 @@ class TestGrowthIsBounded:
         validate('.properties.title + ": " + .properties.summary + " " '
                  '+ (.properties.tags | join(", "))')
 
+    def test_the_split_join_bomb_is_refused_and_counted_honestly(self):
+        """The amplifier a separator charged as `1 + growth(argument)`
+        could not see. `split("")` makes one element per CHARACTER of a
+        published field and `join(sep)` writes `sep` between every pair,
+        so one stage multiplies a title by len(sep) -- 311 here -- while
+        the old arithmetic charged 2 for it however long the separator
+        was. Six stages fit inside MAX_LENGTH: reported 64, exactly
+        MAX_GROWTH, and ACCEPTED; the real factor is 311**6, about 9e14.
+
+        Measured live before the fix: 20 documents totalling 1,084,831
+        bytes POSTed to a provider out of 7-8 character titles, and with
+        three stages one document from a FOUR-character title ran past
+        45 seconds inside libjq -- no exception, no abort(), and a
+        SIGALRM handler that never ran, because one evaluation hands the
+        GIL back to nobody. Nothing downstream can measure a document
+        libjq is still building, so this has to be refused HERE."""
+        separator = "S" * 311
+        program = ".properties.title" + f'|split("")|join("{separator}")' * 6
+        assert len(program) <= MAX_LENGTH
+        with pytest.raises(UnsafeFilter) as refused:
+            validate(program, fields=["properties.title"])
+        assert f"{MAX_GROWTH}x" in str(refused.value)
+        # Honest means "not below what really happens": an upper bound
+        # is the point, so over-reporting is fine and 64 was not.
+        assert static_bound(program).factor >= 311 ** 6
+
+    @pytest.mark.parametrize("program", [
+        '.properties.summary | split(" ") | .[0:30] | join(" ")',
+        '.properties.tags | join(", ")',
+        '.properties.tags | join("-")',
+        '[.properties.title, .properties.summary] | join(" -- ")',
+        '.properties.title | split(" ") | join("-")',
+        '.properties.tags | map(ascii_downcase) | unique | join(", ")',
+        '.properties.title + ": " + (.properties.summary // "")',
+        '.properties.body | split("\\n") | .[0:3] | join(" / ")',
+    ])
+    def test_the_filters_people_actually_write_still_pass(self, program):
+        """Charging the separator as a multiplier must not take the
+        truncation idiom with it. `split(" ") | .[0:30] | join(" ")` is
+        the ordinary way to cap a summary at thirty words, and a review
+        of 25 realistic projections found zero refusals before this
+        change -- a regression here costs the feature, not an attacker."""
+        validate(program)
+
+    def test_a_separator_costs_its_own_length(self):
+        """The arithmetic, stated as a test: `join(sep)` over n elements
+        emits about len(sep) * n characters, and n is bounded by the
+        input, so len(sep) is the multiplier. A flat 2 for every literal
+        separator is what the bomb above was built out of."""
+        assert static_bound('.tags | join(" ")').factor == 2
+        assert static_bound('.tags | join(", ")').factor == 3
+        assert static_bound('.tags | join(" -- ")').factor == 5
+        assert static_bound(f'.tags | join("{"x" * 300}")').factor == 301
+
+    def test_a_slice_credits_the_separator_back(self):
+        """`.[0:30]` bounds the ELEMENT COUNT whatever the row holds, so
+        the separators cost at most 29 * len(sep) characters -- a
+        constant out of the program's own text rather than a multiple of
+        the row. Without that credit this pair would be identical and a
+        long separator after a slice would be refused for an
+        amplification it cannot produce."""
+        long_separator = "x" * 300
+        with pytest.raises(UnsafeFilter):
+            validate(f'.properties.tags | join("{long_separator}")')
+        validate(f'.properties.tags[0:30] | join("{long_separator}")')
+        assert static_bound(
+            f'.properties.tags[0:30] | join("{long_separator}")').factor == 1
+
+    def test_a_literal_multiplied_by_a_slice_is_still_refused(self):
+        """The credit is not a hole: a slice long enough turns the same
+        program text back into an amplifier, and `extra` is where that
+        shows up. `.[0:1000000] | join("<300 characters>")` is 300MB of
+        separator from 30 characters of program."""
+        with pytest.raises(UnsafeFilter) as refused:
+            validate(f'.properties.tags[0:1000000] | join("{"x" * 300}")')
+        assert str(MAX_ADDED) in str(refused.value)
+
+    def test_a_constant_emitted_once_per_element_is_a_factor(self):
+        """`map(f)` runs f once per ELEMENT, so f's constant is emitted
+        once per element and the element count is bounded by the input
+        -- which makes it a multiplier, exactly as `join`'s separator
+        is. Charging it as a constant would leave
+        `map(["<", .] | join(""))` looking free."""
+        assert static_bound('.tags | map(. + "abc")').factor >= 4
+        assert static_bound(f'.tags | map(. + "{"x" * 300}")').factor > MAX_GROWTH
+
     def test_a_pipe_of_plain_steps_does_not_accumulate_growth(self):
         """A pipe MULTIPLIES its sides' factors, so a step that neither
         grows nor shrinks must count as exactly 1. Charging a function
@@ -925,6 +1032,168 @@ class TestPathsReadAgreesWithWhatLibjqRuns:
         assert not self._covered("properties.ssn", frozenset({"properties.title"}))
         assert self._covered("properties.ssn", frozenset({"."}))
         assert self._covered("properties.tags", frozenset({"properties"}))
+
+
+#: Stages a document projection is built out of, weighted toward the
+#: two that manufacture size: `split` makes one element per character,
+#: `join` writes its separator between every pair of them. The long
+#: separators are the whole point -- a checker over 6,000 generated
+#: programs found 50 places where the old arithmetic under-reported,
+#: and every one of them was a `join` with a long literal separator.
+GROWTH_STAGES = (
+    'split("")', 'split(" ")', 'split("a")',
+    'join("")', 'join(" ")', 'join(", ")', 'join("-")', 'join(" -- ")',
+    f'join("{"Z" * 40}")', f'join("{"Q" * 120}")',
+    ".[0:3]", ".[0:30]", ".[1:2]", ".[2:]", ".[:4]", ".[-2:]", ".[]",
+    "map(ascii_downcase)", 'map(. + "xy")', "map(tostring)", 'map(split(""))',
+    'map(["<", .] | join(""))',
+    '. + "tail"', "ascii_downcase", "sort", "unique", "reverse", "tostring",
+    "tojson", "add", "flatten", "length", "first", "last", ".[0]",
+    '"pre \\(.) post"', '[., .] | join("~")', "select(. != null)",
+)
+
+GROWTH_STARTS = (".t", ".tags", ".n", ".", ".tags[]", "[.t, .n]")
+
+#: Deliberately SMALL, because the bound is stated against the input:
+#: a big row would make every ratio comfortable and the property
+#: vacuous. Compact JSON, because that is the tightest reading of "how
+#: many characters is this value" -- the measurement must not be
+#: flattered by whitespace it did not have to emit.
+GROWTH_ROW = {"t": "alpha beta gamma delta", "n": 7, "tags": ["x", "yy", "zzz", ""]}
+
+
+def _measure(value) -> int:
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False))
+
+
+class TestGrowthIsNeverUnderReported:
+    """The property the growth cap needs and that no example test can
+    establish: for every program hopai ACCEPTS, what libjq really emits
+    fits inside the bound hopai computed.
+
+    `_size()` promises `out <= factor * in + extra` in characters of
+    compact JSON. A single number below what actually happens is the
+    whole bug class -- the 6-stage `split("")`/`join()` bomb reported 64
+    while multiplying the row by 9e14 -- so this generates the shapes
+    that amplify, RUNS them, and compares."""
+
+    def test_the_bound_holds_against_what_libjq_emits(self):
+        """A statically computed factor nothing measures is a comment.
+        Run against the old arithmetic this finds 16 violations in this
+        corpus -- `split("") | map(split(""))`, and every `join` with a
+        separator longer than one character."""
+        jq = pytest.importorskip("jq")
+        row_size = _measure(GROWTH_ROW)
+        generator = random.Random(20260817)
+        checked, seen = 0, set()
+        for _ in range(2500):
+            program = generator.choice(GROWTH_STARTS) + "".join(
+                " | " + generator.choice(GROWTH_STAGES)
+                for _ in range(generator.randint(1, 4)))
+            if program in seen:
+                continue
+            seen.add(program)
+            try:
+                validate(program)
+            except UnsafeFilter:
+                continue            # refused: the bound is not a promise about it
+            bound = static_bound(program)
+            try:
+                outputs = jq.compile(program).input_value(GROWTH_ROW).all()
+            except Exception:
+                continue            # a runtime type error emits nothing to measure
+            emitted = sum(_measure(output) for output in outputs)
+            checked += 1
+            assert emitted <= bound.factor * row_size + bound.extra, (
+                f"{program!r} emitted {emitted} characters, over the "
+                f"{bound.factor} * {row_size} + {bound.extra} this module promised")
+        assert checked > 200, "the generator stopped producing runnable programs"
+
+    def test_the_check_can_fail(self):
+        """A property test that cannot fail proves nothing: this is the
+        comparison the loop makes, against the number the old
+        arithmetic produced for a 120-character separator."""
+        assert static_bound(f'.tags | join("{"Q" * 120}")').factor > 2
+
+
+class TestCharactersThatNeverReachLibjq:
+    """The differential in the direction the ACCEPTED corpus cannot
+    reach: characters that make `jq.compile()` fail on a program this
+    module called safe.
+
+    A raw NUL is the plain one -- the binding hands libjq a UTF-8 C
+    string, so the NUL ends it and libjq reports `unexpected end of
+    file` on the half it saw, while hopai had analysed the whole thing.
+    The direction is safe (libjq refuses, nothing runs) but the caller
+    gets a raw parse error instead of a refusal that names the fix,
+    which breaks the promise this module's whole design rests on: what
+    it accepts, libjq accepts.
+
+    The corpus never contained a NUL byte or a surrogate, which is why
+    the differential test above passed for as long as it did."""
+
+    HOSTILE = (
+        '.properties.title + "a\x00b"',       # a raw NUL inside a string literal
+        '.properties.title + "a\\u0000b"',    # the same NUL, spelled as an escape
+        '."\ud83d"',                          # a raw lone surrogate in a field name
+        '"\\ud83d"',                          # a lone HIGH surrogate escape
+        '"\\ude00"',                          # a lone LOW surrogate escape
+        '"\\ud83dx"',                         # a pair that is not one
+        ".a # \x00",                          # a NUL where nothing even tokenizes it
+    )
+
+    @pytest.mark.parametrize("program", HOSTILE)
+    def test_hopai_refuses_them(self, program):
+        """Fail closed and name the fix. `\\u0000` and the lone LOW
+        surrogate are the two libjq accepts -- the first puts a NUL in a
+        document POSTed to a vendor, where it truncates whatever C
+        string reads it, and the second silently yields U+FFFD, content
+        the row never contained. Both are refused for the same reason
+        `implode` and `@base64d` are."""
+        with pytest.raises(UnsafeFilter):
+            validate(program)
+
+    #: The ones libjq compiles happily, with the reason hopai refuses
+    #: them anyway. Over-refusing is always allowed -- the subset is a
+    #: SUBSET -- but each one still has to have a reason written down,
+    #: or the list becomes a list of tastes.
+    OVER_REFUSED = {
+        '.properties.title + "a\\u0000b"':
+            "the NUL survives into the document, where it truncates whatever C string "
+            "reads it on the way to the vendor",
+        '"\\ude00"':
+            "libjq quietly yields U+FFFD, content the row never contained -- the same "
+            "reason `implode` and `@base64d` are out",
+        ".a # \x00":
+            "one rule for NUL bytes everywhere beats one rule per context, and nothing "
+            "legitimate puts one in a comment",
+    }
+
+    @pytest.mark.parametrize("program", HOSTILE)
+    def test_libjq_agrees_or_the_difference_is_ours_to_own(self, program):
+        """What makes the list above a DIFFERENTIAL corpus rather than a
+        list of tastes: either libjq refuses it too -- in which case
+        accepting it would have moved a parse error from validation to
+        ranking time, one row at a time -- or it is one of the three
+        hopai over-refuses on purpose, with the reason recorded."""
+        jq = pytest.importorskip("jq")
+        try:
+            jq.compile(program)
+        except Exception:
+            return                              # libjq refuses it: agreement
+        assert program in self.OVER_REFUSED, \
+            f"{program!r} compiles in libjq, so the refusal above needs a reason"
+
+    def test_a_surrogate_pair_still_means_one_character(self):
+        """The fix must refuse the halves without breaking the whole.
+        `."\\ud83d\\ude00"` names ONE character in libjq; a validator
+        that kept the two surrogates separate would report a field name
+        no allowlist could ever match -- and hand Python a string that
+        cannot be encoded to UTF-8 at all."""
+        jq = pytest.importorskip("jq")
+        program = '."\\ud83d\\ude00"'
+        assert paths_read(program) == frozenset({"\U0001f600"})
+        assert jq.compile(program).input({"\U0001f600": "yes"}).all() == ["yes"]
 
 
 class TestAcceptedProgramsTerminate:

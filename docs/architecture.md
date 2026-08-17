@@ -275,7 +275,11 @@ It is a **gate, not an interpreter**: what it accepts is handed to libjq unchang
 reimplementing jq's semantics for `//`, `?` and null handling is how an edge case becomes
 a silently different document. `build_documents()` validates by default and
 `trusted=True` is the opt-in — the same polarity as `allow_vectors=`/`all=`/`detach=`,
-because an `untrusted=True` you must remember fails open. `fields=` narrows it further to
+because an `untrusted=True` you must remember fails open. That opt-in belongs to that
+call alone: `Rerank` carries no `trusted=`, so every query path — `rerank_hits()` on a
+flat search, `_rerank_pins()` in a traversal, and their async twins — validates
+unconditionally. By the time a filter reaches a query there is nothing left to tell who
+wrote it. `fields=` narrows it further to
 an operator's allowlist of readable paths (at or beneath an allowed path; a read *above*
 one hands back the siblings the allowlist withholds), which is what keeps
 `.properties.ssn` out of a vendor's logs.
@@ -476,8 +480,8 @@ One pair of tables holds every graph, discriminated by `graph_id`.
 ## The MCP server
 
 `hopai/mcp.py` is a front end in the same sense `json_api.py` and `cypher.py` are: each
-tool is one call into those, and there is no query logic in it. Three things about it
-are not obvious from the outside.
+tool is one call into those, and there is no query logic in it. What is not obvious from
+the outside:
 
 - **The advertised JSON Schemas are hopai's own.** The MCP SDK derives a tool's input
   schema from its handler's Python annotations, which turns `start: dict` into
@@ -493,6 +497,21 @@ are not obvious from the outside.
   operator's `embed` callable. The refusal is not re-implemented here:
   `json_api.refuse_vectors()` runs on what the model sent *before* the embedding is
   injected, which is why that function lost its underscore.
+- **The reranker is the operator's, and so is its budget.** `serve(rerank=…)` takes a
+  built `Rerank` — Python-only, since a client object has no command-line spelling —
+  and `tools()` wraps it in a `json_api.RerankPolicy` so the JSON and MCP front ends
+  enforce one set of rules. What a tool call may supply is `document_from` and
+  `candidates`; `rerank_fields` (required beside `rerank`) is the allowlist that filter
+  may read, and `max_candidates` the ceiling it may spend, both refusing rather than
+  clamping. `_with_rerank()` is the surface half: with a policy it rewrites the two
+  advertised sentences that could otherwise only be written in the abstract (via
+  `_reworded()`, which fails loudly if `json_api`'s wording moved), and **with no policy
+  it deletes the `rerank` object from both step schemas** — the same "which surface
+  exists" gate permissions use. `search_similar` never carries one, because it embeds
+  the model's text into a raw vector itself and a raw-vector `Near` with `rerank=`
+  refuses; the reranked route is `traverse_graph` with `near: {field, text}`, which
+  means a reranked result *with scores* is not something MCP can return at all — a
+  traversal is a subgraph.
 - **Permissions decide which tools are registered**, rather than being checked inside a
   handler. `read_only` drops every write tool, `allow_mutations` is what adds
   `mutate_graph`, `allow_ddl` is what adds `enforce_schema`, and `serve()` never mixes

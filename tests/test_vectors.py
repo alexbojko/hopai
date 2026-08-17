@@ -2347,29 +2347,32 @@ class TestTraversalNearLive:
                                                          '| join(",")')),
                        Hop(via={"kind": "cites"}))
 
-    def test_per_path_at_a_start_is_one_document_per_seed(self, fresh_graph):
-        """per_path=True splits a candidate by its paths, and a SEED has
-        none -- nothing reached it. It must still produce exactly one
-        document per seed rather than none, or the flag would silently
-        empty the seed set of every traversal that set it once and
-        reused the Rerank at a Start."""
+    def test_per_path_at_a_start_is_refused(self, fresh_graph):
+        """per_path=True means one provider call per (node, path), and a
+        SEED has no paths -- nothing reached it. So at a Start the flag
+        is not merely cheap, it IS the default under another name: the
+        caller asked for per-path scoring and quietly got per-node
+        scoring, which is "a constraint the options discard is not no
+        constraint". It refuses beside the `.paths`-at-a-Start refusal
+        and says where the mode belongs. Without this the flag was
+        accepted and dropped, with nothing said and a bill either way."""
         needs_jq()
         from hopai import Rerank
 
         g = self._fan_in_graph(fresh_graph)
-        seen = []
+        calls = []
 
         def client(query, documents):
-            seen.extend(documents)
-            return [1.0 if d == "p2" else 0.0 for d in documents]
+            calls.append(documents)
+            return [0.0] * len(documents)
 
-        result = g.traverse(
-            Start(where={"type": "seed"}, near=Near("docvec", text="q"), keep=1,
-                  rerank=Rerank(client, document_from=".properties.name", candidates=5,
-                                per_path=True)),
-            Hop(via={"kind": "cites"}))
-        assert sorted(seen) == ["p1", "p2"]
-        assert {n["id"] for n in result.nodes} == {"11", "12"}
+        with pytest.raises(ValueError, match="per_path=True.*a seed has no provenance"):
+            g.traverse(
+                Start(where={"type": "seed"}, near=Near("docvec", text="q"), keep=1,
+                      rerank=Rerank(client, document_from=".properties.name", candidates=5,
+                                    per_path=True)),
+                Hop(via={"kind": "cites"}))
+        assert not calls, "refused before a document was built, let alone billed"
 
     def test_a_filter_the_grammar_rejects_is_refused_as_a_filter(self, fresh_graph):
         """A document_from outside the safe subset must be refused with

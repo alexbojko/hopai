@@ -761,7 +761,11 @@ _RERANK_DEF: dict = {
         "against your query text -- the accurate, expensive stage after the cheap "
         "similarity one. It reorders and truncates a list that already exists; it never "
         "creates one, so it needs `near` (with `text`) beside it, and `keep`/`k` still "
-        "decides how many survive."
+        "decides how many survive. On a traversal step `keep` is REQUIRED with it: the "
+        "result is a subgraph rather than a ranking, so the reranked order is discarded "
+        "and truncating is the only mark the reranking can leave. NEITHER KEY BELOW IS "
+        "REQUIRED -- whichever you leave out keeps the application's own setting, and "
+        "`{}` asks for reranking exactly as it is configured."
     ),
     "properties": {
         "document_from": {
@@ -779,16 +783,22 @@ _RERANK_DEF: dict = {
                 "\"Raft: a consensus protocol\" from it. Guard anything a row may not "
                 "have with `// \"\"`: a filter that yields nothing, several things, or "
                 "something that is not text refuses rather than ranking against the "
-                "wrong words. " + RERANK_FIELDS_SENTENCE
+                "wrong words. " + RERANK_FIELDS_SENTENCE + " Leave it out to use the "
+                "application's own filter, which is the right answer unless you need to "
+                "rank on different text."
             ),
         },
         "candidates": {
             "type": "integer",
             "description": (
                 "How many hits the reranking model reads, before `keep`/`k` truncates -- "
-                "the INPUT bound, where keep/k is the output bound. It has to be at "
-                "least keep/k, or the reranking cannot change which rows survive and the "
-                "call refuses. " + RERANK_CEILING_SENTENCE
+                "the INPUT bound, where keep/k is the output bound. On a traversal step "
+                "it has to be MORE than `keep`: a traversal returns a subgraph and throws "
+                "the reranked order away, so truncating is the only thing reranking can "
+                "change there, and candidates equal to (or below) `keep` refuses as a "
+                "call billed for a guaranteed no-op. In a vector search, which reports "
+                "the new order and a `rerank_score`, it need only be at least `k`. "
+                + RERANK_CEILING_SENTENCE
             ),
         },
     },

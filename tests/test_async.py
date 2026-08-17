@@ -28,6 +28,7 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+import hopai.asyncio as asyncio_module
 from hopai import Boost, Count, CypherError, Hop, Near, Start, Unique, Vector
 from hopai.asyncio import AsyncGraph
 
@@ -58,6 +59,90 @@ async def _while_ticking(ticks: list, coro):
     finally:
         running = False
         await counter
+
+
+#: How much of an idle loop's throughput a call must leave behind it.
+#:
+#: `ticks > 0` -- what these tests asserted first -- is a test for TOTAL
+#: starvation and nothing else, and total starvation is not the only way
+#: to block a loop: a bounded 600ms stall inside a one-second call scores
+#: hundreds of ticks and passed every one of them. That is exactly how a
+#: 121ms document-building block lived here unnoticed (see
+#: hopai/rerankers.py on pruning). So the assertion is a RATIO against a
+#: baseline measured on the same machine in the same run, which is the
+#: only form that survives a loaded CI box: an absolute ticks/s would be
+#: either flaky or vacuous.
+#:
+#: Half is deliberately generous. A free loop measured ~880-890 ticks/s
+#: here; the unpruned 100KB case measured ZERO during the block and ~20%
+#: over the call containing it, and 500KB measured lower still. Anything
+#: between 50% and 100% is ordinary scheduling noise, and nothing this
+#: library does should land there.
+LOOP_FLOOR = 0.5
+
+
+#: How much longer than an idle loop's own worst pause a call may hold
+#: the thread in ONE stretch, and the floor below which the comparison
+#: stops being meaningful.
+#:
+#: The rate above is the right instrument for a window of known length
+#: -- a 200ms provider call -- and the wrong one for a call whose length
+#: is not fixed: a traversal spends most of itself in the database, so a
+#: 121ms block inside a 185ms call reads as 29% of idle while the same
+#: block inside a 1s call reads as 88%. Measured here, the step-wise
+#: path's rate swung between 33% and 69% run to run for that reason
+#: alone.
+#:
+#: The LONGEST GAP between ticks does not have that problem. It is how
+#: long, in one stretch, the loop was unavailable -- which is what
+#: "blocking" means -- and it is unaffected by how much awaiting
+#: happened either side. Measured on this path: 107ms unpruned against
+#: 8ms pruned, with an idle loop's own worst pause at 5ms.
+GAP_MULTIPLE = 5
+GAP_FLOOR = 0.030
+
+
+async def _profile(coro):
+    """(result, ticks/s, longest gap in seconds) while `coro` runs.
+
+    The gap is measured from the ticker's own timestamps rather than
+    from a count, because a count cannot tell 500 evenly spread ticks
+    from 500 ticks either side of a stall."""
+    stamps = [time.perf_counter()]
+    running = True
+
+    async def tick():
+        while running:
+            await asyncio.sleep(0.001)
+            stamps.append(time.perf_counter())
+
+    counter = asyncio.ensure_future(tick())
+    started = time.perf_counter()
+    try:
+        result = await coro
+    finally:
+        elapsed = time.perf_counter() - started
+        running = False
+        await counter
+    gaps = [after - before for before, after in zip(stamps, stamps[1:], strict=False)]
+    return result, len(gaps) / elapsed, max(gaps, default=elapsed)
+
+
+async def _idle_profile(seconds: float = 0.3):
+    """(ticks/s, longest gap) for a loop with nothing else to do.
+
+    Measured per test rather than hard-coded: `asyncio.sleep(0.001)`
+    resolves to the platform's timer granularity plus whatever else is
+    running on the box, so the only honest baseline is one taken next
+    to the measurement it is compared with."""
+    _, rate, gap = await _profile(asyncio.sleep(seconds))
+    return rate, gap
+
+
+async def _idle_rate(seconds: float = 0.3) -> float:
+    """Ticks per second a loop with nothing else to do achieves."""
+    rate, _ = await _idle_profile(seconds)
+    return rate
 
 
 class TestConstruction:
@@ -931,33 +1016,70 @@ class TestRerankingStaysOffTheLoop:
                                        {"id": 2, "summary": [1.0, 0.0, 0.0]}],
                                 edges=[{"id": 9, "rel": [1.0, 0.0, 0.0]}])
 
-    def _rerank(self, ticks, scores=None, per_call=None):
+    #: How long each fake provider call takes. The window `progress`
+    #: below is a rate over, so it has to be long enough that a handful
+    #: of ticks either way is not the answer.
+    CALL = 0.2
+
+    def _rerank(self, ticks, scores=None, per_call=None, sync=False, **options):
         """A Rerank whose provider call takes a visible amount of time
-        and records what the loop got done while it was inside it. Async
-        by construction, since that is the shape this module is built
-        around -- a sync one falls back to a worker thread, which
-        Embedder's own tests cover."""
+        and records the RATE the loop achieved while it was inside it.
+
+        Async by default, since that is the shape this module is built
+        around. `sync=True` gives the other one on purpose: a plain
+        callable takes `Rerank._aattempt`'s own `asyncio.to_thread`,
+        which is a DIFFERENT thread hop from Embedder's and was only
+        ever unit-tested -- nothing ran a synchronous reranker client
+        through AsyncGraph and watched the loop."""
         from hopai import Rerank
 
         progress, spans = [], []
 
-        async def client(query, documents):
-            before = ticks[0]
-            started = time.perf_counter()
-            await asyncio.sleep(0.2)
-            progress.append(ticks[0] - before)
+        def answer(query, documents, started, before):
+            progress.append((ticks[0] - before) / (time.perf_counter() - started))
             spans.append((started, time.perf_counter()))
             if per_call is not None:
                 per_call.append(query)
             return [(scores or {}).get(d, 0.0) for d in documents]
 
+        async def client(query, documents):
+            before, started = ticks[0], time.perf_counter()
+            await asyncio.sleep(self.CALL)
+            return answer(query, documents, started, before)
+
+        def blocking_client(query, documents):
+            # time.sleep, not asyncio.sleep: a synchronous client BLOCKS,
+            # and the only thing that keeps the loop alive through it is
+            # the worker thread hopai puts it on.
+            before, started = ticks[0], time.perf_counter()
+            time.sleep(self.CALL)
+            return answer(query, documents, started, before)
+
+        if sync:
+            client = blocking_client
+
         # `.id` rather than a property: _seeded()'s nodes carry only a
         # type, and what these tests are about is the loop, not the
         # document.
-        rerank = Rerank(client, document_from=".id", candidates=5)
+        options.setdefault("document_from", ".id")
+        options.setdefault("candidates", 5)
+        rerank = Rerank(client, **options)
         rerank.progress = progress
         rerank.spans = spans
         return rerank
+
+    @staticmethod
+    def _assert_free(rerank, idle):
+        """Every provider call left the loop most of its throughput.
+
+        A RATE against `idle`, not `> 0`: the old form passed on a
+        version that blocked the loop for 600ms, because 600ms of block
+        inside a longer call still lets a 1ms ticker score hundreds of
+        times. See LOOP_FLOOR."""
+        assert rerank.progress, "the reranker was never called"
+        assert all(rate > idle * LOOP_FLOOR for rate in rerank.progress), (
+            f"the loop managed {[round(r) for r in rerank.progress]} ticks/s during the "
+            f"reranker calls against an idle {idle:.0f} -- it is back on its thread")
 
     def test_vector_search_does_not_hold_the_loop_while_it_reranks(self, async_fresh_graph):
         """Run inside run_sync() the scoring would sit on the event
@@ -970,14 +1092,14 @@ class TestRerankingStaysOffTheLoop:
 
         async def body():
             await self._seeded(async_fresh_graph)
+            idle = await _idle_rate()
             return await _while_ticking(ticks, async_fresh_graph.vector_search(
-                Near("summary", text="raft consensus"), k=1, rerank=rerank))
+                Near("summary", text="raft consensus"), k=1, rerank=rerank)), idle
 
-        hits = run(body())
+        hits, idle = run(body())
         assert [hit["id"] for hit in hits] == ["2"]
         assert hits[0]["rerank_score"] == 1.0
-        assert rerank.progress and all(p > 0 for p in rerank.progress), \
-            "the loop made no progress during the rerank -- it is still on its thread"
+        self._assert_free(rerank, idle)
 
     def test_vector_search_many_issues_its_rerank_calls_concurrently(self, async_fresh_graph):
         """N queries mean N reranker calls -- a score is the (query,
@@ -1016,14 +1138,15 @@ class TestRerankingStaysOffTheLoop:
 
         async def body():
             await self._seeded(async_fresh_graph)
+            idle = await _idle_rate()
             return await _while_ticking(ticks, async_fresh_graph.traverse(
                 Start(where={"type": "doc"}),
                 Hop(via={"kind": "cites"}, near=Near("summary", text="raft"), keep=1,
-                    rerank=rerank)))
+                    rerank=rerank))), idle
 
-        result = run(body())
+        (result, idle) = run(body())
         assert sorted(node["id"] for node in result.nodes) == ["1", "2"]
-        assert rerank.progress and all(p > 0 for p in rerank.progress)
+        self._assert_free(rerank, idle)
 
     def test_a_reranked_step_survives_the_text_resolution(self, async_fresh_graph):
         """aresolve_spec_texts() rebuilds each step it resolves, and a
@@ -1088,6 +1211,249 @@ class TestRerankingStaysOffTheLoop:
 
         assert run(body()) == []
         assert queries == []
+
+    def test_a_synchronous_reranker_client_does_not_hold_the_loop(self, async_fresh_graph):
+        """The gap every other test here left: a client that BLOCKS.
+
+        `Rerank._aattempt` puts a synchronous client on
+        `asyncio.to_thread`, and that thread hop is its own -- it is not
+        Embedder's, which the embedding tests cover, and it had only
+        ever been unit-tested on the Rerank in isolation. Nothing ran
+        one through AsyncGraph and watched the loop, which is the level
+        the hop actually has to survive: `_rerank_pins()` and
+        `arerank_hits()` both call `ascore()`, and either could have
+        awaited a blocking call directly with no test saying so."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        rerank = self._rerank(ticks, scores={"2": 1.0}, sync=True)
+        assert rerank.is_async is False                  # the shape under test
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            idle = await _idle_rate()
+            return await _while_ticking(ticks, async_fresh_graph.vector_search(
+                Near("summary", text="raft consensus"), k=1, rerank=rerank)), idle
+
+        hits, idle = run(body())
+        assert [hit["id"] for hit in hits] == ["2"]
+        self._assert_free(rerank, idle)
+
+    def test_a_synchronous_client_stays_off_the_loop_at_a_hop_too(self, async_fresh_graph):
+        """The traversal driver has its own path to `ascore()`, so the
+        same thread hop has to hold there -- `_rerank_pins()` awaits it
+        once per reranked step, outside the bridge."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        rerank = self._rerank(ticks, sync=True)
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            idle = await _idle_rate()
+            return await _while_ticking(ticks, async_fresh_graph.traverse(
+                Start(where={"type": "doc"}),
+                Hop(via={"kind": "cites"}, near=Near("summary", text="raft"), keep=1,
+                    rerank=rerank))), idle
+
+        (result, idle) = run(body())
+        assert sorted(node["id"] for node in result.nodes) == ["1", "2"]
+        self._assert_free(rerank, idle)
+
+    def test_per_path_reranking_does_not_hold_the_loop(self, async_fresh_graph):
+        """The other gap: `per_path=True` was covered only synchronously.
+
+        It is the expensive mode -- one document per (node, route)
+        rather than per node -- so it is the one whose document building
+        multiplies, and it takes a WIDER probe (`.paths` is read, so the
+        hop hydrates every node on every route) before it gets there.
+        Every extra byte of that was, before pruning, extra time on the
+        event loop's thread."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        rerank = self._rerank(ticks, per_path=True,
+                              document_from='.id + " via " + (.paths | tostring)')
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            idle = await _idle_rate()
+            return await _while_ticking(ticks, async_fresh_graph.traverse(
+                Start(where={"type": "doc"}),
+                Hop(via={"kind": "cites"}, near=Near("summary", text="raft"), keep=1,
+                    rerank=rerank))), idle
+
+        (result, idle) = run(body())
+        assert sorted(node["id"] for node in result.nodes) == ["1", "2"]
+        self._assert_free(rerank, idle)
+
+
+class TestDocumentBuildingStaysOffTheLoop:
+    """The block the tick-counting tests above could not see, and the
+    reason they could not.
+
+    `_rerank()`'s progress measures the window INSIDE the provider call.
+    Document building happens before it -- `build_documents()` on the
+    event loop's own thread at hopai/asyncio.py's `_rerank_pins()` and
+    at vectors.py's `arerank_hits()` -- so a stall there fell outside
+    every window this file measured, and `ticks > 0` over the whole call
+    could not distinguish it from scheduling noise. Measured, fifty
+    100KB candidates held the thread for 121ms with the ticker scoring
+    ZERO: the signature of a `time.sleep`, not of a slow function.
+
+    WHY THIS CLASS DOES NOT COUNT TICKS, having every reason to. Three
+    instruments were tried against this call and two of them are traps:
+
+      - THROUGHPUT RATIO (ticks/s against an idle baseline). Wrong for a
+        call whose length is not fixed. A reranked traversal spends most
+        of itself in the database, so the SAME block is a different
+        fraction of two runs: measured between 33% and 69% of idle with
+        the fix in place, straddling any threshold worth setting. It is
+        the right instrument for the 200ms provider window above, where
+        the denominator is known, and it is stable there under load.
+      - LONGEST GAP between ticks. Better -- it is what "blocking" means
+        and it does not move with the call's length (107ms unpruned
+        against 8ms pruned) -- but it is an EXTREME-VALUE statistic over
+        a few dozen samples, and on a loaded box the operating system
+        supplies the extreme. Run under 2x nproc busy loops it failed a
+        different test of this class on most runs. CI runs four Python
+        versions in parallel on shared runners, so that is the
+        environment, not a pathological case.
+      - WHAT IS ACTUALLY ASSERTED HERE: the two facts the fix is made
+        of, neither of which a loaded machine can move.
+
+        1. HOW MUCH jq IS HANDED. The bug was that `input_value()`
+           marshals whatever it is given, so `.properties.title` was
+           handed 100KB to read 60 characters out of. That is a byte
+           count, and it is exact.
+        2. HOW MUCH CPU THE BUILD SPENDS, by `time.process_time` --
+           which counts this process's own cycles and ignores every
+           other process on the box. 0.7ms pruned against 120ms
+           unpruned, and descheduling cannot inflate it.
+
+    Between them they say precisely what the wall-clock instruments were
+    reaching for, with no threshold that depends on the machine. The
+    wall-clock numbers themselves are still reported, by
+    benchmarks/bench_documents.py, where a number is measured rather
+    than gated on."""
+
+    DIMS = 3
+    ROWS = 40
+    KILOBYTES = 100
+
+    #: A pruned view of `.properties.title` is about 30 bytes; the
+    #: candidate it came from is over 100,000. Anything under a kilobyte
+    #: proves the row is not what was handed over, with two orders of
+    #: magnitude to spare either side.
+    MAX_BYTES_HANDED = 1000
+
+    #: Seconds of THIS PROCESS's CPU the whole build may spend. Measured:
+    #: 0.7ms with the fix, ~120ms without it, so 25ms sits ~35x above one
+    #: and ~5x below the other.
+    MAX_CPU_SECONDS = 0.025
+
+    def _embed(self, texts):
+        return [[1.0] + [0.0] * (self.DIMS - 1) for _ in texts]
+
+    async def _seeded(self, graph):
+        """Nodes carrying a big `properties` payload beside a short title
+        -- the shape that made reading the TITLE cost what reading the
+        body would."""
+        from hopai import Vector
+
+        graph.define_vectors(nodes=[Vector("summary", self.DIMS, embed=self._embed)])
+        await graph.migrate_vectors()
+        body = "x" * 1000
+        await graph.add_nodes([
+            dict({"id": i, "type": "doc", "title": f"node {i}"},
+                 **{f"body_{b}": body for b in range(self.KILOBYTES)})
+            for i in range(self.ROWS)])
+        await graph.set_vectors(
+            nodes=[{"id": i, "summary": [1.0, 0.0, 0.0]} for i in range(self.ROWS)])
+
+    def _watched(self, monkeypatch):
+        """A Rerank that records what its document building was handed
+        and what it cost, through the REAL AsyncGraph call sites.
+
+        The spy keeps a REFERENCE to each view rather than measuring it
+        -- sizing 40 candidates of 100KB inside the window being timed
+        would be most of the CPU the window is asserting about."""
+        import hopai.rerankers as rerankers_module
+        from hopai import Rerank
+
+        handed, cost = [], []
+        original = rerankers_module._evaluate
+
+        def spy(program, candidate, filter_text, view=None):
+            handed.append(candidate if view is None else view)
+            return original(program, candidate, filter_text, view)
+
+        monkeypatch.setattr(rerankers_module, "_evaluate", spy)
+
+        class Watched(Rerank):
+            def build_documents(self, candidates, **options):
+                started = time.process_time()
+                try:
+                    return super().build_documents(candidates, **options)
+                finally:
+                    cost.append(time.process_time() - started)
+
+        rerank = Watched(lambda query, documents: [0.0] * len(documents),
+                         document_from=".properties.title", candidates=self.ROWS)
+        rerank.handed, rerank.cost = handed, cost
+        return rerank
+
+    def _assert_cheap(self, rerank):
+        import json
+
+        assert rerank.handed, "build_documents() never ran"
+        assert rerank.cost, "the build was never measured"
+        biggest = max(len(json.dumps(view)) for view in rerank.handed)
+        assert biggest <= self.MAX_BYTES_HANDED, (
+            f"jq was handed {biggest} bytes for one candidate -- the filter reads a "
+            f"title, so it is being handed the row again and the cost is back to being "
+            f"proportional to the payload")
+        spent = sum(rerank.cost)
+        assert spent < self.MAX_CPU_SECONDS, (
+            f"document building spent {spent * 1000:.0f}ms of CPU over "
+            f"{len(rerank.handed)} candidate(s), above the {self.MAX_CPU_SECONDS * 1000:.0f}ms "
+            f"budget -- on the async path every millisecond of that is the event loop's "
+            f"own thread")
+
+    def test_the_flat_search_path_hands_jq_only_the_projection(
+            self, async_fresh_graph, monkeypatch):
+        """vectors.arerank_hits()' call site. `.properties.title` reads
+        60 characters out of a 100KB candidate, and before pruning it
+        cost exactly what reading the 100KB would -- because
+        `input_value()` marshalled the whole row either way."""
+        pytest.importorskip("jq")
+        rerank = self._watched(monkeypatch)
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await async_fresh_graph.vector_search(
+                Near("summary", text="raft"), k=5, rerank=rerank)
+
+        assert len(run(body())) == 5
+        assert len(rerank.handed) == self.ROWS      # every candidate went through jq
+        self._assert_cheap(rerank)
+
+    def test_the_step_wise_path_hands_jq_only_the_projection(
+            self, async_fresh_graph, monkeypatch):
+        """asyncio._rerank_pins()' call site -- the other one, and the
+        one that runs once per reranked STEP rather than once per
+        query."""
+        pytest.importorskip("jq")
+        rerank = self._watched(monkeypatch)
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await async_fresh_graph.traverse(
+                Start(where={"type": "doc"}, near=Near("summary", text="raft"),
+                      keep=5, rerank=rerank))
+
+        result = run(body())
+        assert len(result.nodes) == 5
+        assert len(rerank.handed) == self.ROWS
+        self._assert_cheap(rerank)
+
 
 
 class TestNoTextTakesNoNewPath:
@@ -1254,14 +1620,43 @@ class TestOutOfScope:
     silently reaching the async engine's sync facade outside the greenlet
     bridge (which would raise SQLAlchemy's own MissingGreenlet instead)."""
 
-    @pytest.mark.parametrize("name", [
-        "create_schema", "drop_schema", "define_constraints", "drop_constraints",
-        "enforce_schema", "save_schema", "load_schema", "infer_schema",
-        "schema_violations", "add_networkx", "load_vectors", "embed_stale",
-    ])
+    #: DERIVED from the frozenset, not restated beside it. A hand-written
+    #: list is what let `graphs()` fall out of _NEEDS_SYNC_GRAPH with no
+    #: test failing: an entry nothing exercises is an entry that can go
+    #: missing again, and a list that has to be kept in step by hand is
+    #: the thing that was not kept in step. Deriving it means a name
+    #: added to the set is tested the moment it is added.
+    @pytest.mark.parametrize("name", sorted(asyncio_module._NEEDS_SYNC_GRAPH))
     def test_admin_methods_refuse_with_the_fix_named(self, async_graph, name):
         with pytest.raises(AttributeError, match="plain Graph"):
             getattr(async_graph, name)
+
+    def test_the_set_covers_every_method_that_opens_its_own_connection(self):
+        """The other direction, which parametrizing over the set cannot
+        see: a Graph method that connects on `self.engine` DIRECTLY --
+        rather than through a session the async driver hands it -- has
+        to be listed, or it reaches the async engine's sync facade
+        outside the greenlet bridge and raises MissingGreenlet.
+
+        `graphs()` is exactly that shape and was missing. This asserts
+        the ones known to be, so the next one added to core.py is caught
+        by a name, not by a user."""
+        for name in ("graphs", "load_vectors", "embed_stale", "schema_violations"):
+            assert name in asyncio_module._NEEDS_SYNC_GRAPH, (
+                f"Graph.{name}() opens its own connection -- on AsyncGraph that is a "
+                f"MissingGreenlet, not an AttributeError naming the fix")
+
+    def test_graphs_refuses_rather_than_raising_missing_greenlet(self, async_graph):
+        """The specific hole: `await`-free `async_graph.graphs()` used to
+        reach Graph.graphs()' own `self.engine.connect()` on the sync
+        facade. A raw MissingGreenlet from inside SQLAlchemy is the
+        confusing, out-of-context failure this whole set exists to
+        convert into a sentence naming the fix."""
+        name = "graphs"                       # not a literal: B009 rewrites that to an
+        with pytest.raises(AttributeError) as refused:   # expression ruff then calls useless
+            getattr(async_graph, name)
+        assert "AsyncGraph has no graphs()" in str(refused.value)
+        assert "Graph(<dsn>).graphs(...)" in str(refused.value)
 
     def test_connection_free_methods_pass_through_unchanged(self, async_graph):
         # build_query() never connects, on Graph or AsyncGraph alike --

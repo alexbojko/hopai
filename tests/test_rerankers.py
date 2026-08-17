@@ -1657,11 +1657,17 @@ class TestRerankOnStartAndHop:
             Hop(via_near=Near("edgevec", text="cites"), via_keep=5, rerank=self._rerank())
         assert "reorders the candidates near= ranks" not in str(edge_beam.value)
 
-    def test_candidates_equal_to_keep_is_allowed(self):
-        """The boundary is `<`, not `<=`: reranking exactly as many as
-        you keep still reorders them, which changes the seed set a hop
-        walks from even though it changes no membership."""
-        Start(near=Near("bio", text="sql"), rerank=self._rerank(candidates=10), keep=10)
+    def test_candidates_equal_to_keep_is_refused_on_a_step(self):
+        """The boundary is `<=` on a Start/Hop, not `<`. Reranking
+        exactly as many as you keep DOES reorder them, but a traversal
+        returns a subgraph and discards that order, so the same `keep`
+        nodes continue the walk whichever score sorted them -- a
+        provider call billed per document for a guaranteed no-op.
+        vector_search() keeps the `<` boundary, because it reports the
+        new order and a rerank_score."""
+        with pytest.raises(ValueError,
+                           match="reranks exactly as many candidates as keep=10 keeps"):
+            Start(near=Near("bio", text="sql"), rerank=self._rerank(candidates=10), keep=10)
 
     def test_a_multivector_near_refuses_if_any_field_carries_a_vector(self):
         """One text= field does not make the query readable: the refusal
@@ -1670,3 +1676,670 @@ class TestRerankOnStartAndHop:
         with pytest.raises(ValueError, match="rerank= needs the query as TEXT"):
             Start(near=[Near("bio", text="sql"), Near("summary", [0.1, 0.2])],
                   rerank=self._rerank(), keep=5)
+
+
+#: Candidate rows the pruning proof below runs every accepted filter
+#: against. Each one is a shape the analysis could get wrong, not a
+#: sample of realistic data: a missing key must stay MISSING (jq's `//`
+#: and `Required` both read absent and null as different things), an
+#: intermediate that is not an object must be handed over whole so
+#: libjq's own "Cannot index" survives, and a property name containing a
+#: dot must not be confused with a nested path -- `paths_read()` reports
+#: both as `a.b`.
+PRUNING_ROWS = (
+    {"id": "7",
+     "properties": {"title": "Raft", "summary": "a consensus protocol", "type": "paper",
+                    "name": "r", "n": 3, "tags": ["a", "b", "c"], "ssn": "123",
+                    "odd key": {"title": "deep"}, "body": "x" * 200},
+     "quoted key": "qk", "a": {"b": "ab"}, "c": "c",
+     "similarity": 0.8, "similarities": {"summary": 0.8}, "boosts": {}},
+    {"id": "8", "properties": {}},                       # every key missing
+    {"id": "9"},                                         # properties itself missing
+    {},                                                  # nothing at all
+    {"id": "10", "properties": {"title": None, "tags": None, "n": None, "summary": None}},
+    {"id": "11", "properties": "not an object"},         # jq: Cannot index string
+    {"id": "12", "properties": ["a", "b"]},              # jq: Cannot index array
+    {"id": "13", "properties": 42},
+    {"id": "14", "properties": {"title": "T", "n": 0, "summary": "",
+                                "tags": [{"name": "n1"}, {"name": "n2"}]}},
+    {"id": "15", "properties": {"title": "", "tags": [], "summary": "s", "n": 1}},
+    {"id": "16", "properties": {"title": "T"},
+     "paths": [[{"id": "1", "properties": {"title": "P"}}]]},
+    # The ambiguity: `."a.b"` and `.a.b` are the SAME reported path.
+    {"id": "17", "properties": {"title": "T"}, "a.b": "a literal dotted key",
+     "a": {"b": "nested"}},
+    {"id": "18", "properties": {"title": "T", "n": 1.5, "flag": True,
+                                "tags": [[1, 2], [3]], "odd key": {"title": "x", "z": 1}}},
+)
+
+
+#: Shapes ACCEPTED does not happen to contain, and each is a place the
+#: pruner could get it wrong on its own: a filter reading a parent AND
+#: one of its children (the two must not fight over one slot), and one
+#: reading a property whose NAME contains a dot (indistinguishable, in
+#: what `paths_read()` reports, from a nested path).
+PRUNING_FILTERS = (
+    '(.properties | tojson) + (.properties.title // "")',
+    '.properties.title + (.properties | has("summary") | tostring)',
+    '(.properties | length | tostring) + (.properties.tags | tostring)',
+    '."a.b" // "none"',
+    '.a.b // "none"',
+    '(."a.b" // "") + (.a.b // "")',
+    '.properties."odd key".title // "none"',
+    '[.properties.title, .properties.summary, .id] | tostring',
+)
+
+
+def _both_ways(program, row):
+    """(pruned answer, unpruned answer) for one filter and one row, as
+    values a mismatch can be printed from.
+
+    Raw `jq.compile()` rather than build_documents(): the fallback in
+    `_evaluate()` re-runs a FAILING evaluation against the whole
+    candidate, which is exactly right for the library and would make
+    this check vacuous on every row where the filter errors. Here the
+    two evaluations must agree with nothing catching them -- error text
+    included, because jq quotes the offending value into it."""
+    import json
+
+    import jq
+    from hopai.rerankers import _WHOLE_ROW, _projection_paths, _pruned
+
+    paths = _projection_paths(program)
+    if paths is _WHOLE_ROW:
+        return None, None
+    compiled = jq.compile(program)
+
+    def answer(value):
+        try:
+            return "ok", json.dumps(compiled.input_value(value).all())
+        except Exception as exc:                          # noqa: BLE001 -- compared, not handled
+            return "err", f"{type(exc).__name__}: {exc}"
+
+    return answer(_pruned(row, paths)), answer(row)
+
+
+class TestPruningPreservesEveryDocument:
+    """The correctness bar for the performance fix, and the reason it is
+    a proof rather than an assumption.
+
+    `build_documents()` hands jq only the paths `document_from` reads,
+    because `input_value()` marshals whatever it is given and the cost
+    was therefore proportional to the ROW rather than to the projection
+    -- 121ms of held event loop for fifty 100KB candidates. That makes
+    `jqsafe.paths_read()` load-bearing for CORRECTNESS as well as for
+    the `fields=` allowlist: an under-reported path would silently build
+    a document from `null`, which is the confidently-wrong answer this
+    library exists to refuse.
+
+    So every program in test_jqsafe's ACCEPTED corpus -- the same corpus
+    the differential and termination tests run, so a construct added to
+    the grammar is covered here automatically -- is evaluated against
+    both the pruned candidate and the whole one, and the two answers
+    must be identical. Not "close": the same JSON, or the same error
+    with the same text."""
+
+    def test_every_accepted_program_answers_the_same_pruned(self):
+        needs_jq()
+        from test_jqsafe import ACCEPTED
+
+        compared = 0
+        for program in ACCEPTED + PRUNING_FILTERS:
+            for row in PRUNING_ROWS:
+                pruned, whole = _both_ways(program, row)
+                if pruned is None:
+                    continue                              # reads `.`; not pruned at all
+                compared += 1
+                assert pruned == whole, (
+                    f"{program!r} on {row!r}: pruned {pruned!r}, whole {whole!r}")
+        # A floor, so the check cannot quietly become vacuous if
+        # _projection_paths() ever starts declining to prune everything.
+        assert compared > 500, f"only {compared} (program, row) pairs were pruned at all"
+
+    def test_the_check_can_fail(self):
+        """A proof that cannot fail proves nothing. Pruning to the wrong
+        path is exactly the bug this guards, and it produces `null`
+        rather than an error -- which is why the document, not the
+        exception, is what is compared above."""
+        import jq
+
+        from hopai.rerankers import _pruned
+
+        row = {"properties": {"title": "Raft"}}
+        assert jq.compile(".properties.title").input_value(row).all() == ["Raft"]
+        assert jq.compile(".properties.title").input_value(
+            _pruned(row, ("properties.summary",))).all() == [None]
+
+    def test_a_missing_key_stays_missing_rather_than_becoming_null(self):
+        """The one difference a caller would never see in a document and
+        would see in the RANKING: `.properties.title // "untitled"` takes
+        its default on a missing key AND on a null one, but
+        `.properties | has("title")` does not, and a pruner that filled
+        in the paths it was asked for would answer the second wrongly on
+        every row."""
+        from hopai.rerankers import _pruned
+
+        assert _pruned({"properties": {}}, ("properties.title",)) == {"properties": {}}
+        assert _pruned({}, ("properties.title",)) == {}
+        assert _pruned({"properties": {"title": None}}, ("properties.title",)) == \
+            {"properties": {"title": None}}
+
+    def test_a_value_that_cannot_be_descended_into_is_kept_whole(self):
+        """`paths_read()` collapses indexing -- `.properties.tags[0].name`
+        is reported as `properties.tags.name` -- so the walk arrives at a
+        LIST with a segment still to go. Keeping the list entire is what
+        makes that collapse safe; descending into it would drop every
+        element."""
+        from hopai.rerankers import _pruned
+
+        row = {"properties": {"tags": [{"name": "a"}, {"name": "b"}], "ssn": "123"}}
+        assert _pruned(row, ("properties.tags.name",)) == \
+            {"properties": {"tags": [{"name": "a"}, {"name": "b"}]}}
+        # A string, where libjq's own "Cannot index string" has to survive.
+        assert _pruned({"properties": "text"}, ("properties.title",)) == \
+            {"properties": "text"}
+
+    def test_a_property_name_containing_a_dot_keeps_both_readings(self):
+        """`."a.b"` and `.a.b` are reported identically, so the pruner
+        cannot tell them apart -- and picking one would build a document
+        from `null` on rows shaped the other way. It keeps both, because
+        over-keeping only costs bytes."""
+        from hopai.rerankers import _pruned
+
+        row = {"a.b": "flat", "a": {"b": "nested", "ssn": "123"}, "other": "dropped"}
+        assert _pruned(row, ("a.b",)) == {"a.b": "flat", "a": {"b": "nested"}}
+
+    def test_a_whole_key_wins_over_a_partial_one(self):
+        """`properties` and `properties.title` reported together must not
+        fight over one slot -- the wider read is the one that has to
+        survive."""
+        from hopai.rerankers import _pruned, _projection_paths
+
+        row = {"properties": {"title": "T", "summary": "S"}}
+        assert _pruned(row, ("properties", "properties.title")) == row
+        # ...and _projection_paths() drops the redundant one up front.
+        assert _projection_paths(
+            '.properties | select(.type == "x") | tojson') == ("properties",)
+
+    def test_a_filter_reading_the_whole_row_is_not_pruned(self):
+        """`.` is the case the analysis cannot narrow, and the rule is
+        correct-and-slow over fast-and-wrong."""
+        from hopai.rerankers import _WHOLE_ROW, _projection_paths
+
+        assert _projection_paths(".") is _WHOLE_ROW
+        assert _projection_paths("tojson") is _WHOLE_ROW
+        assert _projection_paths(".properties.title") == ("properties.title",)
+
+    def test_a_filter_the_subset_cannot_parse_is_not_pruned(self):
+        """`trusted=True` gets the full jq language, which `jqsafe` does
+        not parse -- so there is no reported set to trust and nothing may
+        be taken away."""
+        from hopai.rerankers import _WHOLE_ROW, _projection_paths
+
+        assert _projection_paths("to_entries | map(.value) | join(\" \")") is _WHOLE_ROW
+        assert _projection_paths("[paths] | tojson") is _WHOLE_ROW
+
+    def test_a_trusted_full_language_filter_still_builds_its_document(self):
+        """The end-to-end half of the above: an unprunable filter is not
+        a refused one."""
+        needs_jq()
+        rerank = _rerank(lambda q, d: [1.0] * len(d),
+                         document_from='[.properties | to_entries[] | .value] | join(" ")')
+        assert rerank.build_documents(
+            [{"id": "1", "properties": {"a": "x", "b": "y"}}], trusted=True) == ["x y"]
+
+    def test_a_non_dict_candidate_is_handed_over_untouched(self):
+        """The filter runs against whatever the caller passed, and a bare
+        value has no paths to prune -- the refusal it earns must be the
+        one it always earned."""
+        needs_jq()
+        rerank = _rerank(lambda q, d: [1.0] * len(d), document_from=".properties.title")
+        with pytest.raises(ValueError, match="candidate 'a string'"):
+            rerank.build_documents(["a string"])
+
+    def test_an_error_names_the_whole_candidate_not_the_pruned_view(self):
+        """jq quotes the offending VALUE into its error text, so a
+        message built from the view would describe a row the caller does
+        not have. `_evaluate()` re-runs a failure against the whole
+        candidate before reporting it, which keeps the message
+        byte-identical to the one raised before pruning existed."""
+        needs_jq()
+        rerank = _rerank(lambda q, d: [1.0] * len(d), document_from=".properties.title")
+        with pytest.raises(ValueError) as failed:
+            rerank.build_documents([{"id": "9", "properties": "not an object"}])
+        assert "candidate id='9'" in str(failed.value)
+        assert "Cannot index string with" in str(failed.value)
+
+
+class TestPruningSurvivesGeneratedFilters:
+    """The corpus above is hand-written, so it can only cover the
+    constructs someone thought of. This composes filters and rows at
+    random from the same grammar and asserts the same equality --
+    bounded and seeded, so a failure is reproducible and the suite's
+    runtime is not.
+
+    The precedent is test_jqsafe's own fuzz run against libjq, which is
+    where `1.a` was found: 37,000 generated programs, one divergence,
+    and it was a real one."""
+
+    FIELDS = ("title", "summary", "tags", "n", "type", "missing", "odd key")
+    LEAVES = ("Raft", "", None, 3, 1.5, True, ["a", "b"], [], {"name": "x"}, {})
+
+    def _row(self, rng):
+        properties = {name: rng.choice(self.LEAVES)
+                      for name in self.FIELDS if rng.random() < 0.7}
+        row = {"id": str(rng.randrange(100)), "properties": properties}
+        if rng.random() < 0.3:
+            row["properties"] = rng.choice(("a string", 7, ["x"], None))
+        if rng.random() < 0.3:
+            row["paths"] = [[{"id": "1", "properties": {"title": "P"}}]]
+        if rng.random() < 0.2:
+            row["a.b"] = "flat"
+            row["a"] = {"b": "nested"}
+        return row
+
+    def _filter(self, rng, depth=0):
+        base = rng.choice((
+            ".properties", ".properties.title", ".properties.tags", ".properties.n",
+            '.properties."odd key"', ".properties.tags[]", ".properties.tags[0]",
+            ".properties.tags[-1]", ".properties.tags[0:2]", ".properties.missing",
+            ".properties.tags[0].name", ".paths", ".a.b", '.a."b"', ".id",
+        ))
+        if rng.random() < 0.4:
+            base += "?"
+        if depth < 2 and rng.random() < 0.6:
+            base += rng.choice((
+                " | tostring", " | length", " | type", " | tojson", " | not",
+                " | strings", " | values", " | first", " | last", " | sort",
+                " | reverse", " | unique", " | add", " | arrays", " | objects",
+                ' | has("title")', ' | startswith("R")', ' | join(", ")',
+                " | map(tostring)", ' | select(. != null)', " | ascii_downcase",
+                ' | ltrimstr("R")', ' | split(" ")', " | numbers",
+            ))
+        if depth < 1 and rng.random() < 0.4:
+            joiner = rng.choice((" + ", ", ", " // "))
+            return f"({base}){joiner}({self._filter(rng, depth + 1)})"
+        if depth < 1 and rng.random() < 0.2:
+            return f'"text: \\({base})"'
+        return base
+
+    def test_generated_filters_answer_the_same_pruned(self):
+        import random
+
+        from hopai.jqsafe import UnsafeFilter, is_total
+
+        needs_jq()
+        rng = random.Random(20250817)                    # seeded: a failure reproduces
+        rows = [self._row(rng) for _ in range(30)]
+        checked = 0
+        for _ in range(1500):
+            program = self._filter(rng)
+            try:
+                if not is_total(program):
+                    continue                             # outside the subset; not pruned
+            except UnsafeFilter:                         # pragma: no cover -- is_total swallows
+                continue
+            row = rng.choice(rows)
+            pruned, whole = _both_ways(program, row)
+            if pruned is None:
+                continue
+            checked += 1
+            assert pruned == whole, (
+                f"{program!r} on {row!r}: pruned {pruned!r}, whole {whole!r}")
+        assert checked > 500, f"only {checked} generated filters were actually pruned"
+
+
+class TestDocumentBuildingDoesNotScaleWithTheRow:
+    """The regression this whole change exists for.
+
+    Before pruning, `.properties.title` on a 100KB row cost the same as
+    reading the 100KB field itself: ~40us per row plus ~31us per KB of
+    payload, because `input_value()` marshalled the whole candidate
+    either way. That is the shape being pinned -- cost proportional to
+    the PROJECTION, not to the row.
+
+    MEASURED IN CPU TIME, not wall time, and that is what makes it safe
+    to gate a merge on. `time.process_time()` counts this process's own
+    cycles and nothing else on the box, so a shared CI runner with four
+    Python versions building in parallel changes the number by noise
+    rather than by a factor -- where wall time under 2x nproc of load
+    moved it enough to fail a threshold that held comfortably on an idle
+    machine. The ratio between two payload sizes is the primary
+    assertion for the same reason: both sides are measured the same way
+    in the same process, seconds apart."""
+
+    @staticmethod
+    def _rows(count, kilobytes):
+        body = "x" * 1000
+        return [{"id": str(i), "similarity": 0.5, "boosts": {},
+                 "properties": dict({"title": f"node {i}", "summary": "s"},
+                                    **{f"field_{f}": body for f in range(kilobytes)})}
+                for i in range(count)]
+
+    def _cost(self, rerank, rows):
+        """CPU seconds per row, best of three. Best rather than mean
+        because a GC pause inside one run is not the measurement."""
+        rerank.build_documents(rows)                     # warm
+        best = min(self._once(rerank, rows) for _ in range(3))
+        return best / len(rows)
+
+    @staticmethod
+    def _once(rerank, rows):
+        started = time.process_time()
+        rerank.build_documents(rows)
+        return time.process_time() - started
+
+    def test_a_big_payload_costs_what_a_small_one_does(self):
+        needs_jq()
+        rerank = _rerank(lambda q, d: [1.0] * len(d), document_from=".properties.title")
+        small = self._cost(rerank, self._rows(50, 1))
+        large = self._cost(rerank, self._rows(50, 100))
+        # Unpruned this ratio measured ~72x (40us against 2879us per
+        # row). Ten is far above the run-to-run spread of a CPU-time
+        # measurement and an order of magnitude below the regression.
+        assert large < small * 10, (
+            f"{large * 1e6:.0f}us/row at 100KB against {small * 1e6:.0f}us/row at 1KB -- "
+            f"document building is proportional to the row again")
+
+    def test_reading_the_big_field_costs_what_reading_the_title_does(self):
+        """The control the audit used: `.properties.title` (60 characters
+        out) and `.properties.field_0` (1KB out) on the SAME rows. Before
+        pruning they cost the same because both marshalled 100KB; after
+        it they cost the same because both marshal only what they name.
+        Same equality, opposite reason -- so this pins the direction the
+        one above cannot."""
+        needs_jq()
+        rows = self._rows(50, 100)
+        title = self._cost(_rerank(lambda q, d: [], document_from=".properties.title"), rows)
+        field = self._cost(_rerank(lambda q, d: [], document_from=".properties.field_0"), rows)
+        assert field < title * 10 and title < field * 10, (
+            f"{title * 1e6:.0f}us/row for a title against {field * 1e6:.0f}us/row for a "
+            f"1KB field")
+        # ...and both are the projection's price, not the row's: 50
+        # candidates of 100KB each cost 144ms of CPU before this, every
+        # millisecond of it the event loop's own thread on the async
+        # path. 20ms is 7x below that and ~30x above what it now costs.
+        assert title * len(rows) < 0.02, (
+            f"{title * 1e6:.0f}us/row of CPU to read a title out of a 100KB candidate")
+
+
+class TestTheDocumentCountIsBounded:
+    """`candidates=` bounds the NODES a step offers; under
+    `per_path=True` the documents are (node, route) pairs, and how many
+    routes reach a node is the GRAPH's answer, not an option's. So the
+    document count had no bound at all on the Python API --
+    `candidates=500` over nodes reached 200 ways is 100,000 documents,
+    measured at 4.64s of document building before the provider is even
+    called, all of it on the event loop's own thread on the async path.
+
+    MAX_DOCUMENTS refuses instead of truncating, for the reason every
+    other refusal in this module does: the documents that fell off the
+    end are routes a node would have scored on, so the ranking would
+    differ with nothing to show for it."""
+
+    def _rows(self, count):
+        return [{"id": str(i), "properties": {"title": f"n{i}"}} for i in range(count)]
+
+    def test_a_call_over_the_limit_refuses_naming_the_number(self):
+        needs_jq()
+        from hopai.rerankers import MAX_DOCUMENTS
+
+        rerank = _rerank(lambda q, d: [1.0] * len(d), candidates=10)
+        with pytest.raises(ValueError) as refused:
+            rerank.build_documents(self._rows(MAX_DOCUMENTS + 1))
+        message = str(refused.value)
+        assert str(MAX_DOCUMENTS + 1) in message and str(MAX_DOCUMENTS) in message
+        assert "Lower candidates=" in message
+
+    def test_the_limit_itself_is_allowed(self):
+        """The boundary is `>`, not `>=`: a call built from exactly the
+        limit is a call the caller was told they could make."""
+        needs_jq()
+        from hopai.rerankers import MAX_DOCUMENTS
+
+        rerank = _rerank(lambda q, d: [1.0] * len(d), candidates=10)
+        assert len(rerank.build_documents(self._rows(MAX_DOCUMENTS))) == MAX_DOCUMENTS
+
+    def test_the_per_path_message_names_what_actually_multiplied(self):
+        """Under per_path=True the advice "lower candidates=" is only
+        half of it -- the other factor is the fan-in, which max_paths
+        does NOT bound. A caller told to lower max_paths would change
+        nothing and conclude the limit is broken."""
+        needs_jq()
+        from hopai.rerankers import MAX_DOCUMENTS
+
+        rerank = _rerank(lambda q, d: [1.0] * len(d), candidates=500, per_path=True,
+                         max_paths=200)
+        with pytest.raises(ValueError) as refused:
+            rerank.build_documents(self._rows(MAX_DOCUMENTS + 1))
+        message = str(refused.value)
+        assert "per_path=True builds one document per (node, route)" in message
+        assert "not by max_paths=200" in message
+
+    def test_the_message_without_per_path_points_at_candidates(self):
+        """The other half: with per_path=False the count cannot exceed
+        `candidates`, so the knob that is too big is that one and the
+        message says so rather than explaining fan-in to someone who
+        never opted into it."""
+        needs_jq()
+        from hopai.rerankers import MAX_DOCUMENTS
+
+        rerank = _rerank(lambda q, d: [1.0] * len(d), candidates=9000)
+        with pytest.raises(ValueError) as refused:
+            rerank.build_documents(self._rows(MAX_DOCUMENTS + 1))
+        assert "candidates=9000 is the input bound" in str(refused.value)
+
+    def test_it_refuses_before_it_builds_anything(self):
+        """The point of the bound is the 4.64s, so it has to be spent
+        before the loop rather than after it -- a filter that raises on
+        every row must not be what reports the problem."""
+        needs_jq()
+        from hopai.rerankers import MAX_DOCUMENTS
+
+        rerank = _rerank(lambda q, d: [1.0] * len(d), document_from=".nope.title")
+        rows = [{"id": str(i)} for i in range(MAX_DOCUMENTS + 1)]
+        with pytest.raises(ValueError, match="over the 5000 limit"):
+            rerank.build_documents(rows)
+
+    def test_a_generator_of_candidates_is_counted_not_consumed_twice(self):
+        """build_documents() takes a LIST in every call site hopai owns,
+        but it is public and an iterator is what a caller reaches for
+        when the count is the problem. Materializing once is what lets
+        the bound see the number at all."""
+        needs_jq()
+        rerank = _rerank(lambda q, d: [1.0] * len(d))
+        assert rerank.build_documents(iter(self._rows(3))) == ["n0", "n1", "n2"]
+
+
+# ---------------------------------------------------------------------
+# A traversal step reranks IN ORDER TO TRUNCATE, or not at all
+# ---------------------------------------------------------------------
+
+class TestRerankNeedsSomethingToTruncate:
+    """A traversal returns a SUBGRAPH, not a ranking: the reranked order
+    is thrown away, so the only mark a reranker can leave on a Start or a
+    Hop is which nodes it drops -- and dropping is what `keep` means.
+
+    Every refusal here is raised on the line the caller wrote, which is
+    what turns the reproduction below from a live query into a
+    constructor call."""
+
+    @staticmethod
+    def _rerank(**options):
+        options.setdefault("document_from", ".properties.title")
+        return Rerank(lambda query, documents: [0.0] * len(documents), **options)
+
+    def test_a_hop_reranking_with_no_keep_is_refused(self):
+        """THE BUG THIS CLASS EXISTS FOR. `Hop(near=, keep=None)` is an
+        ordinary query -- min_similarity is the other bound -- so a
+        reranker could be attached to one, and then `rerank.candidates`
+        silently became the OUTPUT bound: core.py's probe widens the
+        step's `keep` to it and nothing truncates afterwards, so the
+        candidate set IS the survivor set. Measured against a six-node
+        fan-out, a reranker returning the same score for every document
+        cut the result from 6 nodes to 2 for candidates=1, with nothing
+        said. Refusing is the only answer that cannot be a quietly
+        different subgraph."""
+        near = Near("summary", text="database query planner", min_similarity=-1.0)
+        with pytest.raises(ValueError, match="rerank= needs keep="):
+            Hop(via={"kind": "cites"}, near=near, rerank=self._rerank(candidates=1))
+
+    def test_a_start_reranking_with_no_keep_is_refused_too(self):
+        """The seed step has the same shape and the same consequence:
+        without `keep` the walk would start from `candidates` seeds
+        rather than from every seed `near` qualified."""
+        near = Near("summary", text="raft", min_similarity=-1.0)
+        with pytest.raises(ValueError, match="rerank= needs keep="):
+            Start(near=near, rerank=self._rerank(candidates=25))
+
+    def test_the_no_keep_refusal_names_the_fix_and_the_reason(self):
+        """CLAUDE.md's rule 3: the message names the FIX, and rule 4:
+        it says why the semantics differ from what was expected. Both
+        halves matter here, because "add keep=" is useless advice
+        without "the order is discarded" beside it -- a caller who
+        thinks a traversal returns a ranking has no reason to believe
+        the two are related."""
+        near = Near("summary", text="raft", min_similarity=-1.0)
+        with pytest.raises(ValueError) as refused:
+            Start(near=near, rerank=self._rerank(candidates=25))
+        message = str(refused.value)
+        assert "SUBGRAPH, not a ranking" in message
+        assert "Add keep=N" in message and "candidates=25" in message
+
+    def test_the_second_enforcement_site_catches_a_spec_that_dodged_the_first(self):
+        """Construction is not the only gate: vectors._resolved_spec()
+        and core.py's probe rebuild a step and re-attach its rerank
+        AFTER __post_init__ has run, so rerank_plan() re-validates every
+        reranked step before a statement runs. Without that second site
+        a rebuilt spec could reach the probe with no `keep` at all --
+        which is exactly the state the bug needed."""
+        from hopai.core import rerank_plan
+
+        start = Start(near=Near("summary", text="raft"), keep=5,
+                      rerank=self._rerank(candidates=25))
+        start.keep = None                       # what a rebuild could leave behind
+        with pytest.raises(ValueError, match="rerank= needs keep="):
+            rerank_plan(start, [])
+
+    def test_candidates_equal_to_keep_buys_a_billed_no_op(self):
+        """`candidates < keep` already refuses. At EQUALITY a traversal
+        step is in the same position and was not told: the survivors are
+        the top-`keep` either way, because the order the reranker
+        produced does not survive -- so every document is billed for a
+        result that cannot differ. vector_search() is where equality
+        stays meaningful, and the message says so rather than leaving
+        the caller to infer that the two surfaces differ."""
+        with pytest.raises(ValueError) as refused:
+            Hop(near=Near("summary", text="raft"), keep=4,
+                rerank=self._rerank(candidates=4))
+        message = str(refused.value)
+        assert "reranks exactly as many candidates as keep=4 keeps" in message
+        assert "Raise candidates above keep=4" in message
+        assert "vector_search()" in message
+
+    def test_a_search_may_still_rerank_exactly_k(self):
+        """The other side of the boundary, and why it is not one rule.
+        vector_search() REPORTS the new order and a `rerank_score` per
+        hit, so reranking exactly `k` rows changes the answer a caller
+        can see. Widening the step's refusal over it would put the
+        commonest search shape out of reach."""
+        from hopai.vectors import rerank_query_text
+
+        query = rerank_query_text(Near("summary", text="raft"), self._rerank(candidates=10),
+                                  10, "vector_search()")
+        assert query == "raft"
+
+    def test_a_bare_callable_where_a_rerank_belongs_is_refused(self):
+        """The mistake the documentation invites: "a plain callable is a
+        first-class client" is true of Rerank(client), not of rerank=.
+        Unchecked it constructed fine and died at execution with
+        `AttributeError: 'function' object has no attribute
+        'candidates'` -- an internal attribute, three layers from the
+        line that wrote it."""
+        with pytest.raises(TypeError, match=r"rerank= takes a Rerank\(client"):
+            Start(near=Near("summary", text="raft"), keep=2,
+                  rerank=lambda query, documents: [0.0] * len(documents))
+
+    @pytest.mark.parametrize("wrong", [".properties.title", [1], {"candidates": 5}])
+    def test_every_other_shape_is_refused_the_same_way(self, wrong):
+        """A filter string, a list of Reranks and a JSON-ish dict are
+        the same mistake reaching for the same parameter, so they get
+        the same sentence rather than three different AttributeErrors
+        from three different attributes."""
+        with pytest.raises(TypeError, match="rerank= takes a Rerank"):
+            Hop(near=Near("summary", text="raft"), keep=2, rerank=wrong)
+
+    def test_the_type_refusal_names_the_rewrite(self):
+        """Naming `Rerank(client, document_from=...)` is what turns "not
+        a Rerank" into something a caller can act on -- and saying that
+        the filter is the missing half is what stops them from passing
+        the client again."""
+        with pytest.raises(TypeError) as refused:
+            Start(near=Near("summary", text="raft"), keep=2, rerank=".properties.title")
+        assert "document_from='.properties.title'" in str(refused.value)
+
+    def test_a_search_refuses_a_bare_callable_before_it_queries(self):
+        """vector_search()/vector_search_many() reach the same validator
+        through rerank_query_text(), so the entry points that used to
+        raise AttributeError deep inside candidate fetching now refuse
+        by name."""
+        from hopai.vectors import rerank_query_text, rerank_query_texts
+
+        near = Near("summary", text="raft")
+        with pytest.raises(TypeError, match=r"vector_search\(\): rerank= takes a Rerank"):
+            rerank_query_text(near, lambda q, d: [], 10, "vector_search()")
+        with pytest.raises(TypeError, match="rerank= takes a Rerank"):
+            rerank_query_texts([near], [self._rerank()], 10, "vector_search_many()")
+
+    def test_a_rerank_does_not_hijack_an_unrelated_near_mistake(self):
+        """`near="database"` is a plain type error with its own message
+        one line away. With a rerank= present the text check ran first
+        against something that is not a Near at all, invented
+        `Near('?', ...)`, claimed "was given a raw vector" (false -- a
+        string was given) and named a rewrite nobody can apply. A
+        rerank= must not change which diagnosis an unrelated mistake
+        gets."""
+        spec = Start(near="database", keep=2, rerank=self._rerank())
+        from hopai import Graph
+        graph = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline")
+        with pytest.raises(TypeError,
+                           match=r"near= takes Near\(field, vector\) specs, got 'database'"):
+            graph.build_query(spec, [])
+
+    def test_per_path_at_a_start_is_refused(self):
+        """A seed has no provenance -- which is why `.paths` at a Start
+        already refuses. `per_path=True` means one call per (node,
+        path), so with no paths it IS the default under another name:
+        the caller set a knob and hopai discarded it, which is the
+        "a constraint the options discard is not no constraint" case."""
+        from hopai.core import rerank_plan
+
+        start = Start(near=Near("summary", text="raft"), keep=2,
+                      rerank=self._rerank(candidates=25, per_path=True))
+        with pytest.raises(ValueError, match="per_path=True"):
+            rerank_plan(start, [])
+
+    def test_per_path_stays_legal_at_a_hop(self):
+        """The refusal is about a SEED, not about the mode. A hop is
+        where a node genuinely reads differently depending on the route
+        that found it, and breaking that would take the step-wise case
+        with it."""
+        from hopai.core import rerank_plan
+
+        hop = Hop(via={"kind": "cites"}, near=Near("summary", text="raft"), keep=2,
+                  rerank=self._rerank(candidates=25, per_path=True))
+        assert rerank_plan(Start(where={"type": "doc"}), [hop]) == {0: "raft"}
+
+    def test_the_policy_and_its_parser_are_importable_from_hopai(self):
+        """parse_rerank()'s refusal names `RerankPolicy` as the thing to
+        pass, and its own docstring calls itself public -- while
+        `from hopai import RerankPolicy` raised ImportError. An error
+        naming an unimportable symbol is the "you have to know that..."
+        defect, and every sibling parser (parse_near, parse_boost,
+        parse_filter, parse_aggregate) was already exported."""
+        import hopai
+
+        assert {"RerankPolicy", "parse_rerank"} <= set(hopai.__all__)
+        assert hopai.RerankPolicy is not None and callable(hopai.parse_rerank)
+        for name in hopai.__all__:
+            assert getattr(hopai, name, None) is not None, name
