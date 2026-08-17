@@ -169,6 +169,117 @@ of its own decisions about how: you construct the client, hopai calls one method
   (`_resolve_query_texts()`), because N round trips to the provider would undo the N-1
   round trips to Postgres that call exists to save.
 
+## The reranking pipeline
+
+`rerankers.py` is the second network seam, built like the first: you construct the
+client, hopai calls one method on it — `score(query, documents) -> list[float]`, one
+float per document in the order given, deliberately **not** factored by modality (a
+reranker cannot tell a cosine's candidate from a lexical one, and a hop's candidate is
+neither). The retry policy is not restated: `_retryable`/`_retry_after` are imported
+from `embeddings.py`, so hopai has one classifier for provider failures.
+
+**Flat search** (`vectors.py:search()`) is four steps in a fixed order:
+
+1. `search_candidates()` fetches `rerank.candidates` rows instead of `k` — that is the
+   only change to the statement, `_prepare_search_query(candidates=)`, and `k` still
+   validates everything else so a rerank cannot change which refusals a search produces.
+2. The connection **closes**. Everything after this point runs with nothing open, for
+   the reason `set_vectors()` resolves embeddings before it takes one: a provider round
+   trip inside an open transaction holds a snapshot for the length of an HTTP call.
+3. `build_documents()` evaluates `document_from` once per candidate against the hit dict
+   the caller would have received, and `score()` makes one provider call (chunked at the
+   provider's own per-call cap).
+4. `_reranked()` attaches `rerank_score`, sorts by it (id as tiebreak, so two equal
+   scores never swap between runs) and truncates to `k`. `similarity` is left exactly as
+   retrieval set it — dropping a stage's input score is never the more useful answer.
+
+Cohere's and Voyage's answers come back **sorted by relevance**, so `_indexed_scores()`
+places each score by its own `.index` rather than by arrival order; a result set that
+does not cover every document refuses instead of being completed with guesses. Zipping a
+relevance-sorted answer against the documents that were sent is a plausible, confidently
+wrong ranking that nothing reports, which is the failure this module is written against.
+
+**Step-wise reranking** is the part that could not be a wrapper. A traversal compiles to
+*one* recursive CTE, and a reranker is a network call in the middle of the walk, so a
+reranked traversal cannot be one statement. The shape is **probe → rerank → re-run the
+ordinary traversal with each step's survivors pinned** (`core.py:_rerank_pins`), never
+stitching partial results together:
+
+- `_rerank_probe()` runs the chain **truncated at that step**, with the step's own `keep`
+  widened to `rerank.candidates` and every earlier step's survivors already pinned. It
+  reuses `_walk_matches` — the same seed/walk/match chain `build_query` and
+  `build_aggregate_query` share — so a candidate set is exactly what that step would have
+  reached, cut off at the number the caller agreed to pay for.
+- Path context is fetched only when the filter asks for it: `jqsafe.paths_read()` decides
+  whether `document_from` reads `.paths` (over-reporting when it cannot parse the filter,
+  never under-reporting). When it does, the probe reads `full_walk.local_path` — the same
+  (walk, match) pair `hop_edges_i` is built from — giving one row per (candidate, route);
+  routes are canonically ordered so the same graph always builds the same document, and
+  `max_paths` caps how many one document may quote.
+- Each step's session **closes before** the provider call, and `_rerank_survivors()`
+  reduces the scores to an id list: the max over a node's documents, so `per_path=True`
+  keeps a node when one route is strong.
+- `_pinned()` turns that list into `id IN (...)` on the step's own CTE — and expands to
+  *nothing* when a step has no pins, which is what keeps a rerank-less traversal's SQL
+  byte-identical.
+
+That last point is the whole safety argument. Because the final execution is an ordinary
+traversal, **fan-in, multi-hop edge reconstruction and dead-end pruning are preserved for
+free**: the edges reported for a hop are still derived from `full_walk` against `match_i`,
+and `match_i` still feeds the next hop. `Hop(near=, keep=N)` already narrows `match_i` to
+a subset through `ranked_ids()`; a pin is the same narrowing with a different source for
+the list. A node survives or is dropped as a unit, so every in-edge from a surviving
+parent is still reported — `test_fan_in_both_parents_preserved` sees no difference.
+Stitching would have had to re-derive those edges by hand, which is exactly what "reported
+nodes derive from the edges found" exists to prevent. `aggregate()` inherits pinning for
+the same reason it inherits everything else: it shares `_walk_matches`, and the last
+step's matched nodes after a rerank *are* the survivors.
+
+**The cost, measured rather than assumed** (rule 6;
+`tests/test_vectors.py::test_a_reranked_traversal_costs_one_plus_two_per_reranked_step`
+pins it): a baseline traversal is **3 statements** — the walk plus its two hydrations —
+and each reranked step adds **2** (a probe and one hydration for the properties its
+documents mention), plus one provider call. Those calls are **serial by nature**: hop
+N+1's candidates are whatever hop N's rerank left behind, so unlike
+`vector_search_many()`'s they cannot be issued together — which is also why pruning
+compounds and is unrecoverable, and why `candidates` should be generous at early steps.
+`vector_search_many(rerank=)` stays **one statement**; its N reranker calls are per query
+(one call cannot serve two, since the score is the (query, document) relationship) and
+`arerank_many()` issues them concurrently, because that call exists to turn N round trips
+into one.
+
+**Scores do not survive into a traversal.** `Start` and `Hop` both document that a
+traversal returns a subgraph rather than a ranking; similarity scores never survived it
+and rerank scores get no exception, so `rerank_score` appears on `vector_search()` /
+`vector_search_many()` hits only. What a rerank changed in a traversal is *which* nodes
+are there, which is what `keep=` has always meant.
+
+**The security posture is a grammar, not a blacklist.** `document_from` is
+model-supplyable on purpose — field selection is a retrieval decision a model can make,
+unlike an embedding it would have to invent — but the filter's output *is* the document
+and the document is posted to a third party. `jqsafe.py` validates it against a **total
+subset** of jq, and both claims are structural:
+
+- **Sound**, because jq has no dynamic dispatch to builtins by name (`builtins` yields
+  the *string* `"env/0"`) and no `eval`: the functions a program can call are exactly the
+  literal names in its source, which a parser enumerates completely. `env`, `$ENV`,
+  `input`, `include`/`import` are absent from the grammar rather than blacklisted.
+- **Terminating**, because no unbounded-iteration construct parses — no `def`, `while`,
+  `until`, `repeat`, `recurse`, `range`, `reduce`, `foreach`, no `label`/`break`. That is
+  not a nicety: libjq holds the GIL through an infinite filter (no watchdog can fire, and
+  SIGINT is ignored) and calls `abort()` on memory exhaustion, so neither failure can be
+  caught in-process and both have to be made unreachable instead. A statically computed
+  growth factor (`MAX_GROWTH`) bounds output size, which totality does not.
+
+It is a **gate, not an interpreter**: what it accepts is handed to libjq unchanged, since
+reimplementing jq's semantics for `//`, `?` and null handling is how an edge case becomes
+a silently different document. `build_documents()` validates by default and
+`trusted=True` is the opt-in — the same polarity as `allow_vectors=`/`all=`/`detach=`,
+because an `untrusted=True` you must remember fails open. `fields=` narrows it further to
+an operator's allowlist of readable paths (at or beneath an allowed path; a read *above*
+one hands back the siblings the allowlist withholds), which is what keeps
+`.properties.ssn` out of a vendor's logs.
+
 ## Extra columns
 
 A custom `node_table=`/`edge_table=` may carry columns beyond `id`/`start_id`/`end_id`/
@@ -433,6 +544,8 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/constraints.py` | What each constraint compiles to, and the SQL semantics that surprise people |
 | `hopai/vectors.py` | Why no pgvector, the storage and cost model, cosine-only, multivector semantics, and why a vector never passes through a tool schema |
 | `hopai/embeddings.py` | Which clients are accepted and how they are recognized without an import, the document/query asymmetry, and what this seam deliberately does not do |
+| `hopai/rerankers.py` | The one-method contract and why it is not split by modality, `document_from` as a rule, why scores are re-paired by index, and why a spent call raises instead of degrading |
+| `hopai/jqsafe.py` | What was measured about jq in a server, the soundness and totality claims the subset rests on, and why each excluded family is excluded |
 | `hopai/schema.py` | The graph-schema notations, the annotation mapping, what enforcement compiles to and the endpoint-type limit, and why inference is an observation rather than a `.schema` fallback |
 | `hopai/cypher.py` | The translatable subset — read, write and aggregate — and why each refusal is a refusal |
 | `hopai/asyncio.py` | Why `AsyncGraph` is a bridge, not a second implementation, what it deliberately does not cover, and the benchmark numbers behind the design |
