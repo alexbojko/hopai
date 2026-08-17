@@ -76,9 +76,10 @@ def _validate_boost(owner: str, near, boost) -> None:
         )
 
 
-def _validate_rerank(owner: str, near, keep, rerank, k_name: str = "keep") -> None:
-    """The three ways a rerank= cannot mean anything, refused where the
-    caller wrote it rather than three layers down at execution.
+def _validate_rerank(owner: str, near, keep, rerank, k_name: str = "keep",
+                     via_near=None) -> None:
+    """The ways a rerank= cannot mean anything, refused where the caller
+    wrote it rather than three layers down at execution.
 
     Structural only, like _validate_near_k above: whether the field
     exists and whether the jq filter parses are checked where the Graph
@@ -91,6 +92,19 @@ def _validate_rerank(owner: str, near, keep, rerank, k_name: str = "keep") -> No
     # Same judgement as boost= above and as a Near inside where=: the
     # thing that ranks and the thing that filters are different jobs.
     if near is None:
+        # Told apart from the bare case for the reason _validate_boost's
+        # docstring gives about its own message: "Add near=" to someone
+        # who passed via_near= is a lie that costs them a working query.
+        # via_near ranks EDGES, and following that advice would silently
+        # rerank nodes -- a different answer, quietly.
+        if via_near is not None:
+            raise ValueError(
+                f"{owner}: rerank= reranks the NODES this hop reaches, and via_near= ranks "
+                f"the EDGES it walks -- an edge beam has no rerank stage, so there is "
+                f"nothing here for a reranker to reorder. Add near= to rank the reached "
+                f"nodes and rerank those, or drop rerank= and let via_near= pick the edges "
+                f"on similarity alone"
+            )
         raise ValueError(
             f"{owner}: rerank= reorders the candidates near= ranks -- on its own it has "
             f"nothing to reorder, because a reranker scores a list it is given rather than "
@@ -232,4 +246,5 @@ class Hop:
         _validate_near_k("Hop", self.via_near, self.via_keep,
                          near_name="via_near", k_name="via_keep")
         _validate_boost("Hop", self.near, self.boost)
-        _validate_rerank("Hop", self.near, self.keep, self.rerank)
+        _validate_rerank("Hop", self.near, self.keep, self.rerank,
+                         via_near=self.via_near)

@@ -1636,6 +1636,24 @@ class TestRerankOnStartAndHop:
         with pytest.raises(ValueError, match="reranks fewer candidates than keep=10 keeps"):
             Start(near=Near("bio", text="sql"), rerank=self._rerank(candidates=5), keep=10)
 
+    def test_an_edge_beam_is_told_it_has_no_rerank_stage(self):
+        """`via_near=` ranks EDGES; rerank= reranks the NODES a hop
+        reaches. Sending that caller the bare "Add near=" is the lie
+        _validate_boost's docstring already refuses to tell -- they would
+        follow it and silently rerank nodes, which is a different answer
+        arrived at quietly."""
+        with pytest.raises(ValueError, match="via_near= ranks the EDGES it walks"):
+            Hop(via_near=Near("edgevec", text="cites"), via_keep=5, rerank=self._rerank())
+
+    def test_the_edge_beam_refusal_is_not_the_bare_one(self):
+        """The two refusals must stay textually distinguishable, the same
+        way the two "not usable yet" vector refusals are: a caller who
+        passed via_near= must not be handed advice written for someone
+        who passed nothing."""
+        with pytest.raises(ValueError) as edge_beam:
+            Hop(via_near=Near("edgevec", text="cites"), via_keep=5, rerank=self._rerank())
+        assert "reorders the candidates near= ranks" not in str(edge_beam.value)
+
     def test_candidates_equal_to_keep_is_allowed(self):
         """The boundary is `<`, not `<=`: reranking exactly as many as
         you keep still reorders them, which changes the seed set a hop
