@@ -1055,9 +1055,19 @@ def without_rerank(schema: dict) -> dict:
 
     Lives here rather than in mcp.py because Graph.tool_schemas() needs
     it and core.py must not import the MCP front end -- that module asks
-    for an optional SDK by name. mcp.py's _with_rerank() calls this for
-    its own no-policy branch, so there is one implementation of "take
-    the parameter off"."""
+    for an optional SDK by name.
+
+    mcp.py's _with_rerank() strips the parameter too and does NOT call
+    this, which is worth knowing before "unifying" them: that one
+    MUTATES the schema it was handed and returns it, because its caller
+    built the copy already, while this one deep-copies because
+    tool_schemas() hands it the module-level constants -- stripping
+    those in place would edit TRAVERSE_TOOL_SCHEMA for the whole
+    process. It also has no top-level branch, since the only schemas it
+    is applied to are the traversal and aggregation ones; the top-level
+    `rerank` below belongs to VECTOR_SEARCH_TOOL_SCHEMA, which only
+    reaches this function. Two callers with genuinely different
+    ownership of the dict, not one rule written twice."""
     copy = deepcopy(schema)
     properties = copy["parameters"]["properties"]
     steps = [properties[name] for name in ("start",) if name in properties]

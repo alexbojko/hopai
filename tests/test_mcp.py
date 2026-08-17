@@ -413,6 +413,29 @@ class TestManyGraphs:
             assert "'docs', 'crm'" in spec.description, spec.name
             assert "Node types: paper" not in spec.description, spec.name
 
+    def test_the_connection_instructions_name_the_graphs_only_when_there_are_several(self):
+        """The opening sentence is the ONLY part a second graph changes,
+        and it is the one place a client is told there is no default
+        graph to fall back on. Inverting the branch hands a single-graph
+        server the multi-graph text ("every call names its graph", about
+        graphs that do not exist) and a multi-graph one the sentence
+        that says it exposes one -- both read as instructions and
+        neither is checked by any tool schema. The only test that read
+        them at all needs the real SDK, so mutmut skips it and the
+        inversion survived.
+
+        The advice half is asserted through the constant rather than by
+        quoting it: the two branches must differ in their FIRST sentence
+        and agree on everything after it."""
+        from hopai.mcp import Served, _ADVICE, _instructions
+
+        assert _instructions(Served(offline())) == SERVER_INSTRUCTIONS
+
+        several = _instructions(Served(self.two()))
+        assert several != SERVER_INSTRUCTIONS
+        assert "'docs', 'crm'" in several
+        assert several.endswith(_ADVICE)
+
     def test_strict_schema_needs_one_on_every_served_graph(self):
         """A per-call `graph` argument would otherwise reach a graph
         that cannot be strict, and the refusal would name Cypher rather
@@ -938,6 +961,137 @@ class TestToolSchemas:
         # and the loop above has to have HAD something to check: every
         # injected key reached, or this asserts nothing at all
         assert seen == {"graph", "start.search", "start.keep", "start.search_field"}
+
+    # Two mutants in the same triage batch as the tests below are
+    # EQUIVALENT, checked rather than assumed and recorded here so the
+    # next run does not re-derive them:
+    #
+    # _describe_tool's `vector_field_json(name, field)` -> `(None, field)`
+    # cannot be observed: schema._as_vector_field_schema() reads `name`
+    # only in the TypeError it raises for an entry that is neither a
+    # Vector nor a VectorFieldSchema, and _vector_fields() yields
+    # Graph.vectors, whose entries build_registry() has already refused
+    # unless they are Vectors.
+    #
+    # _with_search's `start.get("anyOf", [])` -> `start.get("anyOf")` is
+    # equivalent for the same reason: the default is dead. Every schema
+    # _with_search can receive is TRAVERSE_TOOL_SCHEMA or
+    # AGGREGATE_TOOL_SCHEMA -- directly, or as the deep copy
+    # tool_schemas() hands back -- and both define `start.anyOf`, which
+    # test_a_seed_set_still_has_to_come_from_somewhere pins. Worth
+    # keeping for the day one of them stops.
+
+    def test_the_only_start_keys_this_module_adds_are_the_two_it_reads(self):
+        """CLAUDE.md's rule for a front end: a tool that offers a
+        parameter no handler accepts is the defect. `start` is parsed by
+        json_api's _START_KEYS and anything outside it is REFUSED there,
+        so the two keys this module may add are the two _seed() pops
+        before parsing -- `search` and `search_field`.
+
+        Derived from _START_KEYS rather than listed, the way
+        test_advertises_the_keys_the_parser_reads derives its side, so a
+        widened parser and a widened schema fail apart. A mutant renamed
+        `keep` to `XXkeepXX` and survived every existing check: the
+        static schema already carries a `keep`, so the renamed copy was
+        an EXTRA advertised key rather than a missing one -- looked up
+        by name, nothing was gone."""
+        from hopai.json_api import _START_KEYS
+
+        several_fields = offline()
+        several_fields.define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)])
+        for name in ("traverse_graph", "aggregate_graph"):
+            start = named(several_fields,
+                          embed=embedder())[name].parameters["properties"]["start"]
+            assert set(start["properties"]) - _START_KEYS == {"search", "search_field"}
+            assert "keep" in start["properties"]
+
+    def test_a_seed_field_is_never_offered_from_the_edge_side(self):
+        """`start.search` ranks NODE vectors -- _seeds_from_text() and
+        _resolve_field(graph, "nodes", ...) both say so -- so a
+        `search_field` enum built from the union of both targets offers
+        a field that fails on every use, which is the exact defect
+        test_edge_only_vectors_offer_search_but_not_a_seed exists for
+        one level up. A mutant read the registry with no target at all
+        (the union) and survived, because every test until now declared
+        edge fields with the same names as the node ones or none at
+        all."""
+        one_each = offline()
+        one_each.define_vectors(nodes=[Vector("summary", 3)],
+                                edges=[Vector("rel", 3), Vector("note", 3)])
+        start = named(one_each, embed=embedder())[
+            "traverse_graph"].parameters["properties"]["start"]
+        assert "search" in start["properties"]
+        # one NODE field is no choice at all, however many edge fields
+        assert "search_field" not in start["properties"]
+
+        two_nodes = offline()
+        two_nodes.define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)],
+                                 edges=[Vector("rel", 3)])
+        start = named(two_nodes, embed=embedder())[
+            "traverse_graph"].parameters["properties"]["start"]
+        assert start["properties"]["search_field"]["enum"] == ["summary", "title"]
+
+    def test_search_similar_says_which_side_each_field_is_on(self):
+        """search_similar ranks EITHER target, so its enum is the union
+        -- but the description tells the model which half is which, and
+        that half is the only thing standing between `target: "nodes"`
+        and a field that exists only on edges. Reading the registry
+        without a target made every field a node field: the enum came
+        out identical, so nothing objected, while the description named
+        an edge field as a node one.
+
+        The edge-only server is the structural half of the same mutant:
+        one field on one side is a `field` argument with a single legal
+        value, which this module deliberately does not advertise -- and
+        counting the same field twice is what makes it appear."""
+        both = offline()
+        both.define_vectors(nodes=[Vector("summary", 3)], edges=[Vector("rel", 3)])
+        field = named(both, embed=embedder())[
+            "search_similar"].parameters["properties"]["field"]
+        assert field["enum"] == ["rel", "summary"]
+        # named once each, on its own side -- not once as a node field
+        # and again as an edge one
+        assert field["description"].count("'rel'") == 1
+        assert field["description"].count("'summary'") == 1
+
+        edges_only = offline()
+        edges_only.define_vectors(edges=[Vector("rel", 3)])
+        assert "field" not in named(edges_only, embed=embedder())[
+            "search_similar"].parameters["properties"]
+
+    def test_the_aggregate_tool_advertises_the_reranker_too(self):
+        """The other half of
+        test_a_configured_reranker_advertises_it_on_both_steps, which
+        reads traverse_graph only. "How many papers cite anything about
+        retrieval" is the same question as the traversal, counted --
+        and a reranked aggregation runs over the reranked survivors, so
+        an operator who configured a reranker gets an aggregate tool
+        that cannot use it while traverse_graph's schema says the
+        feature exists. Wiring it into one of the two tools is a silent
+        half-feature, the same shape as the seeding one."""
+        parameters = named(offline(), **reranking())["aggregate_graph"].parameters
+        assert "rerank" in parameters["properties"]["start"]["properties"]
+        assert "rerank" in parameters["properties"]["hops"]["items"]["properties"]
+
+    def test_a_reranked_aggregation_hands_the_policy_to_the_query(self, monkeypatch):
+        """The schema advertising `rerank` and the handler applying it
+        are two separate lines, and dropping the second leaves a tool
+        that accepts the parameter, answers, and silently ranks on
+        nothing -- the worst thing this library can produce (CLAUDE.md's
+        "refuse, don't approximate"). Asserted on the POLICY object,
+        because that is what the handler must pass: a bare Rerank there
+        would put the published field list and the candidate ceiling out
+        of reach."""
+        seen = {}
+        monkeypatch.setattr("hopai.mcp.aggregate_json",
+                            lambda graph, spec, **options: seen.update(options) or {})
+        options = reranking(rerank_fields=["properties.title"], max_candidates=64)
+        spec = named(offline(), **options)["aggregate_graph"]
+
+        spec.call(start={"where": {"type": "paper"}}, aggregates={"n": {"count": True}})
+        assert seen["rerank"].template is options["rerank"]
+        assert list(seen["rerank"].fields) == ["properties.title"]
+        assert seen["rerank"].max_candidates == 64
 
     def test_search_field_is_offered_only_when_the_choice_is_real(self):
         """One declared field needs no argument. Several make the choice
@@ -1576,6 +1730,25 @@ class TestCommandLine:
             main([])
         assert "--dsn or set HOPAI_DSN" in capsys.readouterr().err
 
+    def test_the_missing_dsn_refusal_names_the_flag_and_the_variable_end_to_end(
+            self, monkeypatch, capsys):
+        """The message names BOTH ways to supply a DSN, and it is the
+        first thing an operator sees -- there is nothing to read a
+        --help for once the process has exited.
+
+        Anchored at both ends rather than by a substring in the middle:
+        mutmut wraps a string literal in `XX...XX`, which leaves every
+        interior substring intact, so
+        test_no_dsn_anywhere_names_the_fix's `"--dsn or set HOPAI_DSN"`
+        went on passing against a message that had been rewritten at
+        both edges."""
+        monkeypatch.delenv("HOPAI_DSN", raising=False)
+        with pytest.raises(SystemExit):
+            main([])
+        line = capsys.readouterr().err.strip().splitlines()[-1]
+        assert "error: no database to serve" in line
+        assert line.endswith("pass --dsn or set HOPAI_DSN")
+
     def test_vector_fields_are_declared_on_the_command_line(self):
         """They are per-handle, not stored in the database like a saved
         schema, so a CLI server has no other way to know about them."""
@@ -1919,6 +2092,126 @@ class TestServeArguments:
         assert registered["allow_ddl"] is False
         assert registered["allow_mutations"] is False
         assert registered["strict_schema"] is False
+
+    @staticmethod
+    def _stub_sdk(monkeypatch, era: int = 2) -> dict:
+        """build_server() with no SDK and no server: record what each of
+        the three calls it makes was handed -- tools(), _register() per
+        spec, and the SDK's server constructor.
+
+        The same idiom the two tests above use for tools(), extended one
+        step: build_server() is pure forwarding, and the only thing that
+        can be wrong about pure forwarding is what arrives."""
+        seen = {"registered": []}
+
+        class FakeTool:
+            """Stands in for the SDK's Tool class, which _register()
+            only ever calls from_function() on."""
+
+        def fake_tools(graph, **options):
+            seen["graph"] = graph
+            seen["options"] = options
+            return ["spec-one", "spec-two"]
+
+        def fake_register(spec, tool_class):
+            seen["registered"].append((spec, tool_class))
+            return f"tool:{spec}"
+
+        def fake_server(*args, **kwargs):
+            seen["constructed"] = (args, kwargs)
+            return object()
+
+        monkeypatch.setattr("hopai.mcp._sdk", lambda: (fake_server, FakeTool, era))
+        monkeypatch.setattr("hopai.mcp.tools", fake_tools)
+        monkeypatch.setattr("hopai.mcp._register", fake_register)
+        seen["tool_class"] = FakeTool
+        return seen
+
+    def test_every_spec_is_registered_against_the_sdks_own_tool_class(self, monkeypatch):
+        """_register() is where hopai's hand-written schema replaces the
+        `{"type": "object"}` the SDK derives from a handler's
+        annotations, and it needs both arguments to do it: the spec for
+        the schema, the SDK's Tool class to build the tool with. Blanking
+        either one, or handing it a single argument, survived everything
+        -- the one test that lists a real server's tools needs the SDK,
+        and mutmut skips it.
+
+        The registered tools are asserted to reach the constructor as
+        well: a list built and then not passed is a server advertising
+        nothing at all."""
+        seen = self._stub_sdk(monkeypatch)
+        build_server(offline())
+        assert seen["registered"] == [("spec-one", seen["tool_class"]),
+                                      ("spec-two", seen["tool_class"])]
+        assert seen["constructed"][1]["tools"] == ["tool:spec-one", "tool:spec-two"]
+
+    def test_the_graph_and_the_three_tool_options_reach_tools(self, monkeypatch):
+        """The permission flags are pinned by the test above this one;
+        these are the rest of build_server()'s forwarding, and each is a
+        different silent failure: the graph itself blanked serves
+        `None`, `embed=None` takes away search by meaning on a server
+        started with an embedder, `max_nodes=None` disables a ceiling an
+        operator set (or, dropped entirely, quietly restores the default
+        500), and `rerank=None` leaves the reranker configured and
+        unreachable.
+
+        Asserted by identity where the argument is an object, so a
+        mutant substituting a different one of the same shape cannot
+        pass."""
+        graph = offline()
+        embed = embedder()
+        options = reranking()
+        seen = self._stub_sdk(monkeypatch)
+
+        build_server(graph, embed=embed, max_nodes=7, **options)
+        assert seen["graph"] is graph
+        assert seen["options"]["embed"] is embed
+        assert seen["options"]["max_nodes"] == 7
+        assert seen["options"]["rerank"] is options["rerank"]
+
+    def test_the_server_is_constructed_with_its_name_and_its_instructions(self, monkeypatch):
+        """A server built with no name is one a client lists under
+        whatever the SDK defaults to, and one built with no instructions
+        loses the only place that can say "call describe_graph first" --
+        no single tool schema can, which is the whole reason
+        _instructions() exists. Both are positional-or-keyword arguments
+        a mutant can blank or drop, and both survived: the test that
+        reads server.instructions needs the real SDK."""
+        from hopai.mcp import Served, _instructions
+
+        graph = offline()
+        seen = self._stub_sdk(monkeypatch)
+        build_server(graph, name="pinned")
+        args, kwargs = seen["constructed"]
+        assert args == ("pinned",)
+        assert kwargs["instructions"] == _instructions(Served(graph))
+        assert "describe_graph first" in kwargs["instructions"]
+
+    @pytest.mark.parametrize("era, on_the_constructor", [(1, True), (2, False)])
+    def test_the_http_settings_reach_the_constructor_only_in_the_1x_era(
+            self, monkeypatch, era, on_the_constructor):
+        """The era split from the other side.
+        test_http_bind_settings_go_where_the_sdk_era_wants_them asserts
+        what run() gets; this asserts what the CONSTRUCTOR gets, and
+        they are two different lines. Passing the bind settings to an
+        mcp 2.0 constructor is a TypeError in a real deployment, and
+        passing none to a 1.x one is a server listening somewhere the
+        operator did not ask for -- neither is visible from run().
+
+        Both eras, because either alone passes for a mutant that always
+        chooses the other; and the stdio call, because `http and
+        era == 1` turned into `http or era == 1` means `**None` on a 1.x
+        server started with no HTTP at all."""
+        seen = self._stub_sdk(monkeypatch, era=era)
+        http = {"host": "0.0.0.0", "port": 9001, "streamable_http_path": "/x"}
+
+        build_server(offline(), http=http)
+        bind = {key: value for key, value in seen["constructed"][1].items()
+                if key not in ("instructions", "tools")}
+        assert bind == (http if on_the_constructor else {})
+
+        build_server(offline())
+        assert set(seen["constructed"][1]) == {"instructions", "tools"}
 
     def test_a_published_field_list_with_no_reranker_refuses(self):
         """A knob with nothing behind it is worse than a missing one: an
