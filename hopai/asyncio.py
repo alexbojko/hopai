@@ -33,28 +33,32 @@ bridged through a greenlet: the function bodies on the other end of
 every call below are unaware anything async is happening, and are the
 same functions the sync Graph calls directly.
 
-WHAT MAY BLOCK INSIDE run_sync(), AND WHAT MAY NOT -- the rule the
-greenlet design does NOT say out loud, and the one issue #74 was
-filed for. That "constant one OS thread" below is the EVENT LOOP'S
-thread. SQLAlchemy's database I/O yields back to the loop from inside
-the greenlet, which is the entire point of the bridge; an ARBITRARY
-blocking call in there has no such arrangement and simply holds the
-thread, stalling every other task in the process. So a call is safe
-inside run_sync() only if it RELEASES THE GIL while it waits.
-Socket I/O does. A CPU-bound C extension does not -- and for that one
-even a thread pool leaves the loop starved, so it does not belong on
-an async path at all. Anything else that later wants to run inside
-the bridge is decided by that question and nothing else.
+THE BRIDGE ONLY COVERS DATABASE I/O -- SQLAlchemy's own calls yield
+back to the loop from inside the greenlet, but an ARBITRARY blocking
+call does not, and just holds the event loop's one thread until it
+returns. An embedding provider's HTTP call is exactly that: reachable
+from Near(text=...) and from a text row in set_vectors(), and, before
+issue #74, made straight from inside fn -- on the loop's own thread,
+for every concurrent traverse()/aggregate()/vector_search()/
+set_vectors() in the process, for the length of the round trip. Every
+method below that can carry text now resolves it FIRST, awaited,
+before fn ever runs: traverse()/aggregate()/vector_search()/
+vector_search_many() call hopai/vectors.py's aresolve_*() helpers,
+set_vectors() calls aplan_vector_writes() -- both await
+Embedder.aembed_*(), which reaches the provider's own async client
+when there is one and asyncio.to_thread() otherwise (see hopai/
+embeddings.py). By the time fn runs, every Near/row it sees already
+carries a plain vector, so the sync functions below make no provider
+call of their own and need no changes to stay correct.
 
-The embedding provider call was the first thing to fail it: every
-read path taking `text=` did a blocking HTTP round trip on the loop's
-thread. Hence the shape the read methods below now have -- resolve
-every embedding FIRST, awaited, then enter run_sync() with specs that
-already carry vectors. That is the same "plan, then open" move
-set_vectors() already made for row locks, with the plan step awaited;
-hopai/vectors.py's aresolve_*/aplan_* functions are the plan, and a
-call with no text= is handed back untouched, so nothing about the
-sync path or the emitted SQL changes.
+RERANKING IS THE SECOND NETWORK CALL ON THE READ PATH (issue #73) and
+lands in exactly the same trap, from the other end: it scores rows the
+database has already returned. So every rerank below is awaited AFTER
+the connection block has closed and OUTSIDE run_sync() -- the SQL
+fetches `rerank.candidates` rows, the bridge closes, and only then
+does the provider see them. A reranked traversal has its own driver
+(_rerank_pins() below), which is the same shape once per reranked
+step: probe through the bridge, score outside it.
 
 NEEDS AN ASYNC DRIVER. psycopg2 (hopai's base dependency) cannot run
 async -- use postgresql+psycopg://... (psycopg3; `pip install
@@ -127,6 +131,21 @@ _NEEDS_SYNC_GRAPH = frozenset({
     # sync facade outside the greenlet bridge, same MissingGreenlet trap
     # as every other admin call in this list.
     "load_vectors",
+    # embed_stale() (issue #74's own review) walks a whole field in
+    # PAGES, each its OWN embed call and its OWN transaction -- the
+    # opposite of "resolve everything, then open one transaction" every
+    # other write in this file relies on, so it cannot be given the
+    # same aplan_vector_writes()-style treatment without a second,
+    # divergent backfill implementation (deliberately refused -- see
+    # CLAUDE.md's "front ends hold no query logic" and "one traversal
+    # implementation" rules). It is also a bulk maintenance sweep, not
+    # a per-request hot path, so there is no concurrency being left on
+    # the table by refusing it, only the one already true for every
+    # other name in this set. Left unlisted, it does not error until
+    # deep inside stale_vectors()/set_vectors() open their own
+    # connection directly on the async engine's sync facade -- a
+    # confusing MissingGreenlet instead of a fix-naming refusal.
+    "embed_stale",
 })
 
 
@@ -203,39 +222,6 @@ class AsyncGraph:
 
     # -- reading ----------------------------------------------------
 
-    async def _embedded(self, start: Start, hops: list) -> tuple:
-        """(start, hops) with every Near(text=) already a vector.
-
-        Awaited HERE, before run_sync() below, because inside the
-        bridge the provider call runs on the event loop's own thread --
-        see the module docstring. Nothing is copied when there is no
-        text= to resolve: the very same Start and Hop objects go on to
-        the same sync function, which is what keeps a traversal without
-        text on exactly the path it was on before (issue #74)."""
-        from .vectors import aresolve_traversal_texts
-        return await aresolve_traversal_texts(self._sync, start, hops)
-
-    async def _lazy_vectors_loaded(self, conn) -> None:
-        """search()'s own first act, done here instead, because
-        resolving text needs the field declaration that call recovers.
-
-        A lazy handle keeps its declarations in the database until
-        something needs them (see Graph.in_graph()), and resolving text
-        outside run_sync() now needs them EARLIER than search() would
-        ask. Doing it here keeps the two in the same order; it is
-        idempotent, so search() finding a registry a moment later is
-        the ordinary case, and it is paid only when there is text.
-
-        Reachability, stated because it is not obvious: AsyncGraph's own
-        in_graph() builds a fresh Graph, which starts non-lazy, so today
-        this only ever finds a registry already in place. It is what
-        stops the async path being the one place that skips the step --
-        without it a lazy handle would be refused with "none are
-        defined ... but this call didn't go through [a search]", from
-        inside a search."""
-        from .vectors import _ensure_lazy_vectors
-        await conn.run_sync(lambda c: _ensure_lazy_vectors(self._sync, c))
-
     async def _rerank_pins(self, start: Start, hops: list, plan: dict) -> dict:
         """Graph._rerank_pins(), with the provider call AWAITED.
 
@@ -277,23 +263,40 @@ class AsyncGraph:
         """(start, hops, pins) -- every provider call on the traversal
         path made, awaited, before anything opens.
 
-        The plan is read from the specs AS WRITTEN, before _embedded()
-        resolves them: `Near._with_vector()` hands back a spec carrying
-        floats and no text, and the reranker's query is that text."""
+        Both network calls on this path in one place and in this order,
+        because the order is the whole point. aresolve_spec_texts()
+        embeds every Near(text=) before run_sync() ever runs (issue
+        #74); _rerank_pins() then scores, also awaited, with nothing
+        open (issue #73).
+
+        The rerank plan is read from the specs AS WRITTEN, BEFORE they
+        are resolved: `Near._with_vector()` hands back a spec carrying
+        floats and no text, and the reranker's query is that text.
+        Reversing these two lines loses it."""
         from .core import rerank_plan
+        from .vectors import aresolve_spec_texts
 
         plan = rerank_plan(start, hops)
-        start, hops = await self._embedded(start, hops)
+        start, hops = await aresolve_spec_texts(self._sync, start, hops)
         pins = await self._rerank_pins(start, hops, plan) if plan else None
         return start, hops, pins
 
     async def traverse(self, start: Start, *hops: Hop) -> Subgraph:
+        from .core import validate_optional_positions
+        # Shape checks the sync build_query() would raise on BEFORE it
+        # ever reaches a Near -- run here too, so a chain that is about
+        # to be refused is never embedded (or reranked) first (issue
+        # #74's own review; see validate_optional_positions()'s
+        # docstring).
+        validate_optional_positions(list(hops))
         start, hops, pins = await self._reranked(start, list(hops))
         async with AsyncSession(self._async_engine) as session:
             return await session.run_sync(
                 lambda s: self._sync._traverse_with_session(s, start, hops, pins=pins))
 
     async def aggregate(self, start: Start, *hops: Hop, aggregates: dict) -> dict:
+        from .core import validate_aggregate_spec
+        validate_aggregate_spec(list(hops), aggregates)
         start, hops, pins = await self._reranked(start, list(hops))
         async with AsyncSession(self._async_engine) as session:
             return await session.run_sync(
@@ -302,23 +305,21 @@ class AsyncGraph:
 
     async def vector_search(self, *near, target: str = "nodes", k: int = 10, where=None,
                             boost=None, rerank=None) -> list:
-        from .vectors import (
-            arerank_hits, aresolve_near_texts, has_text, rerank_query_text, search_candidates,
-        )
+        from .vectors import arerank_hits, aresolve_near, rerank_query_text, search_candidates
         near = list(near)
-        # Read (and validate) the reranker's query BEFORE embedding: the
-        # resolved Near carries floats and no text.
+        # Read (and validate) the reranker's query BEFORE the embedding
+        # resolves it away: Near._with_vector() hands back floats and no
+        # text. The sync search() derives it in the same place, before
+        # it fetches anything.
         query = rerank_query_text(near, rerank, k, "vector_search()")
+        nears = await aresolve_near(self._sync, target, near, k, "vector_search()")
         async with self._async_engine.connect() as conn:
-            if has_text(near):
-                await self._lazy_vectors_loaded(conn)
-                near = await aresolve_near_texts(self._sync, near, target, k)
             hits = await conn.run_sync(
-                lambda c: search_candidates(self._sync, near, target=target, k=k, where=where,
+                lambda c: search_candidates(self._sync, nears, target=target, k=k, where=where,
                                             boost=boost, connection=c, rerank=rerank))
         # Outside the connection block AND outside run_sync(): the
         # scoring is a provider round trip, and inside the bridge it
-        # would run on the loop's own thread.
+        # would run on the loop's own thread (issue #74).
         if rerank is None:
             return hits
         return await arerank_hits(hits, rerank, query, k)
@@ -326,14 +327,11 @@ class AsyncGraph:
     async def vector_search_many(self, queries, target: str = "nodes", k: int = 10, where=None,
                                  boost=None, rerank=None) -> list:
         from .vectors import (
-            arerank_many, aresolve_query_texts, has_text, rerank_query_texts,
-            search_many_candidates,
+            arerank_many, aresolve_queries, rerank_query_texts, search_many_candidates,
         )
         texts = rerank_query_texts(queries, rerank, k, "vector_search_many()")
+        queries = await aresolve_queries(self._sync, target, queries, k, "vector_search_many()")
         async with self._async_engine.connect() as conn:
-            if has_text(queries):
-                await self._lazy_vectors_loaded(conn)
-                queries = await aresolve_query_texts(self._sync, target, queries, k)
             grouped = await conn.run_sync(
                 lambda c: search_many_candidates(self._sync, queries, target=target, k=k,
                                                  where=where, boost=boost, connection=c,
@@ -372,11 +370,14 @@ class AsyncGraph:
         provider call off the row locks, which is the invariant, not a
         preference.
 
-        AWAITED, not merely hoisted: out of the transaction is not the
-        same as off the event loop. Called plainly in this `async def`
-        body -- which is what it was -- the round trip held the loop's
-        thread for its whole duration and stalled every other task in
-        the process (issue #74)."""
+        AWAITED, not called: aplan_vector_writes() is the async twin of
+        plan_vector_writes(), so a text row's embed call is awaited on
+        THIS coroutine, off the event loop's own thread (via the
+        embedder's native async client, or asyncio.to_thread() for a
+        sync one), rather than run synchronously here -- which, before
+        issue #74, blocked the loop directly with no greenlet bridge
+        involved at all, worse than the read paths it was found
+        alongside."""
         from .vectors import aplan_vector_writes, set_vectors
         plan = await aplan_vector_writes(self._sync, nodes, edges)
         async with self._async_engine.begin() as conn:

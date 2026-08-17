@@ -138,8 +138,35 @@ from typing import Any, Optional
 # without being named again here (naming them would only be an unused
 # import that a reader could mistake for a second copy).
 from .embeddings import (
-    _MAX_BACKOFF, _is_async_call, _retry_after, _retryable,
+    _MAX_BACKOFF, _retry_after, _retryable,
 )
+
+
+def _is_async_call(fn) -> bool:
+    """Whether calling `fn` hands back something to await.
+
+    Answered by inspection rather than by calling: the alternative is
+    spending a provider request to find out what kind of client this is.
+
+    NOT imported from embeddings.py, unlike the retry policy above:
+    that module answers the same question with a bare
+    `inspect.iscoroutinefunction` at each of its binding sites, which
+    reports False for a callable OBJECT whose `__call__` is the
+    `async def`. Embedder can afford that -- an unrecognized shape
+    simply takes its asyncio.to_thread() fallback -- but Rerank
+    publishes the answer as `is_async` and refuses score() on it, so a
+    wrong False here is a public attribute stating the opposite of the
+    truth.
+
+    No `fn is None` guard, unlike the embeddings.py sites this was
+    lifted from: _bind() below never hands back a None target -- it
+    tests each attribute before it binds to it -- so a guard here would
+    be a branch nothing can reach."""
+    if inspect.iscoroutinefunction(fn):
+        return True
+    call = getattr(fn, "__call__", None)          # noqa: B004 -- the OBJECT's own __call__
+    return call is not None and inspect.iscoroutinefunction(call)
+
 
 #: The second place hopai makes a network call, so -- as in
 #: embeddings.py -- it gets its own logger, standard library, no handler
@@ -598,9 +625,9 @@ class Rerank:
         #: Read in score() to refuse BEFORE the call rather than after --
         #: calling it would build a coroutine nobody awaits.
         #:
-        #: `embeddings._is_async_call` and not `iscoroutinefunction`,
-        #: which reports False for a callable OBJECT whose `__call__` is
-        #: the `async def` -- ascore() still works there (it awaits the
+        #: `_is_async_call` above and not `iscoroutinefunction`, which
+        #: reports False for a callable OBJECT whose `__call__` is the
+        #: `async def` -- ascore() still works there (it awaits the
         #: awaitable the thread built), but it pays a thread it does not
         #: need and the public attribute states the opposite of the truth.
         self.is_async = _is_async_call(target)

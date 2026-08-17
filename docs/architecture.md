@@ -389,28 +389,16 @@ side are unaware anything async is happening.
 
 Schema and constraint declaration — `create_schema()`, `enforce_schema()`,
 `define_constraints()`, `save_schema()`/`load_schema()`, `infer_schema()`,
-`schema_violations()`, `add_networkx()` — has no async override. These are one-time
-setup calls with no concurrency to gain, and `AsyncGraph`'s wrapped `Graph` runs on
-`AsyncEngine.sync_engine`, a facade only safe to execute against *inside* a greenlet
-`run_sync()` spawns. `AsyncGraph.__getattr__` refuses these by name, pointing at a plain
-`Graph` on the same database, rather than letting the facade fail with SQLAlchemy's own
-`MissingGreenlet` outside the context that explains it.
-
-**What may block inside `run_sync()`, and what may not.** That constant one OS thread
-below is the *event loop's* thread. SQLAlchemy's database I/O yields back to the loop
-from inside the greenlet, which is the point of the bridge; an arbitrary blocking call
-in there has no such arrangement and simply holds the thread. So a call is safe inside
-`run_sync()` only if it **releases the GIL** while it waits — socket I/O does, a
-CPU-bound C extension does not (and for that one even a thread pool leaves the loop
-starved). The embedding provider call was the first thing to fail that test: every read
-path taking `text=` blocked the loop for the length of an HTTP round trip (issue #74).
-The fix is the shape `set_vectors()` already had for row locks — resolve first, then
-open — with the resolve step awaited: `traverse()`, `aggregate()`, `vector_search()`,
-`vector_search_many()` and `set_vectors()` await `vectors.py`'s `aresolve_*`/`aplan_*`
-helpers and hand `run_sync()` specs that already carry vectors. A call with no `text=`
-is handed back untouched (the same objects), so the sync path and the emitted SQL are
-unchanged. `tests/test_async.py::TestTheEventLoopKeepsRunning` is the measurement: an
-independent loop task made zero progress during a provider call before it.
+`schema_violations()`, `add_networkx()`, `load_vectors()` — has no async override. These
+are one-time setup calls with no concurrency to gain, and `AsyncGraph`'s wrapped `Graph`
+runs on `AsyncEngine.sync_engine`, a facade only safe to execute against *inside* a
+greenlet `run_sync()` spawns. `AsyncGraph.__getattr__` refuses these by name, pointing at
+a plain `Graph` on the same database, rather than letting the facade fail with
+SQLAlchemy's own `MissingGreenlet` outside the context that explains it.
+`embed_stale()` gets the same refusal for a different reason: it is a bulk backfill that
+opens its own transaction PER PAGE rather than resolving everything and opening one, so
+it cannot take the `aplan_vector_writes()` treatment issue #74 gave every other write
+without a second, divergent backfill implementation.
 
 A throwaway benchmark (not committed) compared this design against `asyncio.to_thread()`
 — the shape a naive async wrapper defaults to, and the same one `LangChain`'s `ainvoke`
@@ -423,6 +411,40 @@ each `AsyncSession.run_sync()` call's own setup (session open/close, greenlet sp
 paid serially on the one event-loop thread. The case for this design is the resource
 ceiling a thread-pool wrapper eventually hits in a real server, not a guaranteed speed
 win — see `hopai/asyncio.py`'s module docstring for the numbers.
+
+The bridge only covers *database* I/O — SQLAlchemy's own calls yield back to the loop
+from inside the greenlet, but an arbitrary blocking call made from `fn` does not, and
+just holds the one event-loop thread until it returns. An embedding provider's HTTP call
+is exactly that: reachable from `Near(text=...)` on every read path and from a text row
+in `set_vectors()` (issue #74). `hopai/embeddings.py`'s `Embedder` grew an `aembed_*()`
+twin of every `embed_*()` method for this — native async when the client has one
+(`openai.AsyncOpenAI()` and siblings, matched by the same module-name-plus-shape rule as
+the sync client, `inspect.iscoroutinefunction` telling a client's async method apart from
+its sync namesake of the same name) and `asyncio.to_thread()` otherwise, since a provider
+SDK blocked on a socket releases the GIL (the same reasoning does **not** extend to a
+CPU-bound C extension, which a thread pool would leave the loop starved for anyway).
+`AsyncGraph.traverse()`/`aggregate()`/`vector_search()`/`vector_search_many()` await
+`vectors.py`'s `aresolve_*()` helpers and `set_vectors()` awaits `aplan_vector_writes()`
+— all of it *before* `run_sync()`/`begin()` runs, so every `Near`/row `fn` ever sees
+already carries a plain vector and the sync functions below make no provider call of
+their own. A call with no `text=` is handed back untouched, so the sync path and the
+emitted SQL are unchanged.
+`tests/test_async.py::TestTextEmbeddingStaysOffTheLoop` is the measurement: an
+independent loop task made zero progress during a provider call before this.
+
+**Reranking is the second network call on this path** and gets the same treatment from
+the other end: it scores rows the database has already returned, so the obvious place
+for it is inside the `run_sync()` block that fetched them — which is the loop's thread
+again. `AsyncGraph.vector_search()`/`vector_search_many()` therefore call
+`search_candidates()`/`search_many_candidates()` through the bridge and await
+`arerank_hits()`/`arerank_many()` *after* the connection block closes; a reranked
+traversal runs `AsyncGraph._rerank_pins()`, which is probe-through-the-bridge then
+score-outside-it, once per reranked step. The rerank query is read from the specs **as
+written**, before `aresolve_spec_texts()` resolves them — a resolved `Near` carries
+floats and no text — and `vectors._resolved_spec()` re-attaches `rerank=` to each copy
+that resolution rebuilds, since a `Start`/`Hop` validates on construction and would
+otherwise refuse itself for the text it just had.
+`tests/test_async.py::TestRerankingStaysOffTheLoop` is that measurement.
 
 ## Multi-graph
 

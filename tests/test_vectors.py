@@ -3651,6 +3651,26 @@ class TestSetVectorsFromTextLive:
         # in hand; a zero here is a provider call holding row locks.
         assert opened and all(count == 1 for count in opened)
 
+    def test_every_row_across_both_targets_is_validated_before_any_embed_call(
+            self, fresh_graph):
+        """set_vectors(nodes=[...], edges=[...]) validates EVERY row on
+        BOTH targets before embedding either -- a call refused for the
+        edges half (here: a duplicate id) must not have already spent a
+        provider round trip embedding the nodes half. plan_vector_writes()
+        is split into a pure grouping pass (_group_vector_rows(), which
+        raises on this) and a separate embed-then-finalize pass per
+        target precisely so this holds -- issue #74's async review
+        found the two had drifted apart when it checked the async twin
+        against this same invariant."""
+        log = []
+        g = _embedding_graph(fresh_graph, log=log)
+        g.add_nodes([{"id": 1}])
+        with pytest.raises(ValueError, match="edges id 9 appears twice"):
+            g.set_vectors(
+                nodes=[{"id": 1, "docvec": "apple"}],
+                edges=[{"id": 9, "relvec": "x"}, {"id": 9, "relvec": "y"}])
+        assert log == []
+
 
 class TestEmbedStaleLive:
     def test_it_reads_the_property_of_the_fields_own_name(self, fresh_graph):

@@ -991,8 +991,11 @@ class TestAsync:
         whose `__call__` is the `async def`, so `is_async` -- a PUBLIC
         attribute -- reported the opposite of the truth, and ascore()
         paid a thread to build a coroutine it then awaited anyway.
-        `embeddings._is_async_call()` exists for exactly this shape and
-        is imported rather than restated, like `_retryable` beside it."""
+        `rerankers._is_async_call()` exists for exactly this shape --
+        the one question this module answers itself rather than sharing
+        with embeddings.py, which can afford a bare
+        `iscoroutinefunction` because an unrecognized shape only costs
+        it a thread."""
         class AsyncCallable:
             async def __call__(self, query, documents):
                 return [0.75 for _ in documents]

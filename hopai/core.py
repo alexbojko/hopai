@@ -79,8 +79,9 @@ def _rerank_steps(start: Start, hops: list) -> list:
     """Every step carrying a rerank=, in CHAIN order: (index, spec).
 
     Index -1 is the Start and 0.. are the hops -- the same numbering
-    vectors._near_sites() uses, so a step is named the same whichever
-    layer is talking about it. Chain order is not cosmetic: hop N+1's
+    _step_owner() below and vectors.aresolve_spec_texts()'s per-hop
+    caller labels use, so a step is named the same whichever layer is
+    talking about it. Chain order is not cosmetic: hop N+1's
     candidates are whatever hop N's rerank left behind, so these are
     inherently serial and must be walked front to back."""
     steps = [(-1, start)] if start.rerank is not None else []
@@ -216,6 +217,43 @@ def _plain(value):
     if isinstance(value, Decimal):
         return int(value) if value == value.to_integral_value() else float(value)
     return value
+
+
+def validate_optional_positions(hops: list) -> None:
+    """optional=True is only legal on the LAST hop in a chain -- see
+    Graph.build_query(). Pulled out to a standalone, provider-call-free
+    function so AsyncGraph.traverse() (hopai/asyncio.py) can run it
+    BEFORE awaiting text= resolution: a chain refused for this reason
+    must never pay for -- or fail because of -- an embedding round trip
+    first (issue #74's own review)."""
+    n = len(hops)
+    for i, hop in enumerate(hops):
+        if hop.optional and i != n - 1:
+            raise ValueError(
+                f"hop {i} ({hop.label or 'unlabeled'}): optional=True is only supported on "
+                f"the LAST hop in a chain. If you need multiple optional extensions, run "
+                f"separate queries."
+            )
+
+
+def validate_aggregate_spec(hops: list, aggregates: dict) -> None:
+    """aggregates must be a non-empty dict, and no hop may be optional=True
+    -- see Graph.build_aggregate_query(). Same reason as
+    validate_optional_positions(): AsyncGraph.aggregate() runs this
+    before resolving any Near(text=...) in the chain."""
+    if not isinstance(aggregates, dict) or not aggregates:
+        raise ValueError(
+            "aggregates must be a non-empty dict naming each result, e.g. "
+            "{'friends': Count(), 'avg_age': Avg('age')}"
+        )
+    for i, hop in enumerate(hops):
+        if hop.optional:
+            raise ValueError(
+                f"hop {i} ({hop.label or 'unlabeled'}): optional=True has no effect on "
+                f"an aggregation -- aggregates run over the nodes the last hop matched, "
+                f"and a chain the hop did not extend contributes nothing either way. "
+                f"Drop the flag, so nobody reads it as changing the number."
+            )
 
 
 @dataclass
@@ -641,14 +679,7 @@ class Graph:
         edge_id_col = getattr(et.c, self.edge_id_col)
         node_id_col = getattr(nt.c, self.node_id_col)
 
-        n = len(hops)
-        for i, hop in enumerate(hops):
-            if hop.optional and i != n - 1:
-                raise ValueError(
-                    f"hop {i} ({hop.label or 'unlabeled'}): optional=True is only supported on "
-                    f"the LAST hop in a chain. If you need multiple optional extensions, run "
-                    f"separate queries."
-                )
+        validate_optional_positions(hops)
 
         seed, pairs = self._walk_matches(start, hops, pins=pins)
         prev_match = seed
@@ -724,19 +755,7 @@ class Graph:
         summarizes."""
         from .aggregates import resolve_aggregate
 
-        if not isinstance(aggregates, dict) or not aggregates:
-            raise ValueError(
-                "aggregates must be a non-empty dict naming each result, e.g. "
-                "{'friends': Count(), 'avg_age': Avg('age')}"
-            )
-        for i, hop in enumerate(hops):
-            if hop.optional:
-                raise ValueError(
-                    f"hop {i} ({hop.label or 'unlabeled'}): optional=True has no effect on "
-                    f"an aggregation -- aggregates run over the nodes the last hop matched, "
-                    f"and a chain the hop did not extend contributes nothing either way. "
-                    f"Drop the flag, so nobody reads it as changing the number."
-                )
+        validate_aggregate_spec(hops, aggregates)
 
         nt = self.nodes_tbl
         node_id_col = getattr(nt.c, self.node_id_col)
