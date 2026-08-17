@@ -28,12 +28,22 @@ hopai.filters.parse_filter(): plain objects for equality/AND, plus
 array [min, max].
 
 `start` accepts `near` (a {"field", "text"} similarity spec or a list
-of them -- hopai.vectors.parse_near), `keep`, and `boost`
-(hopai.vectors.parse_boost); each hop accepts those plus `via_near`
-and `via_keep`. They mirror Start/Hop exactly. Unknown keys are
-REFUSED rather than ignored, because `top_k`/`limit`/`filter` are the
-names a model reaches for and silently dropping one answers a
+of them -- hopai.vectors.parse_near), `keep`, `boost`
+(hopai.vectors.parse_boost) and `rerank`; each hop accepts those plus
+`via_near` and `via_keep`. They mirror Start/Hop exactly. Unknown keys
+are REFUSED rather than ignored, because `top_k`/`limit`/`filter` are
+the names a model reaches for and silently dropping one answers a
 different question than the one asked.
+
+A `rerank` spec is {"document_from": <jq filter>, "candidates": N} and
+NEVER a client: a reranker holds an API key and a socket, neither of
+which travels in JSON. The reranker is the caller's, handed to these
+functions as `rerank=RerankPolicy(Rerank(...), fields=[...])`, and a
+spec may override only those two keys of it. `document_from` is the one
+place a model writes CODE rather than data, so parse_rerank() is the
+single site that holds it to hopai.jqsafe's total subset and to the
+property paths the policy publishes -- the filter's output IS the
+document, and the document is posted to a third party.
 
 A near spec takes "text" OR "vector", and the difference is the whole
 LLM story. "text" is embedded by the field itself, with the client the
@@ -61,11 +71,16 @@ hopai.aggregates for what the forms mean), run with aggregate_json():
 
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any, Optional
 
+from . import jqsafe
 from .aggregates import parse_aggregate
 from .core import Graph, Subgraph
 from .filters import parse_filter
 from .hop import Hop, Start
+from .rerankers import Rerank, RerankError
 from .vectors import parse_boost, parse_near
 
 
@@ -75,15 +90,23 @@ from .vectors import parse_boost, parse_near
 #: different question than the one asked -- unfiltered, or with the
 #: default k. parse_near/parse_aggregate are strict one level down;
 #: this is the same rule at the top.
-_START_KEYS = {"where", "label", "near", "keep", "boost"}
+_START_KEYS = {"where", "label", "near", "keep", "boost", "rerank"}
 _HOP_KEYS = {"where", "via", "hops", "direction", "optional", "label",
-             "near", "keep", "via_near", "via_keep", "boost"}
-_SEARCH_KEYS = {"near", "target", "k", "where", "boost"}
+             "near", "keep", "via_near", "via_keep", "boost", "rerank"}
+_SEARCH_KEYS = {"near", "target", "k", "where", "boost", "rerank"}
 #: The keys whose values are near specs, and so the only ones that can
 #: carry a literal embedding. Everything else in the similarity family
 #: -- keep, via_keep, boost -- holds integers and property names a
 #: model can supply as truthfully as any filter.
 _NEAR_KEYS = ("near", "via_near")
+#: The keys a spec's `rerank` object may carry. A CLIENT is not among
+#: them and never will be: it holds an API key and an open socket,
+#: neither of which travels in JSON. What a caller on the far side of a
+#: tool call legitimately decides is WHICH TEXT each candidate is
+#: reduced to (`document_from`) and how many candidates to spend on the
+#: question (`candidates`) -- both retrieval choices a model is well
+#: placed to make, unlike an embedding, which it would have to invent.
+_RERANK_KEYS = {"document_from", "candidates"}
 
 
 def _check_keys(spec: dict, allowed: set, what: str) -> None:
@@ -104,10 +127,322 @@ def _boost_of(spec: dict):
     return parse_boost(spec["boost"]) if "boost" in spec else None
 
 
-def spec_to_traversal(spec: dict) -> tuple:
+def _rerank_of(spec: dict, policy: Optional[RerankPolicy], owner: str):
+    return parse_rerank(spec["rerank"], policy, owner) if "rerank" in spec else None
+
+
+# ---------------------------------------------------------------------
+# Reranking, from a spec that may have been written by a model
+# ---------------------------------------------------------------------
+
+def _published(fields, owner: str) -> tuple:
+    """The operator's field allowlist, checked where they wrote it.
+
+    A non-empty list is REQUIRED and there is no "everything" spelling,
+    which is the whole point: the filter's output is the document and
+    the document is posted to a third-party reranker, so somebody has to
+    have decided what may leave the building. `["properties"]` is how
+    you say "the whole properties bag" when that really is the
+    decision -- said, rather than defaulted into."""
+    if fields is None:
+        raise ValueError(
+            f"{owner}: name the property paths a document_from may read, e.g. "
+            f'fields=["properties.title", "properties.summary"]. There is no way to '
+            f"say `everything`: the filter's output is posted to a third-party "
+            f"reranker, so `.properties.ssn` is one accepted filter away unless the "
+            f'paths are named. Pass ["properties"] if the whole bag really is the '
+            f"decision"
+        )
+    if isinstance(fields, str) or not isinstance(fields, (list, tuple)):
+        raise TypeError(
+            f"{owner}: fields= takes a list of dotted property paths, got "
+            f'{type(fields).__name__} -- e.g. ["properties.title", "properties.tags"]'
+        )
+    if not fields:
+        raise ValueError(
+            f"{owner}: fields=[] publishes nothing, so every document_from would "
+            f'refuse -- name the paths a filter may read, e.g. ["properties.title"]'
+        )
+    for field in fields:
+        if not isinstance(field, str) or not field.strip():
+            raise TypeError(
+                f"{owner}: fields= takes dotted property paths as strings, got "
+                f'{field!r} -- e.g. ["properties.title"]'
+            )
+    return tuple(fields)
+
+
+@dataclass(frozen=True)
+class RerankPolicy:
+    """What a spec's `rerank` is allowed to become: the caller's own
+    Rerank as a TEMPLATE, the property paths a spec-supplied
+    `document_from` may read, and a ceiling on how many candidates one
+    call may spend.
+
+        RerankPolicy(
+            Rerank(client, document_from='.properties.title', candidates=50),
+            fields=["properties.title", "properties.summary"],
+            max_candidates=100,
+        )
+
+    THE CLIENT IS NEVER SPEC-SUPPLIED, exactly as `embed=` is never
+    spec-supplied: only `document_from` and `candidates` are overridden
+    from a spec, and everything that holds a credential or decides a
+    bill -- the client, the model, the batch size, the retry budget --
+    stays as constructed here. A spec arriving over a tool call chooses
+    what to rank on, never what to call.
+
+    `fields` is the allowlist parse_rerank() hands to hopai.jqsafe. A
+    path outside it refuses naming the published list, because
+    `.properties.ssn` parses perfectly well in the safe subset and would
+    ship straight to a vendor. Naming `paths` publishes the WHOLE nodes
+    on every route that reached a candidate, their properties included
+    -- it is the one entry that is not a single value.
+
+    `max_candidates` bounds the bill: rerankers price per document, and
+    a spec choosing candidates=200 across a three-hop traversal is 600
+    documents for one query. A larger `candidates` REFUSES naming the
+    ceiling rather than being clamped, for the same reason
+    `candidates < keep` refuses -- quietly serving different numbers
+    than the caller asked for hides that the numbers disagree. `None`
+    disables it, and is for a caller whose specs are their own."""
+
+    template: Any
+    fields: Any = None
+    max_candidates: Optional[int] = None
+
+    def __post_init__(self):
+        owner = "RerankPolicy"
+        if not isinstance(self.template, Rerank):
+            raise TypeError(
+                f"{owner}: the template must be a Rerank, got "
+                f"{type(self.template).__name__} -- e.g. RerankPolicy(Rerank(client, "
+                f"document_from='.properties.title', candidates=50), "
+                f'fields=["properties.title"])'
+            )
+        object.__setattr__(self, "fields", _published(self.fields, owner))
+        if self.max_candidates is not None and (
+                isinstance(self.max_candidates, bool)
+                or not isinstance(self.max_candidates, int) or self.max_candidates < 1):
+            raise ValueError(
+                f"{owner}: max_candidates must be a positive integer, or None to serve "
+                f"specs with no ceiling at all, got {self.max_candidates!r}"
+            )
+        if self.max_candidates is not None and self.template.candidates > self.max_candidates:
+            # Refused here rather than per query: the template's own
+            # `candidates` is what a spec that names none inherits, so
+            # this configuration would have every default call refuse
+            # for a reason that is the operator's, not the caller's.
+            raise ValueError(
+                f"{owner}: the template reranks {self.template.candidates} candidates, "
+                f"over its own max_candidates={self.max_candidates} -- a spec naming no "
+                f"`candidates` inherits the template's, so every such call would refuse. "
+                f"Raise max_candidates, or lower the template's candidates="
+            )
+        # The operator's own filter, held to the list the operator
+        # published -- at the line that wrote both, rather than on the
+        # first query that happens to inherit it.
+        jqsafe.validate(self.template.document_from, fields=self.fields,
+                        owner="the reranker's own document_from")
+
+
+def parse_rerank(spec: Any, policy: Optional[RerankPolicy], owner: str = "rerank"):
+    """The JSON form of Rerank -- and THE ONE PLACE a spec-supplied jq
+    filter is held to hopai.jqsafe's safe subset.
+
+    This is to `document_from` what refuse_vectors() is to `vector`: the
+    single enforcement site, public and named without an underscore so a
+    front end calls it rather than repeating it. hopai/mcp.py must not
+    import hopai.jqsafe at all -- every filter it serves arrives through
+    a spec, every spec reaches a Rerank through here, and a second copy
+    of the rule is a second place for it to rot.
+
+    Both checks it makes are about what leaves the building rather than
+    about what runs:
+
+      - THE GRAMMAR. jq's `env` returns the process environment, and the
+        filter's output IS the document that is POSTed to a reranking
+        vendor, so `document_from='env.DATABASE_URL'` is one-line
+        exfiltration of the DSN. hopai.jqsafe's subset does not parse
+        `env`, `$ENV`, `input`, `def` or `range` at all -- see its
+        module docstring for why an allowlist over parsed syntax is a
+        decision procedure here rather than a blacklist arms race.
+      - THE FIELDS. `.properties.ssn` parses perfectly in that subset.
+        Only the policy's published paths may be read, and a filter
+        reading anything else refuses naming them.
+
+    The template is never replaced, only overridden: `document_from` and
+    `candidates` come from the spec when it names them and from the
+    template when it does not."""
+    if policy is None:
+        raise ValueError(
+            f"{owner}: this spec asks for reranking and none is configured -- a reranker "
+            f"client cannot travel in JSON, since it holds an API key and an open socket, "
+            f"so the one to use has to be yours. Pass rerank=RerankPolicy(Rerank(client, "
+            f"document_from='...'), fields=[...]) to this call, or drop \"rerank\" from "
+            f"the spec"
+        )
+    if not isinstance(spec, dict):
+        raise TypeError(
+            f'"{owner}" must be an object -- got {type(spec).__name__}, e.g. '
+            '{"document_from": ".properties.title", "candidates": 50}'
+        )
+    _check_keys(spec, _RERANK_KEYS, f'"{owner}"')
+    template = policy.template
+
+    document_from = spec.get("document_from", template.document_from)
+    if not isinstance(document_from, str) or not document_from.strip():
+        raise ValueError(
+            f'{owner}: "document_from" is a jq filter as a non-empty string, got '
+            f'{document_from!r} -- e.g. \'.properties.title + ": " + '
+            f'(.properties.summary // "")\''
+        )
+    candidates = spec.get("candidates", template.candidates)
+    if not isinstance(candidates, int) or isinstance(candidates, bool) or candidates < 1:
+        raise ValueError(
+            f'{owner}: "candidates" is how many hits reach the reranker before keep/k '
+            f"truncates, so it must be a positive integer, got {candidates!r}"
+        )
+    if policy.max_candidates is not None and candidates > policy.max_candidates:
+        # Named, never clamped -- the same judgement `candidates < keep`
+        # gets. A reranker is billed per document, so silently serving
+        # 100 where 500 was asked for hides the disagreement in exactly
+        # the place it costs money.
+        raise ValueError(
+            f'{owner}: "candidates" is {candidates}, over the {policy.max_candidates} '
+            f"this reranker is configured to allow -- a reranking model is billed per "
+            f"document, so the ceiling is not something a spec can raise. Ask for at "
+            f"most {policy.max_candidates}, or narrow `where` so that many candidates "
+            f"are worth more"
+        )
+    jqsafe.validate(document_from, fields=policy.fields, owner=f"{owner}.document_from")
+    return _SpecRerank(
+        template.client, document_from=document_from, candidates=candidates,
+        per_path=template.per_path, max_paths=template.max_paths, model=template.model,
+        batch_size=template.batch_size, retries=template.retries, backoff=template.backoff,
+    )
+
+
+def _document_failure(document_from: str, candidate: Any, failed: BaseException) -> ValueError:
+    """The refusal that replaces a document-building failure whose own
+    message quotes the row.
+
+    MEASURED, not assumed: jq's runtime errors quote the offending value
+    verbatim -- `ValueError: string ("SSN-123-45-6789") cannot be parsed
+    as a number` -- and so do two of _evaluate()'s own, which repr the
+    value the filter produced. `fields=` decides which properties a
+    filter may READ, so this is not a privilege escalation; it is a row
+    value taking a route out of the process that nobody chose, into a
+    tool result and whatever logs the far side keeps.
+
+    WHAT REPLACES IT STILL NAMES THE FIX, because an error a model
+    cannot act on costs a retry: the filter, the candidate, the KIND of
+    failure and the rewrite. The kind is read off the exception's shape
+    rather than its text -- TypeError is "not a string", a ValueError
+    with a `__cause__` is jq failing on the row, and one without is
+    _evaluate()'s own count check -- so nothing here parses a message
+    that another module is free to reword."""
+    where = candidate.get("id") if isinstance(candidate, dict) else None
+    if isinstance(failed, TypeError):
+        reason = "it evaluated to something that is not a string"
+        fix = ("Put the default BEFORE the conversion, e.g. "
+               "'.properties.year // \"unknown\" | tostring'")
+    elif failed.__cause__ is not None:
+        reason = ("jq itself failed on that row -- most often a type mismatch, such as "
+                  "adding text to a number or asking tonumber() of something that is not "
+                  "one")
+        fix = ("Guard every field the row may not have, e.g. "
+               "'(.properties.title // \"\") + \": \" + (.properties.summary // \"\")'")
+    else:
+        reason = "it produced no document at all, or more than one"
+        fix = ("Give it a fallback (e.g. '.properties.title // \"untitled\"'), or wrap "
+               "several outputs into one (e.g. '[.properties.tags[]] | join(\", \")')")
+    return ValueError(
+        f"document_from={document_from!r} could not build a document for candidate "
+        f"id={where!r} -- {reason}. The underlying error is not repeated here, because "
+        f"it quotes that row's own values and this document is posted to a reranking "
+        f"provider. {fix}"
+    )
+
+
+def _provider_failure(document_from: str) -> RerankError:
+    """The refusal that replaces a spent RerankError.
+
+    Same rule as above, one layer out: a provider SDK's exception repr
+    can carry the configuration it was constructed with, API key
+    included, and RerankError quotes it verbatim so a Python caller can
+    see what happened. A Python caller is inside the trust boundary; the
+    far side of a tool call is not.
+
+    It stays a RerankError, so `except RerankError` still catches it and
+    the "raised, never degraded" contract is unchanged -- only the text
+    is."""
+    return RerankError(
+        f"rerank=(document_from={document_from!r}): the reranking provider call failed "
+        f"and was not retried into success. The provider's own error is not repeated "
+        f"here, because an SDK exception can carry the credentials it was configured "
+        f"with. Nothing was ranked rather than falling back to the un-reranked order, "
+        f"which would be a different answer with no signal. This is a server-side "
+        f"failure, not something to fix in this call"
+    )
+
+
+class _SpecRerank(Rerank):
+    """The Rerank a spec produced, whose failures may not quote the row.
+
+    Identical to Rerank in every respect that decides an answer -- same
+    client, same documents, same scores -- and different only in what it
+    says when something goes wrong. Constructed by parse_rerank() alone,
+    which is exactly the trust boundary: a Rerank written in Python
+    keeps jq's own diagnostics, because the person reading them wrote
+    the filter and already holds the rows.
+
+    Documents are built ONE CANDIDATE AT A TIME so the failing candidate
+    is known STRUCTURALLY rather than scraped out of a message. The cost
+    is a Python call per candidate against a compiled, cached filter,
+    which is noise beside the provider round trip that follows."""
+
+    def build_documents(self, candidates: list, *, trusted: bool = False, fields=None) -> list:
+        if isinstance(candidates, (dict, str, bytes)):
+            # The base's own call-shape refusal, which names a type and
+            # no data -- and which iterating here would turn into a
+            # complaint about the string 'id'.
+            return super().build_documents(candidates, trusted=trusted, fields=fields)
+        documents = []
+        for candidate in candidates:
+            try:
+                documents.extend(
+                    super().build_documents([candidate], trusted=trusted, fields=fields))
+            except jqsafe.UnsafeFilter:
+                # About the FILTER, never about a row: it quotes the
+                # program the caller wrote and names the construct that
+                # is not allowed, which is the message they need.
+                raise
+            except (ValueError, TypeError) as failed:
+                raise _document_failure(self.document_from, candidate, failed) from None
+        return documents
+
+    def score(self, query: str, documents: list) -> list:
+        try:
+            return super().score(query, documents)
+        except RerankError:
+            raise _provider_failure(self.document_from) from None
+
+    async def ascore(self, query: str, documents: list) -> list:
+        try:
+            return await super().ascore(query, documents)
+        except RerankError:
+            raise _provider_failure(self.document_from) from None
+
+
+def spec_to_traversal(spec: dict, rerank: Optional[RerankPolicy] = None) -> tuple:
     """Convert a JSON spec into (Start, [Hop, ...]). Exposed on its own
     in case you want to inspect or modify the parsed traversal before
-    running it."""
+    running it.
+
+    `rerank` is the RerankPolicy a `rerank` key in the spec is measured
+    against; without one, a spec asking to rerank refuses rather than
+    reranking with a client it cannot have."""
     if "start" not in spec:
         raise ValueError("spec must have a 'start' key, e.g. {\"start\": {\"where\": {...}}}")
 
@@ -120,10 +455,11 @@ def spec_to_traversal(spec: dict) -> tuple:
         near=_near_of(start_spec),
         keep=start_spec.get("keep"),
         boost=_boost_of(start_spec),
+        rerank=_rerank_of(start_spec, rerank, "start.rerank"),
     )
 
     hops = []
-    for h in spec.get("hops", []):
+    for index, h in enumerate(spec.get("hops", [])):
         _check_keys(h, _HOP_KEYS, '"hops" entry')
         hops.append(
             Hop(
@@ -138,6 +474,7 @@ def spec_to_traversal(spec: dict) -> tuple:
                 via_near=_near_of(h, "via_near"),
                 via_keep=h.get("via_keep"),
                 boost=_boost_of(h),
+                rerank=_rerank_of(h, rerank, f"hops[{index}].rerank"),
             )
         )
     return start, hops
@@ -188,7 +525,8 @@ def refuse_vectors(spec: dict, caller: str) -> None:
                     )
 
 
-def traverse_json(graph: Graph, spec: dict, allow_vectors: bool = False) -> dict:
+def traverse_json(graph: Graph, spec: dict, allow_vectors: bool = False,
+                  rerank: Optional[RerankPolicy] = None) -> dict:
     """Run a traversal described entirely in JSON and return a
     JSON-serializable dict -- the single call an LLM tool integration or
     HTTP handler needs: no Python objects in, no Python objects out.
@@ -203,15 +541,20 @@ def traverse_json(graph: Graph, spec: dict, allow_vectors: bool = False) -> dict
     REFUSED unless allow_vectors=True: this is the call an agent
     integration wires up, and a model cannot supply a real embedding.
     Application code holding real vectors opts in explicitly.
+
+    `rerank` is a RerankPolicy -- YOUR reranker, plus the property
+    paths a spec's `document_from` may read and the ceiling on how many
+    candidates it may spend. Without one a spec's `rerank` refuses,
+    since the client can only be yours.
     """
     if not allow_vectors:
         refuse_vectors(spec, "traverse_json()")
-    start, hops = spec_to_traversal(spec)
+    start, hops = spec_to_traversal(spec, rerank)
     subgraph: Subgraph = graph.traverse(start, *hops)
     return subgraph.to_dict()
 
 
-def spec_to_aggregation(spec: dict) -> tuple:
+def spec_to_aggregation(spec: dict, rerank: Optional[RerankPolicy] = None) -> tuple:
     """Convert a JSON spec into (Start, [Hop, ...], {name: aggregate}).
     The traversal half is exactly spec_to_traversal(); `aggregates` maps
     result names to JSON-form aggregates for hopai.aggregates.parse_aggregate()."""
@@ -220,12 +563,14 @@ def spec_to_aggregation(spec: dict) -> tuple:
             'spec must have a non-empty "aggregates" object, e.g. '
             '{"aggregates": {"n": {"fn": "count"}}}'
         )
-    start, hops = spec_to_traversal({k: v for k, v in spec.items() if k != "aggregates"})
+    start, hops = spec_to_traversal({k: v for k, v in spec.items() if k != "aggregates"},
+                                    rerank)
     aggregates = {name: parse_aggregate(a) for name, a in spec["aggregates"].items()}
     return start, hops, aggregates
 
 
-def aggregate_json(graph: Graph, spec: dict, allow_vectors: bool = False) -> dict:
+def aggregate_json(graph: Graph, spec: dict, allow_vectors: bool = False,
+                   rerank: Optional[RerankPolicy] = None) -> dict:
     """Run an aggregation described entirely in JSON and return a
     JSON-serializable dict of the named results -- the aggregation
     counterpart of traverse_json(), and the call behind
@@ -244,11 +589,12 @@ def aggregate_json(graph: Graph, spec: dict, allow_vectors: bool = False) -> dic
     """
     if not allow_vectors:
         refuse_vectors(spec, "aggregate_json()")
-    start, hops, aggregates = spec_to_aggregation(spec)
+    start, hops, aggregates = spec_to_aggregation(spec, rerank)
     return graph.aggregate(start, *hops, aggregates=aggregates)
 
 
-def vector_search_json(graph: Graph, spec: dict, allow_vectors: bool = False) -> dict:
+def vector_search_json(graph: Graph, spec: dict, allow_vectors: bool = False,
+                       rerank: Optional[RerankPolicy] = None) -> dict:
     """Run a vector search described entirely in JSON -- the
     vector_search() counterpart of traverse_json(), and the call behind
     VECTOR_SEARCH_TOOL_SCHEMA.
@@ -265,6 +611,11 @@ def vector_search_json(graph: Graph, spec: dict, allow_vectors: bool = False) ->
     Same gate as traverse_json(): a literal "vector" is refused unless
     allow_vectors=True, while "text" is embedded by the field itself
     and is what a model is meant to send.
+
+    `rerank` is a RerankPolicy, exactly as in traverse_json(); the
+    spec's own `rerank` object sits beside `near` at the top level,
+    because a flat search has one ranked list and one place to reorder
+    it.
     """
     _check_keys(spec, _SEARCH_KEYS, "vector search spec")
     if not allow_vectors:
@@ -278,6 +629,7 @@ def vector_search_json(graph: Graph, spec: dict, allow_vectors: bool = False) ->
         k=spec.get("k", 10),
         where=parse_filter(spec.get("where")),
         boost=_boost_of(spec),
+        rerank=_rerank_of(spec, rerank, "rerank"),
     )
     return {"results": results}
 
@@ -381,6 +733,67 @@ _BOOST_DEF: dict = {
     "required": ["property", "weight"],
 }
 
+#: The two sentences a SERVER rewrites once it knows its own numbers --
+#: hopai/mcp.py replaces each with the published field list and the real
+#: ceiling, the same conditional-sentence idiom _with_search() uses for
+#: `start.search`. Constants rather than prose so a reword here fails
+#: loudly there instead of leaving two descriptions contradicting each
+#: other. With no server in sight these can only say that a list and a
+#: cap exist.
+RERANK_FIELDS_SENTENCE = (
+    "Only a small, always-terminating subset of jq is accepted, and only the properties "
+    "the application publishes may be read -- anything else refuses and names them."
+)
+RERANK_CEILING_SENTENCE = (
+    "The application may cap this, and a larger value refuses naming the cap rather than "
+    "being quietly lowered."
+)
+
+#: The rerank spec as JSON Schema. `document_from` is the one place a
+#: model writes CODE, so its description shows a whole candidate rather
+#: than describing one: a model writes markedly better jq against a
+#: concrete shape than against a paragraph about a shape. There is no
+#: "client" key here and there never will be -- see _RERANK_KEYS.
+_RERANK_DEF: dict = {
+    "type": "object",
+    "description": (
+        "Rerank what `near` ranked, by having a reranking model READ each candidate "
+        "against your query text -- the accurate, expensive stage after the cheap "
+        "similarity one. It reorders and truncates a list that already exists; it never "
+        "creates one, so it needs `near` (with `text`) beside it, and `keep`/`k` still "
+        "decides how many survive."
+    ),
+    "properties": {
+        "document_from": {
+            "type": "string",
+            "description": (
+                "A jq filter that turns ONE candidate into the ONE string the reranking "
+                "model reads. It is a RULE, evaluated once per candidate after the "
+                "search runs -- not a document you write, because none of them exist "
+                "yet. A candidate is exactly this shape: "
+                '{"id": "7", "properties": {"title": "Raft", "abstract": "a consensus '
+                'protocol", "tags": ["consensus", "replication"]}, "similarity": 0.81, '
+                '"similarities": {"abstract": 0.81}, "boosts": {}} -- plus "paths", the '
+                "routes that reached it, on a hop but never on `start`. So "
+                "'.properties.title + \": \" + (.properties.abstract // \"\")' builds "
+                "\"Raft: a consensus protocol\" from it. Guard anything a row may not "
+                "have with `// \"\"`: a filter that yields nothing, several things, or "
+                "something that is not text refuses rather than ranking against the "
+                "wrong words. " + RERANK_FIELDS_SENTENCE
+            ),
+        },
+        "candidates": {
+            "type": "integer",
+            "description": (
+                "How many hits the reranking model reads, before `keep`/`k` truncates -- "
+                "the INPUT bound, where keep/k is the output bound. It has to be at "
+                "least keep/k, or the reranking cannot change which rows survive and the "
+                "call refuses. " + RERANK_CEILING_SENTENCE
+            ),
+        },
+    },
+}
+
 
 TRAVERSE_TOOL_SCHEMA: dict = {
     "name": "traverse_graph",
@@ -394,7 +807,7 @@ TRAVERSE_TOOL_SCHEMA: dict = {
     ),
     "parameters": {
         "type": "object",
-        "$defs": {"near": _NEAR_DEF, "boost": _BOOST_DEF},
+        "$defs": {"near": _NEAR_DEF, "boost": _BOOST_DEF, "rerank": _RERANK_DEF},
         "properties": {
             "start": {
                 "type": "object",
@@ -409,6 +822,7 @@ TRAVERSE_TOOL_SCHEMA: dict = {
                         "description": "How many of the highest-scoring starting nodes to keep.",
                     },
                     "boost": {"$ref": "#/$defs/boost"},
+                    "rerank": {"$ref": "#/$defs/rerank"},
                 },
                 # A seed set has to come from SOMEWHERE. Before `near`
                 # existed this was `required: ["where"]`; dropping it to
@@ -453,6 +867,7 @@ TRAVERSE_TOOL_SCHEMA: dict = {
                             "description": "How many of the highest-scoring edges to follow.",
                         },
                         "boost": {"$ref": "#/$defs/boost"},
+                        "rerank": {"$ref": "#/$defs/rerank"},
                     },
                 },
             },
@@ -473,7 +888,7 @@ VECTOR_SEARCH_TOOL_SCHEMA: dict = {
     ),
     "parameters": {
         "type": "object",
-        "$defs": {"near": _NEAR_DEF, "boost": _BOOST_DEF},
+        "$defs": {"near": _NEAR_DEF, "boost": _BOOST_DEF, "rerank": _RERANK_DEF},
         "properties": {
             "near": _near_schema("The field to search and the text to search for."),
             "target": {
@@ -493,6 +908,7 @@ VECTOR_SEARCH_TOOL_SCHEMA: dict = {
                 ),
             },
             "boost": {"$ref": "#/$defs/boost"},
+            "rerank": {"$ref": "#/$defs/rerank"},
         },
         "required": ["near"],
     },
@@ -516,7 +932,7 @@ AGGREGATE_TOOL_SCHEMA: dict = {
     ),
     "parameters": {
         "type": "object",
-        "$defs": {"near": _NEAR_DEF, "boost": _BOOST_DEF},
+        "$defs": {"near": _NEAR_DEF, "boost": _BOOST_DEF, "rerank": _RERANK_DEF},
         "properties": {
             "start": {
                 "type": "object",
@@ -531,6 +947,7 @@ AGGREGATE_TOOL_SCHEMA: dict = {
                         "description": "How many of the highest-scoring starting nodes to keep.",
                     },
                     "boost": {"$ref": "#/$defs/boost"},
+                    "rerank": {"$ref": "#/$defs/rerank"},
                 },
                 # A seed set has to come from SOMEWHERE. Before `near`
                 # existed this was `required: ["where"]`; dropping it to
@@ -571,6 +988,7 @@ AGGREGATE_TOOL_SCHEMA: dict = {
                             "description": "How many of the highest-scoring edges to follow.",
                         },
                         "boost": {"$ref": "#/$defs/boost"},
+                        "rerank": {"$ref": "#/$defs/rerank"},
                     },
                 },
             },
@@ -610,3 +1028,34 @@ AGGREGATE_TOOL_SCHEMA: dict = {
         "required": ["start", "aggregates"],
     },
 }
+
+
+def without_rerank(schema: dict) -> dict:
+    """A copy of a tool schema with `rerank` taken off every step it
+    appears on, and its `$def` with it.
+
+    NO RERANKER, NO PARAMETER. The static schemas carry `rerank` because
+    the parsers above read it, and a test derives one from the other so
+    the two cannot drift. But a surface with no reranker CONFIGURED must
+    not offer it: `traverse_json(graph, spec)` with no policy refuses a
+    `rerank` key by name, so advertising it there would be a parameter
+    whose handler rejects every use of it -- the defect CLAUDE.md names,
+    and the same reasoning that already keeps VECTOR_SEARCH_TOOL_SCHEMA
+    out of `tool_schemas()` for a graph that has declared no vectors.
+
+    Lives here rather than in mcp.py because Graph.tool_schemas() needs
+    it and core.py must not import the MCP front end -- that module asks
+    for an optional SDK by name. mcp.py's _with_rerank() calls this for
+    its own no-policy branch, so there is one implementation of "take
+    the parameter off"."""
+    copy = deepcopy(schema)
+    properties = copy["parameters"]["properties"]
+    steps = [properties[name] for name in ("start",) if name in properties]
+    if "hops" in properties:
+        steps.append(properties["hops"]["items"])
+    if "rerank" in properties:          # vector_search: rerank is top level
+        properties.pop("rerank")
+    for step in steps:
+        step.get("properties", {}).pop("rerank", None)
+    copy["parameters"].get("$defs", {}).pop("rerank", None)
+    return copy

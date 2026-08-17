@@ -990,7 +990,7 @@ class Graph:
         return (_Target(self.nodes_tbl, "nodes", self.graph, self.graph_col),
                 _Target(self.edges_tbl, "edges", self.graph, self.graph_col))
 
-    def tool_schemas(self) -> list:
+    def tool_schemas(self, rerank: bool = False) -> list:
         """The LLM tool definitions -- traverse, aggregate, ingest,
         mutate, and (when this graph has declared any) vector search --
         as deep copies, with THIS graph's declared schema summarized
@@ -1022,15 +1022,33 @@ class Graph:
         import copy
 
         from .ingest import INGEST_TOOL_SCHEMA
-        from .json_api import AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, VECTOR_SEARCH_TOOL_SCHEMA
+        from .json_api import (
+            AGGREGATE_TOOL_SCHEMA, TRAVERSE_TOOL_SCHEMA, VECTOR_SEARCH_TOOL_SCHEMA,
+            without_rerank,
+        )
         from .mutate import MUTATE_TOOL_SCHEMA
-        tools = [copy.deepcopy(tool) for tool in
-                 (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA, INGEST_TOOL_SCHEMA,
-                  MUTATE_TOOL_SCHEMA)]
+        # `rerank` comes OFF unless the caller says it has a reranker.
+        # A Graph holds none -- the client is the operator's, and arrives
+        # through hopai.mcp's serve(rerank=) or traverse_json(...,
+        # rerank=RerankPolicy(...)) -- so against a bare Graph a spec
+        # carrying `rerank` is refused BY NAME. Advertising a parameter
+        # whose handler rejects every use of it is the defect CLAUDE.md
+        # names, and it is the same judgement that keeps
+        # VECTOR_SEARCH_TOOL_SCHEMA out of this list below for a graph
+        # with no declared vectors: a call that cannot succeed should not
+        # be offered.
+        #
+        # rerank=True is for a caller that HAS one and will fill in its
+        # own published fields and ceiling -- hopai.mcp does exactly that,
+        # and it builds on these schemas rather than beside them, so the
+        # parameter has to survive long enough for it to configure.
+        keep = (lambda tool: copy.deepcopy(tool)) if rerank else without_rerank
+        tools = [keep(tool) for tool in (TRAVERSE_TOOL_SCHEMA, AGGREGATE_TOOL_SCHEMA)]
+        tools += [copy.deepcopy(tool) for tool in (INGEST_TOOL_SCHEMA, MUTATE_TOOL_SCHEMA)]
         from .vectors import field_names
         names = field_names(self._vectors)
         if names:
-            search = copy.deepcopy(VECTOR_SEARCH_TOOL_SCHEMA)
+            search = keep(VECTOR_SEARCH_TOOL_SCHEMA)
             search["parameters"]["$defs"]["near"]["properties"]["field"]["enum"] = names
             tools.append(search)
         if self._schema is not None:
