@@ -351,7 +351,13 @@ class Embedder:
     truncation (OpenAI's text-embedding-3-*, Google's
     output_dimensionality). Elsewhere it is only checked, because
     padding or slicing a vector on the caller's behalf would change what
-    the model said."""
+    the model said.
+
+    Every embed_*() method below has an aembed_*() twin -- aembed_documents,
+    aembed_query, aembed_queries -- for an async caller (AsyncGraph, or
+    any other coroutine): awaited, never blocking the event loop, using
+    this client's own async API when it has one. See the module
+    docstring."""
 
     def __init__(self, client: Any, model: Optional[str] = None,
                  batch_size: Optional[int] = None, dimensions: Optional[int] = None,

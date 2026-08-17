@@ -269,12 +269,16 @@ side are unaware anything async is happening.
 
 Schema and constraint declaration — `create_schema()`, `enforce_schema()`,
 `define_constraints()`, `save_schema()`/`load_schema()`, `infer_schema()`,
-`schema_violations()`, `add_networkx()` — has no async override. These are one-time
-setup calls with no concurrency to gain, and `AsyncGraph`'s wrapped `Graph` runs on
-`AsyncEngine.sync_engine`, a facade only safe to execute against *inside* a greenlet
-`run_sync()` spawns. `AsyncGraph.__getattr__` refuses these by name, pointing at a plain
-`Graph` on the same database, rather than letting the facade fail with SQLAlchemy's own
-`MissingGreenlet` outside the context that explains it.
+`schema_violations()`, `add_networkx()`, `load_vectors()` — has no async override. These
+are one-time setup calls with no concurrency to gain, and `AsyncGraph`'s wrapped `Graph`
+runs on `AsyncEngine.sync_engine`, a facade only safe to execute against *inside* a
+greenlet `run_sync()` spawns. `AsyncGraph.__getattr__` refuses these by name, pointing at
+a plain `Graph` on the same database, rather than letting the facade fail with
+SQLAlchemy's own `MissingGreenlet` outside the context that explains it.
+`embed_stale()` gets the same refusal for a different reason: it is a bulk backfill that
+opens its own transaction PER PAGE rather than resolving everything and opening one, so
+it cannot take the `aplan_vector_writes()` treatment issue #74 gave every other write
+without a second, divergent backfill implementation.
 
 A throwaway benchmark (not committed) compared this design against `asyncio.to_thread()`
 — the shape a naive async wrapper defaults to, and the same one `LangChain`'s `ainvoke`

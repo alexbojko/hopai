@@ -883,19 +883,30 @@ async def _aresolve_query_texts(graph, target: str, parsed: list, caller: str) -
     return _apply_resolved_texts(parsed, ready)
 
 
-async def aresolve_near(graph, target: str, nears: list, caller: str) -> list:
+async def aresolve_near(graph, target: str, nears: list, k, caller: str) -> list:
     """Async pre-resolution for ONE vector_search() call's near= --
     always a list here, matching how AsyncGraph.vector_search() already
-    normalizes *near before this runs. See _aresolve_query_texts()."""
+    normalizes *near before this runs. Mirrors _prepare_search_query()'s
+    own order -- k, then shape, and only THEN a provider call -- so a
+    call about to be refused for either reason is never embedded first
+    (issue #74's own review). See _aresolve_query_texts()."""
+    _check_k(k, caller)
+    nears = _normalized_nears(nears, caller)
     return (await _aresolve_query_texts(graph, target, [nears], caller))[0]
 
 
-async def aresolve_queries(graph, target: str, queries: list, caller: str) -> list:
+async def aresolve_queries(graph, target: str, queries: list, k, caller: str) -> list:
     """Async pre-resolution for vector_search_many()'s queries= -- every
     entry embedded in one batched call per field, same as the sync path
-    inside _prepare_search_many_query(). The result is already the
-    list-of-list-of-Near shape search_many() accepts, so AsyncGraph
-    hands it straight to the sync call with no further reshaping."""
+    inside _prepare_search_many_query(). k is checked first, matching
+    that function's own order. Per-query Near shape is NOT re-checked
+    here before embedding -- _prepare_search_many_query() itself embeds
+    every query's text (_resolve_query_texts()) before running
+    validate_nears() on any of them, so this is not a new ordering,
+    only its async twin. The result is already the list-of-list-of-Near
+    shape search_many() accepts, so AsyncGraph hands it straight to the
+    sync call with no further reshaping."""
+    _check_k(k, caller)
     return await _aresolve_query_texts(graph, target, _as_query_list(queries, caller), caller)
 
 
@@ -912,36 +923,56 @@ async def aresolve_spec_texts(graph, start, hops: list) -> tuple:
     Field/embedder lookups use the SAME per-hop caller label
     core.py's _walk_matches() does ("Start", "hop 2 (label) via_near",
     ...), so a bad field name or a field with no embedder still names
-    the right hop -- only the actual embedding round trip moves here;
-    every other check validate_nears() does (shape, duplicates,
-    dimensions, k-required) still runs once, in the sync path, exactly
-    as it always has.
+    the right hop.
+
+    EVERY near=/via_near= in the chain is shape-checked -- non-empty,
+    every entry a Near, no two ranking the same field -- with
+    _normalized_nears(), BEFORE any of them is embedded: a chain about
+    to be refused for one of these reasons must never pay for, or fail
+    because of, a provider round trip first (issue #74's own review;
+    AsyncGraph.traverse()/aggregate() run the hop-position/aggregate-
+    spec checks earlier still, before this function is even called).
+    Everything validate_nears() checks AFTER shape -- dimensions,
+    missing='zero' with one Near, k-required -- still runs once, in the
+    sync path, unchanged: those already run after embedding on the sync
+    side too, so moving the embed call earlier changes nothing about
+    when they fire relative to it.
 
     Batched by (target, field) across the WHOLE chain, not per hop: a
     multi-hop walk that embeds the same field's text more than once
     costs one provider round trip for it, not one per occurrence."""
-    def as_list(near):
-        return [] if near is None else (list(near) if isinstance(near, (list, tuple)) else [near])
+    def normalized(near, caller):
+        return None if near is None else _normalized_nears(near, caller)
 
-    positions = [("nodes", "Start", start.near)]
+    start_norm = normalized(start.near, "Start")
+    hop_norms = []
     for i, hop in enumerate(hops):
         label = hop.label or "unlabeled"
-        positions.append(("edges", f"hop {i} ({label}) via_near", hop.via_near))
-        positions.append(("nodes", f"hop {i} ({label})", hop.near))
+        hop_norms.append((
+            normalized(hop.near, f"hop {i} ({label})"),
+            normalized(hop.via_near, f"hop {i} ({label}) via_near"),
+        ))
 
-    # (target, field name) -> (caller of the FIRST occurrence, its
-    # Vector, the texts waiting on it). The caller is only for a
-    # readable error if _field()/_embedder() refuses; the embed call
-    # itself needs neither the caller nor which hop asked.
+    # Every position's shape check already ran above, in full, before
+    # any of what follows -- which only collects and embeds TEXT.
     waiting: dict = {}
-    for target, caller, near in positions:
-        for one in as_list(near):
+
+    def collect(target, caller, items):
+        if items is None:
+            return
+        for one in items:
             if isinstance(one, Near) and one.text is not None:
                 key = (target, one.field)
                 if key not in waiting:
                     field = _field(graph, target, one.field, caller)
                     waiting[key] = (caller, field, [])
                 waiting[key][2].append(one.text)
+
+    collect("nodes", "Start", start_norm)
+    for i, (near_norm, via_norm) in enumerate(hop_norms):
+        label = hops[i].label or "unlabeled"
+        collect("edges", f"hop {i} ({label}) via_near", via_norm)
+        collect("nodes", f"hop {i} ({label})", near_norm)
 
     if not waiting:
         return start, hops
@@ -955,24 +986,31 @@ async def aresolve_spec_texts(graph, start, hops: list) -> tuple:
         for key, (caller, field, texts) in ((k, waiting[k]) for k in keys)))
     ready = dict(zip(keys, (iter(answer) for answer in answers), strict=True))
 
-    def has_text(near):
-        return any(isinstance(one, Near) and one.text is not None for one in as_list(near))
+    def has_text(items):
+        return items is not None and any(
+            isinstance(one, Near) and one.text is not None for one in items)
 
-    def resolve(target, near):
-        if near is None:
+    def resolve(target, original, items):
+        if items is None:
             return None
-        items = as_list(near)
         out = [one._with_vector(next(ready[(target, one.field)]))
                if isinstance(one, Near) and one.text is not None else one
                for one in items]
-        return out if isinstance(near, (list, tuple)) else out[0]
+        return out if isinstance(original, (list, tuple)) else out[0]
 
-    new_start = replace(start, near=resolve("nodes", start.near)) if has_text(start.near) else start
-    new_hops = [
-        replace(hop, near=resolve("nodes", hop.near), via_near=resolve("edges", hop.via_near))
-        if has_text(hop.near) or has_text(hop.via_near) else hop
-        for hop in hops
-    ]
+    new_start = (replace(start, near=resolve("nodes", start.near, start_norm))
+                 if has_text(start_norm) else start)
+    new_hops = []
+    for i, hop in enumerate(hops):
+        near_norm, via_norm = hop_norms[i]
+        if has_text(near_norm) or has_text(via_norm):
+            new_hops.append(replace(
+                hop,
+                near=resolve("nodes", hop.near, near_norm),
+                via_near=resolve("edges", hop.via_near, via_norm),
+            ))
+        else:
+            new_hops.append(hop)
     return new_start, new_hops
 
 
@@ -1003,22 +1041,19 @@ def _read_connection(graph, connection=None):
             yield opened
 
 
-def validate_nears(graph, target: str, near, k, caller: str,
-                   limit_name: str = "k") -> list:
-    """Normalize near= (one Near or a list) into a validated list:
-    every entry a Near, every field defined for `target`, every query
-    vector of the declared dimensions -- so a typo fails here with the
-    fix named, not at execution as an undefined-column error.
+def _normalized_nears(near, caller: str) -> list:
+    """near= (one Near or a list) normalized into a list, with every
+    check that needs no field lookup and no provider call already done:
+    non-empty, every entry a Near, no two ranking the same field.
 
-    Any Near carrying text= is resolved here, against the embedder its
-    FIELD declares: this is the first point where the spec and the
-    graph are both in hand. The returned list is a new one, so the
-    caller's specs are left as they were written."""
+    Split out of validate_nears() so it can run FIRST there -- and, for
+    AsyncGraph, be run again standalone before any embedding starts
+    (aresolve_spec_texts()/aresolve_near() in this module): a spec about
+    to be refused for one of these reasons must never be embedded
+    first, on either path (issue #74's own review)."""
     nears = list(near) if isinstance(near, (list, tuple)) else [near]
     if not nears:
         raise ValueError(f"{caller}: near=[] is empty -- pass a Near(...) or a list of them")
-    # Shape first, in full, and only then anything that costs a provider
-    # call: a batch that is about to be refused should never be embedded.
     seen = set()
     for one in nears:
         if not isinstance(one, Near):
@@ -1039,6 +1074,23 @@ def validate_nears(graph, target: str, near, k, caller: str,
                 f"yourself so the blend is visible in your code"
             )
         seen.add(one.field)
+    return nears
+
+
+def validate_nears(graph, target: str, near, k, caller: str,
+                   limit_name: str = "k") -> list:
+    """Normalize near= (one Near or a list) into a validated list:
+    every entry a Near, every field defined for `target`, every query
+    vector of the declared dimensions -- so a typo fails here with the
+    fix named, not at execution as an undefined-column error.
+
+    Any Near carrying text= is resolved here, against the embedder its
+    FIELD declares: this is the first point where the spec and the
+    graph are both in hand. The returned list is a new one, so the
+    caller's specs are left as they were written."""
+    # Shape first, in full, and only then anything that costs a provider
+    # call: a batch that is about to be refused should never be embedded.
+    nears = _normalized_nears(near, caller)
 
     resolved = []
     for one in nears:

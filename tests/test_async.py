@@ -663,6 +663,142 @@ class TestTextEmbeddingCorrectness:
         assert elapsed < delay * 1.7, f"took {elapsed:.2f}s -- the two embed calls ran sequentially"
 
 
+class TestValidationRunsBeforeEmbedding:
+    """A call about to be refused for a reason that has NOTHING to do
+    with the provider must never pay for -- or fail because of -- an
+    embedding round trip first. Hoisting text resolution earlier
+    (aresolve_spec_texts()/aresolve_near()/aresolve_queries() in
+    hopai/vectors.py) would otherwise let exactly that happen: a
+    caller mistake (duplicate field, bad k, a misplaced optional=True)
+    reaching the provider before the cheap, sync-side check that would
+    have caught it -- and, if the provider itself then fails, surfacing
+    as a confusing EmbeddingError instead of the real ValueError/
+    TypeError. Each test below asserts BOTH the right exception AND
+    that the embedder was never called."""
+
+    def test_duplicate_field_in_start_near_is_refused_before_embedding(self, async_fresh_graph):
+        calls = []
+
+        def embed(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=embed)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.traverse(
+                Start(near=[Near("summary", text="a"), Near("summary", text="b")], keep=1))
+
+        with pytest.raises(ValueError, match="two Near specs both rank field"):
+            run(body())
+        assert calls == []
+
+    def test_a_non_near_item_is_refused_before_embedding(self, async_fresh_graph):
+        calls = []
+
+        def embed(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=embed)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.traverse(
+                Start(near=[Near("summary", text="a"), "not-a-near"], keep=1))
+
+        with pytest.raises(TypeError, match="near= takes Near"):
+            run(body())
+        assert calls == []
+
+    def test_a_negative_k_on_vector_search_is_refused_before_embedding(self, async_fresh_graph):
+        calls = []
+
+        def embed(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=embed)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.vector_search(Near("summary", text="q"), k=-5)
+
+        with pytest.raises(ValueError, match="k must be a positive integer"):
+            run(body())
+        assert calls == []
+
+    def test_a_negative_k_on_vector_search_many_is_refused_before_embedding(
+            self, async_fresh_graph):
+        calls = []
+
+        def embed(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=embed)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.vector_search_many([Near("summary", text="q")], k=-5)
+
+        with pytest.raises(ValueError, match="k must be a positive integer"):
+            run(body())
+        assert calls == []
+
+    def test_optional_on_a_non_last_hop_is_refused_before_embedding(self, async_fresh_graph):
+        calls = []
+
+        def embed(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=embed)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.traverse(
+                Start(),
+                Hop(optional=True),
+                Hop(near=Near("summary", text="q"), keep=1))
+
+        with pytest.raises(ValueError, match="optional=True is only supported on the LAST hop"):
+            run(body())
+        assert calls == []
+
+    def test_optional_on_an_aggregate_hop_is_refused_before_embedding(self, async_fresh_graph):
+        calls = []
+
+        def embed(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=embed)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.aggregate(
+                Start(),
+                Hop(optional=True, near=Near("summary", text="q"), keep=1),
+                aggregates={"n": Count()})
+
+        with pytest.raises(ValueError, match="optional=True has no effect on an aggregation"):
+            run(body())
+        assert calls == []
+
+    def test_an_empty_aggregates_dict_is_refused_before_embedding(self, async_fresh_graph):
+        calls = []
+
+        def embed(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=embed)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.aggregate(
+                Start(near=Near("summary", text="q"), keep=1), aggregates={})
+
+        with pytest.raises(ValueError, match="aggregates must be a non-empty dict"):
+            run(body())
+        assert calls == []
+
+
 class TestOutOfScope:
     """Schema/constraint DDL has no async override -- see hopai/asyncio.py's
     module docstring. Each must refuse LOUD, naming the fix, rather than
@@ -672,7 +808,7 @@ class TestOutOfScope:
     @pytest.mark.parametrize("name", [
         "create_schema", "drop_schema", "define_constraints", "drop_constraints",
         "enforce_schema", "save_schema", "load_schema", "infer_schema",
-        "schema_violations", "add_networkx", "load_vectors",
+        "schema_violations", "add_networkx", "load_vectors", "embed_stale",
     ])
     def test_admin_methods_refuse_with_the_fix_named(self, async_graph, name):
         with pytest.raises(AttributeError, match="plain Graph"):
