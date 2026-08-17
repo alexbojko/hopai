@@ -33,6 +33,24 @@ bridged through a greenlet: the function bodies on the other end of
 every call below are unaware anything async is happening, and are the
 same functions the sync Graph calls directly.
 
+THE BRIDGE ONLY COVERS DATABASE I/O -- SQLAlchemy's own calls yield
+back to the loop from inside the greenlet, but an ARBITRARY blocking
+call does not, and just holds the event loop's one thread until it
+returns. An embedding provider's HTTP call is exactly that: reachable
+from Near(text=...) and from a text row in set_vectors(), and, before
+issue #74, made straight from inside fn -- on the loop's own thread,
+for every concurrent traverse()/aggregate()/vector_search()/
+set_vectors() in the process, for the length of the round trip. Every
+method below that can carry text now resolves it FIRST, awaited,
+before fn ever runs: traverse()/aggregate()/vector_search()/
+vector_search_many() call hopai/vectors.py's aresolve_*() helpers,
+set_vectors() calls aplan_vector_writes() -- both await
+Embedder.aembed_*(), which reaches the provider's own async client
+when there is one and asyncio.to_thread() otherwise (see hopai/
+embeddings.py). By the time fn runs, every Near/row it sees already
+carries a plain vector, so the sync functions below make no provider
+call of their own and need no changes to stay correct.
+
 NEEDS AN ASYNC DRIVER. psycopg2 (hopai's base dependency) cannot run
 async -- use postgresql+psycopg://... (psycopg3; `pip install
 hopai[asyncio]`) or postgresql+asyncpg://.... greenlet itself needs no
@@ -104,6 +122,21 @@ _NEEDS_SYNC_GRAPH = frozenset({
     # sync facade outside the greenlet bridge, same MissingGreenlet trap
     # as every other admin call in this list.
     "load_vectors",
+    # embed_stale() (issue #74's own review) walks a whole field in
+    # PAGES, each its OWN embed call and its OWN transaction -- the
+    # opposite of "resolve everything, then open one transaction" every
+    # other write in this file relies on, so it cannot be given the
+    # same aplan_vector_writes()-style treatment without a second,
+    # divergent backfill implementation (deliberately refused -- see
+    # CLAUDE.md's "front ends hold no query logic" and "one traversal
+    # implementation" rules). It is also a bulk maintenance sweep, not
+    # a per-request hot path, so there is no concurrency being left on
+    # the table by refusing it, only the one already true for every
+    # other name in this set. Left unlisted, it does not error until
+    # deep inside stale_vectors()/set_vectors() open their own
+    # connection directly on the async engine's sync facade -- a
+    # confusing MissingGreenlet instead of a fix-naming refusal.
+    "embed_stale",
 })
 
 
@@ -181,26 +214,40 @@ class AsyncGraph:
     # -- reading ----------------------------------------------------
 
     async def traverse(self, start: Start, *hops: Hop) -> Subgraph:
+        from .core import validate_optional_positions
+        from .vectors import aresolve_spec_texts
+        # Shape checks the sync build_query() would raise on BEFORE it
+        # ever reaches a Near -- run here too, so a chain that is about
+        # to be refused is never embedded first (issue #74's own review;
+        # see validate_optional_positions()'s docstring).
+        validate_optional_positions(list(hops))
+        start, hops = await aresolve_spec_texts(self._sync, start, list(hops))
         async with AsyncSession(self._async_engine) as session:
             return await session.run_sync(
-                lambda s: self._sync._traverse_with_session(s, start, list(hops)))
+                lambda s: self._sync._traverse_with_session(s, start, hops))
 
     async def aggregate(self, start: Start, *hops: Hop, aggregates: dict) -> dict:
+        from .core import validate_aggregate_spec
+        from .vectors import aresolve_spec_texts
+        validate_aggregate_spec(list(hops), aggregates)
+        start, hops = await aresolve_spec_texts(self._sync, start, list(hops))
         async with AsyncSession(self._async_engine) as session:
             return await session.run_sync(
-                lambda s: self._sync._aggregate_with_session(s, start, list(hops), aggregates))
+                lambda s: self._sync._aggregate_with_session(s, start, hops, aggregates))
 
     async def vector_search(self, *near, target: str = "nodes", k: int = 10, where=None,
                             boost=None) -> list:
-        from .vectors import search
+        from .vectors import aresolve_near, search
+        nears = await aresolve_near(self._sync, target, list(near), k, "vector_search()")
         async with self._async_engine.connect() as conn:
             return await conn.run_sync(
-                lambda c: search(self._sync, list(near), target=target, k=k, where=where,
+                lambda c: search(self._sync, nears, target=target, k=k, where=where,
                                  boost=boost, connection=c))
 
     async def vector_search_many(self, queries, target: str = "nodes", k: int = 10, where=None,
                                  boost=None) -> list:
-        from .vectors import search_many
+        from .vectors import aresolve_queries, search_many
+        queries = await aresolve_queries(self._sync, target, queries, k, "vector_search_many()")
         async with self._async_engine.connect() as conn:
             return await conn.run_sync(
                 lambda c: search_many(self._sync, queries, target=target, k=k, where=where,
@@ -232,9 +279,18 @@ class AsyncGraph:
         cannot, since the transaction is already open by the time
         run_sync() reaches into vectors.py. Planning here keeps the
         provider call off the row locks, which is the invariant, not a
-        preference."""
-        from .vectors import plan_vector_writes, set_vectors
-        plan = plan_vector_writes(self._sync, nodes, edges)
+        preference.
+
+        AWAITED, not called: aplan_vector_writes() is the async twin of
+        plan_vector_writes(), so a text row's embed call is awaited on
+        THIS coroutine, off the event loop's own thread (via the
+        embedder's native async client, or asyncio.to_thread() for a
+        sync one), rather than run synchronously here -- which, before
+        issue #74, blocked the loop directly with no greenlet bridge
+        involved at all, worse than the read paths it was found
+        alongside."""
+        from .vectors import aplan_vector_writes, set_vectors
+        plan = await aplan_vector_writes(self._sync, nodes, edges)
         async with self._async_engine.begin() as conn:
             return await conn.run_sync(
                 lambda c: set_vectors(self._sync, connection=c, plan=plan))

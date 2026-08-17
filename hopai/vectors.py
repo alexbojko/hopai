@@ -184,11 +184,12 @@ row whose id does not exist fails the whole call by name.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 import re
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 from sqlalchemy import (
@@ -821,26 +822,196 @@ def _table(graph, target: str):
     return graph.nodes_tbl if target == "nodes" else graph.edges_tbl
 
 
-def _resolve_query_texts(graph, target: str, parsed: list, caller: str) -> list:
-    """Every Near(text=) across a batch of queries, embedded in one
-    call per field. validate_nears() resolves one query's texts on its
-    own; this exists because vector_search_many() has N of them, and N
-    round trips would undo the round trip it saves."""
+def _group_query_texts(parsed: list) -> dict:
+    """{field name: [text, ...]} across a batch of queries -- the
+    grouping half of _resolve_query_texts()/_aresolve_query_texts(),
+    shared because it is pure (no provider call, so no sync/async
+    split to make)."""
     waiting: dict = {}
     for one in parsed:
         for near in one:
             if isinstance(near, Near) and near.text is not None:
                 waiting.setdefault(near.field, []).append(near.text)
+    return waiting
+
+
+def _apply_resolved_texts(parsed: list, ready: dict) -> list:
+    """parsed, with every Near(text=) swapped for the vector its field's
+    embedder returned -- the reassembly half shared by the sync/async
+    resolvers below."""
+    return [[near._with_vector(next(ready[near.field]))
+             if isinstance(near, Near) and near.text is not None else near
+             for near in one]
+            for one in parsed]
+
+
+def _resolve_query_texts(graph, target: str, parsed: list, caller: str) -> list:
+    """Every Near(text=) across a batch of queries, embedded in one
+    call per field. validate_nears() resolves one query's texts on its
+    own; this exists because vector_search_many() has N of them, and N
+    round trips would undo the round trip it saves."""
+    waiting = _group_query_texts(parsed)
     if not waiting:
         return parsed
     ready = {}
     for name, texts in waiting.items():
         field = _field(graph, target, name, caller)
         ready[name] = iter(_embedder(field, target, caller).embed_queries(texts))
-    return [[near._with_vector(next(ready[near.field]))
-             if isinstance(near, Near) and near.text is not None else near
-             for near in one]
-            for one in parsed]
+    return _apply_resolved_texts(parsed, ready)
+
+
+async def _aresolve_query_texts(graph, target: str, parsed: list, caller: str) -> list:
+    """Async twin of _resolve_query_texts() -- see hopai/asyncio.py's
+    module docstring and issue #74. Used by AsyncGraph.vector_search()/
+    vector_search_many() to embed every Near(text=) BEFORE the query
+    reaches conn.run_sync(): validate_nears()/search() then see
+    near.text is None and make no provider call of their own, so the
+    embedding round trip never runs inside the greenlet bridge and
+    blocks the event loop."""
+    waiting = _group_query_texts(parsed)
+    if not waiting:
+        return parsed
+    names = list(waiting)
+    embedders = [_embedder(_field(graph, target, name, caller), target, caller) for name in names]
+    # gather, not one await per field in a loop: a query ranking two or
+    # three fields at once should cost the SLOWEST provider round trip,
+    # not their sum.
+    answers = await asyncio.gather(*(
+        embedder.aembed_queries(waiting[name])
+        for embedder, name in zip(embedders, names, strict=True)))
+    ready = dict(zip(names, (iter(answer) for answer in answers), strict=True))
+    return _apply_resolved_texts(parsed, ready)
+
+
+async def aresolve_near(graph, target: str, nears: list, k, caller: str) -> list:
+    """Async pre-resolution for ONE vector_search() call's near= --
+    always a list here, matching how AsyncGraph.vector_search() already
+    normalizes *near before this runs. Mirrors _prepare_search_query()'s
+    own order -- k, then shape, and only THEN a provider call -- so a
+    call about to be refused for either reason is never embedded first
+    (issue #74's own review). See _aresolve_query_texts()."""
+    _check_k(k, caller)
+    nears = _normalized_nears(nears, caller)
+    return (await _aresolve_query_texts(graph, target, [nears], caller))[0]
+
+
+async def aresolve_queries(graph, target: str, queries: list, k, caller: str) -> list:
+    """Async pre-resolution for vector_search_many()'s queries= -- every
+    entry embedded in one batched call per field, same as the sync path
+    inside _prepare_search_many_query(). k is checked first, matching
+    that function's own order. Per-query Near shape is NOT re-checked
+    here before embedding -- _prepare_search_many_query() itself embeds
+    every query's text (_resolve_query_texts()) before running
+    validate_nears() on any of them, so this is not a new ordering,
+    only its async twin. The result is already the list-of-list-of-Near
+    shape search_many() accepts, so AsyncGraph hands it straight to the
+    sync call with no further reshaping."""
+    _check_k(k, caller)
+    return await _aresolve_query_texts(graph, target, _as_query_list(queries, caller), caller)
+
+
+async def aresolve_spec_texts(graph, start, hops: list) -> tuple:
+    """Every Near(text=) in a Start/Hop chain -- start.near, each hop's
+    near and via_near -- embedded before AsyncGraph.traverse()/
+    aggregate() enter the greenlet bridge. Returns a NEW (Start, [Hop])
+    with each resolved Near swapped in via Near._with_vector(); the
+    sync build_query()/build_aggregate_query() path is completely
+    unchanged downstream of that -- validate_nears() there sees
+    near.text is None and skips the provider call it would otherwise
+    make. See hopai/asyncio.py's module docstring and issue #74.
+
+    Field/embedder lookups use the SAME per-hop caller label
+    core.py's _walk_matches() does ("Start", "hop 2 (label) via_near",
+    ...), so a bad field name or a field with no embedder still names
+    the right hop.
+
+    EVERY near=/via_near= in the chain is shape-checked -- non-empty,
+    every entry a Near, no two ranking the same field -- with
+    _normalized_nears(), BEFORE any of them is embedded: a chain about
+    to be refused for one of these reasons must never pay for, or fail
+    because of, a provider round trip first (issue #74's own review;
+    AsyncGraph.traverse()/aggregate() run the hop-position/aggregate-
+    spec checks earlier still, before this function is even called).
+    Everything validate_nears() checks AFTER shape -- dimensions,
+    missing='zero' with one Near, k-required -- still runs once, in the
+    sync path, unchanged: those already run after embedding on the sync
+    side too, so moving the embed call earlier changes nothing about
+    when they fire relative to it.
+
+    Batched by (target, field) across the WHOLE chain, not per hop: a
+    multi-hop walk that embeds the same field's text more than once
+    costs one provider round trip for it, not one per occurrence."""
+    def normalized(near, caller):
+        return None if near is None else _normalized_nears(near, caller)
+
+    start_norm = normalized(start.near, "Start")
+    hop_norms = []
+    for i, hop in enumerate(hops):
+        label = hop.label or "unlabeled"
+        hop_norms.append((
+            normalized(hop.near, f"hop {i} ({label})"),
+            normalized(hop.via_near, f"hop {i} ({label}) via_near"),
+        ))
+
+    # Every position's shape check already ran above, in full, before
+    # any of what follows -- which only collects and embeds TEXT.
+    waiting: dict = {}
+
+    def collect(target, caller, items):
+        if items is None:
+            return
+        for one in items:
+            if isinstance(one, Near) and one.text is not None:
+                key = (target, one.field)
+                if key not in waiting:
+                    field = _field(graph, target, one.field, caller)
+                    waiting[key] = (caller, field, [])
+                waiting[key][2].append(one.text)
+
+    collect("nodes", "Start", start_norm)
+    for i, (near_norm, via_norm) in enumerate(hop_norms):
+        label = hops[i].label or "unlabeled"
+        collect("edges", f"hop {i} ({label}) via_near", via_norm)
+        collect("nodes", f"hop {i} ({label})", near_norm)
+
+    if not waiting:
+        return start, hops
+
+    keys = list(waiting)
+    # gather, not one await per field in a loop: a chain ranking several
+    # DIFFERENT fields by text should cost the slowest provider round
+    # trip, not their sum -- the same reasoning as _aresolve_query_texts().
+    answers = await asyncio.gather(*(
+        _embedder(field, key[0], caller).aembed_queries(texts)
+        for key, (caller, field, texts) in ((k, waiting[k]) for k in keys)))
+    ready = dict(zip(keys, (iter(answer) for answer in answers), strict=True))
+
+    def has_text(items):
+        return items is not None and any(
+            isinstance(one, Near) and one.text is not None for one in items)
+
+    def resolve(target, original, items):
+        if items is None:
+            return None
+        out = [one._with_vector(next(ready[(target, one.field)]))
+               if isinstance(one, Near) and one.text is not None else one
+               for one in items]
+        return out if isinstance(original, (list, tuple)) else out[0]
+
+    new_start = (replace(start, near=resolve("nodes", start.near, start_norm))
+                 if has_text(start_norm) else start)
+    new_hops = []
+    for i, hop in enumerate(hops):
+        near_norm, via_norm = hop_norms[i]
+        if has_text(near_norm) or has_text(via_norm):
+            new_hops.append(replace(
+                hop,
+                near=resolve("nodes", hop.near, near_norm),
+                via_near=resolve("edges", hop.via_near, via_norm),
+            ))
+        else:
+            new_hops.append(hop)
+    return new_start, new_hops
 
 
 def _embedder(field: Vector, target: str, caller: str):
@@ -870,22 +1041,19 @@ def _read_connection(graph, connection=None):
             yield opened
 
 
-def validate_nears(graph, target: str, near, k, caller: str,
-                   limit_name: str = "k") -> list:
-    """Normalize near= (one Near or a list) into a validated list:
-    every entry a Near, every field defined for `target`, every query
-    vector of the declared dimensions -- so a typo fails here with the
-    fix named, not at execution as an undefined-column error.
+def _normalized_nears(near, caller: str) -> list:
+    """near= (one Near or a list) normalized into a list, with every
+    check that needs no field lookup and no provider call already done:
+    non-empty, every entry a Near, no two ranking the same field.
 
-    Any Near carrying text= is resolved here, against the embedder its
-    FIELD declares: this is the first point where the spec and the
-    graph are both in hand. The returned list is a new one, so the
-    caller's specs are left as they were written."""
+    Split out of validate_nears() so it can run FIRST there -- and, for
+    AsyncGraph, be run again standalone before any embedding starts
+    (aresolve_spec_texts()/aresolve_near() in this module): a spec about
+    to be refused for one of these reasons must never be embedded
+    first, on either path (issue #74's own review)."""
     nears = list(near) if isinstance(near, (list, tuple)) else [near]
     if not nears:
         raise ValueError(f"{caller}: near=[] is empty -- pass a Near(...) or a list of them")
-    # Shape first, in full, and only then anything that costs a provider
-    # call: a batch that is about to be refused should never be embedded.
     seen = set()
     for one in nears:
         if not isinstance(one, Near):
@@ -906,6 +1074,23 @@ def validate_nears(graph, target: str, near, k, caller: str,
                 f"yourself so the blend is visible in your code"
             )
         seen.add(one.field)
+    return nears
+
+
+def validate_nears(graph, target: str, near, k, caller: str,
+                   limit_name: str = "k") -> list:
+    """Normalize near= (one Near or a list) into a validated list:
+    every entry a Near, every field defined for `target`, every query
+    vector of the declared dimensions -- so a typo fails here with the
+    fix named, not at execution as an undefined-column error.
+
+    Any Near carrying text= is resolved here, against the embedder its
+    FIELD declares: this is the first point where the spec and the
+    graph are both in hand. The returned list is a new one, so the
+    caller's specs are left as they were written."""
+    # Shape first, in full, and only then anything that costs a provider
+    # call: a batch that is about to be refused should never be embedded.
+    nears = _normalized_nears(near, caller)
 
     resolved = []
     for one in nears:
@@ -2153,21 +2338,18 @@ def _coerce_id(value):
     return value
 
 
-def plan_vector_writes(graph, nodes=None, edges=None) -> list:
-    """Everything set_vectors() does BEFORE it takes a connection:
-    validate every row, and turn every string into a vector.
+def _group_vector_rows(graph, nodes, edges) -> list:
+    """The pure half of plan_vector_writes()/aplan_vector_writes():
+    validate every row and split it into per-field-signature groups,
+    WITHOUT calling the embedder -- that is the one part sync and
+    async must do differently (embed_documents() vs aembed_documents()),
+    so it is left to each of their finishing passes below.
 
-    Separate so it can be called from outside a transaction. The
-    sync path gets that for free -- it plans, then opens one. The
-    async one cannot: AsyncGraph opens the transaction and reaches
-    this module through run_sync(), so planning inside set_vectors()
-    would put a provider round trip inside an open transaction with
-    the row locks already held. AsyncGraph.set_vectors() calls this
-    first and passes the finished plan in.
-    """
-    # Validation is pure, so it all happens before a connection is
-    # taken -- including the embedding, which is the slow part.
-    plan = []
+    Returns one (target_name, table, id_column, groups, fields, pending)
+    per target that has rows. `pending` is {field name: [(cleaned row,
+    text)]}, still needing a provider call; `groups` already holds every
+    row that carried no text at all."""
+    parts = []
     for target_name, rows in (("nodes", nodes), ("edges", edges)):
         if not rows:
             continue
@@ -2226,20 +2408,72 @@ def plan_vector_writes(graph, nodes=None, edges=None) -> list:
                         )
                 cleaned[name] = value
             groups.setdefault(tuple(names), []).append((row_id, cleaned))
+        parts.append((target_name, table, id_column, groups, fields, pending))
+    return parts
 
+
+def _apply_embedded_rows(target_name: str, name: str, dimensions: int, waiting: list,
+                         vectors: list) -> None:
+    """Write each embedded vector back into the row `_group_vector_rows()`
+    set aside for it, in place -- shared by plan_vector_writes()'s and
+    aplan_vector_writes()'s finishing pass."""
+    for (cleaned, _), vector in zip(waiting, vectors, strict=True):
+        if len(vector) != dimensions:
+            raise ValueError(
+                f"set_vectors(): the embedder for {target_name} field {name!r} "
+                f"returned {len(vector)} dimensions, the field is defined with "
+                f"{dimensions} -- nothing was written"
+            )
+        cleaned[name] = list(vector)
+
+
+def plan_vector_writes(graph, nodes=None, edges=None) -> list:
+    """Everything set_vectors() does BEFORE it takes a connection:
+    validate every row, and turn every string into a vector.
+
+    Separate so it can be called from outside a transaction. The
+    sync path gets that for free -- it plans, then opens one. The
+    async one cannot: AsyncGraph opens the transaction and reaches
+    this module through run_sync(), so planning inside set_vectors()
+    would put a provider round trip inside an open transaction with
+    the row locks already held. AsyncGraph.set_vectors() calls
+    aplan_vector_writes() -- the awaited twin below -- first, and
+    passes the finished plan in.
+    """
+    # Validation is pure, so it all happens before a connection is
+    # taken -- including the embedding, which is the slow part.
+    plan = []
+    for target_name, table, id_column, groups, fields, pending in _group_vector_rows(
+            graph, nodes, edges):
         # One provider call per field for the whole set_vectors(), not
         # one per row: 500 rows of text is 500 HTTP round trips done
         # naively, and the Embedder already chunks to the provider's cap.
         for name, waiting in pending.items():
             vectors = fields[name].embed.embed_documents([text for _, text in waiting])
-            for (cleaned, _), vector in zip(waiting, vectors, strict=True):
-                if len(vector) != fields[name].dimensions:
-                    raise ValueError(
-                        f"set_vectors(): the embedder for {target_name} field {name!r} "
-                        f"returned {len(vector)} dimensions, the field is defined with "
-                        f"{fields[name].dimensions} -- nothing was written"
-                    )
-                cleaned[name] = list(vector)
+            _apply_embedded_rows(target_name, name, fields[name].dimensions, waiting, vectors)
+        plan.append((target_name, table, id_column, groups))
+    return plan
+
+
+async def aplan_vector_writes(graph, nodes=None, edges=None) -> list:
+    """Async twin of plan_vector_writes() -- AsyncGraph.set_vectors()
+    awaits this BEFORE opening its transaction (see its docstring),
+    which is what keeps a text row's provider call off the event loop's
+    own thread entirely, rather than merely off the greenlet bridge the
+    way traverse()/aggregate()/vector_search() need to (issue #74).
+
+    Every field's embed call is gathered, not awaited one at a time: a
+    call writing text to two or three DIFFERENT fields should cost the
+    slowest provider round trip, not their sum."""
+    plan = []
+    for target_name, table, id_column, groups, fields, pending in _group_vector_rows(
+            graph, nodes, edges):
+        names = list(pending)
+        answers = await asyncio.gather(*(
+            fields[name].embed.aembed_documents([text for _, text in pending[name]])
+            for name in names))
+        for name, vectors in zip(names, answers, strict=True):
+            _apply_embedded_rows(target_name, name, fields[name].dimensions, pending[name], vectors)
         plan.append((target_name, table, id_column, groups))
     return plan
 
