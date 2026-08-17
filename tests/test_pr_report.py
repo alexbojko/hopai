@@ -118,6 +118,33 @@ class TestMutationSection:
         body = render_mutation({"total": 5, "killed": 5}, [], "scope")
         assert "No survivors" in body
 
+    def test_zero_killed_and_zero_survivors_is_not_a_clean_sweep(self):
+        """The state a budget-killed run exports: a `total`, and every
+        count at zero. It used to render as "every mutant on the changed
+        lines was caught" -- a reader takes that as evidence the tests
+        are strong, when in fact nothing ran. A harness that stopped and
+        a suite that caught everything must never look alike."""
+        body = render_mutation({"total": 2145, "killed": 0}, [], "scope")
+        assert "No survivors" not in body
+        assert "2145 of 2145 mutant(s) never reached a verdict" in body
+        assert "no evidence" in body
+
+    def test_a_partial_run_reports_the_remainder(self):
+        """A budget that expires PART way through is the common case, and
+        the mutants it did check are real results -- so the survivors
+        still list, and only the unchecked remainder is disclaimed."""
+        body = render_mutation({"total": 10, "killed": 3}, [("m1", "survived")], "scope")
+        assert "6 of 10 mutant(s) never reached a verdict" in body
+        assert "| `m1` | survived |" in body
+
+    def test_a_complete_run_carries_no_warning(self):
+        """Every mutant accounted for as killed, survived or inconclusive
+        means the run finished; a warning there would cry wolf on every
+        healthy PR."""
+        body = render_mutation({"total": 5, "killed": 3, "timeout": 1}, [("m", "survived")],
+                               "scope")
+        assert "never reached a verdict" not in body
+
     def test_inconclusive_outcomes_are_called_out_separately(self):
         """A timeout or a segfault is neither a kill nor a survival, and
         folding it into the score would flatter or damn it wrongly."""

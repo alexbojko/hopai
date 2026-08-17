@@ -138,6 +138,47 @@ advertises it, and a field with no embedder refuses by name when the
 text is resolved. Sending both `search` and a `start.near` is refused
 rather than resolved: one of the two would have to be silently dropped.
 
+RERANKING, and the two ceilings that make it safe to offer. A reranker
+READS each candidate against the query, which is accurate, expensive
+and billed per document -- so `rerank=` is the operator's, exactly as
+`embed=` is:
+
+    serve(graph,
+          rerank=Rerank(client, document_from='.properties.title', candidates=50),
+          rerank_fields=["properties.title", "properties.summary"],
+          max_candidates=100)
+
+The CLIENT is never model-supplied; what a model supplies is
+`document_from`, a jq filter projecting one candidate into the one
+string the reranker reads, and `candidates`, how many to spend. Both
+are retrieval decisions a model is well placed to make -- unlike an
+embedding, which it would have to invent.
+
+    rerank_fields  which property paths that filter may read. The
+                   filter's OUTPUT IS THE DOCUMENT and the document is
+                   POSTed to a vendor, so `.properties.ssn` parses
+                   perfectly in the safe subset and would ship straight
+                   out. A path outside the list refuses, naming it.
+    max_candidates the ceiling on `candidates`. A larger value REFUSES
+                   naming the ceiling; it is never clamped, for the same
+                   reason `candidates < keep` refuses.
+
+json_api.parse_rerank() is the single site that enforces both, the way
+json_api.refuse_vectors() is the single site for the vector rule --
+this module never imports hopai.jqsafe and never validates a filter of
+its own.
+
+With no `rerank=` configured NO TOOL ADVERTISES A RERANK PARAMETER at
+all: the permission is which surface exists, not a check inside a
+handler. `search_similar` never carries one either, and that is a
+property of reranking rather than of this server -- it embeds the
+model's text into a raw vector itself, and a reranker scores a query
+against a document by READING BOTH, so a raw-vector `near` with a
+`rerank=` refuses (hopai/hop.py's _validate_rerank). The way to rerank
+a search here is `traverse_graph` with `near: {"field", "text"}`, whose
+text the FIELD embeds -- so the dense stage and the rerank stage see
+the same query rather than two spellings of it that could disagree.
+
 SIZE. `traverse_graph` and a Cypher MATCH both return the ENTIRE
 matching subgraph, whatever its size -- fine for a Python caller, not
 fine for a model: a broad traversal returns everything, the MCP client
@@ -234,7 +275,10 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any, Optional, get_type_hints
 
 from .core import Graph
-from .json_api import aggregate_json, refuse_vectors, traverse_json, vector_search_json
+from .json_api import (
+    RERANK_CEILING_SENTENCE, RERANK_FIELDS_SENTENCE, RerankPolicy, aggregate_json,
+    refuse_vectors, traverse_json, vector_search_json,
+)
 from .models import DEFAULT_GRAPH
 
 #: Server-level guidance, sent to the client at connection time. What a
@@ -286,6 +330,16 @@ DEFAULT_KEEP = 25
 #: less than blows a context window" rather than measured against any
 #: one client; an operator with a bigger (or no) budget passes their own.
 DEFAULT_MAX_NODES = 500
+
+#: Default ceiling on a tool call's `candidates` -- how many documents
+#: one reranking call may be billed for. A ceiling exists BY DEFAULT
+#: rather than on request, because the cost of not having one is a model
+#: writing `candidates: 5000` across three hops and nobody finding out
+#: until the invoice. 100 is twice the reranking literature's usual 50,
+#: so a model asking for a wider pool than the operator's own template
+#: still has room. `None` disables it, for an operator who prices their
+#: own reranker.
+DEFAULT_MAX_CANDIDATES = 100
 
 
 #: Per-caller narrowing advice, in each one's own vocabulary --
@@ -501,7 +555,13 @@ def _static_schemas(served: Served) -> dict:
     for every other graph -- a summary that is wrong for all but one of
     them is worse than none. _described() names the graphs instead."""
     if not served.many:
-        return {tool["name"]: tool for tool in served.first.tool_schemas()}
+        # rerank=True keeps the parameter in the schema for _with_rerank()
+        # below to fill in with THIS server's published fields and ceiling.
+        # tool_schemas() strips it by default because a bare Graph has no
+        # reranker to call; here there may be one, and stripping it before
+        # the surface that configures it would offer nothing at all.
+        return {tool["name"]: tool
+                for tool in served.first.tool_schemas(rerank=True)}
 
     import copy
 
@@ -726,6 +786,74 @@ def _with_search(schema: dict, served: Served, sentence: str) -> dict:
     return schema
 
 
+def _reworded(text: str, sentence: str, replacement: str, what: str) -> str:
+    """Swap one sentence of a static description for this server's own.
+
+    The same guard _with_search() makes, factored out because reranking
+    needs it twice: a sentence that moved or was reworded in
+    hopai/json_api.py must fail LOUDLY here rather than leaving the
+    static wording in place beside parameters that contradict it."""
+    if sentence not in text:
+        raise RuntimeError(
+            f"hopai.mcp expected to replace this sentence in {what} and did not find it: "
+            f"{sentence!r}. It moved or was reworded -- update RERANK_FIELDS_SENTENCE / "
+            f"RERANK_CEILING_SENTENCE in hopai/json_api.py to match, or the description "
+            f"and the ceiling it describes will contradict each other"
+        )
+    return text.replace(sentence, replacement)
+
+
+def _step_schemas(schema: dict) -> list:
+    """The `start` object and a hop entry, which carry the same per-step
+    keys -- one list so a key is added to (or taken off) both, and
+    neither can be forgotten."""
+    properties = schema["parameters"]["properties"]
+    return [properties["start"], properties["hops"]["items"]]
+
+
+def _with_rerank(schema: dict, policy: Optional[RerankPolicy]) -> dict:
+    """A traversal/aggregation tool schema, taught what this server's
+    reranker will accept -- or stripped of the parameter entirely.
+
+    NO RERANKER, NO PARAMETER. The static schemas advertise `rerank`
+    because json_api's parsers read it (a test derives one from the
+    other), but a server with no client to call must not offer it: the
+    gate here is which surface EXISTS, not a check inside a handler, so
+    a tool a model cannot see is a tool it cannot be talked into
+    calling.
+
+    With one configured, the two sentences that could only be written in
+    the abstract become this server's own numbers: which properties a
+    `document_from` may read, and how many candidates it may spend. A
+    model picking from a published list is both safer and easier to get
+    right than one guessing at a shape."""
+    defs = schema["parameters"].get("$defs", {})
+    if policy is None:
+        for step in _step_schemas(schema):
+            step["properties"].pop("rerank", None)
+        defs.pop("rerank", None)
+        return schema
+    spec = defs["rerank"]["properties"]
+    published = ", ".join(f"`.{field.lstrip('.')}`" for field in policy.fields)
+    spec["document_from"]["description"] = _reworded(
+        spec["document_from"]["description"], RERANK_FIELDS_SENTENCE,
+        f"Only a small, always-terminating subset of jq is accepted, and the only "
+        f"properties this server will send are {published} -- reading anything else "
+        f"refuses, because whatever this filter produces is posted to a third-party "
+        f"reranking service.",
+        "the rerank spec's `document_from`")
+    ceiling = (f"This server allows at most {policy.max_candidates}, and asking for more "
+               f"refuses rather than being quietly lowered."
+               if policy.max_candidates is not None else
+               "This server sets no ceiling on it.")
+    spec["candidates"]["description"] = _reworded(
+        spec["candidates"]["description"], RERANK_CEILING_SENTENCE,
+        f"{ceiling} Leave it out to use this server's default of "
+        f"{policy.template.candidates}.",
+        "the rerank spec's `candidates`")
+    return schema
+
+
 # ---------------------------------------------------------------------
 # The tools
 # ---------------------------------------------------------------------
@@ -766,7 +894,8 @@ def _list_graphs_tool(served: Served) -> ToolSpec:
 
 
 def _describe_tool(served: Served, read_only: bool, allow_ddl: bool, allow_mutations: bool,
-                   embed: Optional[Callable], max_nodes: Optional[int]) -> ToolSpec:
+                   embed: Optional[Callable], max_nodes: Optional[int],
+                   rerank: Optional[RerankPolicy]) -> ToolSpec:
     def describe_graph(graph: Optional[str] = None, counts: bool = False) -> dict:
         graph = served.pick(graph, "describe_graph")
         schema = graph.schema
@@ -799,6 +928,15 @@ def _describe_tool(served: Served, read_only: bool, allow_ddl: bool, allow_mutat
             # section for what this counts and why traverse_graph/cypher
             # enforce it after the read rather than before.
             "max_nodes": max_nodes,
+            # Reported rather than left out for the reason max_nodes is:
+            # a model can tell "this server cannot rerank" from "I did
+            # not ask" without a second call, and the published field
+            # list is what a `document_from` has to be written against.
+            # None throughout when no reranker is configured, which is
+            # also the configuration where no tool advertises `rerank`.
+            "rerank_available": rerank is not None,
+            "rerank_fields": list(rerank.fields) if rerank is not None else None,
+            "max_candidates": rerank.max_candidates if rerank is not None else None,
             # What the library refuses, plus -- when mutations are off
             # -- the fact that nothing here can delete. A model that
             # finds no delete tool and is not told why emulates one, by
@@ -853,9 +991,10 @@ def _describe_tool(served: Served, read_only: bool, allow_ddl: bool, allow_mutat
 
 
 def _traverse_tool(served: Served, schema: dict, embed: Optional[Callable],
-                   max_nodes: Optional[int]) -> ToolSpec:
+                   max_nodes: Optional[int], rerank: Optional[RerankPolicy]) -> ToolSpec:
     if served.seeds_from_text(embed):
         schema = _with_search(schema, served, _NO_MEANING)
+    schema = _with_rerank(schema, rerank)
     schema["parameters"]["properties"].update(_graph_key(served))
 
     def traverse_graph(start: dict, hops: Optional[list] = None,
@@ -866,7 +1005,20 @@ def _traverse_tool(served: Served, schema: dict, embed: Optional[Callable],
         # allow_vectors: every vector in this spec was put there by
         # _seed() from an embedding of the model's TEXT, and both
         # refusals above have already run against what the model sent.
-        result = traverse_json(chosen, spec, allow_vectors=True)
+        #
+        # `rerank` goes in as the POLICY, never as a parsed Rerank: the
+        # client is the operator's and only `document_from`/`candidates`
+        # come from the model, held to the safe subset and the published
+        # fields by json_api.parse_rerank() -- the single enforcement
+        # site, which is why nothing here validates a filter itself.
+        #
+        # Synchronous on purpose, reranking included. Every ToolSpec.call
+        # is an ordinary function and _register() runs it in a worker
+        # thread, so a provider round trip inside one blocks that thread
+        # rather than the event loop; nothing in this module reaches
+        # AsyncGraph, and half-converting one handler would leave two
+        # answers to "how does hopai run a blocking call here".
+        result = traverse_json(chosen, spec, allow_vectors=True, rerank=rerank)
         # AFTER the traversal, on its exact node count -- not a
         # aggregate_graph pre-count. See the module docstring's SIZE
         # section for why a pre-count is wrong rather than merely
@@ -881,9 +1033,11 @@ def _traverse_tool(served: Served, schema: dict, embed: Optional[Callable],
     return ToolSpec(schema["name"], schema["description"], schema["parameters"], traverse_graph)
 
 
-def _aggregate_tool(served: Served, schema: dict, embed: Optional[Callable]) -> ToolSpec:
+def _aggregate_tool(served: Served, schema: dict, embed: Optional[Callable],
+                    rerank: Optional[RerankPolicy]) -> ToolSpec:
     if served.seeds_from_text(embed):
         schema = _with_search(schema, served, _NO_MEANING_AGGREGATE)
+    schema = _with_rerank(schema, rerank)
     schema["parameters"]["properties"].update(_graph_key(served))
 
     def aggregate_graph(start: dict, aggregates: dict, hops: Optional[list] = None,
@@ -892,7 +1046,9 @@ def _aggregate_tool(served: Served, schema: dict, embed: Optional[Callable]) -> 
         spec = {"start": _seed(chosen, embed, start, "aggregate_graph"),
                 "hops": hops or [], "aggregates": aggregates}
         refuse_vectors({"hops": spec["hops"]}, "aggregate_graph")
-        return aggregate_json(chosen, spec, allow_vectors=True)
+        # Reranked aggregates run over the reranked SURVIVORS, which is
+        # still "the nodes the last step matched" -- see Graph.aggregate.
+        return aggregate_json(chosen, spec, allow_vectors=True, rerank=rerank)
 
     return ToolSpec(schema["name"], schema["description"], schema["parameters"], aggregate_graph)
 
@@ -1225,7 +1381,9 @@ def _enforce_schema_tool(served: Served) -> ToolSpec:
 
 def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
           allow_mutations: bool = False, embed: Optional[Callable] = None,
-          strict_schema: bool = False, max_nodes: Optional[int] = DEFAULT_MAX_NODES) -> list:
+          strict_schema: bool = False, max_nodes: Optional[int] = DEFAULT_MAX_NODES,
+          rerank: Optional[Any] = None, rerank_fields: Optional[list] = None,
+          max_candidates: Optional[int] = DEFAULT_MAX_CANDIDATES) -> list:
     """Every tool this server would register, as ToolSpecs -- the single
     source of what hopai offers over MCP.
 
@@ -1239,10 +1397,38 @@ def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
     SIZE section. `None` disables it. A SERVER setting, not a per-call
     argument a model could widen for itself.
 
+    `rerank` is the operator's own Rerank(...), the way `embed` is the
+    operator's own embedding callable -- the client never comes from a
+    tool call. `rerank_fields` names the property paths a model-written
+    `document_from` may read (required with `rerank`, since that filter's
+    output is posted to a third party) and `max_candidates` caps how many
+    documents one call may be billed for; a larger `candidates` refuses
+    naming the ceiling. Without `rerank`, no tool advertises the
+    parameter at all. See the module docstring's RERANKING section.
+
     Separated from build_server() so the tools can be inspected, tested
     and called with no SDK installed and no server running: `call` is an
     ordinary function whose parameters are the tool's arguments."""
     served = Served(graph)
+    if rerank is None:
+        if rerank_fields is not None:
+            # A knob with nothing behind it is worse than a missing one:
+            # an operator who published a field list and never noticed
+            # the reranker was absent believes they narrowed something.
+            # The same refusal Rerank makes for a model= nothing reads.
+            raise ValueError(
+                "rerank_fields= says which properties a model-written document_from may "
+                "read, and there is no reranker here to read them -- pass "
+                "rerank=Rerank(client, document_from='...') as well, or drop "
+                "rerank_fields="
+            )
+        policy = None
+    else:
+        # Every check lives in RerankPolicy, where a JSON/HTTP front end
+        # gets the identical one: what a spec may override, what it may
+        # read, and what it may spend are properties of the policy, not
+        # of this transport.
+        policy = RerankPolicy(rerank, fields=rerank_fields, max_candidates=max_candidates)
     if embed is not None:
         if not callable(embed):
             raise TypeError(f"embed must be a callable taking text and returning a vector, "
@@ -1290,9 +1476,10 @@ def tools(graph, *, read_only: bool = False, allow_ddl: bool = False,
     static = _static_schemas(served)
     specs = [
         *([_list_graphs_tool(served)] if served.many else []),
-        _describe_tool(served, read_only, allow_ddl, allow_mutations, embed, max_nodes),
-        _traverse_tool(served, static["traverse_graph"], embed, max_nodes),
-        _aggregate_tool(served, static["aggregate_graph"], embed),
+        _describe_tool(served, read_only, allow_ddl, allow_mutations, embed, max_nodes,
+                       policy),
+        _traverse_tool(served, static["traverse_graph"], embed, max_nodes, policy),
+        _aggregate_tool(served, static["aggregate_graph"], embed, policy),
         _cypher_tool(served, read_only, allow_mutations, strict_schema, max_nodes),
         _infer_schema_tool(served),
     ]
@@ -1403,6 +1590,8 @@ def build_server(graph, *, name: str = "hopai", read_only: bool = False,
                  allow_ddl: bool = False, allow_mutations: bool = False,
                  embed: Optional[Callable] = None,
                  strict_schema: bool = False, max_nodes: Optional[int] = DEFAULT_MAX_NODES,
+                 rerank: Optional[Any] = None, rerank_fields: Optional[list] = None,
+                 max_candidates: Optional[int] = DEFAULT_MAX_CANDIDATES,
                  http: Optional[dict] = None):
     """The configured MCP server object, not yet running.
 
@@ -1411,7 +1600,8 @@ def build_server(graph, *, name: str = "hopai", read_only: bool = False,
     tools); serve() is the whole thing when it does not.
 
     `graph` is one Graph or a {name: Graph} mapping -- see tools().
-    `max_nodes` is tools()'s own argument, forwarded unchanged.
+    `max_nodes`, `rerank`, `rerank_fields` and `max_candidates` are
+    tools()'s own arguments, forwarded unchanged.
 
     `http` carries the HTTP bind settings, which mcp 1.x takes on the
     constructor and mcp 2.0 takes on run() -- serve() fills it in, and
@@ -1420,7 +1610,9 @@ def build_server(graph, *, name: str = "hopai", read_only: bool = False,
     registered = [_register(spec, tool_class)
                   for spec in tools(graph, read_only=read_only, allow_ddl=allow_ddl,
                                     allow_mutations=allow_mutations, embed=embed,
-                                    strict_schema=strict_schema, max_nodes=max_nodes)]
+                                    strict_schema=strict_schema, max_nodes=max_nodes,
+                                    rerank=rerank, rerank_fields=rerank_fields,
+                                    max_candidates=max_candidates)]
     settings = http if (http and era == 1) else {}
     return server_class(name, instructions=_instructions(Served(graph)), tools=registered,
                         **settings)
@@ -1435,7 +1627,8 @@ def serve(graph, *, transport: str = "stdio", host: str = "127.0.0.1",
         serve({"docs": docs, "crm": crm})               # several graphs, one pool
 
     Takes build_server()'s options (read_only, allow_ddl, allow_mutations,
-    embed, strict_schema, max_nodes, name). HTTP binds 127.0.0.1 unless told otherwise:
+    embed, strict_schema, max_nodes, rerank, rerank_fields, max_candidates,
+    name). HTTP binds 127.0.0.1 unless told otherwise:
     there is no authentication here, and a graph an agent may write to
     is not a thing to put on 0.0.0.0 by accident."""
     if transport not in ("stdio", "http"):

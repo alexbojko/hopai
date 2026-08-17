@@ -1,6 +1,6 @@
 # Runnable documentation
 
-Nine notebooks that go from an empty database to the SQL underneath. They are
+Ten notebooks that go from an empty database to the SQL underneath. They are
 documentation, so they are meant to be read with the outputs already there —
 on GitHub, or on the [documentation site](https://hopai.readthedocs.io/),
 which renders these same files and is published on every release — and they
@@ -17,6 +17,7 @@ run, so nothing in them can quietly stop being true.
 | [07 · Many graphs](07_many_graphs.ipynb) | Thousands of isolated graphs in one pair of tables, and what keeps them apart |
 | [08 · Under the hood](08_under_the_hood.ipynb) | The emitted SQL read with no database, then `EXPLAIN ANALYZE` with one |
 | [09 · Vector search](09_vector_search.ipynb) | Exact cosine similarity on nodes and edges, multivector and hybrid ranking, similarity as a traversal seed and as an edge beam, and the two refusals |
+| [10 · Reranking](10_reranking.ipynb) | The third retrieval stage: `Rerank` on a flat search and step-wise inside a walk, `document_from` as a jq rule, `candidates` against `k`/`keep`, every refusal, and the total jq subset a model may write |
 
 Read them in order the first time; after that each one stands alone.
 

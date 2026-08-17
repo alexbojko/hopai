@@ -107,6 +107,59 @@ def _object_schema() -> dict:
     return {"type": "object", "properties": {}, "required": []}
 
 
+def without_rerank(parameters: dict) -> dict:
+    """A static traversal/aggregation `parameters` as a server with NO
+    reranker advertises it: `rerank` gone from both steps and its $def
+    gone with it.
+
+    Written out here rather than imported from hopai.mcp so the test
+    states the expected shape independently of the code that produces
+    it -- a stripper that forgot the hops entry, or left a `$ref`
+    dangling at a `$def` it had removed, would still agree with
+    itself."""
+    import copy
+
+    stripped = copy.deepcopy(parameters)
+    if "rerank" not in stripped.get("$defs", {}):
+        return stripped                     # mutate_graph: no ranked set to reorder
+    stripped["properties"]["start"]["properties"].pop("rerank")
+    stripped["properties"]["hops"]["items"]["properties"].pop("rerank")
+    stripped["$defs"].pop("rerank")
+    return stripped
+
+
+def rerank_client(prefer: str = ""):
+    """A reranker client that speaks the whole contract and touches no
+    network: score(query, documents) -> one float per document.
+
+    It records what it was asked to score, which is how a test tells
+    "the reranker ran, on these documents" from "the ranking happened to
+    come out that way", and `prefer` names the document it should like
+    least -- enough to make a rerank that ran visible in the answer."""
+    seen = []
+
+    def score(query: str, documents: list) -> list:
+        seen.append((query, list(documents)))
+        return [0.0 if document == prefer else 1.0 for document in documents]
+
+    score.seen = seen
+    return score
+
+
+def reranking(**options) -> dict:
+    """serve()/tools() options for a server that CAN rerank: the
+    operator's own client, the properties it publishes, and a ceiling."""
+    from hopai import Rerank
+    return {
+        "rerank": Rerank(options.pop("client", None) or rerank_client(),
+                         document_from=options.pop("document_from", ".properties.title"),
+                         candidates=options.pop("candidates", 50)),
+        "rerank_fields": options.pop("rerank_fields",
+                                     ["properties.title", "properties.body"]),
+        **options,
+    }
+
+
 class _Stub:
     """Stands in for whatever a stubbed library call returns, for the
     tests that assert on the ARGUMENTS reaching it. The handlers then
@@ -360,6 +413,29 @@ class TestManyGraphs:
             assert "'docs', 'crm'" in spec.description, spec.name
             assert "Node types: paper" not in spec.description, spec.name
 
+    def test_the_connection_instructions_name_the_graphs_only_when_there_are_several(self):
+        """The opening sentence is the ONLY part a second graph changes,
+        and it is the one place a client is told there is no default
+        graph to fall back on. Inverting the branch hands a single-graph
+        server the multi-graph text ("every call names its graph", about
+        graphs that do not exist) and a multi-graph one the sentence
+        that says it exposes one -- both read as instructions and
+        neither is checked by any tool schema. The only test that read
+        them at all needs the real SDK, so mutmut skips it and the
+        inversion survived.
+
+        The advice half is asserted through the constant rather than by
+        quoting it: the two branches must differ in their FIRST sentence
+        and agree on everything after it."""
+        from hopai.mcp import Served, _ADVICE, _instructions
+
+        assert _instructions(Served(offline())) == SERVER_INSTRUCTIONS
+
+        several = _instructions(Served(self.two()))
+        assert several != SERVER_INSTRUCTIONS
+        assert "'docs', 'crm'" in several
+        assert several.endswith(_ADVICE)
+
     def test_strict_schema_needs_one_on_every_served_graph(self):
         """A per-call `graph` argument would otherwise reach a graph
         that cannot be strict, and the refusal would name Cypher rather
@@ -436,8 +512,16 @@ class TestToolSchemas:
         they are what actually reaches a client. mutate_graph is the one
         with a `oneOf` per operation -- the part a derived schema loses
         most, since `operations: list` says nothing about which four
-        shapes an entry may take."""
-        assert named(offline(), allow_mutations=True)[name].parameters == static["parameters"]
+        shapes an entry may take.
+
+        `rerank` is the one key the static schema carries and THIS
+        server does not: no reranker is configured here, and a
+        parameter no client can serve must not be advertised (the
+        permission is which surface exists). Removed from the
+        expectation rather than skipped over, so a server that started
+        advertising anything ELSE still fails."""
+        assert named(offline(), allow_mutations=True)[name].parameters \
+            == without_rerank(static["parameters"])
 
     def test_ingest_adds_the_merge_keys_to_the_static_schema(self):
         """Update, not just create: without merge_nodes_on a model can
@@ -485,6 +569,83 @@ class TestToolSchemas:
                       if p.default is inspect.Parameter.empty}
             assert required <= accepted, spec.name
             assert needed <= required, spec.name
+
+    def test_no_tool_advertises_rerank_without_a_reranker(self, vector_graph):
+        """The permission is which surface EXISTS, not a check inside a
+        handler -- CLAUDE.md is explicit, and a tool a model cannot see
+        is a tool it cannot be talked into calling. Without this the
+        schema kept advertising `rerank` on a server holding no client,
+        so every call that used it failed at run time with a message
+        about configuration the model cannot change.
+
+        Every configuration that adds a tool, and the whole nested walk:
+        `rerank` lives inside `start` and inside a hop, so a top-level
+        check would have seen neither."""
+        for spec in tools(vector_graph, embed=embedder(), allow_ddl=True,
+                          allow_mutations=True):
+            assert "rerank" not in parameter_names(spec.parameters), spec.name
+
+    def test_a_configured_reranker_advertises_it_on_both_steps(self):
+        """The other half. `rerank` on `start` prunes the seed set
+        before any hop walks; on a hop it prunes the frontier before the
+        next one does -- two different capabilities, and advertising
+        only one leaves the step-wise case unreachable from a tool
+        call."""
+        parameters = named(offline(), **reranking())["traverse_graph"].parameters
+        assert "rerank" in parameters["properties"]["start"]["properties"]
+        assert "rerank" in parameters["properties"]["hops"]["items"]["properties"]
+
+    def test_the_document_from_description_names_the_published_fields(self):
+        """The static schema can only say a published list exists; this
+        server knows what is on it. A model picking from a named list
+        writes a filter that is accepted, where one guessing writes
+        `.properties.body` at a server publishing `.properties.abstract`
+        and gets a refusal it has to spend a turn on."""
+        parameters = named(offline(), **reranking(
+            rerank_fields=["properties.title", "properties.abstract"]))[
+                "traverse_graph"].parameters
+        description = parameters["$defs"]["rerank"]["properties"]["document_from"][
+            "description"]
+        assert "`.properties.title`, `.properties.abstract`" in description
+        assert "reading anything else refuses" in description
+
+    def test_both_rerank_keys_say_what_leaving_them_out_means(self):
+        """The rendered object has no "required" list, so each key has
+        to say for itself. `candidates` already ended "Leave it out to
+        use this server's default of N"; `document_from` said nothing,
+        which reads as mandatory -- and a model that writes its own
+        filter rather than inheriting the operator's is both more likely
+        to be refused by the published-field allowlist and more likely
+        to rank on the wrong words. The sentence is written once in
+        json_api's static text; this pins that _with_rerank()'s two
+        rewrites do not drop it on the way out."""
+        parameters = named(offline(), **reranking(candidates=40))[
+            "traverse_graph"].parameters
+        spec = parameters["$defs"]["rerank"]
+        assert "required" not in spec
+        for key in ("document_from", "candidates"):
+            assert "Leave it out" in spec["properties"][key]["description"], key
+        # Exactly one, not the static sentence plus the server's.
+        assert spec["properties"]["candidates"]["description"].count("Leave it out") == 1
+
+    def test_the_candidates_description_names_this_servers_ceiling(self):
+        """A ceiling a model cannot see is a refusal it can only
+        discover by tripping over it."""
+        description = named(offline(), **reranking(candidates=40, max_candidates=120))[
+            "traverse_graph"].parameters["$defs"]["rerank"]["properties"]["candidates"][
+                "description"]
+        assert "at most 120" in description and "default of 40" in description
+
+    def test_a_reworded_static_sentence_fails_loudly_rather_than_contradicting(self,
+                                                                               monkeypatch):
+        """The same guard _with_search() makes for `start.search`: if
+        the sentence hopai/json_api.py writes moves or is reworded, this
+        server would otherwise leave the abstract wording ("the
+        application may cap this") in place beside a real cap -- two
+        descriptions of one parameter that disagree."""
+        monkeypatch.setattr("hopai.mcp.RERANK_CEILING_SENTENCE", "a sentence nothing says")
+        with pytest.raises(RuntimeError, match="RERANK_CEILING_SENTENCE"):
+            named(offline(), **reranking())
 
     def test_no_tool_advertises_a_vector_parameter(self, vector_graph):
         """The invariant tests/test_vectors.py pins for the static tool
@@ -801,6 +962,137 @@ class TestToolSchemas:
         # injected key reached, or this asserts nothing at all
         assert seen == {"graph", "start.search", "start.keep", "start.search_field"}
 
+    # Two mutants in the same triage batch as the tests below are
+    # EQUIVALENT, checked rather than assumed and recorded here so the
+    # next run does not re-derive them:
+    #
+    # _describe_tool's `vector_field_json(name, field)` -> `(None, field)`
+    # cannot be observed: schema._as_vector_field_schema() reads `name`
+    # only in the TypeError it raises for an entry that is neither a
+    # Vector nor a VectorFieldSchema, and _vector_fields() yields
+    # Graph.vectors, whose entries build_registry() has already refused
+    # unless they are Vectors.
+    #
+    # _with_search's `start.get("anyOf", [])` -> `start.get("anyOf")` is
+    # equivalent for the same reason: the default is dead. Every schema
+    # _with_search can receive is TRAVERSE_TOOL_SCHEMA or
+    # AGGREGATE_TOOL_SCHEMA -- directly, or as the deep copy
+    # tool_schemas() hands back -- and both define `start.anyOf`, which
+    # test_a_seed_set_still_has_to_come_from_somewhere pins. Worth
+    # keeping for the day one of them stops.
+
+    def test_the_only_start_keys_this_module_adds_are_the_two_it_reads(self):
+        """CLAUDE.md's rule for a front end: a tool that offers a
+        parameter no handler accepts is the defect. `start` is parsed by
+        json_api's _START_KEYS and anything outside it is REFUSED there,
+        so the two keys this module may add are the two _seed() pops
+        before parsing -- `search` and `search_field`.
+
+        Derived from _START_KEYS rather than listed, the way
+        test_advertises_the_keys_the_parser_reads derives its side, so a
+        widened parser and a widened schema fail apart. A mutant renamed
+        `keep` to `XXkeepXX` and survived every existing check: the
+        static schema already carries a `keep`, so the renamed copy was
+        an EXTRA advertised key rather than a missing one -- looked up
+        by name, nothing was gone."""
+        from hopai.json_api import _START_KEYS
+
+        several_fields = offline()
+        several_fields.define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)])
+        for name in ("traverse_graph", "aggregate_graph"):
+            start = named(several_fields,
+                          embed=embedder())[name].parameters["properties"]["start"]
+            assert set(start["properties"]) - _START_KEYS == {"search", "search_field"}
+            assert "keep" in start["properties"]
+
+    def test_a_seed_field_is_never_offered_from_the_edge_side(self):
+        """`start.search` ranks NODE vectors -- _seeds_from_text() and
+        _resolve_field(graph, "nodes", ...) both say so -- so a
+        `search_field` enum built from the union of both targets offers
+        a field that fails on every use, which is the exact defect
+        test_edge_only_vectors_offer_search_but_not_a_seed exists for
+        one level up. A mutant read the registry with no target at all
+        (the union) and survived, because every test until now declared
+        edge fields with the same names as the node ones or none at
+        all."""
+        one_each = offline()
+        one_each.define_vectors(nodes=[Vector("summary", 3)],
+                                edges=[Vector("rel", 3), Vector("note", 3)])
+        start = named(one_each, embed=embedder())[
+            "traverse_graph"].parameters["properties"]["start"]
+        assert "search" in start["properties"]
+        # one NODE field is no choice at all, however many edge fields
+        assert "search_field" not in start["properties"]
+
+        two_nodes = offline()
+        two_nodes.define_vectors(nodes=[Vector("summary", 3), Vector("title", 3)],
+                                 edges=[Vector("rel", 3)])
+        start = named(two_nodes, embed=embedder())[
+            "traverse_graph"].parameters["properties"]["start"]
+        assert start["properties"]["search_field"]["enum"] == ["summary", "title"]
+
+    def test_search_similar_says_which_side_each_field_is_on(self):
+        """search_similar ranks EITHER target, so its enum is the union
+        -- but the description tells the model which half is which, and
+        that half is the only thing standing between `target: "nodes"`
+        and a field that exists only on edges. Reading the registry
+        without a target made every field a node field: the enum came
+        out identical, so nothing objected, while the description named
+        an edge field as a node one.
+
+        The edge-only server is the structural half of the same mutant:
+        one field on one side is a `field` argument with a single legal
+        value, which this module deliberately does not advertise -- and
+        counting the same field twice is what makes it appear."""
+        both = offline()
+        both.define_vectors(nodes=[Vector("summary", 3)], edges=[Vector("rel", 3)])
+        field = named(both, embed=embedder())[
+            "search_similar"].parameters["properties"]["field"]
+        assert field["enum"] == ["rel", "summary"]
+        # named once each, on its own side -- not once as a node field
+        # and again as an edge one
+        assert field["description"].count("'rel'") == 1
+        assert field["description"].count("'summary'") == 1
+
+        edges_only = offline()
+        edges_only.define_vectors(edges=[Vector("rel", 3)])
+        assert "field" not in named(edges_only, embed=embedder())[
+            "search_similar"].parameters["properties"]
+
+    def test_the_aggregate_tool_advertises_the_reranker_too(self):
+        """The other half of
+        test_a_configured_reranker_advertises_it_on_both_steps, which
+        reads traverse_graph only. "How many papers cite anything about
+        retrieval" is the same question as the traversal, counted --
+        and a reranked aggregation runs over the reranked survivors, so
+        an operator who configured a reranker gets an aggregate tool
+        that cannot use it while traverse_graph's schema says the
+        feature exists. Wiring it into one of the two tools is a silent
+        half-feature, the same shape as the seeding one."""
+        parameters = named(offline(), **reranking())["aggregate_graph"].parameters
+        assert "rerank" in parameters["properties"]["start"]["properties"]
+        assert "rerank" in parameters["properties"]["hops"]["items"]["properties"]
+
+    def test_a_reranked_aggregation_hands_the_policy_to_the_query(self, monkeypatch):
+        """The schema advertising `rerank` and the handler applying it
+        are two separate lines, and dropping the second leaves a tool
+        that accepts the parameter, answers, and silently ranks on
+        nothing -- the worst thing this library can produce (CLAUDE.md's
+        "refuse, don't approximate"). Asserted on the POLICY object,
+        because that is what the handler must pass: a bare Rerank there
+        would put the published field list and the candidate ceiling out
+        of reach."""
+        seen = {}
+        monkeypatch.setattr("hopai.mcp.aggregate_json",
+                            lambda graph, spec, **options: seen.update(options) or {})
+        options = reranking(rerank_fields=["properties.title"], max_candidates=64)
+        spec = named(offline(), **options)["aggregate_graph"]
+
+        spec.call(start={"where": {"type": "paper"}}, aggregates={"n": {"count": True}})
+        assert seen["rerank"].template is options["rerank"]
+        assert list(seen["rerank"].fields) == ["properties.title"]
+        assert seen["rerank"].max_candidates == 64
+
     def test_search_field_is_offered_only_when_the_choice_is_real(self):
         """One declared field needs no argument. Several make the choice
         the caller's, because ranking against the wrong field returns
@@ -870,7 +1162,7 @@ def _single_graph_tool_specs() -> list:
                          edges=[Vector("rel", 3)])
     specs = []
     for options in ({}, {"read_only": True}, {"allow_mutations": True},
-                    {"allow_ddl": True}, {"embed": embedder()}):
+                    {"allow_ddl": True}, {"embed": embedder()}, reranking()):
         specs.extend(tools(graph, **options))
     return specs
 
@@ -1328,6 +1620,23 @@ class TestDescribeGraph:
         described = named(g, embed=embedder())["describe_graph"].call()
         assert described["search_by_meaning"] is True
 
+    def test_it_says_whether_reranking_is_available_and_on_what(self):
+        """A `document_from` has to be written against the published
+        list, and describe_graph is the call a model makes first -- so
+        the list belongs in its answer as well as in the schema. None
+        throughout when there is no reranker, so "cannot" is
+        distinguishable from "did not ask" without a second call, the
+        same reason max_nodes reports its own absence."""
+        without = named(offline())["describe_graph"].call()
+        assert without["rerank_available"] is False
+        assert (without["rerank_fields"], without["max_candidates"]) == (None, None)
+
+        with_one = named(offline(), **reranking(
+            rerank_fields=["properties.title"], max_candidates=64))["describe_graph"].call()
+        assert with_one["rerank_available"] is True
+        assert with_one["rerank_fields"] == ["properties.title"]
+        assert with_one["max_candidates"] == 64
+
     def test_it_reports_the_permissions_it_was_started_with(self, vector_graph):
         described = named(vector_graph, embed=embedder(), read_only=True)["describe_graph"].call()
         assert described["writes_allowed"] is False
@@ -1420,6 +1729,25 @@ class TestCommandLine:
         with pytest.raises(SystemExit):
             main([])
         assert "--dsn or set HOPAI_DSN" in capsys.readouterr().err
+
+    def test_the_missing_dsn_refusal_names_the_flag_and_the_variable_end_to_end(
+            self, monkeypatch, capsys):
+        """The message names BOTH ways to supply a DSN, and it is the
+        first thing an operator sees -- there is nothing to read a
+        --help for once the process has exited.
+
+        Anchored at both ends rather than by a substring in the middle:
+        mutmut wraps a string literal in `XX...XX`, which leaves every
+        interior substring intact, so
+        test_no_dsn_anywhere_names_the_fix's `"--dsn or set HOPAI_DSN"`
+        went on passing against a message that had been rewritten at
+        both edges."""
+        monkeypatch.delenv("HOPAI_DSN", raising=False)
+        with pytest.raises(SystemExit):
+            main([])
+        line = capsys.readouterr().err.strip().splitlines()[-1]
+        assert "error: no database to serve" in line
+        assert line.endswith("pass --dsn or set HOPAI_DSN")
 
     def test_vector_fields_are_declared_on_the_command_line(self):
         """They are per-handle, not stored in the database like a saved
@@ -1715,6 +2043,190 @@ class TestServeArguments:
         assert seen["graph"] is graph
         assert seen["options"]["read_only"] is True
         assert seen["options"]["name"] == "pinned"
+
+    def test_the_reranker_and_its_two_ceilings_reach_the_tools(self, monkeypatch):
+        """serve() -> build_server() -> tools() is three signatures a
+        new option can be dropped from, and dropping `rerank_fields`
+        specifically would publish the WHOLE ROW to a third-party
+        reranker while every schema still said otherwise. Asserted
+        through build_server's own call, which is where they are
+        forwarded."""
+        from hopai.mcp import build_server, serve
+
+        options = reranking(rerank_fields=["properties.title"], max_candidates=64)
+        seen = self._stub(monkeypatch)
+        serve(offline(), **options)
+        assert seen["options"]["rerank"] is options["rerank"]
+        assert seen["options"]["rerank_fields"] == ["properties.title"]
+        assert seen["options"]["max_candidates"] == 64
+
+        registered = {}
+        monkeypatch.setattr("hopai.mcp._sdk", lambda: (
+            lambda *a, **kw: None, type("T", (), {}), 2))
+        monkeypatch.setattr("hopai.mcp.tools",
+                            lambda graph, **kw: registered.update(kw) or [])
+        build_server(offline(), **options)
+        assert registered["rerank_fields"] == ["properties.title"]
+        assert registered["max_candidates"] == 64
+
+    def test_the_permission_defaults_are_the_closed_ones(self, monkeypatch):
+        """build_server() carries its OWN copy of every permission
+        default and forwards it to tools(), so the posture of a server
+        started with no flags is decided here and nowhere else. Flipping
+        `allow_ddl` or `allow_mutations` to True hands an unconfigured
+        model DDL and DELETE; flipping `read_only` the other way makes a
+        server that was asked for nothing silently refuse every write.
+        Both survived every other test in this file, because the only
+        one that calls build_server() with no options asserts its
+        instructions -- and it needs the real SDK, so mutmut skips it.
+        Asserted through the forwarding call, which needs neither."""
+        from hopai.mcp import build_server
+
+        registered = {}
+        monkeypatch.setattr("hopai.mcp._sdk", lambda: (
+            lambda *a, **kw: None, type("T", (), {}), 2))
+        monkeypatch.setattr("hopai.mcp.tools",
+                            lambda graph, **kw: registered.update(kw) or [])
+        build_server(offline())
+        assert registered["read_only"] is False
+        assert registered["allow_ddl"] is False
+        assert registered["allow_mutations"] is False
+        assert registered["strict_schema"] is False
+
+    @staticmethod
+    def _stub_sdk(monkeypatch, era: int = 2) -> dict:
+        """build_server() with no SDK and no server: record what each of
+        the three calls it makes was handed -- tools(), _register() per
+        spec, and the SDK's server constructor.
+
+        The same idiom the two tests above use for tools(), extended one
+        step: build_server() is pure forwarding, and the only thing that
+        can be wrong about pure forwarding is what arrives."""
+        seen = {"registered": []}
+
+        class FakeTool:
+            """Stands in for the SDK's Tool class, which _register()
+            only ever calls from_function() on."""
+
+        def fake_tools(graph, **options):
+            seen["graph"] = graph
+            seen["options"] = options
+            return ["spec-one", "spec-two"]
+
+        def fake_register(spec, tool_class):
+            seen["registered"].append((spec, tool_class))
+            return f"tool:{spec}"
+
+        def fake_server(*args, **kwargs):
+            seen["constructed"] = (args, kwargs)
+            return object()
+
+        monkeypatch.setattr("hopai.mcp._sdk", lambda: (fake_server, FakeTool, era))
+        monkeypatch.setattr("hopai.mcp.tools", fake_tools)
+        monkeypatch.setattr("hopai.mcp._register", fake_register)
+        seen["tool_class"] = FakeTool
+        return seen
+
+    def test_every_spec_is_registered_against_the_sdks_own_tool_class(self, monkeypatch):
+        """_register() is where hopai's hand-written schema replaces the
+        `{"type": "object"}` the SDK derives from a handler's
+        annotations, and it needs both arguments to do it: the spec for
+        the schema, the SDK's Tool class to build the tool with. Blanking
+        either one, or handing it a single argument, survived everything
+        -- the one test that lists a real server's tools needs the SDK,
+        and mutmut skips it.
+
+        The registered tools are asserted to reach the constructor as
+        well: a list built and then not passed is a server advertising
+        nothing at all."""
+        seen = self._stub_sdk(monkeypatch)
+        build_server(offline())
+        assert seen["registered"] == [("spec-one", seen["tool_class"]),
+                                      ("spec-two", seen["tool_class"])]
+        assert seen["constructed"][1]["tools"] == ["tool:spec-one", "tool:spec-two"]
+
+    def test_the_graph_and_the_three_tool_options_reach_tools(self, monkeypatch):
+        """The permission flags are pinned by the test above this one;
+        these are the rest of build_server()'s forwarding, and each is a
+        different silent failure: the graph itself blanked serves
+        `None`, `embed=None` takes away search by meaning on a server
+        started with an embedder, `max_nodes=None` disables a ceiling an
+        operator set (or, dropped entirely, quietly restores the default
+        500), and `rerank=None` leaves the reranker configured and
+        unreachable.
+
+        Asserted by identity where the argument is an object, so a
+        mutant substituting a different one of the same shape cannot
+        pass."""
+        graph = offline()
+        embed = embedder()
+        options = reranking()
+        seen = self._stub_sdk(monkeypatch)
+
+        build_server(graph, embed=embed, max_nodes=7, **options)
+        assert seen["graph"] is graph
+        assert seen["options"]["embed"] is embed
+        assert seen["options"]["max_nodes"] == 7
+        assert seen["options"]["rerank"] is options["rerank"]
+
+    def test_the_server_is_constructed_with_its_name_and_its_instructions(self, monkeypatch):
+        """A server built with no name is one a client lists under
+        whatever the SDK defaults to, and one built with no instructions
+        loses the only place that can say "call describe_graph first" --
+        no single tool schema can, which is the whole reason
+        _instructions() exists. Both are positional-or-keyword arguments
+        a mutant can blank or drop, and both survived: the test that
+        reads server.instructions needs the real SDK."""
+        from hopai.mcp import Served, _instructions
+
+        graph = offline()
+        seen = self._stub_sdk(monkeypatch)
+        build_server(graph, name="pinned")
+        args, kwargs = seen["constructed"]
+        assert args == ("pinned",)
+        assert kwargs["instructions"] == _instructions(Served(graph))
+        assert "describe_graph first" in kwargs["instructions"]
+
+        # And the DEFAULT name, which passing one explicitly cannot
+        # hold: it is what a client lists this server under when the
+        # operator names nothing, so it is a published identifier
+        # rather than an internal string.
+        build_server(offline())
+        assert seen["constructed"][0] == ("hopai",)
+
+    @pytest.mark.parametrize("era, on_the_constructor", [(1, True), (2, False)])
+    def test_the_http_settings_reach_the_constructor_only_in_the_1x_era(
+            self, monkeypatch, era, on_the_constructor):
+        """The era split from the other side.
+        test_http_bind_settings_go_where_the_sdk_era_wants_them asserts
+        what run() gets; this asserts what the CONSTRUCTOR gets, and
+        they are two different lines. Passing the bind settings to an
+        mcp 2.0 constructor is a TypeError in a real deployment, and
+        passing none to a 1.x one is a server listening somewhere the
+        operator did not ask for -- neither is visible from run().
+
+        Both eras, because either alone passes for a mutant that always
+        chooses the other; and the stdio call, because `http and
+        era == 1` turned into `http or era == 1` means `**None` on a 1.x
+        server started with no HTTP at all."""
+        seen = self._stub_sdk(monkeypatch, era=era)
+        http = {"host": "0.0.0.0", "port": 9001, "streamable_http_path": "/x"}
+
+        build_server(offline(), http=http)
+        bind = {key: value for key, value in seen["constructed"][1].items()
+                if key not in ("instructions", "tools")}
+        assert bind == (http if on_the_constructor else {})
+
+        build_server(offline())
+        assert set(seen["constructed"][1]) == {"instructions", "tools"}
+
+    def test_a_published_field_list_with_no_reranker_refuses(self):
+        """A knob with nothing behind it is worse than a missing one: an
+        operator who published a list and never noticed the reranker was
+        absent believes they narrowed something. The same refusal Rerank
+        makes for a `model=` nothing reads."""
+        with pytest.raises(ValueError, match="no reranker here"):
+            tools(offline(), rerank_fields=["properties.title"])
 
     def test_the_bind_defaults_reach_the_server_that_is_built(self, monkeypatch):
         """The defaults are asserted through the CALL, not through
@@ -2106,10 +2618,17 @@ class TestWriteToolsLive:
         report = spec.call()
         assert report["dry_run"] is True and report["clean"] is False
         assert report["rules"] and report["rules"][0]["rows"]
-        # the prose summary too: it is what a model reads before the
+        # The prose summary too: it is what a model reads before the
         # rules array, and a mutant renaming the KEY dropped it in
-        # silence while every other assertion here still passed
-        assert report["summary"]
+        # silence while every other assertion here still passed.
+        # Asserted for its CONTENT, not merely for being truthy --
+        # `str(violations)` mutated to `str(None)` yields the string
+        # "None", which passes a truthiness check and tells a model
+        # deciding whether to enforce precisely nothing.
+        assert report["summary"].startswith("2 row(s) violate 2 schema rule(s):")
+        assert "e.g. id 1" in report["summary"]           # the missing email
+        assert "e.g. id 2" in report["summary"]           # the one typed wrong
+        assert "None" not in report["summary"]
 
         from sqlalchemy.exc import IntegrityError
         with pytest.raises(IntegrityError):
@@ -2198,3 +2717,98 @@ class TestSearchLive:
         spec = named(fresh_graph, embed=lambda text: [1.0, 0.0, 0.0])["traverse_graph"]
         found = spec.call(start={"search": "graphs", "keep": 1}, hops=[{"via": {"kind": "by"}}])
         assert {n["id"] for n in found["nodes"]} == {"1", "3"}
+
+    # -- reranking, end to end through the tool ------------------------
+    #
+    # A jq RUNTIME error quotes the offending value verbatim and the
+    # document is posted to a third party, so the two tests below are
+    # about what comes OUT of the tool rather than about what it
+    # computes. They need a real traversal: the failure happens after
+    # the SQL returns, on rows nothing earlier in the stack has seen.
+
+    SECRET = "SSN-123-45-6789"
+
+    def seeded(self, graph):
+        """Two seed nodes with vectors, both pointing at one author --
+        so a rerank that picks the FAR one is visible in the walk."""
+        graph.define_vectors(nodes=[Vector("summary", 3, embed=field_embedder())])
+        graph.migrate_vectors()
+        graph.add_nodes([{"id": 1, "type": "doc", "title": "graphs"},
+                         {"id": 2, "type": "doc", "title": self.SECRET},
+                         {"id": 3, "type": "author"}])
+        graph.add_edges([{"start_id": 1, "end_id": 3, "kind": "by"},
+                         {"start_id": 2, "end_id": 3, "kind": "by"}])
+        graph.set_vectors(nodes=[{"id": 1, "summary": [1.0, 0.0, 0.0]},
+                                 {"id": 2, "summary": [0.0, 1.0, 0.0]}])
+        return graph
+
+    def seed_start(self, **rerank) -> dict:
+        return {"where": {"type": "doc"}, "near": {"field": "summary", "text": "graphs"},
+                "keep": 1, "rerank": rerank}
+
+    def test_a_reranked_seed_set_decides_which_node_the_walk_starts_from(self, fresh_graph):
+        """The whole feature in one call: similarity puts node 1 first,
+        the reranker READS both documents and prefers node 2, and the
+        walk leaves from node 2. Without the policy reaching
+        traverse_json() the tool would rank on cosine alone and still
+        return a plausible subgraph -- the silent-different-answer this
+        library is written against."""
+        graph = self.seeded(fresh_graph)
+        # Similarity puts "graphs" first; the reranker likes it least.
+        client = rerank_client(prefer="graphs")
+        spec = named(graph, **reranking(client=client,
+                                        rerank_fields=["properties.title"]))["traverse_graph"]
+        found = spec.call(start=self.seed_start(document_from=".properties.title",
+                                                candidates=5),
+                          hops=[{"via": {"kind": "by"}}])
+        assert {n["id"] for n in found["nodes"]} == {"2", "3"}
+        assert client.seen[0][0] == "graphs"                     # scored against the query
+        assert sorted(client.seen[0][1]) == sorted(["graphs", self.SECRET])
+
+    def test_a_jq_failure_never_puts_a_row_value_in_the_tool_result(self, fresh_graph):
+        """MEASURED: `tonumber` on text raises `ValueError: string
+        ("SSN-123-45-6789") cannot be parsed as a number`, quoting the
+        row. That message would go straight back over MCP -- and into
+        whatever the client logs -- so it is replaced by one naming the
+        FILTER and the CANDIDATE and nothing from the row. Without the
+        guard this assertion fails on the secret."""
+        graph = self.seeded(fresh_graph)
+        spec = named(graph, **reranking(rerank_fields=["properties.title"]))["traverse_graph"]
+        with pytest.raises(ValueError) as exc:
+            spec.call(start=self.seed_start(document_from=".properties.title | tonumber",
+                                            candidates=5),
+                      hops=[{"via": {"kind": "by"}}])
+        message = str(exc.value)
+        assert self.SECRET not in message
+        assert "cannot be parsed" not in message                 # nor jq's own wording
+        assert ".properties.title | tonumber" in message and "candidate id=" in message
+
+    def test_a_provider_failure_never_puts_its_own_error_in_the_tool_result(self, fresh_graph):
+        """A reranking SDK's exception repr can carry the configuration
+        it was constructed with, API key included, and RerankError
+        quotes it verbatim for a Python caller who is inside the trust
+        boundary. The far side of a tool call is not."""
+        graph = self.seeded(fresh_graph)
+
+        def explode(query, documents):
+            raise RuntimeError("401 Unauthorized for key sk-live-DEADBEEF")
+
+        spec = named(graph, **reranking(client=explode,
+                                        rerank_fields=["properties.title"]))["traverse_graph"]
+        with pytest.raises(Exception) as exc:
+            spec.call(start=self.seed_start(document_from=".properties.title", candidates=5),
+                      hops=[{"via": {"kind": "by"}}])
+        assert "DEADBEEF" not in str(exc.value)
+        assert "server-side failure" in str(exc.value)
+
+    def test_a_filter_reading_an_unpublished_property_never_runs_at_all(self, fresh_graph):
+        """The refusal has to land BEFORE the query, not after: a filter
+        that reached the rows would have read the property this server
+        declined to publish, whatever it then did with it."""
+        from hopai.jqsafe import UnsafeFilter
+
+        graph = self.seeded(fresh_graph)
+        spec = named(graph, **reranking(rerank_fields=["properties.title"]))["traverse_graph"]
+        with pytest.raises(UnsafeFilter) as exc:
+            spec.call(start=self.seed_start(document_from=".properties.ssn", candidates=5))
+        assert "properties.ssn" in str(exc.value) and "properties.title" in str(exc.value)

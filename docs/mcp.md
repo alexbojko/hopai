@@ -169,6 +169,82 @@ rank the seed set, so accepting both would mean silently dropping one.
 Without `--embed`, `search_similar` is not registered and `start.search` is not
 advertised; `near` still works for any field that can embed its own text.
 
+## Reranking
+
+Retrieval that works is three stages, not two: retrieve wide and cheap, **rerank**
+a bounded top-N by *reading* each candidate against the query, then keep what
+survives. Stage two is a call to a reranking model — accurate, expensive, and
+billed per document — so the client is the **operator's**, exactly as `embed` is,
+and it is configured in Python:
+
+```python
+import cohere
+from hopai import Rerank
+from hopai.mcp import serve
+
+serve(graph,
+      rerank=Rerank(cohere.ClientV2(), model="rerank-v3.5",
+                    document_from='.properties.title + ": " + (.properties.summary // "")',
+                    candidates=50),
+      rerank_fields=["properties.title", "properties.summary"],
+      max_candidates=100)
+```
+
+What a model supplies is never the client. It is `document_from` — a jq filter
+projecting one candidate into the one string the reranker reads — and
+`candidates`, how many to spend. Both are retrieval decisions a model is well
+placed to make, unlike an embedding it would have to invent.
+
+**`rerank_fields` is required with `rerank`**, and it publishes what that filter
+may read. The filter's *output is the document*, and the document is POSTed to a
+vendor, so `.properties.ssn` parses perfectly well in the safe jq subset and
+would ship straight out; a path outside the list refuses, naming it. The list is
+not just a gate — it is written into the advertised description of
+`document_from`, so a model picks from published paths rather than guessing. It
+binds your own template too — the list is checked against the `document_from` you
+passed when the server is built, so a `rerank_fields` that forgets a path your
+own filter reads refuses at start-up rather than at the first tool call.
+`rerank_fields=` **without** `rerank=` refuses rather than looking like a
+narrowing that is not there.
+
+**`max_candidates` bounds the bill** (default 100; `None` disables it). A
+`candidates` above the ceiling **refuses naming it** rather than being quietly
+lowered — the same judgement a `candidates` gets when it leaves `keep`/`k`
+nothing to choose from. Silently serving 100 where 500 was asked for hides the
+disagreement in the one place it costs money.
+
+The parameter lives on `traverse_graph` and `aggregate_graph`, on `start` and on
+every hop, beside that step's `near`. With **no reranker configured, no tool
+advertises it at all** — the whole `rerank` object is stripped from both schemas,
+which is the rule permissions already follow here: a parameter a model cannot see
+is one it cannot be talked into sending. A spec that asks for reranking on such a
+server refuses, since a reranker client cannot travel in JSON. `describe_graph`
+reports `rerank_available`, `rerank_fields` and `max_candidates`, so a model can
+tell *this server cannot rerank* from *I asked for it wrong*.
+
+### `search_similar` deliberately has no `rerank`
+
+That is a property of reranking rather than of this server. `search_similar`
+embeds the model's text into a raw vector itself, and a reranker scores a query
+against a document by **reading both** — a raw-vector `near` with a `rerank=`
+refuses in hopai's core, so the parameter would be one whose every use failed.
+Rerank through `traverse_graph` instead, whose `start.near` carries `{field,
+text}` and whose text the **field** embeds, so the dense stage and the rerank
+stage see the same query rather than two spellings of it:
+
+```jsonc
+{"start": {"near": {"field": "summary", "text": "how do nodes agree?"},
+           "keep": 10,
+           "rerank": {"document_from": ".properties.title", "candidates": 50}}}
+```
+
+Be aware of what that costs you, because nothing warns about it: a traversal
+returns a **subgraph, not a ranking**. Similarity scores never survived into one
+and rerank scores get no exception, so what a rerank changed there is *which*
+nodes come back — never a score you can read. `rerank_score` exists on
+`vector_search()` hits in Python, and no tool returns those.
+**Reranked results with their scores are not reachable over MCP today.**
+
 ## All flags
 
 | Flag | Default | Effect |
@@ -187,6 +263,9 @@ advertised; `near` still works for any field that can embed its own text.
 | `--vector` | none | Declare a vector field. Repeatable. |
 | `--embed` | none | `MODULE:FUNCTION` returning a vector for text. |
 | `--no-load-schema` | loads | Skip adopting the schema saved in the database. |
+| `--max-nodes N\|none` | `500` | Refuse a `traverse_graph` call or Cypher `MATCH` whose result would exceed this many nodes — naming the real count, rather than letting the client silently truncate the subgraph. `none` disables the ceiling. |
+
+There is no `--rerank`: see [From Python](#from-python) below.
 
 ## From Python
 
@@ -209,8 +288,16 @@ app = build_server(graph)      # mount it in an app that owns the transport
 specs = tools(graph)           # just the tool definitions, no SDK needed
 ```
 
-`serve()` takes the same options as the flags: `read_only`, `allow_mutations`,
-`allow_ddl`, `strict_schema`, `embed`, `name`.
+`serve()` takes every flag that is not about *building* the graph — `read_only`,
+`allow_mutations`, `allow_ddl`, `strict_schema`, `embed`, `max_nodes`, `name` —
+and three options that have no flag at all: **`rerank`, `rerank_fields` and
+`max_candidates`**. Those are Python-only because a `Rerank` is a constructed
+object, not a name: it carries the provider client, a model name, a jq filter and
+a candidate budget, and a shell has nowhere to put one. `--embed
+MODULE:FUNCTION` is as far as the command line goes, and it works only because an
+embedder can be a bare module-level callable — which is also why `embed=` is the
+option people end up setting in Python whenever the client needs configuring.
+`build_server()` takes the same set.
 
 ## Try it
 
@@ -243,6 +330,11 @@ first. If the server was started with `--graph`, check the data is in *that* gra
 deliberate: `mutate_graph` needs `--allow-mutations`, `enforce_schema` needs
 `--allow-ddl`, `search_similar` needs `--embed` plus a declared vector field.
 `describe_graph` reports what this server will and won't do.
+
+**The model cannot find `rerank`.** No reranker is configured, so the parameter
+is not advertised anywhere — that is the same gate the tools themselves are
+behind. It is `serve(rerank=…, rerank_fields=[…])` in Python; there is no flag.
+`describe_graph` answers `rerank_available: false` for exactly this question.
 
 **A write says the server is read-only.** `--read-only` was passed. Note that it cannot
 be combined with `--allow-mutations` or `--allow-ddl`; that combination refuses at

@@ -1626,6 +1626,41 @@ def _corpus(fresh_graph) -> Graph:
 QUERY = [1.0, 0.0, 0.0]
 
 
+def needs_jq():
+    """The jq binding is an optional extra (`hopai[rerankers]`), and
+    `document_from` is evaluated with it -- so the reranking tests skip
+    without it, exactly as tests/test_rerankers.py does."""
+    return pytest.importorskip("jq")
+
+
+def _searchable(fresh_graph) -> Graph:
+    """_corpus(), with docvec declaring an embedder.
+
+    Reranking needs the query as TEXT, and the text becomes a vector
+    through the FIELD's own embed= -- so the dense stage and the rerank
+    stage see the same query. Every text here embeds to QUERY, which
+    keeps the similarity ordering the hand-checked one above."""
+    g = _corpus(fresh_graph)
+    g.define_vectors(
+        nodes=[Vector("docvec", 3, embed=lambda texts: [list(QUERY) for _ in texts]),
+               Vector("titlevec", 3)],
+        edges=[Vector("relvec", 3)])
+    return g
+
+
+def _by_name(order: list, calls=None):
+    """A reranker client whose score is `order`'s reverse index of the
+    document -- so the ranking a test expects is written in the test,
+    not left to a provider. `calls` collects (query, documents) per
+    call, which is how "one call per step" is asserted."""
+    def client(query, documents):
+        if calls is not None:
+            calls.append((query, list(documents)))
+        return [float(len(order) - order.index(d)) if d in order else -1.0
+                for d in documents]
+    return client
+
+
 class TestVectorSearchLive:
     def test_ranking_and_scores_match_hand_computed_cosine(self, fresh_graph):
         g = _corpus(fresh_graph)
@@ -1865,6 +1900,158 @@ class TestVectorSearchLive:
         with pytest.raises(ValueError, match="declares no embedder"):
             vector_search_json(g, {"near": {"field": "docvec", "text": "anything"}})
 
+    # -- reranking: the third stage ------------------------------------
+
+    def test_rerank_reorders_and_reports_both_scores(self, fresh_graph):
+        """The whole point, and the shape of the answer. Without this,
+        `rerank=` could be accepted and quietly ignored: the hits would
+        still come back, in similarity order, with nothing to see."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = _searchable(fresh_graph)
+        calls = []
+        # "opposite" is the WORST cosine (-1.0) and the best document --
+        # only a real rerank can put it first.
+        rerank = Rerank(_by_name(["opposite", "exact"], calls),
+                        document_from=".properties.name", candidates=5)
+        hits = g.vector_search(Near("docvec", text="how do nodes agree?"), k=2,
+                               where={"type": "doc"}, rerank=rerank)
+        assert [h["id"] for h in hits] == ["5", "1"]
+        assert [h["rerank_score"] for h in hits] == [2.0, 1.0]
+        # `similarity` KEEPS the retrieval stage's number rather than
+        # being overwritten, so a caller can see what the reranker moved.
+        assert [h["similarity"] for h in hits] == pytest.approx([-1.0, 1.0], abs=1e-6)
+        # One provider call, with the caller's own text as the query.
+        assert len(calls) == 1 and calls[0][0] == "how do nodes agree?"
+
+    def test_candidates_bounds_the_input_and_k_bounds_the_output(self, fresh_graph):
+        """Two DIFFERENT bounds that never overlap -- LanceDB's `top_n`
+        beside `.limit()` is the trap this avoids. `candidates` decides
+        how many rows the SQL fetches (and how many documents are
+        billed); `k` decides how many come back."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = _searchable(fresh_graph)
+        calls = []
+        rerank = Rerank(_by_name([], calls), document_from=".properties.name", candidates=3)
+        hits = g.vector_search(Near("docvec", text="q"), k=2, where={"type": "doc"},
+                               rerank=rerank)
+        assert len(calls[0][1]) == 3          # candidates reached the reranker
+        assert len(hits) == 2                 # k truncated afterwards
+
+    def test_no_rerank_leaves_the_hit_shape_exactly_as_it_was(self, fresh_graph):
+        """Additive only: without rerank= there must be no rerank_score
+        key and no reordering, or every existing caller's result shape
+        changed the day this landed."""
+        g = _corpus(fresh_graph)
+        hits = g.vector_search(Near("docvec", QUERY), k=3, where={"type": "doc"})
+        assert all("rerank_score" not in hit for hit in hits)
+        assert [h["id"] for h in hits] == ["1", "3", "2"]
+
+    def test_candidates_below_k_is_refused_by_the_call_too(self, fresh_graph):
+        """hop.py holds this rule for Start/Hop; vector_search() reaches
+        the SAME validator rather than restating it, so the two can
+        never disagree about whether reranking 5 to keep 10 is legal."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = _searchable(fresh_graph)
+        with pytest.raises(ValueError, match="reranks fewer candidates than k=10 keeps"):
+            g.vector_search(Near("docvec", text="q"), k=10,
+                            rerank=Rerank(_by_name([]), document_from=".properties.name",
+                                          candidates=5))
+
+    def test_a_raw_vector_query_with_rerank_is_refused_before_any_sql(self, fresh_graph):
+        """A reranker reads the query. A list of floats is not something
+        it can read, and no implementation makes it one -- so this
+        refuses rather than growing a second way to supply the query,
+        which could disagree with the first silently."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = _searchable(fresh_graph)
+        with pytest.raises(ValueError, match="rerank= needs the query as TEXT"):
+            g.vector_search(Near("docvec", QUERY), k=2,
+                            rerank=Rerank(_by_name([]), document_from=".properties.name"))
+
+    def test_two_different_texts_have_no_single_query_to_score_with(self, fresh_graph):
+        """A multivector query is ONE question asked of several fields.
+        Two texts give the reranker no single query, and picking the
+        first would score every document against a question the caller
+        never asked -- a plausible, confidently wrong ranking."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = _searchable(fresh_graph)
+        g.define_vectors(nodes=[
+            Vector("docvec", 3, embed=lambda t: [list(QUERY) for _ in t]),
+            Vector("titlevec", 3, embed=lambda t: [list(QUERY) for _ in t])])
+        with pytest.raises(ValueError, match="carry 2 different texts"):
+            g.vector_search(Near("docvec", text="raft"), Near("titlevec", text="paxos"), k=2,
+                            rerank=Rerank(_by_name([]), document_from=".properties.name"))
+
+    def test_the_provider_is_called_after_the_round_trip_closes(self, fresh_graph):
+        """The rule set_vectors() already keeps, on the read side: an
+        HTTP round trip inside an open transaction holds a snapshot for
+        its whole duration. Asserted by making the client itself LOOK --
+        a connection still checked out here means the provider call is
+        sitting on top of one."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = _searchable(fresh_graph)
+        held = [0]
+        timeline = []
+
+        @event.listens_for(g.engine, "checkout")
+        def out(*args):                                   # noqa: ARG001
+            held[0] += 1
+
+        @event.listens_for(g.engine, "checkin")
+        def back(*args):                                  # noqa: ARG001
+            held[0] -= 1
+
+        def client(query, documents):
+            timeline.append(held[0])
+            return [0.0] * len(documents)
+
+        try:
+            g.vector_search(Near("docvec", text="q"), k=2,
+                            rerank=Rerank(client, document_from=".properties.name",
+                                          candidates=3))
+        finally:
+            event.remove(g.engine, "checkout", out)
+            event.remove(g.engine, "checkin", back)
+        assert timeline == [0], "the provider was called with a connection still open"
+
+    def test_an_empty_result_never_reaches_the_provider(self, fresh_graph):
+        """No documents, no call: an empty rerank request is billed by
+        some providers and refused by others, and neither is an answer."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = _searchable(fresh_graph)
+        calls = []
+        g.vector_search(Near("docvec", text="q", min_similarity=0.999), k=2,
+                        where={"type": "nothing-matches-this"},
+                        rerank=Rerank(_by_name([], calls), document_from=".properties.name"))
+        assert calls == []
+
+    def test_rerank_with_no_near_at_all_is_refused(self, fresh_graph):
+        """hop.py's "nothing to reorder" rule sees `near=None`, and
+        vector_search() spells the same absence `near=[]` -- which is
+        not None, so it needs saying here too. A reranker REORDERS a
+        candidate list; it cannot produce one."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = _searchable(fresh_graph)
+        with pytest.raises(ValueError, match=r"rerank= reorders the candidates near= ranks"):
+            g.vector_search(k=2, rerank=Rerank(_by_name([]),
+                                               document_from=".properties.name"))
+
 
 # ---------------------------------------------------------------------
 # Live: similarity inside a traversal
@@ -1915,6 +2102,399 @@ class TestTraversalNearLive:
         counted = g.aggregate(Start(near=Near("docvec", QUERY), keep=3, where={"type": "doc"}),
                               aggregates={"n": Count()})
         assert counted == {"n": 3}
+
+    # -- step-wise reranking -------------------------------------------
+    #
+    # A traversal compiles to ONE recursive CTE and a reranker is a
+    # network call in the middle of the walk, so a reranked traversal
+    # probes, reranks, then RE-RUNS THE ORDINARY TRAVERSAL with each
+    # step's survivors pinned. Everything below is about that final
+    # re-run being an ordinary traversal: if it ever became a stitching
+    # of partial results, fan-in, multi-hop edge reconstruction and
+    # dead-end pruning would each have to be re-derived by hand, which
+    # is exactly what the invariants in tests/test_hopai.py forbid.
+
+    def _fan_in_graph(self, fresh_graph) -> Graph:
+        """Two parents feeding one intermediate, a second reachable node
+        for the reranker to choose between, and a dead end whose only
+        edge is the wrong kind.
+
+            p1, p2 -> shared -> tail
+            p1     -> other
+            p1     -> deadend   (kind: wrong)
+        """
+        g = _searchable(fresh_graph)
+        g.add_nodes([{"id": 10, "type": "seed", "name": "p1"},
+                     {"id": 11, "type": "seed", "name": "p2"},
+                     {"id": 12, "name": "shared"},
+                     {"id": 13, "name": "other"},
+                     {"id": 14, "name": "deadend"},
+                     {"id": 15, "name": "tail"}])
+        g.set_vectors(nodes=[{"id": 10, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 11, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 12, "docvec": [0.6, 0.8, 0.0]},
+                             {"id": 13, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 14, "docvec": [1.0, 0.0, 0.0]},
+                             {"id": 15, "docvec": [1.0, 0.0, 0.0]}])
+        g.add_edges([{"start_id": 10, "end_id": 12, "kind": "cites"},
+                     {"start_id": 11, "end_id": 12, "kind": "cites"},
+                     {"start_id": 10, "end_id": 13, "kind": "cites"},
+                     {"start_id": 10, "end_id": 14, "kind": "wrong"},
+                     {"start_id": 12, "end_id": 15, "kind": "cites"}])
+        return g
+
+    def test_a_hop_rerank_prunes_and_fan_in_is_still_preserved(self, fresh_graph):
+        """The invariant test_fan_in_both_parents_preserved protects,
+        under a rerank: `shared` is the WORST cosine and the best
+        document, so only a real rerank keeps it -- and once it is kept,
+        BOTH parents' edges must still be reported. A node survives or
+        is dropped as a UNIT, which is what makes that true."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        result = g.traverse(
+            Start(where={"type": "seed"}),
+            Hop(via={"kind": "cites"}, near=Near("docvec", text="fan in"), keep=1,
+                rerank=Rerank(_by_name(["shared"]), document_from=".properties.name",
+                              candidates=5)))
+        assert {n["id"] for n in result.nodes} == {"10", "11", "12"}
+        # Both in-edges, from both parents -- the fan-in the per-hop path
+        # tracking exists to keep.
+        assert {(e["start_id"], e["end_id"]) for e in result.edges} \
+            == {("10", "12"), ("11", "12")}
+
+    def test_a_reranked_hop_still_prunes_dead_ends_and_wrong_edges(self, fresh_graph):
+        """Reported nodes derive from the EDGES found, never from a
+        surviving id list. `deadend` is reachable only by a `wrong` edge,
+        so however highly the reranker scores it, the hop never reaches
+        it and it never appears."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        result = g.traverse(
+            Start(where={"type": "seed"}),
+            Hop(via={"kind": "cites"}, near=Near("docvec", text="q"), keep=2,
+                rerank=Rerank(_by_name(["deadend", "other", "shared"]),
+                              document_from=".properties.name", candidates=5)))
+        assert "14" not in {n["id"] for n in result.nodes}
+
+    def test_multi_hop_edge_reconstruction_survives_a_rerank(self, fresh_graph):
+        """A hop spanning several real edges must report ALL of them,
+        not one fabricated edge between the endpoints. The final
+        traversal is an ordinary one, so `hop_edges_i` still unnests
+        `local_edges` -- this is what would notice if pinning ever
+        started reporting edges from the pinned id list instead."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        result = g.traverse(
+            Start(where={"name": "p1"}),
+            Hop(via={"kind": "cites"}, hops=(2, 2), near=Near("docvec", text="q"), keep=1,
+                rerank=Rerank(_by_name(["tail"]), document_from=".properties.name",
+                              candidates=5)))
+        # p1 -> shared -> tail is two real edges, both reported.
+        assert {(e["start_id"], e["end_id"]) for e in result.edges} \
+            == {("10", "12"), ("12", "15")}
+
+    def test_a_start_rerank_prunes_the_seed_before_any_hop_walks(self, fresh_graph):
+        """The seed set is a ranked set too, so `rerank=` belongs there
+        as well -- and pruning it changes what the whole chain reaches,
+        which is the point rather than a side effect."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        result = g.traverse(
+            Start(where={"type": "seed"}, near=Near("docvec", text="q"), keep=1,
+                  rerank=Rerank(_by_name(["p2"]), document_from=".properties.name",
+                                candidates=5)),
+            Hop(via={"kind": "cites"}))
+        # p2's only edge goes to `shared`; p1 never seeded, so `other`
+        # is unreachable.
+        assert {n["id"] for n in result.nodes} == {"11", "12"}
+
+    def test_a_hop_document_may_read_the_paths_that_reached_it(self, fresh_graph):
+        """The capability a flat reranker structurally cannot offer: at
+        a hop a candidate is a node PLUS how it was reached. `.paths` is
+        every route, canonically ordered, with the candidate itself
+        dropped -- so `.[-1]` is the immediate parent ("cited by") and
+        not the node restating its own title."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        seen = []
+
+        def client(query, documents):
+            seen.extend(documents)
+            return [0.0] * len(documents)
+
+        g.traverse(
+            Start(where={"type": "seed"}),
+            Hop(via={"kind": "cites"}, near=Near("docvec", text="q"), keep=1,
+                rerank=Rerank(client, candidates=5,
+                              document_from='.properties.name + " <- " '
+                                            '+ (.paths | map(.[-1].properties.name) '
+                                            '| join(","))')))
+        assert sorted(seen) == ["other <- p1", "shared <- p1,p2"]
+
+    def test_paths_are_hydrated_only_when_the_filter_reads_them(self, fresh_graph):
+        """Path context costs a wider probe. A filter reading only the
+        node's own properties must not pay for it -- and must not be
+        handed a `paths` key it never asked about, which would change
+        what a `.` filter or a `keys` produces."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+
+        class Watching(Rerank):
+            """A Rerank that reports the SHAPE of what it was handed."""
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.shapes = []
+
+            def build_documents(self, candidates, **kwargs):
+                self.shapes.extend(sorted(candidate) for candidate in candidates)
+                return super().build_documents(candidates, **kwargs)
+
+        def run(document_from):
+            rerank = Watching(_by_name([]), document_from=document_from, candidates=5)
+            g.traverse(Start(where={"type": "seed"}),
+                       Hop(via={"kind": "cites"}, near=Near("docvec", text="q"), keep=1,
+                           rerank=rerank))
+            return rerank.shapes
+
+        plain = run(".properties.name")
+        assert plain and all(shape == ["id", "properties"] for shape in plain)
+        reading = run('.paths | map(.[-1].properties.name) | join(",")')
+        assert reading and all(shape == ["id", "paths", "properties"] for shape in reading)
+
+    def test_per_path_scores_a_node_by_its_BEST_route(self, fresh_graph):
+        """per_path=True is one document per (node, path) and the node's
+        score is the MAX over its paths -- not the sum, not the mean --
+        so one strong route is enough to keep it. That is the same "any
+        valid parent counts" semantics the fan-in invariant protects; a
+        mean would let a node's weak second parent vote it out."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        seen = []
+
+        def client(query, documents):
+            seen.extend(documents)
+            # `shared` via p1 is terrible, via p2 is the best document
+            # here. Under max it survives; under mean or sum of these
+            # numbers `other` would win instead.
+            return [{"shared <- p1": -10.0, "shared <- p2": 5.0}.get(d, 1.0)
+                    for d in documents]
+
+        result = g.traverse(
+            Start(where={"type": "seed"}),
+            Hop(via={"kind": "cites"}, near=Near("docvec", text="q"), keep=1,
+                rerank=Rerank(client, candidates=5, per_path=True,
+                              document_from='.properties.name + " <- " '
+                                            '+ (.paths | map(.[-1].properties.name) '
+                                            '| join(","))')))
+        # One document per (node, path): `shared` was scored twice.
+        assert sorted(seen) == ["other <- p1", "shared <- p1", "shared <- p2"]
+        assert {n["id"] for n in result.nodes} == {"10", "11", "12"}
+
+    def test_max_paths_caps_what_one_document_may_quote(self, fresh_graph):
+        """A high fan-in node can be reached hundreds of ways, and a
+        document quoting all of them blows the provider's token limit --
+        as a hard error if you are lucky, as a silent server-side
+        truncation if you are not. The cap is visible and deterministic,
+        which is why the paths are canonically ordered first."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        seen = []
+
+        def client(query, documents):
+            seen.extend(documents)
+            return [0.0] * len(documents)
+
+        g.traverse(
+            Start(where={"type": "seed"}),
+            Hop(via={"kind": "cites"}, near=Near("docvec", text="q"), keep=1,
+                rerank=Rerank(client, candidates=5, max_paths=1,
+                              document_from='.properties.name + " <- " '
+                                            '+ (.paths | map(.[-1].properties.name) '
+                                            '| join(","))')))
+        assert sorted(seen) == ["other <- p1", "shared <- p1"]
+
+    def test_reading_paths_at_a_start_is_refused_before_any_sql(self, fresh_graph):
+        """A seed has no provenance -- nothing reached it -- so `.paths`
+        there would be `null` and every document would quietly change
+        shape. "You have to know that .paths is hop-only" is the kind of
+        gap this library treats as a defect, so it refuses and names the
+        rewrite."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        with pytest.raises(ValueError, match=r"reads \.paths, but a seed has no provenance"):
+            g.traverse(Start(where={"type": "seed"}, near=Near("docvec", text="q"), keep=1,
+                             rerank=Rerank(_by_name([]), candidates=5,
+                                           document_from='.paths | map(.[-1].properties.name) '
+                                                         '| join(",")')),
+                       Hop(via={"kind": "cites"}))
+
+    def test_per_path_at_a_start_is_refused(self, fresh_graph):
+        """per_path=True means one provider call per (node, path), and a
+        SEED has no paths -- nothing reached it. So at a Start the flag
+        is not merely cheap, it IS the default under another name: the
+        caller asked for per-path scoring and quietly got per-node
+        scoring, which is "a constraint the options discard is not no
+        constraint". It refuses beside the `.paths`-at-a-Start refusal
+        and says where the mode belongs. Without this the flag was
+        accepted and dropped, with nothing said and a bill either way."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        calls = []
+
+        def client(query, documents):
+            calls.append(documents)
+            return [0.0] * len(documents)
+
+        with pytest.raises(ValueError, match="per_path=True.*a seed has no provenance"):
+            g.traverse(
+                Start(where={"type": "seed"}, near=Near("docvec", text="q"), keep=1,
+                      rerank=Rerank(client, document_from=".properties.name", candidates=5,
+                                    per_path=True)),
+                Hop(via={"kind": "cites"}))
+        assert not calls, "refused before a document was built, let alone billed"
+
+    def test_a_filter_the_grammar_rejects_is_refused_as_a_filter(self, fresh_graph):
+        """A document_from outside the safe subset must be refused with
+        `document_from` as the owner and the offending construct named
+        -- NOT with the ".paths at a Start" message, which would blame
+        something the caller never wrote. Deciding "does it read paths"
+        by parsing means an unparseable filter has no answer, and the
+        one it gets must be the one that does not mislead."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        with pytest.raises(Exception, match="document_from") as raised:
+            g.traverse(Start(where={"type": "seed"}, near=Near("docvec", text="q"), keep=1,
+                             rerank=Rerank(_by_name([]), candidates=5,
+                                           document_from="def f: .properties.name; f")),
+                       Hop(via={"kind": "cites"}))
+        assert "paths" not in str(raised.value)
+
+    def test_a_step_whose_probe_finds_nothing_never_calls_the_provider(self, fresh_graph):
+        """An empty candidate set pins nothing and costs no provider
+        call -- and the traversal that follows is simply empty, rather
+        than falling back to the unpruned walk, which would be a
+        different answer with no signal."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        calls = []
+        result = g.traverse(
+            Start(where={"type": "nothing-matches-this"}, near=Near("docvec", text="q"),
+                  keep=1, rerank=Rerank(_by_name([], calls), document_from=".properties.name",
+                                        candidates=5)),
+            Hop(via={"kind": "cites"}))
+        assert calls == [] and result.nodes == [] and result.edges == []
+
+    def test_rerank_scores_never_reach_the_traversal_result(self, fresh_graph):
+        """A traversal returns a SUBGRAPH, not a ranking -- Start's and
+        Hop's docstrings both say so, and similarity scores have never
+        survived into it. Reranking gets no exception: `result.nodes`
+        keeps its exact shape, and vector_search() is where scores
+        live."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        result = g.traverse(
+            Start(where={"type": "seed"}),
+            Hop(via={"kind": "cites"}, near=Near("docvec", text="q"), keep=1,
+                rerank=Rerank(_by_name(["shared"]), document_from=".properties.name",
+                              candidates=5)))
+        assert all(sorted(node) == ["id", "properties"] for node in result.nodes)
+
+    def test_a_reranked_traversal_costs_one_plus_two_per_reranked_step(self, fresh_graph):
+        """Rule 6: "probably fine" is not a measurement. A reranked
+        traversal is a probe and a hydration per reranked step, then the
+        ordinary traversal -- whose own hydration SELECTs are the two
+        it has always issued. Pinned here so a change that doubles the
+        round trips is visible in a diff rather than in a latency
+        graph."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        statements = []
+
+        @event.listens_for(g.engine, "before_cursor_execute")
+        def record(conn, cursor, statement, *args):       # noqa: ARG001
+            statements.append(statement)
+
+        def rerank(order):
+            return Rerank(_by_name(order), document_from=".properties.name", candidates=5)
+
+        try:
+            plain = g.traverse(Start(where={"type": "seed"}), Hop(via={"kind": "cites"}))
+            baseline = len(statements)
+            statements.clear()
+            g.traverse(Start(where={"type": "seed"}, near=Near("docvec", text="q"), keep=2,
+                             rerank=rerank(["p1", "p2"])),
+                       Hop(via={"kind": "cites"}, near=Near("docvec", text="q"), keep=1,
+                           rerank=rerank(["shared"])))
+            reranked = len(statements)
+        finally:
+            event.remove(g.engine, "before_cursor_execute", record)
+        assert plain.nodes                       # the baseline really ran
+        assert baseline == 3                     # the walk plus its two hydrations
+        assert reranked == baseline + 2 * 2      # + (probe, hydration) per reranked step
+
+    def test_aggregates_run_over_the_reranked_survivors(self, fresh_graph):
+        """aggregate() shares _walk_matches(), so pinning reaches it for
+        free -- and that is the right answer rather than an accident:
+        aggregates run over the LAST step's matched nodes, and after a
+        rerank those nodes ARE the survivors, exactly as they are after
+        a `keep=`."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = self._fan_in_graph(fresh_graph)
+        counted = g.aggregate(
+            Start(where={"type": "seed"}),
+            Hop(via={"kind": "cites"}, near=Near("docvec", text="q"), keep=1,
+                rerank=Rerank(_by_name(["shared"]), document_from=".properties.name",
+                              candidates=5)),
+            aggregates={"n": Count()})
+        assert counted == {"n": 1}
+
+    def test_a_traversal_with_no_rerank_never_probes(self, fresh_graph):
+        """The negative half: reranking is opt-in per step, so a chain
+        with none must not pay a probe, a hydration or a provider call
+        -- and must reach build_query() with pins=None."""
+        g = self._fan_in_graph(fresh_graph)
+        statements = []
+
+        @event.listens_for(g.engine, "before_cursor_execute")
+        def record(conn, cursor, statement, *args):       # noqa: ARG001
+            statements.append(statement)
+        try:
+            g.traverse(Start(where={"type": "seed"}),
+                       Hop(via={"kind": "cites"}, near=Near("docvec", QUERY), keep=1))
+        finally:
+            event.remove(g.engine, "before_cursor_execute", record)
+        assert len(statements) == 3
 
 
 # ---------------------------------------------------------------------
@@ -2243,6 +2823,48 @@ class TestSearchManyLive:
                                           boost=Boost("score", 1.0))
         assert [h["id"] for h in plain] == ["1", "2"]
         assert [h["id"] for h in boosted] == ["2", "1"]
+
+    def test_rerank_is_per_call_and_costs_one_provider_call_per_query(self, fresh_graph):
+        """`rerank=` sits where `boost=` sits -- per CALL, not per query
+        -- because `candidates` decides how many rows the ONE statement
+        fetches and this call takes ONE k. But a score IS the (query,
+        document) relationship, so one provider call cannot serve two
+        queries: N queries mean N calls, each with its own text."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = _searchable(fresh_graph)
+        calls = []
+        rerank = Rerank(_by_name(["opposite", "exact"], calls),
+                        document_from=".properties.name", candidates=5)
+        batch = g.vector_search_many(
+            [Near("docvec", text="first question"), Near("docvec", text="second question")],
+            k=2, where={"type": "doc"}, rerank=rerank)
+        assert [[h["id"] for h in one] for one in batch] == [["5", "1"], ["5", "1"]]
+        assert [query for query, _ in calls] == ["first question", "second question"]
+        # candidates, not k, decided how wide each query's list was.
+        assert [len(documents) for _, documents in calls] == [5, 5]
+
+    def test_the_batch_still_costs_one_round_trip_when_it_reranks(self, fresh_graph):
+        """Reranking must not turn the one statement back into N. The
+        provider calls are N by necessity; the SQL is not."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = _searchable(fresh_graph)
+        statements = []
+
+        @event.listens_for(g.engine, "before_cursor_execute")
+        def record(conn, cursor, statement, *args):       # noqa: ARG001
+            statements.append(statement)
+        try:
+            g.vector_search_many([Near("docvec", text="a"), Near("docvec", text="b")], k=1,
+                                 rerank=Rerank(_by_name([]),
+                                               document_from=".properties.name",
+                                               candidates=3))
+        finally:
+            event.remove(g.engine, "before_cursor_execute", record)
+        assert len(statements) == 1
 
 
 # ---------------------------------------------------------------------
@@ -3774,7 +4396,7 @@ class TestGraphVectorWrappersForwardEveryArgument:
                         "limit": 7, "batch": 3},
         "set_vectors": {"nodes": ["N"], "edges": ["E"]},
         "vector_search_many": {"queries": ["Q"], "target": "edges", "k": 3,
-                               "where": {"w": 1}, "boost": "B"},
+                               "where": {"w": 1}, "boost": "B", "rerank": "R"},
         "load_vectors": {"connection": "C"},
     }
 
@@ -3807,7 +4429,8 @@ class TestGraphVectorWrappersForwardEveryArgument:
         table cannot express."""
         seen = self._record(monkeypatch, "search")
         near = Near("summary", [1.0, 0.0, 0.0])
-        offline_graph.vector_search(near, target="edges", k=3, where={"w": 1}, boost="B")
+        offline_graph.vector_search(near, target="edges", k=3, where={"w": 1}, boost="B",
+                                    rerank="R")
         assert [near] in seen["passed"]
-        for value in ("edges", 3, {"w": 1}, "B"):
+        for value in ("edges", 3, {"w": 1}, "B", "R"):
             assert value in seen["passed"]

@@ -45,6 +45,11 @@ use it without being taught anything new.
   rebuild — and an unfiltered scan is linear in rows × dimensions (see
   [What this costs](#what-this-costs)); `pgvector_exit_ddl()` prints
   the migration for when you outgrow it.
+- 🎯 **Reranking, including inside the walk** — `Rerank(client,
+  document_from='<jq>')` adds the third retrieval stage to a search
+  *and* to a traversal step, where a candidate is a node plus how it was
+  reached. A model may write the projection: it is validated against a
+  total jq subset in which `env` does not parse.
 - 🧪 **Tested like it matters** — SQL-level assertions, a live-Postgres
   suite, an 85% coverage gate and mutation testing in CI.
 - 📊 **Measured, not claimed** — real benchmark numbers in `benchmarks/`,
@@ -992,6 +997,161 @@ confidently wrong neighbors — so it is the single thing the tool
 schemas never advertise, and the JSON front ends refuse it unless you
 pass `allow_vectors=True` from your own code.
 
+## 🎯 Reranking
+
+Retrieval that works is three stages, not two: retrieve wide and cheap
+(the cosine above), **rerank** a bounded top-N by actually reading each
+candidate against the query, then keep `k`. A distance knows a candidate
+is about databases; only a reranker knows it is about the *query
+planner*:
+
+```python
+import cohere
+from hopai import Near, Rerank
+
+reader = Rerank(cohere.ClientV2(), model="rerank-v3.5",
+                document_from='.properties.title + ": " + (.properties.summary // "")',
+                candidates=50)          # how many hits reach the reranker
+
+graph.vector_search(Near("summary", "how do nodes agree?"), rerank=reader, k=10)
+# [{"id": "1", "rerank_score": 0.91, "similarity": 0.62, "properties": {...},
+#   "similarities": {"summary": 0.62}, "boosts": {}}, ...]
+```
+
+Additive only: hits gain `rerank_score` and are ordered by it, while
+`similarity` keeps the value retrieval gave it — so you can see what the
+reranker changed. Without `rerank=`, results are byte-identical to
+before.
+
+One method is the whole contract —
+`score(query: str, documents: list[str]) -> list[float]`, one float per
+document in the order given. A Cohere or Voyage client (`model=`
+required), a `sentence-transformers` `CrossEncoder`, anything with
+`.score(...)`, or a plain callable are all spellings of it, matched by
+duck typing: hopai imports no provider package here either. The extra is
+`pip install "hopai[rerankers]"`, and it brings **`jq`, not a provider** —
+because of the next paragraph.
+
+**`document_from=` is a rule, not a document.** Nothing about the
+documents exists when you write the query, so the parameter holds a jq
+filter hopai evaluates once per candidate at execution time — after the
+SQL round trip closes, never inside it. It runs against the candidate's
+own JSON (the dict `vector_search()` returns, plus `paths` at a hop), and
+jq's operators already cover nested fields, lists and defaults:
+
+```python
+document_from='.properties.title + " [" + (.properties.tags | join(", ")) + "]"'
+```
+
+**Step-wise reranking is the graph part.** `Rerank` also attaches to
+`Start` and `Hop`, where it narrows a candidate list mid-walk rather than
+producing one. At a hop a candidate is not a row — it is a node *plus how
+it was reached* — so `document_from` may read `.paths`:
+
+```python
+graph.traverse(
+    Start(near=Near("bio", "postgres query planning"),   # better seeds, before any hop
+          rerank=Rerank(client, document_from='.properties.bio', candidates=50),
+          keep=10),
+    Hop(via={"kind": "cites"},
+        near=Near("summary", "leader election"),
+        rerank=Rerank(client, candidates=50,
+                      document_from='.properties.title + " (cited by: "'
+                                    ' + (.paths | map(.[-1].properties.title) | join(", "))'
+                                    ' + ")"'),
+        keep=10),
+)
+```
+
+A traversal still returns a **subgraph, not a ranking**: similarity
+scores never survived into it and rerank scores get no exception —
+`rerank_score` appears on `vector_search()` hits only. Fan-in, multi-hop
+edge reconstruction and dead-end pruning are untouched, because a
+reranked step is probed, reranked, and then re-run as the *ordinary*
+traversal with its survivors pinned.
+
+**`candidates` bounds the input, `k`/`keep` bounds the output**, and they
+never overlap — which is what the refusals below keep true. In a
+traversal a reranked step has to say how many rows survive it (`keep=`)
+and has to rerank strictly more than that: a subgraph discards the
+order, so truncation is the only thing left for a reranker to change,
+and `candidates == keep` bills every document for a guaranteed no-op. A
+flat search keeps the order, so there `candidates == k` is a real
+reordering and only a `candidates` below `k` refuses. Reranking cannot
+promote a candidate it never saw, so pruning early is unrecoverable —
+prune wrong at hop 1 and hop 2 never sees the right nodes, which is the
+argument for a generous `candidates` at early steps.
+
+It costs: a flat search stays one statement plus one reranker call; a
+reranked traversal adds a probe and a hydration per reranked step, and
+those provider calls are **serial** (hop N+1's candidates are whatever
+hop N left). Inside a walk, one document is built per distinct node,
+quoting up to `max_paths` (default 10) of the routes that reached it;
+`per_path=True` builds one document per *(node, route)* and takes the
+**max** over them, which multiplies the provider bill by the number of
+routes and is opt-in for exactly that reason.
+[10 · Reranking](notebooks/10_reranking.ipynb) runs both and prints what
+the reranker was handed. `vector_search_many(rerank=)` takes one
+`Rerank` for the whole call, applied to every query — one reranker call
+per query, since a score is the (query, document) relationship and one
+call cannot serve two; sequential on `Graph`, concurrent on `AsyncGraph`.
+
+Seven things refuse rather than approximate:
+
+- **a raw-vector `Near` with `rerank=`** — a reranker scores a query
+  against a document by reading both, and a list of floats is not
+  readable. This is what reranking *is*, not a limitation to lift later;
+  the error names `Near(field, text="...")`, whose embedding then comes
+  from the field's own `embed=`, so both stages see the same query.
+- **`rerank=` with no `near=`** — a reranker reorders a ranked list, it
+  does not create one.
+- **`rerank=` with no `keep=`** on a `Start` or `Hop` — with no
+  truncation the reranker's order is discarded and `candidates` quietly
+  becomes the bound instead, so the same query would return a different
+  subgraph than it does without `rerank=`.
+- **`candidates` not above `keep`** at a step (and below `k` on a flat
+  search) — reranking a pool no larger than what survives it cannot
+  change which rows survive, and clamping would hide that the query's
+  own numbers disagree.
+- **`per_path=True` at a `Start`** — a seed was reached by nothing, so
+  there is exactly one document per node either way; the mode belongs to
+  a `Hop`.
+- **`.paths` read at a `Start`** — a seed has no provenance, and `null`
+  there would quietly change every document.
+- **a spent provider call** — `RerankError`, never a silent fall back to
+  the pre-rerank ordering, which is a different answer with no signal.
+  Transient failures are retried first on `embeddings.py`'s own policy
+  (`retries=2`, `backoff=0.5`, full jitter, `Retry-After` winning), and
+  the provider's exception rides along as `__cause__` so degrading stays
+  a decision you take visibly in your own code.
+
+**A model may choose the fields.** Field selection is a retrieval
+decision a model is well placed to make, unlike an embedding it would
+have to invent — so hopai treats every `document_from` as untrusted by
+default rather than restricting who may write one. It is not an
+invitation to run arbitrary jq: the filter's output *is* the document,
+and the document is posted to a third party.
+`hopai.jqsafe` validates it against a **total subset**: sound because jq
+has no dynamic dispatch to builtins by name, so an allowlist over parsed
+syntax cannot be smuggled past (`env`, `$ENV`, `input`, `import` do not
+parse at all), and terminating because no unbounded-iteration construct
+parses either — which matters, since libjq holds the GIL and `abort()`s
+on memory exhaustion, so neither a hang nor an OOM can be caught
+in-process. `validate(fields=[...])` / `build_documents(..., fields=[...])`
+add the operator's allowlist of readable paths on top, so
+`.properties.ssn` refuses by name. **Every query validates**: there is no
+`trusted=` on `Rerank`, so a filter that reaches `vector_search(rerank=)`
+or a `Start`/`Hop` is held to the subset whoever wrote it.
+`trusted=True` is a parameter of `build_documents()` alone — the preview
+call that builds documents without spending a provider call — for a human
+checking a filter in their own process, where they already run arbitrary
+code and the subset would restrict nothing real.
+
+[10 · Reranking](notebooks/10_reranking.ipynb) runs all of this against a
+real database, with a deterministic stand-in reranker so it works
+offline. Over MCP the client is the operator's and a model supplies only
+the filter and the budget — see [MCP server](#-mcp-server) below.
+
 ## 🤖 The JSON interface
 
 For callers that shouldn't or can't write Python — an LLM tool call, an
@@ -1029,6 +1189,28 @@ traverse_json(graph, {
 })
 ```
 
+Reranking travels as JSON too — but the **client does not**, since it
+holds an API key and an open socket. A spec names only the filter and
+the budget; the reranker itself comes from your side of the call:
+
+```python
+from hopai import Rerank, RerankPolicy, traverse_json
+
+traverse_json(graph, {
+    "start": {"near": {"field": "summary", "text": "distributed consensus"},
+              "keep": 10,
+              "rerank": {"document_from": ".properties.title", "candidates": 50}},
+}, rerank=RerankPolicy(Rerank(client, document_from=".properties.title",
+                              candidates=50),
+                       fields=["properties.title", "properties.summary"],
+                       max_candidates=100))
+```
+
+`fields` is the allowlist that `document_from` may read — the filter's
+output is posted to a vendor — and `max_candidates` the ceiling it may
+spend; both refuse rather than clamp. Without a `RerankPolicy`, a spec
+naming `rerank` refuses instead of ignoring it.
+
 `hopai.TRAVERSE_TOOL_SCHEMA` is a ready-to-use JSON Schema for wiring
 this into an LLM function-calling definition directly, alongside
 `AGGREGATE_TOOL_SCHEMA`, `INGEST_TOOL_SCHEMA`, `MUTATE_TOOL_SCHEMA` and
@@ -1047,7 +1229,12 @@ tools = graph.tool_schemas()   # traverse / aggregate / ingest / mutate,
 ```
 
 That is every front end, `mutate_graph` included — hand over the subset
-you actually want the model to have.
+you actually want the model to have. `tool_schemas()` leaves `rerank`
+out of the traversal and aggregation definitions unless you ask for it
+(`tool_schemas(rerank=True)`), so a model is offered the parameter only
+where there is a `RerankPolicy` to serve it — the module-level
+`TRAVERSE_TOOL_SCHEMA`/`AGGREGATE_TOOL_SCHEMA` constants do carry it,
+because the parsers read it and the two are tested against each other.
 
 ## 🗣️ Cypher as input syntax
 
@@ -1224,6 +1411,14 @@ Every graph in the database is served unless `--graph` narrows it, and
 **search by meaning takes text, never vectors** — you supply the embedding
 function, so no tool has anywhere for a model to put invented floats.
 
+**Reranking there is the operator's**, like the embedder and for the same
+reason — a client holding an API key cannot travel in a tool call, so it
+is `serve(rerank=…, rerank_fields=[…], max_candidates=…)` from Python,
+with no flag. A model chooses only `document_from` (within the published
+`rerank_fields`) and `candidates` (within the ceiling, which refuses
+rather than clamps). With no reranker configured, no tool advertises the
+parameter at all.
+
 📖 **[Full guide](https://hopai.readthedocs.io/en/latest/mcp/)** — client
 setup, every tool, every flag, and troubleshooting.
 
@@ -1297,10 +1492,10 @@ reaches the database bridge above, on every method that can carry text.
 
 ## 📓 Runnable documentation
 
-Everything above, as nine notebooks you can execute against a throwaway
+Everything above, as ten notebooks you can execute against a throwaway
 database — quick start, traversal semantics, aggregation, the JSON and
 Cypher front ends, constraints, graph schema, multi-graph, the SQL
-underneath, and vector search:
+underneath, vector search, and reranking:
 
 ```bash
 pip install -e ".[dev,notebooks]"

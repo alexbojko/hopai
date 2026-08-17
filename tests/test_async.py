@@ -28,12 +28,79 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from hopai import Boost, Count, CypherError, Hop, Near, Start, Unique, Vector
+import hopai.asyncio as asyncio_module
+from hopai import Boost, Count, CypherError, Hop, Near, Start, Sum, Unique, Vector
 from hopai.asyncio import AsyncGraph
 
 
 def run(coro):
     return asyncio.run(coro)
+
+
+async def _while_ticking(ticks: list, coro):
+    """Await `coro` alongside an independent task that counts, into
+    `ticks`, every time the event loop came back to it.
+
+    This is the measurement issue #74 asks for and the reason these
+    tests are not "probably fine": the counter is ordinary loop work,
+    so it advances only while the loop is free to run something other
+    than `coro`. A provider call that holds the loop's thread shows up
+    as a stretch where the count does not move at all."""
+    running = True
+
+    async def tick():
+        while running:
+            await asyncio.sleep(0.001)
+            ticks[0] += 1
+
+    counter = asyncio.ensure_future(tick())
+    try:
+        return await coro
+    finally:
+        running = False
+        await counter
+
+
+#: How much of the loop's OWN throughput, in the same run, a provider
+#: call must leave behind it.
+#:
+#: `ticks > 0` -- what these tests asserted first -- is a test for TOTAL
+#: starvation and nothing else, and total starvation is not the only way
+#: to block a loop: a bounded 600ms stall inside a one-second call scores
+#: hundreds of ticks and passed every one of them. That is exactly how a
+#: 121ms document-building block lived here unnoticed (see
+#: hopai/rerankers.py on pruning).
+#:
+#: THE BASELINE IS THE SAME RUN, NOT AN IDLE MEASUREMENT, and that is the
+#: fix for the obvious next problem. A ratio against ticks/s measured on
+#: an idle loop holds on a quiet box and fails on a busy one: under 2x
+#: nproc of competing load the ticker managed 261 ticks/s during a
+#: perfectly healthy provider call against an idle baseline of 785 --
+#: 33%, under any threshold worth setting. CI runs four Python versions
+#: in parallel on shared runners, so that IS the environment.
+#:
+#: So `_assert_free()` compares the ticks/s achieved DURING the provider
+#: calls with the ticks/s achieved during the rest of the very same call,
+#: milliseconds apart and under whatever load is in effect for both. A
+#: slow machine scales the two together and the ratio survives; a loop
+#: held on its thread does not, because the inside rate goes to zero
+#: while the outside rate does not.
+#:
+#: Half is deliberately generous for a comparison that measured ~1.0 in
+#: every healthy run, quiet or loaded, and 0.0 on a version that awaited
+#: the provider call inside the greenlet bridge.
+LOOP_FLOOR = 0.5
+
+
+async def _counted(ticks: list, coro):
+    """(result, (ticks, seconds)) for the WHOLE call, with `ticks` the
+    same counter the reranker client reads -- so the provider windows it
+    recorded can be subtracted from these totals and the rest of the
+    same run is what remains to compare against."""
+    started = time.perf_counter()
+    before = ticks[0]
+    result = await _while_ticking(ticks, coro)
+    return result, (ticks[0] - before, time.perf_counter() - started)
 
 
 class TestConstruction:
@@ -67,6 +134,102 @@ class TestSameAnswerAsSync:
         sync_result = graph.aggregate(start, aggregates={"n": Count()})
         async_result = run(async_graph.aggregate(start, aggregates={"n": Count()}))
         assert async_result == sync_result
+
+    def test_a_reranked_traversal_answers_the_same_either_way(
+            self, async_fresh_graph, async_admin_graph):
+        """AsyncGraph has its OWN rerank driver -- the probes go through
+        run_sync() and the scoring is awaited outside it -- so unlike
+        every case above there really are two orderings of the same
+        steps here. They must still pin the same survivors and re-run
+        the same ordinary traversal."""
+        pytest.importorskip("jq")
+        from hopai import Rerank
+
+        def seed(g):
+            g.define_vectors(nodes=[Vector("summary", 3, embed=lambda t: [[1.0, 0.0, 0.0]
+                                                                          for _ in t])])
+
+        def rerank():
+            # `far` is the WORST cosine and the best document, so only a
+            # real rerank keeps it -- and both paths must agree on that.
+            return Rerank(lambda query, documents: [1.0 if d == "far" else 0.0
+                                                    for d in documents],
+                          document_from=".properties.name", candidates=5)
+
+        def spec():
+            return (Start(where={"type": "doc"}),
+                    Hop(via={"kind": "cites"}, near=Near("summary", text="q"), keep=1,
+                        rerank=rerank()))
+
+        async def body():
+            seed(async_fresh_graph)
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([
+                {"id": 1, "type": "doc", "name": "seed"},
+                {"id": 2, "name": "near"}, {"id": 3, "name": "far"}])
+            await async_fresh_graph.set_vectors(nodes=[
+                {"id": 2, "summary": [1.0, 0.0, 0.0]}, {"id": 3, "summary": [-1.0, 0.0, 0.0]}])
+            await async_fresh_graph.add_edges([
+                {"start_id": 1, "end_id": 2, "kind": "cites"},
+                {"start_id": 1, "end_id": 3, "kind": "cites"}])
+            return await async_fresh_graph.traverse(*spec())
+
+        async_result = run(body())
+        # The same rows, reached through the plain sync Graph the
+        # async_admin_graph fixture points at the very same schema.
+        seed(async_admin_graph)
+        sync_result = async_admin_graph.traverse(*spec())
+        assert {n["id"] for n in async_result.nodes} == {"1", "3"}
+        assert sync_result.nodes == async_result.nodes
+        assert sync_result.edges == async_result.edges
+
+    def test_a_reranked_aggregate_counts_the_survivors_either_way(
+            self, async_fresh_graph, async_admin_graph):
+        """aggregate() is the second caller of the rerank driver and
+        threads the pins through a DIFFERENT statement builder, so the
+        case above does not cover it: drop `pins=` here and the aggregate
+        silently runs over whatever cosine alone kept -- a number with
+        nothing wrong-looking about it, which is the worst thing this
+        library can return.
+
+        `Sum("rank")` rather than `Count()` on purpose. `keep=1` leaves
+        exactly one node with or without the pins, so a count is 1 either
+        way and sees nothing; the rank says WHICH one, and `far` -- the
+        worst cosine and the best document -- is the only answer a real
+        rerank produces."""
+        pytest.importorskip("jq")
+        from hopai import Rerank
+
+        def seed(g):
+            g.define_vectors(nodes=[Vector("summary", 3, embed=lambda t: [[1.0, 0.0, 0.0]
+                                                                          for _ in t])])
+
+        def spec():
+            return (Start(where={"type": "doc"}),
+                    Hop(via={"kind": "cites"}, near=Near("summary", text="q"), keep=1,
+                        rerank=Rerank(lambda query, documents: [1.0 if d == "far" else 0.0
+                                                                for d in documents],
+                                      document_from=".properties.name", candidates=5)))
+
+        async def body():
+            seed(async_fresh_graph)
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([
+                {"id": 1, "type": "doc", "name": "seed"},
+                {"id": 2, "name": "near", "rank": 10}, {"id": 3, "name": "far", "rank": 20}])
+            await async_fresh_graph.set_vectors(nodes=[
+                {"id": 2, "summary": [1.0, 0.0, 0.0]}, {"id": 3, "summary": [-1.0, 0.0, 0.0]}])
+            await async_fresh_graph.add_edges([
+                {"start_id": 1, "end_id": 2, "kind": "cites"},
+                {"start_id": 1, "end_id": 3, "kind": "cites"}])
+            return await async_fresh_graph.aggregate(
+                *spec(), aggregates={"n": Count(), "rank": Sum("rank")})
+
+        async_result = run(body())
+        assert async_result == {"n": 1, "rank": 20}          # `far`, not `near`
+        seed(async_admin_graph)
+        assert async_admin_graph.aggregate(
+            *spec(), aggregates={"n": Count(), "rank": Sum("rank")}) == async_result
 
     def test_cypher_traverse(self, graph, async_graph):
         query = "MATCH (a {type: 'leaf'})-[:knows]->(b) RETURN a, b"
@@ -284,6 +447,53 @@ class TestVectors:
         assert hits[0]["id"] == "1"
         assert got["nodes"]["1"]["summary"] == pytest.approx([1.0, 0.0, 0.0])
         assert dropped == ["nodes.vec_summary"]
+
+    def test_drop_vectors_drops_the_edge_fields_it_was_asked_for(self, async_fresh_graph):
+        """Every call in this file passes `node_fields=` only, so the
+        `edge_fields` argument could be dropped on the way across the
+        bridge and nothing would notice (issue #69). Asked for an EDGE
+        field alone, so a forwarding that loses it drops nothing and
+        returns an empty list rather than quietly doing the node side."""
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3)],
+                                             edges=[Vector("rel", 3)])
+            await async_fresh_graph.migrate_vectors()
+            return await async_fresh_graph.drop_vectors(edge_fields=["rel"])
+
+        assert run(body()) == ["edges.vec_rel"]
+
+    def test_stale_vectors_narrows_by_field_by_limit_and_by_cursor(self, async_fresh_graph):
+        """The case above calls stale_vectors() with NO arguments, so
+        every argument AsyncGraph hands across the bridge is unasserted
+        -- and each one only ever WIDENS the answer when it goes
+        missing. Dropping `node_fields` reports fields the caller did
+        not ask about; dropping `limit` returns the whole backlog to a
+        caller paging through it. Both are a bigger answer than was
+        asked for, which is the shape of mistake nothing downstream
+        notices.
+
+        `after` is the third and the one worth spelling out, because it
+        is not merely a wider answer: paging needs BOTH, since a row
+        that can never be filled in stays stale forever and `limit`
+        alone hands back the same leading rows on every call. Drop
+        `after` on the way across and the walk never advances -- an
+        embedding backfill that runs forever, re-reporting the rows it
+        already returned, with each page looking perfectly reasonable."""
+        async def body():
+            async_fresh_graph.define_vectors(
+                nodes=[Vector("summary", 3), Vector("title", 3)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1, "type": "doc"},
+                                               {"id": 2, "type": "doc"}])
+            return (await async_fresh_graph.stale_vectors(node_fields=["summary"]),
+                    await async_fresh_graph.stale_vectors(node_fields=["summary"], limit=1),
+                    await async_fresh_graph.stale_vectors(node_fields=["summary"], after=1))
+
+        every, capped, walked = run(body())
+        assert set(every["nodes"]) == {"summary"}          # not "title" as well
+        assert sorted(every["nodes"]["summary"]["missing"]) == ["1", "2"]
+        assert len(capped["nodes"]["summary"]["missing"]) == 1
+        assert walked["nodes"]["summary"]["missing"] == ["2"]     # the cursor moved
 
     def test_text_is_embedded_before_the_transaction_opens(self, async_fresh_graph):
         """The sync set_vectors() plans and then opens a transaction, so
@@ -628,6 +838,32 @@ class TestTextEmbeddingCorrectness:
         # ONE call, carrying BOTH texts -- not two calls of one each.
         assert calls == [["q1", "q2"]]
 
+    def test_a_batch_of_queries_still_costs_one_provider_call_per_field(
+            self, async_fresh_graph):
+        """vector_search_many() exists to turn N round trips into one,
+        and aresolve_queries() must not put them back on the way to the
+        embedder -- the async twin of test_vectors.py's
+        test_many_queries_cost_one_provider_call_per_field, which pins
+        the same thing for the sync resolver."""
+        calls = []
+
+        def counting_embed(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=counting_embed)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1}])
+            await async_fresh_graph.set_vectors(nodes=[{"id": 1, "summary": [1.0, 0.0, 0.0]}])
+            return await async_fresh_graph.vector_search_many(
+                [Near("summary", text="apple"), Near("summary", text="banana"),
+                 Near("summary", text="cherry")], k=1)
+
+        results = run(body())
+        assert len(results) == 3
+        assert calls == [["apple", "banana", "cherry"]]
+
     def test_different_fields_are_embedded_concurrently_not_sequentially(self, async_fresh_graph):
         """A chain ranking two DIFFERENT fields by text batches to two
         provider calls (one call per field is unavoidable -- they are
@@ -799,20 +1035,717 @@ class TestValidationRunsBeforeEmbedding:
         assert calls == []
 
 
+class TestRerankingStaysOffTheLoop:
+    """Issue #73's provider call, held to issue #74's rule.
+
+    Reranking is the SECOND network call on the read path, and it lands
+    in the same trap from the other end: it scores rows the database has
+    already returned, so the obvious place to put it is inside the
+    run_sync() block that fetched them -- which is the event loop's own
+    thread. Every test below runs the reranked call next to an
+    independent ticking task and asserts that task got somewhere DURING
+    the provider call. On a version that scored inside the bridge, each
+    one scores exactly zero: that is the measurement, not an assumption.
+
+    Embedding is not what these measure -- TestTextEmbeddingStaysOffTheLoop
+    above does that -- so the embedder here is instant on purpose, and
+    the ticks are counted by the RERANKER, inside its own call."""
+
+    DIMS = 3
+
+    def _embed(self, texts):
+        return [[1.0] + [0.0] * (self.DIMS - 1) for _ in texts]
+
+    async def _seeded(self, graph):
+        """A graph with one vector field per target, a node and an edge
+        already embedded -- everything the reads below need, with the
+        setup's own provider calls already spent."""
+        graph.define_vectors(nodes=[Vector("summary", self.DIMS, embed=self._embed)],
+                             edges=[Vector("rel", self.DIMS, embed=self._embed)])
+        await graph.migrate_vectors()
+        await graph.add_nodes([{"id": 1, "type": "doc"}, {"id": 2, "type": "doc"}])
+        await graph.add_edges([{"id": 9, "start_id": 1, "end_id": 2, "kind": "cites"}])
+        await graph.set_vectors(nodes=[{"id": 1, "summary": [1.0, 0.0, 0.0]},
+                                       {"id": 2, "summary": [1.0, 0.0, 0.0]}],
+                                edges=[{"id": 9, "rel": [1.0, 0.0, 0.0]}])
+
+    #: How long each fake provider call takes. The window `progress`
+    #: below is a rate over, so it has to be long enough that a handful
+    #: of ticks either way is not the answer.
+    CALL = 0.2
+
+    def _rerank(self, ticks, scores=None, per_call=None, sync=False, **options):
+        """A Rerank whose provider call takes a visible amount of time
+        and records the RATE the loop achieved while it was inside it.
+
+        Async by default, since that is the shape this module is built
+        around. `sync=True` gives the other one on purpose: a plain
+        callable takes `Rerank._aattempt`'s own `asyncio.to_thread`,
+        which is a DIFFERENT thread hop from Embedder's and was only
+        ever unit-tested -- nothing ran a synchronous reranker client
+        through AsyncGraph and watched the loop."""
+        from hopai import Rerank
+
+        progress, spans = [], []
+
+        def answer(query, documents, started, before):
+            # RAW, not a rate: _assert_free() needs the provider window's
+            # ticks and seconds separately, so it can subtract both from
+            # the whole call's and get the rest of the same run to
+            # compare against.
+            progress.append((ticks[0] - before, time.perf_counter() - started))
+            spans.append((started, time.perf_counter()))
+            if per_call is not None:
+                per_call.append(query)
+            return [(scores or {}).get(d, 0.0) for d in documents]
+
+        async def client(query, documents):
+            before, started = ticks[0], time.perf_counter()
+            await asyncio.sleep(self.CALL)
+            return answer(query, documents, started, before)
+
+        def blocking_client(query, documents):
+            # time.sleep, not asyncio.sleep: a synchronous client BLOCKS,
+            # and the only thing that keeps the loop alive through it is
+            # the worker thread hopai puts it on.
+            before, started = ticks[0], time.perf_counter()
+            time.sleep(self.CALL)
+            return answer(query, documents, started, before)
+
+        if sync:
+            client = blocking_client
+
+        # `.id` rather than a property: _seeded()'s nodes carry only a
+        # type, and what these tests are about is the loop, not the
+        # document.
+        options.setdefault("document_from", ".id")
+        options.setdefault("candidates", 5)
+        rerank = Rerank(client, **options)
+        rerank.progress = progress
+        rerank.spans = spans
+        return rerank
+
+    @staticmethod
+    def _assert_free(rerank, whole):
+        """The loop ran as much other work DURING the provider calls as
+        it did during the rest of the same call.
+
+        A rate, not `> 0`: the old form passed on a version that blocked
+        the loop for 600ms. Compared against the same run rather than
+        against an idle baseline, so a loaded machine scales both sides
+        -- see LOOP_FLOOR. `whole` is (ticks, seconds) for the whole
+        call, which the provider windows are subtracted from."""
+        assert rerank.progress, "the reranker was never called"
+        total_ticks, total_seconds = whole
+        inside_ticks = sum(ticks for ticks, _ in rerank.progress)
+        inside_seconds = sum(seconds for _, seconds in rerank.progress)
+        outside_seconds = total_seconds - inside_seconds
+        assert inside_seconds > 0 and outside_seconds > 0, (
+            f"nothing to compare: {inside_seconds:.3f}s inside the provider calls, "
+            f"{outside_seconds:.3f}s outside them")
+        inside = inside_ticks / inside_seconds
+        outside = (total_ticks - inside_ticks) / outside_seconds
+        assert inside > outside * LOOP_FLOOR, (
+            f"the loop managed {inside:.0f} ticks/s during the reranker calls against "
+            f"{outside:.0f} ticks/s during the rest of the same call -- the provider "
+            f"call is back on its thread")
+
+    def test_vector_search_does_not_hold_the_loop_while_it_reranks(self, async_fresh_graph):
+        """Run inside run_sync() the scoring would sit on the event
+        loop's own thread for the whole round trip. It is awaited
+        OUTSIDE the bridge, and this is the measurement -- on a version
+        that awaited it inside, the ticker below scores zero."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        rerank = self._rerank(ticks, scores={"2": 1.0})
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await _counted(ticks, async_fresh_graph.vector_search(
+                Near("summary", text="raft consensus"), k=1, rerank=rerank))
+
+        hits, whole = run(body())
+        assert [hit["id"] for hit in hits] == ["2"]
+        assert hits[0]["rerank_score"] == 1.0
+        self._assert_free(rerank, whole)
+
+    def test_vector_search_many_issues_its_rerank_calls_concurrently(self, async_fresh_graph):
+        """N queries mean N reranker calls -- a score is the (query,
+        document) relationship, so one call cannot serve two. But this
+        call exists to turn N round trips into ONE, and issuing the
+        provider calls one after another hands that straight back.
+        Asserted on the calls' own clocks OVERLAPPING rather than on the
+        wall time of the whole search -- the embedding round trip in
+        front of it would otherwise decide the number."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        queries = []
+        rerank = self._rerank(ticks, per_call=queries)
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await _while_ticking(ticks, async_fresh_graph.vector_search_many(
+                [Near("summary", text="raft"), Near("summary", text="paxos")], k=1,
+                rerank=rerank))
+
+        results = run(body())
+        assert len(results) == 2
+        assert queries == ["raft", "paxos"]          # one call per query, its own text
+        starts, ends = zip(*rerank.spans, strict=True)
+        assert len(rerank.spans) == 2 and max(starts) < min(ends), \
+            "the reranker calls ran one after another, not together"
+
+    def test_the_batch_path_truncates_each_group_to_k(self, async_fresh_graph):
+        """`rerank=` deliberately widens the retrieval to `candidates`,
+        so `k` is the ONLY thing between the caller and the whole
+        widened candidate set. vector_search() forwards it straight to
+        rerank_hits(); vector_search_many() forwards it through a
+        SECOND function, and the case above asserts how many groups come
+        back but never how long one is. Drop `k` there and a `k=1`
+        search hands back every candidate -- `candidates` silently
+        become the output bound, the same defect the step-wise path
+        refuses `rerank=` without `keep=` to prevent."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        rerank = self._rerank(ticks)
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await async_fresh_graph.vector_search_many(
+                [Near("summary", text="raft"), Near("summary", text="paxos")], k=1,
+                rerank=rerank)
+
+        results = run(body())
+        # Two candidates are reachable per query -- both nodes carry a
+        # `summary` -- so an untruncated group is two long, not one.
+        assert [len(group) for group in results] == [1, 1]
+
+    def test_a_step_wise_rerank_does_not_hold_the_loop_either(self, async_fresh_graph):
+        """The traversal path has its own driver -- probe, score, pin --
+        and its own chance to score inside the bridge. The probe goes
+        through run_sync() because it is ordinary SQL; the scoring must
+        not."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        rerank = self._rerank(ticks)
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await _counted(ticks, async_fresh_graph.traverse(
+                Start(where={"type": "doc"}),
+                Hop(via={"kind": "cites"}, near=Near("summary", text="raft"), keep=1,
+                    rerank=rerank)))
+
+        (result, whole) = run(body())
+        assert sorted(node["id"] for node in result.nodes) == ["1", "2"]
+        self._assert_free(rerank, whole)
+
+    def test_a_reranked_step_survives_the_text_resolution(self, async_fresh_graph):
+        """aresolve_spec_texts() rebuilds each step it resolves, and a
+        Start/Hop validates on construction -- one of those rules being
+        that rerank= needs the query as TEXT, which the rebuild has just
+        turned into floats. Without vectors._resolved_spec() re-attaching
+        the reranker AFTER the copy, every reranked-and-text-ranked
+        traversal refuses itself with "rerank= needs the query as TEXT"
+        for a query that had it."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        rerank = self._rerank(ticks, scores={"2": 1.0})
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await async_fresh_graph.traverse(
+                Start(near=Near("summary", text="raft"), keep=1, rerank=rerank))
+
+        result = run(body())
+        # Both nodes carry the same vector, so similarity alone would
+        # keep node 1 on the id tiebreak. Node 2 surviving is the
+        # reranker having run -- with the query text it was written
+        # with, read before the resolution turned it into floats.
+        assert [node["id"] for node in result.nodes] == ["2"]
+        assert rerank.progress
+
+    def test_a_step_that_finds_nothing_spends_no_provider_call(self, async_fresh_graph):
+        """AsyncGraph has its own rerank driver, so the sync one's "no
+        candidates, no call" shortcut has to exist here too -- awaiting
+        `ascore` on an empty list would be a billed round trip for an
+        answer nobody can use, and it would hold the loop for the length
+        of it."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        queries = []
+        rerank = self._rerank(ticks, per_call=queries)
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await async_fresh_graph.traverse(
+                Start(where={"type": "nothing-matches-this"},
+                      near=Near("summary", text="raft"), keep=1, rerank=rerank),
+                Hop(via={"kind": "cites"}))
+
+        result = run(body())
+        assert queries == [] and result.nodes == [] and result.edges == []
+
+    def test_an_empty_search_result_is_not_sent_to_the_reranker_either(
+            self, async_fresh_graph):
+        """The flat path's own version of the same shortcut, on the
+        awaited side."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        queries = []
+        rerank = self._rerank(ticks, per_call=queries)
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await async_fresh_graph.vector_search(
+                Near("summary", text="raft"), k=1, where={"type": "nothing-matches-this"},
+                rerank=rerank)
+
+        assert run(body()) == []
+        assert queries == []
+
+    def test_a_synchronous_reranker_client_does_not_hold_the_loop(self, async_fresh_graph):
+        """The gap every other test here left: a client that BLOCKS.
+
+        `Rerank._aattempt` puts a synchronous client on
+        `asyncio.to_thread`, and that thread hop is its own -- it is not
+        Embedder's, which the embedding tests cover, and it had only
+        ever been unit-tested on the Rerank in isolation. Nothing ran
+        one through AsyncGraph and watched the loop, which is the level
+        the hop actually has to survive: `_rerank_pins()` and
+        `arerank_hits()` both call `ascore()`, and either could have
+        awaited a blocking call directly with no test saying so."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        rerank = self._rerank(ticks, scores={"2": 1.0}, sync=True)
+        assert rerank.is_async is False                  # the shape under test
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await _counted(ticks, async_fresh_graph.vector_search(
+                Near("summary", text="raft consensus"), k=1, rerank=rerank))
+
+        hits, whole = run(body())
+        assert [hit["id"] for hit in hits] == ["2"]
+        self._assert_free(rerank, whole)
+
+    def test_a_synchronous_client_stays_off_the_loop_at_a_hop_too(self, async_fresh_graph):
+        """The traversal driver has its own path to `ascore()`, so the
+        same thread hop has to hold there -- `_rerank_pins()` awaits it
+        once per reranked step, outside the bridge."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        rerank = self._rerank(ticks, sync=True)
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await _counted(ticks, async_fresh_graph.traverse(
+                Start(where={"type": "doc"}),
+                Hop(via={"kind": "cites"}, near=Near("summary", text="raft"), keep=1,
+                    rerank=rerank)))
+
+        (result, whole) = run(body())
+        assert sorted(node["id"] for node in result.nodes) == ["1", "2"]
+        self._assert_free(rerank, whole)
+
+    def test_per_path_reranking_does_not_hold_the_loop(self, async_fresh_graph):
+        """The other gap: `per_path=True` was covered only synchronously.
+
+        It is the expensive mode -- one document per (node, route)
+        rather than per node -- so it is the one whose document building
+        multiplies, and it takes a WIDER probe (`.paths` is read, so the
+        hop hydrates every node on every route) before it gets there.
+        Every extra byte of that was, before pruning, extra time on the
+        event loop's thread."""
+        pytest.importorskip("jq")
+        ticks = [0]
+        rerank = self._rerank(ticks, per_path=True,
+                              document_from='.id + " via " + (.paths | tostring)')
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await _counted(ticks, async_fresh_graph.traverse(
+                Start(where={"type": "doc"}),
+                Hop(via={"kind": "cites"}, near=Near("summary", text="raft"), keep=1,
+                    rerank=rerank)))
+
+        (result, whole) = run(body())
+        assert sorted(node["id"] for node in result.nodes) == ["1", "2"]
+        self._assert_free(rerank, whole)
+
+
+class TestDocumentBuildingStaysOffTheLoop:
+    """The block the tick-counting tests above could not see, and the
+    reason they could not.
+
+    `_rerank()`'s progress measures the window INSIDE the provider call.
+    Document building happens before it -- `build_documents()` on the
+    event loop's own thread at hopai/asyncio.py's `_rerank_pins()` and
+    at vectors.py's `arerank_hits()` -- so a stall there fell outside
+    every window this file measured, and `ticks > 0` over the whole call
+    could not distinguish it from scheduling noise. Measured, fifty
+    100KB candidates held the thread for 121ms with the ticker scoring
+    ZERO: the signature of a `time.sleep`, not of a slow function.
+
+    WHY THIS CLASS DOES NOT COUNT TICKS, having every reason to. Three
+    instruments were tried against this call and two of them are traps:
+
+      - THROUGHPUT RATIO (ticks/s against an idle baseline). Wrong for a
+        call whose length is not fixed. A reranked traversal spends most
+        of itself in the database, so the SAME block is a different
+        fraction of two runs: measured between 33% and 69% of idle with
+        the fix in place, straddling any threshold worth setting. It is
+        the right instrument for the 200ms provider window above, where
+        the denominator is known, and it is stable there under load.
+      - LONGEST GAP between ticks. Better -- it is what "blocking" means
+        and it does not move with the call's length (107ms unpruned
+        against 8ms pruned) -- but it is an EXTREME-VALUE statistic over
+        a few dozen samples, and on a loaded box the operating system
+        supplies the extreme. Run under 2x nproc busy loops it failed a
+        different test of this class on most runs. CI runs four Python
+        versions in parallel on shared runners, so that is the
+        environment, not a pathological case.
+      - WHAT IS ACTUALLY ASSERTED HERE: the two facts the fix is made
+        of, neither of which a loaded machine can move.
+
+        1. HOW MUCH jq IS HANDED. The bug was that `input_value()`
+           marshals whatever it is given, so `.properties.title` was
+           handed 100KB to read 60 characters out of. That is a byte
+           count, and it is exact.
+        2. HOW MUCH CPU THE BUILD SPENDS, by `time.process_time` --
+           which counts this process's own cycles and ignores every
+           other process on the box. 0.7ms pruned against 120ms
+           unpruned, and descheduling cannot inflate it.
+
+    Between them they say precisely what the wall-clock instruments were
+    reaching for, with no threshold that depends on the machine. The
+    wall-clock numbers themselves are still reported, by
+    benchmarks/bench_documents.py, where a number is measured rather
+    than gated on."""
+
+    DIMS = 3
+    ROWS = 40
+    KILOBYTES = 100
+
+    #: A pruned view of `.properties.title` is about 30 bytes; the
+    #: candidate it came from is over 100,000. Anything under a kilobyte
+    #: proves the row is not what was handed over, with two orders of
+    #: magnitude to spare either side.
+    MAX_BYTES_HANDED = 1000
+
+    #: Seconds of THIS PROCESS's CPU the whole build may spend. Measured:
+    #: 0.7ms with the fix, ~120ms without it, so 25ms sits ~35x above one
+    #: and ~5x below the other.
+    MAX_CPU_SECONDS = 0.025
+
+    def _embed(self, texts):
+        return [[1.0] + [0.0] * (self.DIMS - 1) for _ in texts]
+
+    async def _seeded(self, graph):
+        """Nodes carrying a big `properties` payload beside a short title
+        -- the shape that made reading the TITLE cost what reading the
+        body would."""
+        from hopai import Vector
+
+        graph.define_vectors(nodes=[Vector("summary", self.DIMS, embed=self._embed)])
+        await graph.migrate_vectors()
+        body = "x" * 1000
+        await graph.add_nodes([
+            dict({"id": i, "type": "doc", "title": f"node {i}"},
+                 **{f"body_{b}": body for b in range(self.KILOBYTES)})
+            for i in range(self.ROWS)])
+        await graph.set_vectors(
+            nodes=[{"id": i, "summary": [1.0, 0.0, 0.0]} for i in range(self.ROWS)])
+
+    def _watched(self, monkeypatch):
+        """A Rerank that records what its document building was handed
+        and what it cost, through the REAL AsyncGraph call sites.
+
+        The spy keeps a REFERENCE to each view rather than measuring it
+        -- sizing 40 candidates of 100KB inside the window being timed
+        would be most of the CPU the window is asserting about."""
+        import hopai.rerankers as rerankers_module
+        from hopai import Rerank
+
+        handed, cost = [], []
+        original = rerankers_module._evaluate
+
+        def spy(program, candidate, filter_text, view=None):
+            handed.append(candidate if view is None else view)
+            return original(program, candidate, filter_text, view)
+
+        monkeypatch.setattr(rerankers_module, "_evaluate", spy)
+
+        class Watched(Rerank):
+            def build_documents(self, candidates, **options):
+                started = time.process_time()
+                try:
+                    return super().build_documents(candidates, **options)
+                finally:
+                    cost.append(time.process_time() - started)
+
+        rerank = Watched(lambda query, documents: [0.0] * len(documents),
+                         document_from=".properties.title", candidates=self.ROWS)
+        rerank.handed, rerank.cost = handed, cost
+        return rerank
+
+    def _assert_cheap(self, rerank):
+        import json
+
+        assert rerank.handed, "build_documents() never ran"
+        assert rerank.cost, "the build was never measured"
+        biggest = max(len(json.dumps(view)) for view in rerank.handed)
+        assert biggest <= self.MAX_BYTES_HANDED, (
+            f"jq was handed {biggest} bytes for one candidate -- the filter reads a "
+            f"title, so it is being handed the row again and the cost is back to being "
+            f"proportional to the payload")
+        spent = sum(rerank.cost)
+        assert spent < self.MAX_CPU_SECONDS, (
+            f"document building spent {spent * 1000:.0f}ms of CPU over "
+            f"{len(rerank.handed)} candidate(s), above the {self.MAX_CPU_SECONDS * 1000:.0f}ms "
+            f"budget -- on the async path every millisecond of that is the event loop's "
+            f"own thread")
+
+    def test_the_flat_search_path_hands_jq_only_the_projection(
+            self, async_fresh_graph, monkeypatch):
+        """vectors.arerank_hits()' call site. `.properties.title` reads
+        60 characters out of a 100KB candidate, and before pruning it
+        cost exactly what reading the 100KB would -- because
+        `input_value()` marshalled the whole row either way."""
+        pytest.importorskip("jq")
+        rerank = self._watched(monkeypatch)
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await async_fresh_graph.vector_search(
+                Near("summary", text="raft"), k=5, rerank=rerank)
+
+        assert len(run(body())) == 5
+        assert len(rerank.handed) == self.ROWS      # every candidate went through jq
+        self._assert_cheap(rerank)
+
+    def test_the_step_wise_path_hands_jq_only_the_projection(
+            self, async_fresh_graph, monkeypatch):
+        """asyncio._rerank_pins()' call site -- the other one, and the
+        one that runs once per reranked STEP rather than once per
+        query."""
+        pytest.importorskip("jq")
+        rerank = self._watched(monkeypatch)
+
+        async def body():
+            await self._seeded(async_fresh_graph)
+            return await async_fresh_graph.traverse(
+                Start(where={"type": "doc"}, near=Near("summary", text="raft"),
+                      keep=5, rerank=rerank))
+
+        result = run(body())
+        assert len(result.nodes) == 5
+        assert len(rerank.handed) == self.ROWS
+        self._assert_cheap(rerank)
+
+
+
+class TestNoTextTakesNoNewPath:
+    """The negative half of issue #74, and the async twin of
+    test_defining_vectors_changes_no_near_less_query: resolving text
+    earlier must be invisible to every traversal that has none. Not
+    "equivalent" -- the SAME objects reach the same sync function, so
+    there is nothing for the SQL to differ about."""
+
+    def test_a_traversal_without_text_is_handed_the_very_same_spec(
+            self, async_graph, monkeypatch):
+        """Identity, not equality: a rebuilt-but-equal Start would pass
+        an == check while proving nothing about the path taken."""
+        from hopai.core import Graph
+
+        seen = {}
+        original = Graph._traverse_with_session
+
+        def record(self, session, start, hops, pins=None):
+            seen["start"], seen["hops"], seen["pins"] = start, hops, pins
+            return original(self, session, start, hops, pins=pins)
+
+        monkeypatch.setattr(Graph, "_traverse_with_session", record)
+        start, hop = Start(where={"type": "leaf"}), Hop(via={"kind": "knows"})
+        run(async_graph.traverse(start, hop))
+        assert seen["start"] is start
+        assert seen["hops"] == [hop] and seen["hops"][0] is hop
+        # And no pins: a chain with no rerank= must reach build_query()
+        # with pins=None, which is what keeps its SQL byte-identical to
+        # what it emitted before step-wise reranking existed.
+        assert seen["pins"] is None
+
+    def test_a_vector_valued_near_never_reaches_the_embedder(self, async_fresh_graph):
+        """A Near carrying floats is already resolved, so declaring an
+        embedder on the field must not make the async path call it --
+        that would be a provider bill (and a round trip) for a query
+        that asked for none."""
+        calls = []
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[
+                Vector("summary", 2, embed=lambda texts: calls.append(texts) or [[1.0, 0.0]])])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1}])
+            await async_fresh_graph.set_vectors(nodes=[{"id": 1, "summary": [1.0, 0.0]}])
+            await async_fresh_graph.traverse(
+                Start(near=Near("summary", [1.0, 0.0]), keep=1))
+            await async_fresh_graph.vector_search(Near("summary", [1.0, 0.0]), k=1)
+            await async_fresh_graph.vector_search_many([Near("summary", [1.0, 0.0])], k=1)
+
+        run(body())
+        assert calls == []
+
+    def test_a_vector_carrying_near_beside_a_text_one_is_left_alone(
+            self, async_fresh_graph):
+        """A multivector query may mix the two. Only the text half is
+        embedded -- resolving "everything in the list" would re-embed a
+        vector the caller supplied, which is not text and cannot be."""
+        embedded = []
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[
+                Vector("summary", 2, embed=lambda texts: embedded.extend(texts)
+                       or [[1.0, 0.0] for _ in texts]),
+                Vector("title", 2),          # no embedder: never asked for one
+            ])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1}])
+            await async_fresh_graph.set_vectors(
+                nodes=[{"id": 1, "summary": [1.0, 0.0], "title": [1.0, 0.0]}])
+            return await async_fresh_graph.vector_search(
+                Near("summary", text="raft"), Near("title", [1.0, 0.0]), k=1)
+
+        assert [hit["id"] for hit in run(body())] == ["1"]
+        assert embedded == ["raft"]
+
+    def test_a_multivector_batch_resolves_only_its_text(self, async_fresh_graph):
+        """vector_search_many() takes a LIST of queries, each of which
+        may itself be a list -- so "does this need a provider" has to
+        look one level deeper than a single search does."""
+        embedded = []
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[
+                Vector("summary", 2, embed=lambda texts: embedded.extend(texts)
+                       or [[1.0, 0.0] for _ in texts]),
+                Vector("title", 2),
+            ])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.add_nodes([{"id": 1}])
+            await async_fresh_graph.set_vectors(
+                nodes=[{"id": 1, "summary": [1.0, 0.0], "title": [1.0, 0.0]}])
+            return await async_fresh_graph.vector_search_many(
+                [[Near("summary", text="raft"), Near("title", [1.0, 0.0])]], k=1)
+
+        assert [hit["id"] for hit in run(body())[0]] == ["1"]
+        assert embedded == ["raft"]
+
+    def test_declaring_vectors_changes_no_near_less_query(self, async_graph):
+        """The pinned sync invariant, asserted through AsyncGraph's own
+        pass-through builder: a traversal with no near= must compile to
+        byte-identical SQL whether or not fields are declared."""
+        from sqlalchemy.dialects import postgresql
+
+        from hopai import Graph
+
+        def sql(graph):
+            return str(graph.build_query(Start(where={"type": "leaf"}), [Hop(hops=(1, 3))])
+                       .compile(dialect=postgresql.dialect()))
+
+        plain = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline")
+        async_graph.define_vectors(nodes=[Vector("summary", 3)])
+        assert sql(async_graph) == sql(plain)
+
+
+class TestTheSameRefusalsInTheSameOrder:
+    """Resolving text a step earlier moves WHERE a refusal is raised
+    from, so each one has to keep saying the same thing. The caller
+    labels ("Start", "hop 0 (...)", "... via_near") are built in
+    core.py for the sync path and re-derived in vectors.py's
+    aresolve_spec_texts() for the async one; without these, the two are
+    free to drift and an async user gets told to fix a different hop.
+    Stronger than asserting a label by pattern: the two messages are
+    compared to each other, character for character."""
+
+    def _defined(self, graph):
+        graph.define_vectors(nodes=[Vector("summary", 3)], edges=[Vector("rel", 3)])
+
+    @pytest.mark.parametrize("spec", [
+        lambda: (Start(near=Near("nope", text="q"), keep=1), []),
+        lambda: (Start(), [Hop(near=Near("nope", text="q"), keep=1)]),
+        lambda: (Start(), [Hop(via_near=Near("nope", text="q"), via_keep=1)]),
+    ])
+    def test_an_unknown_field_names_the_same_place_either_way(
+            self, async_fresh_graph, async_admin_graph, spec):
+        self._defined(async_fresh_graph)
+        self._defined(async_admin_graph)
+        start, hops = spec()
+        with pytest.raises(ValueError) as sync_failure:
+            async_admin_graph.traverse(start, *hops)
+        with pytest.raises(ValueError) as async_failure:
+            run(async_fresh_graph.traverse(start, *hops))
+        assert str(async_failure.value) == str(sync_failure.value)
+        assert "no vector field 'nope'" in str(async_failure.value)
+
+    def test_a_field_without_an_embedder_names_the_same_place_either_way(
+            self, async_fresh_graph, async_admin_graph):
+        """The refusal a caller actually hits: the field exists, the
+        query is text, and nothing was declared to embed it."""
+        self._defined(async_fresh_graph)
+        self._defined(async_admin_graph)
+        start = Start(near=Near("summary", text="q"), keep=1)
+        with pytest.raises(ValueError) as sync_failure:
+            async_admin_graph.traverse(start)
+        with pytest.raises(ValueError) as async_failure:
+            run(async_fresh_graph.traverse(start))
+        assert str(async_failure.value) == str(sync_failure.value)
+        assert "declares no embedder" in str(async_failure.value)
+
+
 class TestOutOfScope:
     """Schema/constraint DDL has no async override -- see hopai/asyncio.py's
     module docstring. Each must refuse LOUD, naming the fix, rather than
     silently reaching the async engine's sync facade outside the greenlet
     bridge (which would raise SQLAlchemy's own MissingGreenlet instead)."""
 
-    @pytest.mark.parametrize("name", [
-        "create_schema", "drop_schema", "define_constraints", "drop_constraints",
-        "enforce_schema", "save_schema", "load_schema", "infer_schema",
-        "schema_violations", "add_networkx", "load_vectors", "embed_stale",
-    ])
+    #: DERIVED from the frozenset, not restated beside it. A hand-written
+    #: list is what let `graphs()` fall out of _NEEDS_SYNC_GRAPH with no
+    #: test failing: an entry nothing exercises is an entry that can go
+    #: missing again, and a list that has to be kept in step by hand is
+    #: the thing that was not kept in step. Deriving it means a name
+    #: added to the set is tested the moment it is added.
+    @pytest.mark.parametrize("name", sorted(asyncio_module._NEEDS_SYNC_GRAPH))
     def test_admin_methods_refuse_with_the_fix_named(self, async_graph, name):
         with pytest.raises(AttributeError, match="plain Graph"):
             getattr(async_graph, name)
+
+    def test_the_set_covers_every_method_that_opens_its_own_connection(self):
+        """The other direction, which parametrizing over the set cannot
+        see: a Graph method that connects on `self.engine` DIRECTLY --
+        rather than through a session the async driver hands it -- has
+        to be listed, or it reaches the async engine's sync facade
+        outside the greenlet bridge and raises MissingGreenlet.
+
+        `graphs()` is exactly that shape and was missing. This asserts
+        the ones known to be, so the next one added to core.py is caught
+        by a name, not by a user."""
+        for name in ("graphs", "load_vectors", "embed_stale", "schema_violations"):
+            assert name in asyncio_module._NEEDS_SYNC_GRAPH, (
+                f"Graph.{name}() opens its own connection -- on AsyncGraph that is a "
+                f"MissingGreenlet, not an AttributeError naming the fix")
+
+    def test_graphs_refuses_rather_than_raising_missing_greenlet(self, async_graph):
+        """The specific hole: `await`-free `async_graph.graphs()` used to
+        reach Graph.graphs()' own `self.engine.connect()` on the sync
+        facade. A raw MissingGreenlet from inside SQLAlchemy is the
+        confusing, out-of-context failure this whole set exists to
+        convert into a sentence naming the fix."""
+        name = "graphs"                       # not a literal: B009 rewrites that to an
+        with pytest.raises(AttributeError) as refused:   # expression ruff then calls useless
+            getattr(async_graph, name)
+        assert "AsyncGraph has no graphs()" in str(refused.value)
+        assert "Graph(<dsn>).graphs(...)" in str(refused.value)
 
     def test_connection_free_methods_pass_through_unchanged(self, async_graph):
         # build_query() never connects, on Graph or AsyncGraph alike --
