@@ -1,0 +1,1099 @@
+"""
+hopai.jqsafe
+
+Deciding whether a jq filter is safe to run, BEFORE libjq ever sees it.
+
+A reranker scores (query, document) pairs, so every candidate row has to
+be projected into one string. That projection is written as a jq filter
+-- the one small language every model already writes fluently -- and it
+may arrive from a model through an MCP tool call:
+
+    document_from='.properties.title + ": " + (.properties.summary // "")'
+
+    from hopai.jqsafe import validate, paths_read, UnsafeFilter
+
+    validate(document_from, fields=["properties.title", "properties.summary"])
+    paths_read(document_from)   # {"properties.title", "properties.summary"}
+
+WHY THIS FILE EXISTS. jq is not a sandbox, and three of its properties
+are load-bearing against us. Each was measured against the `jq` PyPI
+package (CFFI bindings to libjq), not assumed:
+
+  - `env` and `$ENV` return the PROCESS ENVIRONMENT -- `env|keys` gave
+    133 entries on the machine this was written on, including every
+    credential the application holds. The filter's OUTPUT is posted to a
+    third-party reranker API, so this is a one-line exfiltration of a
+    database password to a vendor.
+  - `def f: f; f` is a non-terminating program that holds the GIL. A
+    watchdog thread cannot even print, SIGINT is ignored, and only
+    SIGKILL ends the process. There is NO in-process timeout that works.
+  - `[range(100000000)]` makes libjq call abort() -- SIGABRT, not a
+    Python MemoryError -- so it cannot be caught either.
+
+What jq does NOT have is equally load-bearing: no shell, no network, no
+file writes, module loading off by default, and -- the important one --
+NO DYNAMIC DISPATCH TO BUILTINS BY NAME. `builtins` yields the STRING
+"env/0"; there is no `eval`, no way to call a function whose name was
+computed at runtime.
+
+THE TWO CLAIMS THE WHOLE SECURITY POSTURE RESTS ON.
+
+  1. SOUNDNESS: static analysis is decidable here. Because a name can
+     never be constructed at runtime, the set of builtins a program can
+     invoke is exactly the set of literal names appearing in its source
+     -- which a parser enumerates completely. That is what turns this
+     from a blacklist arms race into a decision procedure: we ALLOWLIST
+     names, and no amount of string arithmetic inside the filter can
+     reach a name that is not written in it. (Module loading would break
+     this claim, which is why `import`/`include` are absent from the
+     grammar rather than merely refused.)
+  2. TOTALITY: termination is structural, not a timeout. Every accepted
+     program is built from constructs whose output stream is bounded by
+     the input: field access, indexing, iteration over an existing
+     array, pipes, and a fixed set of elementwise builtins. There is no
+     recursion (`def`), no generator (`range`), no loop (`while`,
+     `until`, `repeat`, `recurse`, `..`), no fold (`reduce`, `foreach`)
+     and no re-entry (`label`/`break`). By structural induction over the
+     parse tree, evaluation of an accepted program halts on any finite
+     input -- so the hang above is not "unlikely", it is unreachable.
+     `is_total()` is exactly "does this parse in the subset".
+
+Totality bounds the number of outputs but not their SIZE: `(. + .)` is
+one node and doubles a string, and `(.+.)|(.+.)|(.+.)|...` doubles once
+per stage, so a 60-character program could ask for 2**10 times the row.
+So every accepted program also carries a statically computed growth
+factor -- how many times its own input it may emit -- and anything above
+MAX_GROWTH is refused with that number in the message. Concatenation is
+the only amplifier left once `*` is gone, and it is now bounded.
+
+WHAT WAS REJECTED, and why none of it is enough on its own:
+
+  - A watchdog thread with a timeout. Measured above: it cannot fire.
+    The GIL is held by libjq, which never yields.
+  - A subprocess per row with rlimits and a scrubbed environment. It
+    would work, and it is the wrong shape for this library: a fork+exec
+    per candidate row on the ranking path, plus SIGABRT handling, plus a
+    second copy of the connection state -- a sidecar in all but name,
+    which rule 1 of CLAUDE.md exists to refuse. Static validation costs
+    microseconds once per query rather than a process per row.
+  - Scanning the source for dangerous substrings. `.environment` and
+    `.env_var` are ordinary property names and a substring scan rejects
+    both; `"env"` inside a string literal is data. Tokenizing is what
+    tells a NAME from a FIELD from TEXT, which is why there is a real
+    tokenizer here and not a regex.
+  - Writing our own jq evaluator. Then hopai would own jq's semantics
+    forever, and every divergence would be a silently different document
+    -- the worst thing this library can produce (rule 4). So this module
+    PARSES ONLY TO REFUSE: what it accepts is handed to libjq unchanged,
+    verbatim, and a differential test asserts that everything this
+    parser accepts, `jq.compile()` also accepts. The subset is a genuine
+    subset; we never accept something libjq then rejects at runtime.
+
+WHAT IS IN THE SUBSET: identity `.`; field access `.foo`, `."quoted"`,
+with `?`; indexing `.[0]`, `.[-1]`, slices `.[1:3]`, iteration `.[]`;
+pipe; comma; parentheses; array construction `[...]`; string literals
+with `\\(...)` interpolation; numbers; `true`/`false`/`null`; `+` and
+`-`; the alternative `//`; the comparisons and `and`/`or`; and calls, by
+literal name only, to the allowlist in _ARITY.
+
+WHY EACH EXCLUDED FAMILY IS EXCLUDED (the ones a reader will reach for):
+
+  - `test`/`match`/`capture`/`sub`/`gsub`/`scan`/`splits`: a regex from a
+    model is a regex we would have to run, and catastrophic backtracking
+    on a chosen pattern is the same unkillable hang as `def f: f; f`.
+    `startswith`/`endswith`/`split`/`ascii_downcase` cover what a
+    document projection actually needs. (This is also why `split` is
+    pinned to ONE argument: `split("x"; "g")` is the regex form.)
+  - `getpath`/`setpath`/`paths`/`leaf_paths`/`to_entries`: the path is
+    DATA, so no static check can see which property is read -- they
+    defeat the `fields=` allowlist completely, which is the one thing
+    that keeps `.properties.ssn` out of a vendor's logs. Same reason
+    `.[expr]` with a non-literal index is refused.
+  - `env`/`$ENV`/`$__loc__`/`input`/`inputs`/`debug`/`input_line_number`:
+    data that is not the candidate row. The first two are the
+    exfiltration vector; the rest leak process state into a document.
+  - `implode`/`explode`/`ascii`/`@base64d`: they synthesize content the
+    row never contained -- `@base64d` in particular turns opaque bytes
+    into text nothing has validated, one layer below every check here.
+  - `*`, `/`, `%`: `"x" * 1000000000` is an unbounded memory amplifier
+    from a literal, `/` on strings is a second spelling of `split`, and
+    none of the three has any role in building a document. `+` (and
+    `-` for numbers and arrays) is the whole arithmetic a projection
+    needs, and it is bounded by the growth cap above.
+  - `if`/`then`/`else`: `//` supplies a default and `select(...)`
+    filters, which is the whole of what a projection conditional does;
+    a second spelling would buy nothing and cost the `elif` chain.
+  - `try`/`catch`: `catch` binds jq's ERROR MESSAGE, and jq quotes the
+    offending input value inside it -- straight into the document, which
+    is posted to a third party. `?` is the one spelling for "tolerate a
+    missing key", and it cannot carry data.
+  - `as $x` bindings, and `$` in general: without variables there is
+    nowhere for `$ENV` or `$__loc__` to appear, so they are excluded by
+    the absence of a construct rather than by name.
+  - object construction `{a: .b}`: computed keys (`{(.k): .v}`) are the
+    same problem as computed paths, and a document is a string.
+
+Names ARE recognized by spelling in one place only: the error messages.
+`_EXPLAIN` exists so that `env` is refused with the sentence that tells
+the caller what to write instead, rather than with the generic "not in
+the allowlist". Rejection is by allowlist; explanation is by name. Those
+two must not be confused -- deleting every entry in `_EXPLAIN` would
+make the errors worse and change nothing about what is accepted.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import NamedTuple, Optional
+
+__all__ = ["UnsafeFilter", "validate", "paths_read", "is_total"]
+
+
+class UnsafeFilter(ValueError):
+    """A jq filter outside the subset hopai will accept from a model."""
+
+
+#: A projection is one expression over one row. Anything past this is a
+#: program, not a projection, and the cheapest way to bound the parser's
+#: work is to bound its input.
+MAX_LENGTH = 2000
+
+#: Nesting depth, so a pathological `((((...))))` cannot reach Python's
+#: own recursion limit -- which would surface as RecursionError from a
+#: validator whose entire job is to answer yes or no.
+MAX_DEPTH = 40
+
+#: How many times its own input an accepted filter may emit. Totality
+#: bounds the number of outputs, not their size: string `+` doubles, and
+#: doubling once per pipe stage is exponential in the PROGRAM's length.
+#: 64x a row is far past any real projection (a document concatenates a
+#: handful of fields, growth 3 or 4) and far below anything that
+#: threatens memory.
+MAX_GROWTH = 64
+
+#: The functions a filter may call, with the arities jq gives them.
+#: Calls are by literal name only -- see the module docstring on why
+#: that makes this list exhaustive rather than optimistic.
+#:
+#: Arity is pinned, not just the name: `split/1` is plain string
+#: splitting while `split/2` is the REGEX form, and `first/1`/`last/1`
+#: take a filter whose totality is checked like any other subexpression.
+_ARITY = {
+    "add": frozenset({0}),
+    "arrays": frozenset({0}),
+    "ascii_downcase": frozenset({0}),
+    "ascii_upcase": frozenset({0}),
+    "empty": frozenset({0}),
+    "endswith": frozenset({1}),
+    "first": frozenset({0, 1}),
+    "flatten": frozenset({0, 1}),
+    "has": frozenset({1}),
+    "join": frozenset({1}),
+    "last": frozenset({0, 1}),
+    "length": frozenset({0}),
+    "ltrimstr": frozenset({1}),
+    "map": frozenset({1}),
+    # jq spells negation as a zero-argument FILTER reading its input from
+    # the left -- `.a | not` -- and there is no prefix operator form, so
+    # `not(.a)` is a call with one argument too many and refused as one.
+    "not": frozenset({0}),
+    "numbers": frozenset({0}),
+    "objects": frozenset({0}),
+    "reverse": frozenset({0}),
+    "rtrimstr": frozenset({1}),
+    "select": frozenset({1}),
+    "sort": frozenset({0}),
+    "split": frozenset({1}),
+    "startswith": frozenset({1}),
+    "strings": frozenset({0}),
+    "tojson": frozenset({0}),
+    "tonumber": frozenset({0}),
+    "tostring": frozenset({0}),
+    "type": frozenset({0}),
+    "unique": frozenset({0}),
+    "values": frozenset({0}),
+}
+
+#: Calls that hand their input through rather than reading a value out
+#: of it -- filters, reorderings and selections. Used by paths_read():
+#: `.properties | select(.type == "paper") | .title` reads
+#: properties.type and properties.title, and reporting a bare
+#: `properties` for the select would make a correct filter fail an
+#: allowlist that names the two leaves. Everything NOT listed here
+#: consumes its input, and consuming it is a read.
+_PASSTHROUGH = frozenset({
+    "arrays", "empty", "first", "flatten", "last", "map", "numbers",
+    "objects", "reverse", "select", "sort", "strings", "unique", "values",
+})
+
+#: The literals jq spells as bare words.
+_KEYWORD_LITERALS = frozenset({"true", "false", "null"})
+
+#: Infix words, so they are never mistaken for a call.
+_WORD_OPERATORS = frozenset({"and", "or"})
+
+_COMPARISONS = frozenset({"==", "!=", "<", "<=", ">", ">="})
+
+_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_NUMBER_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+_HEX = frozenset("0123456789abcdefABCDEF")
+
+_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f",
+            "n": "\n", "r": "\r", "t": "\t"}
+
+#: Why a particular spelling is not here, for the caller who reached for
+#: it. ERROR QUALITY ONLY: none of these names is what makes a program
+#: unsafe -- the allowlist is -- so a name missing from this table is
+#: still refused, just with the generic message.
+_EXPLAIN = {
+    "env": "a document is built from the candidate row only, and this filter's output "
+           "is posted to a third-party reranker -- `env` would send it your process "
+           "environment. Read a property instead, e.g. `.properties.title`",
+    "builtins": "it enumerates jq's own function names and has nothing to do with the row",
+    "input": "there is exactly one input, the candidate row -- reading further inputs "
+             "would put another row's data in this row's document",
+    "inputs": "there is exactly one input, the candidate row -- reading further inputs "
+              "would put another row's data in this row's document",
+    "debug": "diagnostics belong in hopai's log, not in a document posted to a vendor",
+    "stderr": "diagnostics belong in hopai's log, not in a document posted to a vendor",
+    "input_line_number": "it reports parser state, which is not part of the row",
+    "getpath": "a computed path is DATA, so no static check can see which property it "
+               "reads -- it would defeat the field allowlist entirely. Name the "
+               "property, e.g. `.properties.title`",
+    "setpath": "a document projection reads the row, it never writes it",
+    "delpaths": "a document projection reads the row, it never writes it",
+    "paths": "it walks every path in the row, so no field allowlist can constrain it. "
+             "Name the properties you want, e.g. `.properties.title`",
+    "leaf_paths": "it walks every path in the row, so no field allowlist can constrain "
+                  "it. Name the properties you want, e.g. `.properties.title`",
+    "to_entries": "it turns key names into data, which puts every property in reach of "
+                  "a filter that named none of them",
+    "with_entries": "it turns key names into data, which puts every property in reach of "
+                    "a filter that named none of them",
+    "test": "a regex from a model is a regex hopai would have to run, and catastrophic "
+            "backtracking on a chosen pattern is an unkillable hang. Use `startswith`, "
+            "`endswith`, `split` or `ascii_downcase`",
+    "match": "a regex from a model is a regex hopai would have to run, and catastrophic "
+             "backtracking on a chosen pattern is an unkillable hang. Use `startswith`, "
+             "`endswith`, `split` or `ascii_downcase`",
+    "capture": "a regex from a model is a regex hopai would have to run, and catastrophic "
+               "backtracking on a chosen pattern is an unkillable hang. Use `startswith`, "
+               "`endswith`, `split` or `ascii_downcase`",
+    "scan": "a regex from a model is a regex hopai would have to run, and catastrophic "
+            "backtracking on a chosen pattern is an unkillable hang. Use `split`",
+    "splits": "a regex from a model is a regex hopai would have to run, and catastrophic "
+              "backtracking on a chosen pattern is an unkillable hang. Use `split`, which "
+              "here splits on a plain string",
+    "sub": "a regex from a model is a regex hopai would have to run, and catastrophic "
+           "backtracking on a chosen pattern is an unkillable hang. Use `ltrimstr` or "
+           "`rtrimstr`",
+    "gsub": "a regex from a model is a regex hopai would have to run, and catastrophic "
+            "backtracking on a chosen pattern is an unkillable hang. Use `split` and "
+            "`join`",
+    "def": "this subset has no user-defined functions -- `def f: f; f` is a "
+           "non-terminating program that no timeout can interrupt, and having no "
+           "recursion at all is what makes every accepted filter terminate",
+    "reduce": "a fold over a stream is not in the subset. Use `map`, `add` or `join`",
+    "foreach": "a fold over a stream is not in the subset. Use `map`, `add` or `join`",
+    "while": "unbounded iteration is not in the subset -- every accepted filter "
+             "terminates precisely because no such construct exists. Use `map`",
+    "until": "unbounded iteration is not in the subset -- every accepted filter "
+             "terminates precisely because no such construct exists. Use `map`",
+    "repeat": "unbounded iteration is not in the subset -- every accepted filter "
+              "terminates precisely because no such construct exists. Use `map`",
+    "recurse": "it walks the row to an unbounded depth, so neither termination nor the "
+               "field allowlist can be established. Name the properties you want",
+    "range": "it generates an arbitrarily long stream -- `[range(100000000)]` makes "
+             "libjq abort() the process, which no Python `except` can catch",
+    "limit": "stream control implies a generator to limit, and this subset has none",
+    "import": "module loading is off, and it is the one thing that would let a filter "
+              "call a name it does not spell",
+    "include": "module loading is off, and it is the one thing that would let a filter "
+               "call a name it does not spell",
+    "modulemeta": "module loading is off, and it is the one thing that would let a "
+                  "filter call a name it does not spell",
+    "label": "a non-local exit needs a matching `break`, and neither is in the subset",
+    "break": "a non-local exit needs a matching `label`, and neither is in the subset",
+    "if": "conditionals are not in the subset -- `//` supplies a default and "
+          "`select(...)` filters, which is the whole of what a projection needs",
+    "then": "conditionals are not in the subset -- `//` supplies a default and "
+            "`select(...)` filters",
+    "elif": "conditionals are not in the subset -- `//` supplies a default and "
+            "`select(...)` filters",
+    "else": "conditionals are not in the subset -- `//` supplies a default and "
+            "`select(...)` filters",
+    "end": "conditionals are not in the subset -- `//` supplies a default and "
+           "`select(...)` filters",
+    "try": "`catch` binds jq's error MESSAGE, which quotes the offending input value, "
+           "into a document that is posted to a vendor. Use `?` to tolerate a missing "
+           "key, e.g. `.properties.title?`",
+    "catch": "`catch` binds jq's error MESSAGE, which quotes the offending input value, "
+             "into a document that is posted to a vendor. Use `?` to tolerate a missing "
+             "key, e.g. `.properties.title?`",
+    "as": "variable bindings are not in the subset -- which is also why `$ENV` and "
+          "`$__loc__` have nowhere to appear",
+    "implode": "building text from code points produces content the row never contained",
+    "explode": "code-point arithmetic produces content the row never contained",
+    "ascii": "code-point arithmetic produces content the row never contained",
+    "tostream": "it turns every path in the row into data, so no field allowlist can "
+                "constrain it",
+}
+
+
+class _Token(NamedTuple):
+    kind: str          # field | dot | name | number | string | op | punct | end
+    text: str          # what was written, for error messages
+    value: object      # field name, string parts, or None
+    pos: int           # offset into the ORIGINAL program, interpolations included
+
+
+def _refuse(owner: str, pos: int, what: str, why: str):
+    """The single shape every rejection takes: what, where, and the fix.
+
+    One helper rather than raise-sites, because an error a model reads
+    is part of this module's interface -- an inconsistent one costs a
+    retry the caller pays for."""
+    raise UnsafeFilter(f"{owner}: {what} (offset {pos}) -- {why}")
+
+
+# ---------------------------------------------------------------------
+# Tokenizer. A tokenizer and not a regex scan, because the whole point
+# is to tell a NAME (`env`) from a FIELD (`.environment`) from TEXT
+# ("env") -- the three spellings a substring blacklist confuses.
+# ---------------------------------------------------------------------
+
+def _scan_string(src: str, i: int, base: int, owner: str):
+    """Scan the string literal starting at src[i] == '"'.
+
+    Returns (parts, index-after-the-closing-quote). `parts` alternates
+    plain text (str) and interpolations, each recorded as
+    ("interp", source, absolute-offset) so the parser can validate the
+    interpolated expression with offsets that still point into the
+    program the caller wrote."""
+    parts: list = []
+    text: list = []
+    n = len(src)
+    i += 1
+    while True:
+        if i >= n:
+            _refuse(owner, base + i, "the string literal is never closed",
+                    'add the missing `"`')
+        ch = src[i]
+        if ch == '"':
+            i += 1
+            break
+        if ch != "\\":
+            text.append(ch)
+            i += 1
+            continue
+        nxt = src[i + 1:i + 2]
+        if nxt == "(":
+            if text:
+                parts.append("".join(text))
+                text = []
+            end = _scan_paren(src, i + 1, base, owner)
+            parts.append(("interp", src[i + 2:end - 1], base + i + 2))
+            i = end
+            continue
+        if nxt == "u":
+            digits = src[i + 2:i + 6]
+            if len(digits) != 4 or any(c not in _HEX for c in digits):
+                _refuse(owner, base + i, "`\\u` needs exactly four hex digits",
+                        "write the character itself, or a complete escape like `\\u00e9`")
+            text.append(chr(int(digits, 16)))
+            i += 6
+            continue
+        if nxt in _ESCAPES:
+            text.append(_ESCAPES[nxt])
+            i += 2
+            continue
+        _refuse(owner, base + i, f"`\\{nxt}` is not a jq string escape",
+                'the escapes are \\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX and \\(...)')
+    if text:
+        parts.append("".join(text))
+    return parts, i
+
+
+def _scan_paren(src: str, i: int, base: int, owner: str) -> int:
+    """Index just past the `)` matching src[i] == `(`.
+
+    Strings inside are skipped by _scan_string, which recurses back here
+    for their own interpolations -- so `"\\("\\(.a)")"` is measured the
+    same way jq measures it, rather than by counting parentheses in
+    text."""
+    depth = 0
+    n = len(src)
+    while i < n:
+        ch = src[i]
+        if ch == '"':
+            _, i = _scan_string(src, i, base, owner)
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    _refuse(owner, base + i, "an interpolation `\\(` is never closed", "add the missing `)`")
+
+
+def _tokenize(src: str, owner: str, base: int = 0) -> list:
+    """Turn a filter into tokens, refusing characters the subset has no
+    place for. `base` is the offset of `src` inside the original program,
+    so an error inside `"\\(...)"` still names an offset the caller can
+    count to."""
+    tokens: list = []
+    i, n = 0, len(src)
+    while i < n:
+        ch = src[i]
+        if ch in " \t\r\n":
+            i += 1
+            continue
+        if ch == "#":                                   # jq comment, to end of line
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if ch == ".":
+            if src.startswith("..", i):
+                _refuse(owner, base + i, "`..` (recursive descent) is not in the subset",
+                        "it walks the whole row to an unbounded depth, so neither "
+                        "termination nor the field allowlist can be established. Name "
+                        "the properties you want, e.g. `.properties.title`")
+            match = _NAME_RE.match(src, i + 1)
+            if match:
+                tokens.append(_Token("field", "." + match.group(), match.group(), base + i))
+                i = match.end()
+                continue
+            if src[i + 1:i + 2] == '"':
+                parts, end = _scan_string(src, i + 1, base, owner)
+                if any(not isinstance(part, str) for part in parts):
+                    _refuse(owner, base + i,
+                            "a field name built by interpolation is not in the subset",
+                            "the property being read has to be visible to the field "
+                            'allowlist, so write it out: `.properties.title`')
+                name = "".join(parts)
+                tokens.append(_Token("field", "." + src[i + 1:end], name, base + i))
+                i = end
+                continue
+            tokens.append(_Token("dot", ".", None, base + i))
+            i += 1
+            continue
+        if ch == '"':
+            parts, end = _scan_string(src, i, base, owner)
+            tokens.append(_Token("string", src[i:end], parts, base + i))
+            i = end
+            continue
+        if ch in "0123456789":                          # not .isdigit(): that is true of
+            match = _NUMBER_RE.match(src, i)            # unicode digits _NUMBER_RE rejects
+            tokens.append(_Token("number", match.group(), match.group(), base + i))
+            i = match.end()
+            continue
+        if ch == "$":
+            _refuse(owner, base + i, "variables are not in the subset",
+                    "a projection reads the candidate row and nothing else -- which is "
+                    "also why `$ENV` and `$__loc__` have nowhere to appear. Read a "
+                    "property, e.g. `.properties.title`")
+        if ch == "@":
+            _refuse(owner, base + i, "`@` format strings are not in the subset",
+                    "`@base64d` in particular decodes bytes into text nothing has "
+                    "validated. Build the document from properties and string literals")
+        if ch == "{":
+            _refuse(owner, base + i, "object construction is not in the subset",
+                    "a computed key (`{(.k): .v}`) is invisible to the field allowlist, "
+                    "and a document is a string -- concatenate with `+` or `join`")
+        if ch == "}":
+            _refuse(owner, base + i, "`}` has no matching construct in the subset",
+                    "object construction is not accepted here")
+        if src.startswith("?//", i):
+            _refuse(owner, base + i, "the destructuring alternative `?//` is not in the "
+                                     "subset",
+                    "it belongs to `as` bindings, which are not accepted -- use `//` for "
+                    "a default value")
+        for spelling in ("//", "==", "!=", "<=", ">="):
+            if src.startswith(spelling, i):
+                if src.startswith(spelling + "=", i):
+                    _refuse(owner, base + i, f"`{spelling}=` assigns to the row",
+                            "a projection reads the row, it never updates it")
+                tokens.append(_Token("op", spelling, None, base + i))
+                i += len(spelling)
+                break
+        else:
+            if ch in "+-*/%<>|":
+                if src[i + 1:i + 2] == "=":
+                    _refuse(owner, base + i, f"`{ch}=` assigns to the row",
+                            "a projection reads the row, it never updates it")
+                tokens.append(_Token("op", ch, None, base + i))
+                i += 1
+                continue
+            if ch == "=":
+                _refuse(owner, base + i, "`=` assigns to the row",
+                        "a projection reads the row, it never updates it. Did you mean "
+                        "`==`?")
+            if ch in "()[],;:?":
+                tokens.append(_Token("punct", ch, None, base + i))
+                i += 1
+                continue
+            match = _NAME_RE.match(src, i)
+            if match:
+                tokens.append(_Token("name", match.group(), match.group(), base + i))
+                i = match.end()
+                continue
+            _refuse(owner, base + i, f"`{ch}` is not part of any construct in the subset",
+                    "a document is built from properties, string literals, `+`, `//` and "
+                    "the allowed functions")
+    tokens.append(_Token("end", "the end of the filter", None, base + len(src)))
+    return tokens
+
+
+# ---------------------------------------------------------------------
+# Parser. Recursive descent over jq's own precedence, producing a tree
+# used for exactly two things: refusing, and reporting which properties
+# are read. It is NOT an evaluator -- see the module docstring.
+#
+# Node shapes:
+#   ("path", base|None, steps)   steps: ("field", name) | ("index", int)
+#                                     | ("slice", lo|None, hi|None)
+#                                     | ("iterate",) | ("optional",)
+#   ("call", name, [arg, ...])   ("bin", op, left, right)
+#   ("pipe", left, right)        ("paren", inner)
+#   ("array", inner|None)        ("str", [text | node, ...])
+#   ("num", text)                ("lit", "true"|"false"|"null")
+# ---------------------------------------------------------------------
+
+#: Tokens that cannot start an expression, with the reason a caller most
+#: likely needs. Error quality only; the parser refuses them either way.
+_UNEXPECTED = {
+    "*": "`*` is not in the subset -- `\"x\" * 1000000000` repeats a string a billion "
+         "times, which is an unbounded memory amplifier, and multiplication has no role "
+         "in building a document. Concatenate with `+`, or use `join`",
+    "/": "`/` is not in the subset -- on strings jq's `/` is splitting, which is spelled "
+         "`split(\";\")` here, and division has no role in building a document",
+    "%": "`%` is not in the subset -- arithmetic beyond `+` and `-` has no role in "
+         "building a document",
+    ";": "`;` separates the arguments of a multi-argument function, and none in this "
+         "subset takes more than one",
+    ":": "`:` appears only inside a slice, e.g. `.properties.tags[0:3]`",
+    "-": "a leading `-` is not in the subset -- write a subtraction with both sides, "
+         "e.g. `.a - 1`, or use a negative index like `.[-1]`",
+}
+
+
+class _Parser:
+    def __init__(self, tokens: list, owner: str, depth: int = 0):
+        self.tokens = tokens
+        self.owner = owner
+        self.i = 0
+        self.depth = depth
+
+    # -- token plumbing ------------------------------------------------
+    def peek(self) -> _Token:
+        return self.tokens[self.i]
+
+    def take(self) -> _Token:
+        token = self.tokens[self.i]
+        self.i += 1
+        return token
+
+    def at(self, kind: str, text: Optional[str] = None) -> bool:
+        token = self.peek()
+        return token.kind == kind and (text is None or token.text == text)
+
+    def accept(self, kind: str, text: Optional[str] = None) -> bool:
+        if self.at(kind, text):
+            self.i += 1
+            return True
+        return False
+
+    def expect(self, kind: str, text: str):
+        if not self.accept(kind, text):
+            token = self.peek()
+            _refuse(self.owner, token.pos, f"expected `{text}`, found `{token.text}`",
+                    "the filter does not parse in the jq subset hopai accepts")
+
+    def unexpected(self, token: _Token):
+        why = _UNEXPECTED.get(token.text)
+        if why is None:
+            _refuse(self.owner, token.pos, f"`{token.text}` cannot appear here",
+                    "the filter does not parse in the jq subset hopai accepts -- a "
+                    "document is built from properties, string literals, `+`, `//` and "
+                    "the allowed functions")
+        _refuse(self.owner, token.pos, "this is not in the subset", why)
+
+    # -- grammar -------------------------------------------------------
+    def program(self):
+        node = self.pipe()
+        token = self.peek()
+        if token.kind != "end":
+            self.unexpected(token)
+        return node
+
+    def pipe(self):
+        # Every nesting level -- parens, call arguments, interpolations,
+        # array construction -- passes through here, so one guard bounds
+        # them all and the parser can never outrun Python's own stack.
+        self.depth += 1
+        if self.depth > MAX_DEPTH:
+            token = self.peek()
+            _refuse(self.owner, token.pos, f"the filter nests more than {MAX_DEPTH} deep",
+                    "a document projection is a few fields joined together; this is a "
+                    "program")
+        node = self.comma()
+        while self.accept("op", "|"):
+            node = ("pipe", node, self.comma())
+        self.depth -= 1
+        return node
+
+    def comma(self):
+        # Comma IS total: it concatenates two finite streams, so its
+        # growth is the sum of its sides and nothing iterates. It stays
+        # because `[.a, .b] | join(" ")` is the natural way to build a
+        # document from several fields, and forbidding it here would
+        # push callers to `+` chains that grow the same amount.
+        node = self.alternative()
+        while self.accept("punct", ","):
+            node = ("bin", ",", node, self.alternative())
+        return node
+
+    def alternative(self):
+        node = self.disjunction()
+        while self.accept("op", "//"):
+            node = ("bin", "//", node, self.disjunction())
+        return node
+
+    def disjunction(self):
+        node = self.conjunction()
+        while self.at("name", "or"):
+            self.take()
+            node = ("bin", "or", node, self.conjunction())
+        return node
+
+    def conjunction(self):
+        node = self.comparison()
+        while self.at("name", "and"):
+            self.take()
+            node = ("bin", "and", node, self.comparison())
+        return node
+
+    def comparison(self):
+        node = self.additive()
+        if self.peek().kind == "op" and self.peek().text in _COMPARISONS:
+            operator = self.take()
+            node = ("bin", operator.text, node, self.additive())
+            following = self.peek()
+            # jq's comparisons are non-associative: `a == b == c` is a
+            # syntax error there, so accepting it here would accept
+            # something libjq rejects -- the one thing the differential
+            # test exists to catch.
+            if following.kind == "op" and following.text in _COMPARISONS:
+                _refuse(self.owner, following.pos, "comparisons do not chain in jq",
+                        "compare once, and join with `and`: `.a > 1 and .a < 9`")
+        return node
+
+    def additive(self):
+        node = self.postfix()
+        while self.peek().kind == "op" and self.peek().text in ("+", "-"):
+            operator = self.take()
+            node = ("bin", operator.text, node, self.postfix())
+        return node
+
+    def postfix(self):
+        node = self.primary()
+        while True:
+            token = self.peek()
+            if token.kind == "field":
+                self.take()
+                node = self._extend(node, ("field", token.value))
+                continue
+            if token.kind == "punct" and token.text == "[":
+                self.take()
+                node = self._extend(node, self.bracket())
+                continue
+            if token.kind == "punct" and token.text == "?":
+                self.take()
+                node = self._extend(node, ("optional",))
+                continue
+            return node
+
+    @staticmethod
+    def _extend(node, step):
+        """Grow a path, or start one rooted at a non-path expression.
+
+        `(.a + .b) | tostring` and `(.a).b` are both legal jq; the second
+        is a path whose base is an expression, which paths_read() then
+        treats as derived data rather than as a named property."""
+        if node[0] == "path":
+            return ("path", node[1], (*node[2], step))
+        return ("path", node, (step,))
+
+    def bracket(self):
+        """Everything between `[` and `]` on a path, which is where a
+        computed index would otherwise slip past the field allowlist."""
+        if self.accept("punct", "]"):
+            return ("iterate",)
+        token = self.peek()
+        if token.kind == "end":
+            _refuse(self.owner, token.pos, "`[` is never closed",
+                    "add the missing `]` -- `[]` iterates, `[0]` indexes, `[0:3]` slices")
+        if token.kind == "string":
+            _refuse(self.owner, token.pos, "indexing by a string is not in the subset",
+                    "there is one spelling for reading a property, and it is the one the "
+                    'field allowlist reads: `.foo` or `."foo bar"`')
+        low = self._integer()
+        if self.accept("punct", ":"):
+            high = self._integer()
+            if low is None and high is None:
+                # libjq rejects `.[:]` outright, and this module must never
+                # accept something libjq then refuses to compile.
+                _refuse(self.owner, token.pos, "`[:]` is not a slice",
+                        "give at least one end -- `[0:3]`, `[2:]`, `[:3]` -- or `[]` to "
+                        "iterate every element")
+            self.expect("punct", "]")
+            return ("slice", low, high)
+        if low is None:
+            _refuse(self.owner, token.pos, "a computed index is not in the subset",
+                    "the index would be DATA, so no static check could see which "
+                    "property is read -- it would defeat the field allowlist. Use a "
+                    "literal, e.g. `.properties.tags[0]`, or `[]` for every element")
+        self.expect("punct", "]")
+        return ("index", low)
+
+    def _integer(self) -> Optional[int]:
+        """An integer literal, or None when the next token is not one --
+        which is how `.[:3]` and a refused `.[.key]` are told apart."""
+        sign = 1
+        mark = self.i
+        if self.at("op", "-"):
+            self.take()
+            sign = -1
+        token = self.peek()
+        if token.kind == "number" and token.text.isdigit():
+            self.take()
+            return sign * int(token.text)
+        self.i = mark
+        return None
+
+    def primary(self):
+        token = self.take()
+        if token.kind == "dot":
+            return ("path", None, ())
+        if token.kind == "field":
+            return ("path", None, (("field", token.value),))
+        if token.kind == "number":
+            return ("num", token.text)
+        if token.kind == "string":
+            return ("str", [part if isinstance(part, str) else self._interpolated(part)
+                            for part in token.value])
+        if token.kind == "punct" and token.text == "(":
+            node = self.pipe()
+            self.expect("punct", ")")
+            return ("paren", node)
+        if token.kind == "punct" and token.text == "[":
+            if self.accept("punct", "]"):
+                return ("array", None)
+            node = self.pipe()
+            self.expect("punct", "]")
+            return ("array", node)
+        if token.kind == "name":
+            return self.call(token)
+        self.unexpected(token)
+
+    def _interpolated(self, part):
+        """Parse `\\(...)` with the same parser, at the same depth.
+
+        Interpolation is the one place a filter can hide a second filter,
+        so it gets no relaxation: the inner expression is in the subset
+        or the whole program is refused."""
+        _, source, offset = part
+        inner = _Parser(_tokenize(source, self.owner, offset), self.owner, self.depth)
+        return inner.program()
+
+    def call(self, token: _Token):
+        name = token.value
+        if name in _KEYWORD_LITERALS:
+            return ("lit", name)
+        if name in _WORD_OPERATORS:
+            _refuse(self.owner, token.pos, f"`{name}` needs an expression on its left",
+                    "it joins two conditions, e.g. `.a > 1 and .b == \"x\"`")
+        if name not in _ARITY:
+            why = _EXPLAIN.get(name)
+            if why is not None:
+                _refuse(self.owner, token.pos, f"`{name}` is not available", why)
+            _refuse(self.owner, token.pos, f"`{name}` is not a function this filter may call",
+                    "the allowed functions are " + ", ".join(sorted(_ARITY)) +
+                    " -- everything else is either unbounded, regex-driven, or reads "
+                    "something that is not the candidate row")
+        args = []
+        if self.at("punct", "("):
+            self.take()
+            args.append(self.pipe())
+            while self.at("punct", ";"):
+                separator = self.take()
+                _refuse(self.owner, separator.pos,
+                        f"`{name}` is accepted with at most one argument",
+                        "the two-argument forms in jq are the regex ones (`split/2`, "
+                        "`sub/3`), and a regex from a model is a hang hopai cannot "
+                        "interrupt")
+            self.expect("punct", ")")
+        if len(args) not in _ARITY[name]:
+            _refuse(self.owner, token.pos,
+                    f"`{name}` takes {' or '.join(str(a) for a in sorted(_ARITY[name]))} "
+                    f"argument(s), not {len(args)}",
+                    "libjq would reject the call too, so hopai refuses it here rather "
+                    "than at ranking time")
+        return ("call", name, args)
+
+
+# ---------------------------------------------------------------------
+# Growth. Totality bounds how MANY values a filter emits; this bounds
+# how BIG they get. Every factor is "output size / input size", worst
+# case, and it composes the way the operators do: a pipe multiplies,
+# concatenation and comma add, `//` takes whichever side runs.
+# ---------------------------------------------------------------------
+
+def _growth(node) -> int:
+    kind = node[0]
+    if kind == "path":
+        return 1 if node[1] is None else _growth(node[1])
+    if kind == "pipe":
+        return _growth(node[1]) * _growth(node[2])
+    if kind == "paren":
+        return _growth(node[1])
+    if kind == "array":
+        return 1 if node[1] is None else _growth(node[1])
+    if kind == "str":
+        return 1 + sum(_growth(part) for part in node[1] if not isinstance(part, str))
+    if kind == "bin":
+        operator, left, right = node[1], node[2], node[3]
+        if operator in ("+", ","):
+            return _growth(left) + _growth(right)
+        if operator == "-":
+            return _growth(left)                       # never grows its left side
+        if operator == "//":
+            return max(_growth(left), _growth(right))
+        return 1                                       # comparisons yield a boolean
+    if kind == "call":
+        name, args = node[1], node[2]
+        # An argument is a PARAMETER, not something appended per element,
+        # so it does not add to the factor -- except where the function
+        # emits it (`join`) or emits its output (`map`, `first`, `last`).
+        # Charging every argument made `... | ltrimstr("x") | join(", ")`
+        # look like 4x growth and put ordinary projections near the cap.
+        if name in ("map", "first", "last") and args:
+            return _growth(args[0])
+        if name == "join":
+            return 1 + _growth(args[0])                # one separator per element
+        if name in ("tostring", "tojson"):
+            return 2                                   # escaping can double a string
+        return 1                                       # every other allowed call shrinks
+    return 1                                           # num, lit
+
+
+# ---------------------------------------------------------------------
+# Which properties a filter reads. Used for the operator-side `fields=`
+# allowlist and for error messages, so it errs toward reporting MORE:
+# an over-reported path makes validate() stricter, never leakier.
+# ---------------------------------------------------------------------
+
+def _dotted(ctx) -> str:
+    """A context as the caller writes it. The root -- a bare `.`, which
+    reads the entire row -- is reported as "." rather than "", so a
+    message can name it and an allowlist can refuse it."""
+    return ".".join(ctx) if ctx else "."
+
+
+def _flow(node, ctx, out: set):
+    """Walk `node` with `ctx` as the path its input came from, recording
+    reads into `out`, and return the path of its OUTPUT (or None once
+    the value is derived rather than named).
+
+    The distinction between this and _value() is what keeps
+    `.properties | .title` from reporting a read of `properties`: on the
+    left of a pipe a path is navigation, and only the value that is
+    finally consumed is a read."""
+    kind = node[0]
+    if kind == "path":
+        base, steps = node[1], node[2]
+        if base is not None:
+            _value(base, ctx, out)
+            return None                                # derived; not a named property
+        if ctx is None:
+            return None
+        for step in steps:
+            if step[0] == "field":
+                ctx = (*ctx, step[1])
+            # index / slice / iterate / optional stay inside the same
+            # property, which is exactly what the prefix rule wants:
+            # `properties.tags[]` is within `properties.tags`.
+        return ctx
+    if kind == "pipe":
+        return _flow(node[2], _flow(node[1], ctx, out), out)
+    if kind == "paren":
+        return _flow(node[1], ctx, out)
+    if kind == "array":
+        if node[1] is not None:
+            _value(node[1], ctx, out)
+        return None
+    if kind == "str":
+        for part in node[1]:
+            if not isinstance(part, str):
+                _value(part, ctx, out)
+        return None
+    if kind == "bin":
+        _value(node[2], ctx, out)
+        _value(node[3], ctx, out)
+        return None
+    if kind == "call":
+        name, args = node[1], node[2]
+        for arg in args:
+            # An argument runs against the same data -- inside `map(f)`
+            # against its ELEMENTS, which live at the same path.
+            _value(arg, ctx, out)
+        if name in _PASSTHROUGH:
+            return ctx
+        if ctx is not None:
+            out.add(_dotted(ctx))                      # consuming the value reads it
+        return None
+    return None                                        # num, lit: reads nothing
+
+
+def _value(node, ctx, out: set):
+    """_flow(), plus the record that makes the result a read: whatever a
+    value position ends up holding is emitted, so its path is read.
+
+    This is what catches `.properties.ssn | first` -- `first` passes its
+    input through, so nothing inside records anything, but the row's ssn
+    is what comes out."""
+    result = _flow(node, ctx, out)
+    if result is not None:
+        out.add(_dotted(result))
+    return result
+
+
+def _read_paths(node) -> frozenset:
+    out: set = set()
+    _value(node, (), out)
+    return frozenset(out)
+
+
+# ---------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------
+
+def _compile(program: str, owner: str):
+    if not isinstance(program, str):
+        raise TypeError(
+            f"{owner}: expected a jq filter as a string, got {type(program).__name__} -- "
+            f'e.g. \'.properties.title + ": " + (.properties.summary // "")\''
+        )
+    if not program.strip():
+        raise UnsafeFilter(
+            f"{owner}: the filter is empty -- give the projection that builds a document "
+            f'from a row, e.g. `.properties.title`'
+        )
+    if len(program) > MAX_LENGTH:
+        raise UnsafeFilter(
+            f"{owner}: the filter is {len(program)} characters, over the {MAX_LENGTH} "
+            f"character limit -- a document projection is a few fields joined together, "
+            f"so this is a program"
+        )
+    node = _Parser(_tokenize(program, owner), owner).program()
+    growth = _growth(node)
+    if growth > MAX_GROWTH:
+        raise UnsafeFilter(
+            f"{owner}: this filter can emit {growth} times its own input, over the "
+            f"{MAX_GROWTH}x limit -- repeated concatenation doubles at every step, so a "
+            f"short filter can ask for more memory than the process has. Build the "
+            f"document from the fields you need, joined once"
+        )
+    return node
+
+
+def _allowed(fields, owner: str):
+    """Normalize the operator's allowlist. A leading `.` is accepted
+    because that is how the same path is written inside the filter, and
+    a caller should not have to know which side wants which spelling."""
+    normalized = []
+    for field in fields:
+        if not isinstance(field, str):
+            raise TypeError(
+                f"{owner}: fields= takes dotted property paths as strings, got "
+                f'{type(field).__name__} -- e.g. ["properties.title", "properties.tags"]'
+            )
+        cleaned = field.strip()
+        if cleaned.startswith("."):
+            cleaned = cleaned[1:]
+        if not cleaned:
+            raise ValueError(
+                f"{owner}: fields= contains an empty path. To allow the whole row, pass "
+                f"fields=None"
+            )
+        normalized.append(cleaned)
+    return tuple(normalized)
+
+
+def _within(path: str, allowed) -> bool:
+    """A read is allowed when it is AT or BENEATH an allowed path --
+    `properties.tags[]` reads `properties.tags`, and `.properties.tags[0].name`
+    reads `properties.tags.name`, both of which are that field's own
+    data. A read ABOVE one (`properties`) is not: it hands back the
+    siblings the allowlist exists to withhold."""
+    return any(path == field or path.startswith(field + ".") for field in allowed)
+
+
+def validate(program: str, *, fields=None, owner: str = "document_from") -> None:
+    """Raise UnsafeFilter if `program` is outside the subset, or --
+    when `fields` is given -- reads a property path outside it.
+
+        validate('.properties.title', fields=["properties.title"])
+
+    `fields` is an allowlist of dotted paths; a read at or beneath one
+    is allowed, a read above one is not. `owner` names the option the
+    filter arrived on, so the message points at the caller's own
+    spelling rather than at this module."""
+    node = _compile(program, owner)
+    if fields is None:
+        return
+    allowed = _allowed(fields, owner)
+    named = ", ".join(allowed) if allowed else "(none)"
+    for path in sorted(_read_paths(node)):
+        if _within(path, allowed):
+            continue
+        if path == ".":
+            raise UnsafeFilter(
+                f"{owner}: `.` reads the whole row, which is more than this filter may "
+                f"see -- the fields it may read are: {named}. Read them by name, e.g. "
+                f"`.{allowed[0] if allowed else 'properties.title'}`"
+            )
+        raise UnsafeFilter(
+            f"{owner}: reads `.{path}`, which is not one of the fields this filter may "
+            f"see: {named}. Read one of those, or add `{path}` to the fields this "
+            f"reranker is allowed to send"
+        )
+
+
+def paths_read(program: str) -> frozenset[str]:
+    """Dotted top-level paths the program reads, e.g. {"properties.title"}.
+    Used for the operator-side field allowlist and for error messages.
+
+    Index, slice and iteration steps do not add a segment, because they
+    stay inside the same property: `.properties.tags[0].name` reads
+    `properties.tags.name`. A filter that reads the entire row -- a bare
+    `.` -- reports `"."`. Reads are OVER-reported where the analysis
+    cannot be sure (a path off a computed base is attributed to the base
+    it came from), never under-reported: the set is what `validate()`
+    refuses on."""
+    return _read_paths(_compile(program, "paths_read"))
+
+
+def is_total(program: str) -> bool:
+    """True when the program parses in the subset (and so terminates).
+
+    There is no third answer and no timeout: the subset has no
+    recursion, no generator, no loop and no fold, so parsing IS the
+    termination proof. See the module docstring."""
+    try:
+        _compile(program, "is_total")
+    except UnsafeFilter:
+        return False
+    return True

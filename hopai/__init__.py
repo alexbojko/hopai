@@ -190,6 +190,10 @@ from .json_api import (
 from .embeddings import Embedder, EmbeddingError
 from .models import Edge, Node
 from .mutate import MUTATE_TOOL_SCHEMA, MutationResult, spec_to_mutations
+# Rerank imports no provider package and no jq binding at module scope --
+# both are resolved lazily on first use -- so naming it here costs an
+# install nothing, exactly as Embedder does above.
+from .rerankers import Rerank, RerankError
 from .schema import (
     DroppedEdgeType, EdgeType, GraphSchema, InferenceReport, NodeType, Property,
     SchemaViolations, TypeConflict,
@@ -220,6 +224,7 @@ __all__ = [
     "Vector", "Near", "Boost", "parse_near", "parse_boost", "vector_search_json",
     "VECTOR_SEARCH_TOOL_SCHEMA",
     "Embedder", "EmbeddingError",
+    "Rerank", "RerankError",
     "IngestResult", "INGEST_TOOL_SCHEMA",
     "Node", "Edge",
 ]
