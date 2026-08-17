@@ -2187,6 +2187,13 @@ class TestServeArguments:
         assert kwargs["instructions"] == _instructions(Served(graph))
         assert "describe_graph first" in kwargs["instructions"]
 
+        # And the DEFAULT name, which passing one explicitly cannot
+        # hold: it is what a client lists this server under when the
+        # operator names nothing, so it is a published identifier
+        # rather than an internal string.
+        build_server(offline())
+        assert seen["constructed"][0] == ("hopai",)
+
     @pytest.mark.parametrize("era, on_the_constructor", [(1, True), (2, False)])
     def test_the_http_settings_reach_the_constructor_only_in_the_1x_era(
             self, monkeypatch, era, on_the_constructor):

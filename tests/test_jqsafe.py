@@ -958,6 +958,25 @@ class TestLimits:
             validate("(" * MAX_DEPTH + ".a" + ")" * MAX_DEPTH)
         assert str(MAX_DEPTH) in str(refused.value)
 
+    def test_leaving_a_group_restores_the_depth_it_was_entered_at(self):
+        """The fourth mutation of the same line, and the worst: not
+        `-= 2`, not `+= 1`, but `self.depth = 1` -- leaving ANY group
+        resets the counter to the top level instead of to the level the
+        group was entered at.
+
+        None of the other three tests see it. At the top level `= 1` and
+        `-= 1` agree, so the sibling and boundary cases pass unchanged;
+        the difference only shows one level in. Nest to 38, evaluate a
+        trivial `(.a)` there, and the reset hands back the whole budget
+        -- the 38 levels that follow start from 1 instead of 38, and a
+        filter 76 deep is ACCEPTED. Repeatable, so the bound is not
+        merely loosened, it is gone: one legal group per level buys the
+        next level for free."""
+        n = MAX_DEPTH - 2
+        with pytest.raises(UnsafeFilter) as refused:
+            validate("(" * n + "(.a) + " + "(" * n + ".a" + ")" * n + ")" * n)
+        assert str(MAX_DEPTH) in str(refused.value)
+
     def test_a_wide_filter_is_not_a_deep_one(self):
         """The other direction, and it needs saying separately: the
         counter must come back down, not just fail to overshoot. Every

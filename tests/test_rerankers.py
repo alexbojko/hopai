@@ -500,6 +500,16 @@ class TestTheQueryAndDocuments:
         with pytest.raises(TypeError, match=r"a bare string is ONE document"):
             _rerank(lambda q, d: [1.0]).score("q", documents)
 
+    def test_a_non_numeric_plain_score_names_which_position_it_was(self):
+        """An in-order provider returns a bare list, so the ONLY thing
+        identifying a bad score is its index -- there is no `.index` to
+        fall back on the way `_indexed_scores()` has. Drop that context
+        and the complaint is "came back as str" with no way to tell
+        which of fifty documents the caller has to go and look at."""
+        with pytest.raises(RerankError) as raised:
+            _rerank(lambda q, d: [1.0, "not-a-number"]).score("q", ["a", "b"])
+        assert "score 1 came back as str" in str(raised.value)
+
     def test_a_bare_string_costs_no_provider_call(self):
         calls = []
         rerank = _rerank(lambda q, d: calls.append(d) or [1.0] * len(d))

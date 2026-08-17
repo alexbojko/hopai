@@ -132,16 +132,26 @@ because of bugs, not taste:
   the internals it exists to check. Equivalent — and worth keeping for the day the
   construction changes.
 
-- **`hopai/jqsafe.py`'s depth counter wants THREE tests, not one, and the two that
-  pass are the load-bearing ones.** `_Parser.pipe()`'s `self.depth -= 1` has three
+- **`hopai/jqsafe.py`'s depth counter wants FOUR tests, not one, and the two that
+  pass are the load-bearing ones.** `_Parser.pipe()`'s `self.depth -= 1` has four
   interesting mutations and a test asserting only that a too-deep filter is refused
-  catches none of them: `-= 2` lets sibling groups drive the counter negative so each
-  one buys a level (measured — 30 of them got an otherwise-refused chain ACCEPTED),
-  `+= 1` turns the bound into a budget for the whole filter so 60 shallow siblings are
-  refused, and seeding `_Parser.__init__`'s own `depth` at 1 silently costs a level at
-  the top-level entry. What kills all three is asserting the boundary from BOTH sides
-  (`MAX_DEPTH - 1` accepted, `MAX_DEPTH` refused) plus one wide-and-shallow filter that
-  must be accepted. Any new guard with a counter wants the same shape.
+  catches none of them:
+  - `-= 2` lets sibling groups drive the counter negative so each one buys a level
+    (measured — 30 of them got an otherwise-refused chain ACCEPTED);
+  - `+= 1` turns the bound into a budget for the whole filter, so 60 shallow siblings
+    are refused;
+  - `= 1` resets to the TOP level on leaving any group, so one legal `(.a)` at depth 38
+    hands back the whole budget and a filter 76 deep is accepted — repeatable, so the
+    bound is gone rather than loosened, and it is invisible at the top level where
+    `= 1` and `-= 1` agree;
+  - seeding `_Parser.__init__`'s own `depth` at 1 silently costs a level at the
+    top-level entry (the nested parser passes its parent's depth explicitly).
+
+  What kills all four is asserting the boundary from BOTH sides (`MAX_DEPTH - 1`
+  accepted, `MAX_DEPTH` refused), one wide-and-shallow filter that must be accepted,
+  and one sibling group nested INSIDE the nesting. Any new guard with a counter wants
+  the same shape: both sides of the bound, and the counter exercised somewhere other
+  than the top level, where an incorrect reset looks correct.
 
 - **`_current_depth()`'s `depth += 1` -> `+= 2` is equivalent for the property under
   test.** It counts the frames already on the stack to compute how much recursion
