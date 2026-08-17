@@ -154,6 +154,52 @@ class TestQueryStructure:
         sql = norm(offline_graph.build_query(Start(), [Hop(via={"kind": "knows"}, hops=(1, 3))]))
         assert sql.count("properties @> CAST") >= 2
 
+    def test_no_pins_emits_byte_identical_sql(self, offline_graph):
+        """Step-wise reranking threads an optional `pins` through the
+        whole walk. A traversal with no rerank= passes None, and None
+        must add NOTHING -- the same promise
+        test_defining_vectors_changes_no_near_less_query makes for
+        declared vector fields. Without this, every existing query plan
+        would be up for renegotiation the moment reranking landed."""
+        start, hops = Start(where={"type": "person"}), [Hop(hops=(1, 3)), Hop(optional=True)]
+        assert (norm(offline_graph.build_query(start, hops))
+                == norm(offline_graph.build_query(start, hops, pins=None)))
+        # The aggregate path shares _walk_matches and so shares the
+        # promise; optional= is dropped only because aggregation refuses
+        # it for reasons of its own.
+        plain = [Hop(hops=(1, 3)), Hop()]
+        assert (norm(offline_graph.build_aggregate_query(start, plain, {"n": Count()}))
+                == norm(offline_graph.build_aggregate_query(start, plain, {"n": Count()},
+                                                            pins=None)))
+
+    def test_pinning_narrows_the_step_it_names_and_nothing_else(self, offline_graph):
+        """Pinning is an `id IN (...)` on the SEED and on `match_i`, and
+        each step gets only its own list. A pin leaking onto the wrong
+        step would silently traverse from nodes the reranker dropped."""
+        sql = norm(offline_graph.build_query(
+            Start(where={"type": "person"}),
+            [Hop(via={"kind": "knows"}), Hop()], pins={-1: [1, 2], 1: [9]}), literal_binds=True)
+        assert "nodes.id IN (1, 2)" in sql
+        assert "walk_1.to_id IN (9)" in sql
+        # hop 0 was not pinned, so its match keeps the shape it had: the
+        # only `walk_0.to_id IN` left is hop_edges_0's own subquery
+        # against match_0, never a literal id list.
+        assert "walk_0.to_id IN (SELECT match_0.node_id" in sql
+        assert "walk_0.to_id IN (9)" not in sql
+        assert "walk_0.to_id IN (1, 2)" not in sql
+
+    def test_a_pinned_step_still_reports_its_edges_from_the_walk(self, offline_graph):
+        """The whole safety argument for re-running an ORDINARY
+        traversal with survivors pinned: `hop_edges_i` still derives
+        from `full_walk` joined against `match_i`, so multi-hop edge
+        reconstruction and dead-end pruning are untouched. If pinning
+        ever started reporting edges from the pinned id list itself,
+        this is what would notice."""
+        sql = norm(offline_graph.build_query(Start(), [Hop(hops=(1, 3))], pins={0: [4, 5]}))
+        assert "hop_edges_0 AS" in sql
+        assert "unnest(walk_0.local_edges)" in sql
+        assert "walk_0.to_id IN (SELECT match_0.node_id" in sql
+
 
 class TestCustomSchema:
     def test_custom_table_and_column_names_are_used(self):

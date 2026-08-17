@@ -236,40 +236,113 @@ class AsyncGraph:
         from .vectors import _ensure_lazy_vectors
         await conn.run_sync(lambda c: _ensure_lazy_vectors(self._sync, c))
 
+    async def _rerank_pins(self, start: Start, hops: list, plan: dict) -> dict:
+        """Graph._rerank_pins(), with the provider call AWAITED.
+
+        The probe and the hydration go through run_sync() -- they are
+        ordinary SQL -- and the scoring does not: inside the bridge it
+        would run on the event loop's own thread and stall every other
+        task for the length of the round trip, which is issue #74's
+        finding applied to the second network call on the read path.
+        The session is closed before the await for the reason the sync
+        driver closes it: a provider round trip must never happen with a
+        transaction open.
+
+        Serial by nature, and that is not a shortcut taken here: hop
+        N+1's candidates ARE hop N's survivors, so there is nothing to
+        gather.
+
+        Everything except the await is the sync driver's, imported
+        rather than restated -- which document each candidate becomes,
+        how a node scores across its paths, and how many survive are
+        one set of rules, and a second copy is how the two paths drift
+        into pinning different nodes for the same query."""
+        from .core import _rerank_documents, _rerank_steps, _rerank_survivors
+
+        pins: dict = {}
+        for index, spec in _rerank_steps(start, hops):
+            async with AsyncSession(self._async_engine) as session:
+                candidates = await session.run_sync(
+                    lambda s, i=index: self._sync._rerank_probe(s, start, hops, i, pins))
+            units = _rerank_documents(candidates, spec.rerank)
+            if not units:
+                pins[index] = []
+                continue
+            documents = spec.rerank.build_documents([candidate for _, candidate in units])
+            scores = await spec.rerank.ascore(plan[index], documents)
+            pins[index] = _rerank_survivors(units, scores, spec.keep)
+        return pins
+
+    async def _reranked(self, start: Start, hops: list) -> tuple:
+        """(start, hops, pins) -- every provider call on the traversal
+        path made, awaited, before anything opens.
+
+        The plan is read from the specs AS WRITTEN, before _embedded()
+        resolves them: `Near._with_vector()` hands back a spec carrying
+        floats and no text, and the reranker's query is that text."""
+        from .core import rerank_plan
+
+        plan = rerank_plan(start, hops)
+        start, hops = await self._embedded(start, hops)
+        pins = await self._rerank_pins(start, hops, plan) if plan else None
+        return start, hops, pins
+
     async def traverse(self, start: Start, *hops: Hop) -> Subgraph:
-        start, hops = await self._embedded(start, list(hops))
+        start, hops, pins = await self._reranked(start, list(hops))
         async with AsyncSession(self._async_engine) as session:
             return await session.run_sync(
-                lambda s: self._sync._traverse_with_session(s, start, hops))
+                lambda s: self._sync._traverse_with_session(s, start, hops, pins=pins))
 
     async def aggregate(self, start: Start, *hops: Hop, aggregates: dict) -> dict:
-        start, hops = await self._embedded(start, list(hops))
+        start, hops, pins = await self._reranked(start, list(hops))
         async with AsyncSession(self._async_engine) as session:
             return await session.run_sync(
-                lambda s: self._sync._aggregate_with_session(s, start, hops, aggregates))
+                lambda s: self._sync._aggregate_with_session(s, start, hops, aggregates,
+                                                             pins=pins))
 
     async def vector_search(self, *near, target: str = "nodes", k: int = 10, where=None,
-                            boost=None) -> list:
-        from .vectors import aresolve_near_texts, has_text, search
+                            boost=None, rerank=None) -> list:
+        from .vectors import (
+            arerank_hits, aresolve_near_texts, has_text, rerank_query_text, search_candidates,
+        )
         near = list(near)
+        # Read (and validate) the reranker's query BEFORE embedding: the
+        # resolved Near carries floats and no text.
+        query = rerank_query_text(near, rerank, k, "vector_search()")
         async with self._async_engine.connect() as conn:
             if has_text(near):
                 await self._lazy_vectors_loaded(conn)
                 near = await aresolve_near_texts(self._sync, near, target, k)
-            return await conn.run_sync(
-                lambda c: search(self._sync, near, target=target, k=k, where=where,
-                                 boost=boost, connection=c))
+            hits = await conn.run_sync(
+                lambda c: search_candidates(self._sync, near, target=target, k=k, where=where,
+                                            boost=boost, connection=c, rerank=rerank))
+        # Outside the connection block AND outside run_sync(): the
+        # scoring is a provider round trip, and inside the bridge it
+        # would run on the loop's own thread.
+        if rerank is None:
+            return hits
+        return await arerank_hits(hits, rerank, query, k)
 
     async def vector_search_many(self, queries, target: str = "nodes", k: int = 10, where=None,
-                                 boost=None) -> list:
-        from .vectors import aresolve_query_texts, has_text, search_many
+                                 boost=None, rerank=None) -> list:
+        from .vectors import (
+            arerank_many, aresolve_query_texts, has_text, rerank_query_texts,
+            search_many_candidates,
+        )
+        texts = rerank_query_texts(queries, rerank, k, "vector_search_many()")
         async with self._async_engine.connect() as conn:
             if has_text(queries):
                 await self._lazy_vectors_loaded(conn)
                 queries = await aresolve_query_texts(self._sync, target, queries, k)
-            return await conn.run_sync(
-                lambda c: search_many(self._sync, queries, target=target, k=k, where=where,
-                                      boost=boost, connection=c))
+            grouped = await conn.run_sync(
+                lambda c: search_many_candidates(self._sync, queries, target=target, k=k,
+                                                 where=where, boost=boost, connection=c,
+                                                 rerank=rerank))
+        if rerank is None:
+            return grouped
+        # CONCURRENTLY: this call exists to turn N round trips into one,
+        # and N sequential provider calls would hand that straight back.
+        return await arerank_many(grouped, rerank, texts, k)
 
     async def get_vectors(self, node_ids=None, edge_ids=None, node_fields=None,
                           edge_fields=None) -> dict:

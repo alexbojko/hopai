@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from dataclasses import replace as _respec
 from decimal import Decimal
 
 from typing import Optional, Union
@@ -60,6 +61,151 @@ def _extra_columns(table, reserved: set, graph_col: Optional[str]) -> tuple:
     names = set(reserved) | ({graph_col} if graph_col is not None else set())
     return tuple(c.name for c in table.columns
                  if c.name not in names and not c.name.startswith(VECTOR_COLUMN_PREFIX))
+
+
+def _pinned(id_expr, pins: Optional[dict], index: int) -> tuple:
+    """`(id IN (...),)` for a pinned step, or `()` for every other one.
+
+    A tuple rather than a condition-or-None so the call sites splat it:
+    `and_(a, b, *_pinned(...))` with no pins is `and_(a, b)`, the exact
+    expression that was there before pinning existed, which is what
+    keeps a rerank-less traversal's SQL byte-identical."""
+    if not pins or index not in pins:
+        return ()
+    return (id_expr.in_(pins[index]),)
+
+
+def _rerank_steps(start: Start, hops: list) -> list:
+    """Every step carrying a rerank=, in CHAIN order: (index, spec).
+
+    Index -1 is the Start and 0.. are the hops -- the same numbering
+    vectors._near_sites() uses, so a step is named the same whichever
+    layer is talking about it. Chain order is not cosmetic: hop N+1's
+    candidates are whatever hop N's rerank left behind, so these are
+    inherently serial and must be walked front to back."""
+    steps = [(-1, start)] if start.rerank is not None else []
+    steps.extend((i, hop) for i, hop in enumerate(hops) if hop.rerank is not None)
+    return steps
+
+
+def _step_owner(index: int, hops: list) -> str:
+    """How a step is named in a refusal -- build_query()'s own wording
+    for a hop, so one traversal never gets two spellings of hop 1."""
+    return "Start" if index < 0 else f"hop {index} ({hops[index].label or 'unlabeled'})"
+
+
+def _reads_paths(document_from: str, unknown: bool) -> bool:
+    """Whether a document_from filter reads `.paths`, answering
+    `unknown` when the subset cannot parse it at all.
+
+    Path context costs a wider probe and a second hydration, so the
+    common filter -- one that only reads the node's own properties --
+    must not pay for it. `jqsafe.paths_read()` answers this by parsing,
+    and OVER-reports rather than under-reports where it cannot be sure.
+
+    The two callers want opposite answers for a filter the grammar
+    rejects, which is why this takes the fallback rather than choosing
+    one. HYDRATION asks with unknown=True: hydrating paths nobody reads
+    is waste, missing paths somebody reads is a document built from
+    `null`. The Start refusal asks with unknown=False, because such a
+    filter already has a refusal of its own coming -- from
+    build_documents(), with `document_from` as the owner and the
+    offending construct named -- and answering "it reads .paths" there
+    would blame something the caller never wrote."""
+    from . import jqsafe
+    try:
+        read = jqsafe.paths_read(document_from)
+    except Exception:
+        return unknown
+    return any(path == "paths" or path.startswith("paths.") for path in read)
+
+
+def _rerank_documents(candidates: list, rerank) -> list:
+    """(node id, candidate JSON) per DOCUMENT the provider will see.
+
+    Default -- one document per distinct NODE, quoting every path that
+    reached it. This follows the decision `_walk_matches()` already
+    recorded for Near at a hop ("Rank AFTER deduplication..."): many
+    walks reach one node, and paying per walk buys nothing when the
+    answer is one number per node. The reranker also sees every route at
+    once, which is more evidence than any single path carries.
+
+    per_path=True -- one document per (node, path), because a node can
+    genuinely read differently depending on the route that found it.
+    Opt-in precisely because it costs |paths| documents instead of
+    |nodes|, and the bill is per document."""
+    if not rerank.per_path:
+        return list(candidates)
+    expanded = []
+    for node_id, candidate in candidates:
+        paths = candidate.get("paths")
+        if not paths:
+            expanded.append((node_id, candidate))
+            continue
+        expanded.extend((node_id, {**candidate, "paths": [path]}) for path in paths)
+    return expanded
+
+
+def _rerank_survivors(units: list, scores: list, keep: Optional[int]) -> list:
+    """The ids that survive one reranked step, best first.
+
+    A node's score is the MAX over its documents -- not the sum, not the
+    mean -- so under per_path=True one strong route is enough to keep
+    it. That is the same "any valid parent counts" semantics
+    test_fan_in_both_parents_preserved exists to protect, and it is why
+    a node survives or is dropped as a UNIT: every in-edge from a
+    surviving parent is still reported, because the walk is re-run
+    normally afterwards and derives its edges the way it always did.
+
+    `keep=None` keeps them all, and the step is still narrowed: the
+    probe fetched `rerank.candidates` of them, which is the input bound
+    doing its job. Reordering alone changes nothing downstream, since a
+    traversal is a subgraph rather than a ranking."""
+    best: dict = {}
+    for (node_id, _), score in zip(units, scores, strict=True):
+        value = float(score)
+        if node_id not in best or value > best[node_id]:
+            best[node_id] = value
+    ranked = sorted(best, key=lambda node_id: (-best[node_id], str(node_id)))
+    return ranked if keep is None else ranked[:keep]
+
+
+def rerank_plan(start: Start, hops: list) -> dict:
+    """{step index: the text its Rerank scores against}, empty when
+    nothing reranks -- and every pre-flight refusal, raised before a
+    single statement runs.
+
+    Called first by traverse()/aggregate() and, on the async path, by
+    AsyncGraph BEFORE it embeds: `Near._with_vector()` hands back a spec
+    carrying floats and no text, so the query has to be read while it is
+    still there.
+
+    The empty case returns before it imports anything, because every
+    traversal in the library now runs through here and a chain with no
+    rerank= must pay one attribute test for the privilege."""
+    steps = _rerank_steps(start, hops)
+    if not steps:
+        return {}
+    from .vectors import rerank_query_text
+
+    plan = {}
+    for index, spec in steps:
+        owner = _step_owner(index, hops)
+        if index < 0 and _reads_paths(spec.rerank.document_from, unknown=False):
+            # A seed has no provenance -- nothing reached it -- so
+            # `.paths` there would be `null` and every document would
+            # quietly change shape. Refused at query time rather than
+            # producing one, and named where the caller wrote it.
+            raise ValueError(
+                f"{owner}: document_from={spec.rerank.document_from!r} reads .paths, but a "
+                f"seed has no provenance -- nothing reached it, so there is no path to "
+                f"quote. `.paths` exists at a Hop and not at a Start. Move the rerank= to "
+                f"the Hop that reaches these nodes, or build the seed's document from its "
+                f"own properties"
+            )
+        plan[index] = rerank_query_text(spec.near, spec.rerank, spec.keep, owner,
+                                        k_name="keep")
+    return plan
 
 
 def _plain(value):
@@ -292,10 +438,25 @@ class Graph:
     # build_aggregate_query needs the exact same seed/walk/match chain;
     # there is still exactly one place the walk is built.
 
-    def _walk_matches(self, start: Start, hops: list):
+    def _walk_matches(self, start: Start, hops: list, pins: Optional[dict] = None):
         """The seed CTE plus, per hop, its (full recursive walk, match)
         CTE pair. Shared by build_query and build_aggregate_query, so
-        the two can never disagree about what a traversal matches."""
+        the two can never disagree about what a traversal matches.
+
+        `pins` narrows a step to an explicit id list -- {-1: seed ids,
+        i: hop i's ids} -- and is how a reranked traversal re-runs as an
+        ORDINARY traversal with the survivors of each provider call
+        already decided (see _rerank_pins()). It is private and stays
+        private: `Hop(near=..., keep=N)` already narrows `match_i` to a
+        subset through ranked_ids(), build_query() already derives that
+        hop's reported edges from that subset, and pinning is the same
+        operation with a different source for the list -- but a public
+        field would invite a caller to hand-write ids that no step
+        actually reached, which is a subgraph nothing in the graph
+        supports.
+
+        `pins=None` adds nothing anywhere: the SQL is byte-identical to
+        what a traversal emitted before reranking existed."""
         from sqlalchemy.dialects.postgresql import array
         from sqlalchemy.sql.expression import any_ as sa_any_
         from sqlalchemy import not_ as sa_not_
@@ -306,7 +467,8 @@ class Graph:
         edge_id_col = getattr(et.c, self.edge_id_col)
         node_id_col = getattr(nt.c, self.node_id_col)
 
-        seed_condition = and_(self._scoped(nt), resolve(nt.c.properties, start.where))
+        seed_condition = and_(self._scoped(nt), resolve(nt.c.properties, start.where),
+                              *_pinned(node_id_col, pins, -1))
         if start.near is not None:
             # Similarity-seeded: the seed CTE becomes "the k most
             # similar nodes that also pass `where`", ranked inside the
@@ -448,8 +610,10 @@ class Graph:
                              resolve(nt.c.properties, hop.where))
                 )
                 from .vectors import validate_boosts
+                pinned = _pinned(reached.c.node_id, pins, i)
                 match_i = ranked_ids(
-                    self, nt, reached.c.node_id, joined, None, nears, hop.keep,
+                    self, nt, reached.c.node_id, joined,
+                    and_(*pinned) if pinned else None, nears, hop.keep,
                     validate_boosts(hop.boost, f"hop {i} ({hop.label or 'unlabeled'})"),
                 ).cte(f"match_{i}")
             else:
@@ -461,7 +625,8 @@ class Graph:
                                      resolve(nt.c.properties, hop.where))
                         )
                     )
-                    .where(full_walk.c.depth >= hop.min_hops)
+                    .where(full_walk.c.depth >= hop.min_hops,
+                           *_pinned(full_walk.c.to_id, pins, i))
                     .cte(f"match_{i}")
                 )
             pairs.append((full_walk, match_i))
@@ -469,7 +634,7 @@ class Graph:
 
         return seed, pairs
 
-    def build_query(self, start: Start, hops: list):
+    def build_query(self, start: Start, hops: list, pins: Optional[dict] = None):
         nt, et = self.nodes_tbl, self.edges_tbl
         edge_start_col = getattr(et.c, self.edge_start_col)
         edge_end_col = getattr(et.c, self.edge_end_col)
@@ -485,7 +650,7 @@ class Graph:
                     f"separate queries."
                 )
 
-        seed, pairs = self._walk_matches(start, hops)
+        seed, pairs = self._walk_matches(start, hops, pins=pins)
         prev_match = seed
         hop_edge_ctes = []
         pre_optional_match = None
@@ -548,7 +713,8 @@ class Graph:
 
         return node_selects[0].union(*node_selects[1:], *edge_selects)
 
-    def build_aggregate_query(self, start: Start, hops: list, aggregates: dict):
+    def build_aggregate_query(self, start: Start, hops: list, aggregates: dict,
+                              pins: Optional[dict] = None):
         """The single statement Graph.aggregate() runs: the same
         seed/walk/match chain as build_query, with the aggregates
         computed over the final match instead of the subgraph being
@@ -574,7 +740,7 @@ class Graph:
 
         nt = self.nodes_tbl
         node_id_col = getattr(nt.c, self.node_id_col)
-        seed, pairs = self._walk_matches(start, hops)
+        seed, pairs = self._walk_matches(start, hops, pins=pins)
         # The final match: what the last hop reached, or the seed set when
         # there are no hops. Aggregating any OTHER position would count
         # nodes with no continuation to the end of the chain -- the
@@ -1297,7 +1463,7 @@ class Graph:
                                        boost=boost)
 
     def vector_search_many(self, queries, target: str = "nodes", k: int = 10, where=None,
-                           boost=None) -> list:
+                           boost=None, rerank=None) -> list:
         """Rank several queries in ONE round trip, returning one result
         list per query, in order:
 
@@ -1313,12 +1479,21 @@ class Graph:
         entry may
         itself be a list of Near specs (a multivector query); every
         query must share the same field shape, which the call refuses
-        rather than silently ranking them differently."""
+        rather than silently ranking them differently.
+
+        `rerank` is PER CALL, where `boost` already sits -- not per
+        query: `candidates` decides how many rows the ONE statement
+        fetches and this call takes ONE `k`, so per-query Reranks could
+        disagree in a way one statement cannot serve. N queries produce
+        N reranker calls (a score is the (query, document) relationship,
+        so one call cannot serve two queries); AsyncGraph issues them
+        concurrently."""
         from .vectors import search_many
-        return search_many(self, queries, target=target, k=k, where=where, boost=boost)
+        return search_many(self, queries, target=target, k=k, where=where, boost=boost,
+                           rerank=rerank)
 
     def vector_search(self, *near, target: str = "nodes", k: int = 10, where=None,
-                      boost=None) -> list:
+                      boost=None, rerank=None) -> list:
         """Exact cosine similarity search over this graph's nodes or
         edges -- one statement, no extension, no approximation.
 
@@ -1341,9 +1516,21 @@ class Graph:
         missing="zero" scored it 0 in the combined total) and `boosts`
         (per Boost, keyed by property), so a caller tuning weights can
         see what actually drove a result rather than only the sum. The
-        cost model and every design refusal live in hopai/vectors.py."""
+        cost model and every design refusal live in hopai/vectors.py.
+
+        `rerank=Rerank(client, document_from='...', candidates=50)` adds
+        the third retrieval stage: `candidates` rows are fetched instead
+        of `k`, each becomes a document by evaluating the jq filter,
+        ONE provider call scores them -- after the SQL round trip has
+        closed, never inside it -- and the list comes back ordered by
+        the new score and truncated to `k`. Purely additive: each hit
+        gains `rerank_score` and `similarity` keeps its original value,
+        so a caller can see what the reranker changed. It needs the
+        query as TEXT (`Near("summary", text="...")`), because a
+        reranker scores a query against a document by reading both."""
         from .vectors import search
-        return search(self, list(near), target=target, k=k, where=where, boost=boost)
+        return search(self, list(near), target=target, k=k, where=where, boost=boost,
+                      rerank=rerank)
 
     # -- writing --------------------------------------------------------
 
@@ -1531,14 +1718,15 @@ class Graph:
 
     # -- execution ------------------------------------------------------
 
-    def _aggregate_with_session(self, session, start: Start, hops: list, aggregates: dict) -> dict:
+    def _aggregate_with_session(self, session, start: Start, hops: list, aggregates: dict,
+                                pins: Optional[dict] = None) -> dict:
         """The aggregate work itself, given an OPEN session. aggregate()
         opens one and calls this directly; AsyncGraph.aggregate()
         (hopai/asyncio.py) reaches the SAME function through
         AsyncSession.run_sync() -- one implementation, two callers, so
         sync and async can never disagree about what an aggregate
         answers."""
-        query = self.build_aggregate_query(start, hops, aggregates)
+        query = self.build_aggregate_query(start, hops, aggregates, pins=pins)
         row = session.execute(query).one()
         # strict= is unobservable here and that is on purpose:
         # build_aggregate_query() emits exactly one labeled column per
@@ -1562,14 +1750,178 @@ class Graph:
 
         Returns plain JSON-serializable values: count -> int, sum -> a
         number (0 when nothing matched), avg/min/max -> a number or None
-        when nothing matched. One statement, one round trip."""
-        with Session(self.engine) as session:
-            return self._aggregate_with_session(session, start, list(hops), aggregates)
+        when nothing matched. One statement, one round trip.
 
-    def _traverse_with_session(self, session, start: Start, hops: list) -> Subgraph:
+        With a `rerank=` anywhere in the chain the aggregates run over
+        the reranked SURVIVORS -- still "the nodes the last hop
+        matched", because pinning narrows exactly what `keep=` narrows,
+        and it costs the probe round trips traverse() documents."""
+        hops = list(hops)
+        plan = rerank_plan(start, hops)
+        pins = self._rerank_pins(start, hops, plan) if plan else None
+        with Session(self.engine) as session:
+            return self._aggregate_with_session(session, start, hops, aggregates, pins=pins)
+
+    # -- step-wise reranking --------------------------------------------
+    #
+    # A traversal compiles to ONE recursive CTE, and a reranker is a
+    # network call in the middle of the walk, so it cannot stay one
+    # statement. The shape here is PROBE, RERANK, THEN RE-RUN THE
+    # ORDINARY TRAVERSAL with each step's survivors pinned -- not
+    # stitching partial results together.
+    #
+    # That choice is the whole safety argument. Because the final
+    # execution is an ordinary traversal, fan-in, multi-hop edge
+    # reconstruction and dead-end pruning are preserved for free: the
+    # edges reported for a hop are still derived from `full_walk` against
+    # `match_i`, and `match_i` is still what feeds the next hop. Pinning
+    # only changes where that hop's id list came from -- `Hop(near=,
+    # keep=N)` already narrows it to a subset through ranked_ids(), and
+    # this narrows it to a subset the provider chose instead. Stitching
+    # would have had to re-derive the edges by hand, which is exactly
+    # what "reported nodes derive from the edges found" exists to stop.
+    #
+    # COST, stated honestly because rule 6 says a measurement rather than
+    # "probably fine": 1 + (2 x reranked steps) round trips -- one probe
+    # and one hydration per reranked step, then the traversal itself --
+    # plus one provider call per reranked step. Those calls are SERIAL by
+    # nature: hop N+1's candidates are whatever hop N's rerank left, so
+    # unlike vector_search_many()'s N calls they cannot be issued
+    # together. tests/test_vectors.py pins the count so a change that
+    # doubles it is visible.
+
+    def _rerank_probe(self, session, start: Start, hops: list, index: int,
+                      pins: dict) -> list:
+        """The candidates one reranked step offers, as
+        (id, {"id", "properties"}) pairs -- plus "paths" at a hop, when
+        the filter reads them.
+
+        The step is run TRUNCATED: everything up to and including it,
+        with its own `keep` widened to `rerank.candidates` (the input
+        bound) and every earlier step's survivors already pinned. So the
+        candidate set is exactly what that step would have reached, cut
+        off at the number the caller agreed to pay for."""
+        spec = start if index < 0 else hops[index]
+        rerank = spec.rerank
+        nt = self.nodes_tbl
+        node_id_col = getattr(nt.c, self.node_id_col)
+
+        # `rerank=None` on the copy, and not only for tidiness: the spec
+        # re-validates on construction, and by the time the ASYNC path
+        # gets here the Near carries floats with its text= already
+        # resolved away -- which _validate_rerank() would (correctly, in
+        # any other context) refuse as a raw-vector query. The probe has
+        # no reranker to run anyway; it is what produces its input.
+        if index < 0:
+            probe_start = _respec(start, keep=rerank.candidates, rerank=None)
+            probe_hops = []
+        else:
+            probe_start = start
+            probe_hops = list(hops[:index]) + [
+                _respec(hops[index], keep=rerank.candidates, rerank=None)]
+        seed, pairs = self._walk_matches(probe_start, probe_hops, pins=pins)
+
+        wants_paths = index >= 0 and _reads_paths(rerank.document_from, unknown=True)
+        if index < 0:
+            walks = [(row.node_id, None)
+                     for row in session.execute(select(seed.c.node_id)).all()]
+        else:
+            full_walk, match_i = pairs[index]
+            if wants_paths:
+                # The same (walk, match) pair build_query() reads for
+                # `hop_edges_i`, asked for local_path instead of
+                # local_edges: one row per (candidate, route), which is
+                # what makes a candidate here "a node PLUS how it was
+                # reached" rather than a row.
+                query = select(full_walk.c.to_id, full_walk.c.local_path).where(
+                    and_(full_walk.c.depth >= probe_hops[index].min_hops,
+                         full_walk.c.to_id.in_(select(match_i.c.node_id))))
+                walks = [(row.to_id, list(row.local_path))
+                         for row in session.execute(query).all()]
+            else:
+                walks = [(row.node_id, None)
+                         for row in session.execute(select(match_i.c.node_id)).all()]
+
+        routes: dict = {}
+        for node_id, local_path in walks:
+            paths = routes.setdefault(node_id, set())
+            if local_path:
+                # The walk's local_path is [anchor, ..., candidate]. The
+                # candidate itself is not provenance -- it is already the
+                # document's own `.properties` -- so a path is who
+                # REACHED it, which is what makes `.paths[][-1]` the
+                # immediate parent ("cited by") rather than the node
+                # restating itself.
+                paths.add(tuple(local_path[:-1]))
+
+        wanted = set(routes)
+        wanted.update(node_id for paths in routes.values() for path in paths for node_id in path)
+        properties = self._rerank_properties(session, node_id_col, wanted)
+
+        def hydrate(node_id):
+            return {"id": str(node_id), "properties": properties.get(str(node_id), {})}
+
+        candidates = []
+        for node_id in sorted(routes, key=str):
+            candidate = hydrate(node_id)
+            if wants_paths:
+                # Canonically ordered, so the same graph always produces
+                # the same document (and, once max_paths trims it, the
+                # same TRUNCATION) -- a reranker that scored the same
+                # node differently between two identical runs would be
+                # untestable and unreproducible.
+                candidate["paths"] = [
+                    [hydrate(step) for step in path]
+                    for path in sorted(routes[node_id],
+                                       key=lambda path: tuple(str(step) for step in path))
+                ]
+            candidates.append((node_id, candidate))
+        return candidates
+
+    def _rerank_properties(self, session, node_id_col, node_ids: set) -> dict:
+        """Properties for every node a step's documents mention -- the
+        candidates and, when paths are read, the nodes on them -- in ONE
+        statement, keyed by the string id every result already uses."""
+        if not node_ids:
+            return {}
+        query = select(cast(node_id_col, String).label("id"), self.nodes_tbl.c.properties).where(
+            and_(self._scoped(self.nodes_tbl), node_id_col.in_(sorted(node_ids, key=str))))
+        return {row.id: row.properties for row in session.execute(query).all()}
+
+    def _rerank_pins(self, start: Start, hops: list, plan: dict) -> dict:
+        """Every reranked step's survivors, walked front to back.
+
+        Each step opens its own session and CLOSES it before the
+        provider call: an HTTP round trip inside an open transaction
+        holds a read snapshot for its whole duration, which is the same
+        rule set_vectors() keeps for row locks.
+
+        The documents are built with build_documents()' own defaults --
+        the SAFE SUBSET, no `trusted=True`. The dangerous thing is the
+        one you have to ask for, the polarity `allow_vectors=`, `all=`
+        and `detach=` already keep: a filter can reach a Rerank from a
+        tool call or over the wire as easily as from a caller's own
+        Python, and the engine cannot tell which. Widening it is the
+        job of whoever knows the filter's provenance, not of the code
+        that runs every traversal."""
+        pins: dict = {}
+        for index, spec in _rerank_steps(start, hops):
+            with Session(self.engine) as session:
+                candidates = self._rerank_probe(session, start, hops, index, pins)
+            units = _rerank_documents(candidates, spec.rerank)
+            if not units:
+                pins[index] = []
+                continue
+            documents = spec.rerank.build_documents([candidate for _, candidate in units])
+            scores = spec.rerank.score(plan[index], documents)
+            pins[index] = _rerank_survivors(units, scores, spec.keep)
+        return pins
+
+    def _traverse_with_session(self, session, start: Start, hops: list,
+                               pins: Optional[dict] = None) -> Subgraph:
         """The traverse work itself, given an OPEN session -- see
         _aggregate_with_session() just above for why this split exists."""
-        query = self.build_query(start, hops)
+        query = self.build_query(start, hops, pins=pins)
         t0 = time.perf_counter()
         rows = session.execute(query).all()
         node_ids = [r.id for r in rows if r.kind == "node"]
@@ -1621,6 +1973,36 @@ class Graph:
     def traverse(self, start: Start, *hops: Hop) -> Subgraph:
         """Run one traversal. `start` picks the seed set; each `Hop`
         after it is one step of the walk. Returns a Subgraph with every
-        node and edge on at least one complete matching chain."""
+        node and edge on at least one complete matching chain.
+
+        ONE STATEMENT, unless a step carries `rerank=`. A reranker is a
+        provider call in the middle of the walk, so a reranked traversal
+        runs as: per reranked step, a probe for its candidates and a
+        hydration for their properties, then the provider call with
+        nothing open, and finally THIS ordinary traversal with each
+        step's survivors pinned.
+
+        COST, measured rather than assumed (see
+        test_a_reranked_traversal_costs_one_plus_two_per_reranked_step):
+        1 + (2 x reranked steps) round trips on top of what this
+        traversal already costs -- the traversal itself is unchanged,
+        its own hydration SELECTs included -- and one provider call per
+        reranked step. Those calls are SERIAL by nature: hop N+1's
+        candidates are whatever hop N's rerank left behind, so unlike
+        vector_search_many()'s they cannot be issued together. Pruning
+        therefore COMPOUNDS and is unrecoverable: prune wrong at hop 1
+        and hop 2 never sees the right nodes, which is the argument for
+        a generous `candidates` at early steps.
+
+        The result shape does not change. A traversal returns a
+        SUBGRAPH, not a ranking -- similarity scores have never survived
+        into it and rerank scores get no exception. Use vector_search()
+        when the scores themselves are the answer."""
+        hops = list(hops)
+        # Every refusal first, before a statement runs: a chain that will
+        # be rejected must not spend a probe (or a provider call) on the
+        # way to being rejected.
+        plan = rerank_plan(start, hops)
+        pins = self._rerank_pins(start, hops, plan) if plan else None
         with Session(self.engine) as session:
-            return self._traverse_with_session(session, start, list(hops))
+            return self._traverse_with_session(session, start, hops, pins=pins)
