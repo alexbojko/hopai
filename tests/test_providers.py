@@ -17,6 +17,8 @@ one step; one reading `KeyError` opens the source.
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 from hopai import providers
@@ -270,7 +272,70 @@ class TestAzureSpecifics:
         assert embedder.provider == "openai"
 
 
+class TestTheImportEachBuilderAsksFor:
+    """Which module a builder imports, and under which pip extra.
+
+    The fixture above has always recorded this -- its docstring says so
+    -- and nothing read it. That mattered more than it looks: every
+    test here fakes _import, so the module NAME never reaches a real
+    import, and `_import("XXopenaiXX", ...)` sailed through a complete
+    mutation run. In production that name is the import, so a wrong one
+    means the provider can never be built: `--embed-provider openai`
+    would refuse with "needs the 'openai' package -- pip install
+    hopai[openai]" on a machine where openai is installed, which sends
+    the operator to reinstall a package they already have.
+
+    The pairs are worth reading as documentation, since three of the
+    six differ from the provider name: voyage imports voyageai, google
+    imports google.genai, and azure-openai imports plain openai."""
+
+    @pytest.mark.parametrize("provider, module, extra", [
+        ("openai", "openai", "openai"),
+        ("azure-openai", "openai", "openai"),
+        ("cohere", "cohere", "cohere"),
+        ("voyage", "voyageai", "voyageai"),
+        ("google", "google.genai", "google"),
+        ("sentence-transformers", "sentence_transformers", "sentence-transformers"),
+    ])
+    def test_it_imports_the_module_that_actually_holds_the_client(
+            self, imported, provider, module, extra):
+        asked = imported(fake_module(
+            OpenAI=FakeOpenAI, AzureOpenAI=FakeOpenAI, ClientV2=FakeCohere,
+            Client=FakeVoyage, SentenceTransformer=FakeSentenceTransformer))
+        # google's Client fake is the wrong shape for this one call; the
+        # import is recorded before any of that matters.
+        with contextlib.suppress(ProviderError, TypeError):
+            embedder_from_env(provider, env=TestEveryRefusalNamesItsProvider.FILLED,
+                              model="m")
+        assert (asked["module"], asked["extra"]) == (module, extra)
+
+    def test_a_dotted_module_resolves_to_the_submodule_not_its_parent(self):
+        """`fromlist` is why _import() returns google.genai rather than
+        google, and google is the one dotted provider.
+
+        Without it __import__("google.genai") hands back the `google`
+        package, and the very next line -- genai.Client(...) -- is an
+        AttributeError rather than a client. Every other test fakes
+        _import, so the real one is only ever reached with a package
+        that is absent; a dotted stdlib module exercises it without
+        installing anything, which is the point of this file."""
+        import os.path
+
+        assert providers._import("os.path", "x", "y") is os.path
+
+
 class TestPassThrough:
+    def test_the_api_key_reaches_the_client_under_the_name_the_sdk_expects(
+            self, imported):
+        """`api_key` is a keyword the real SDK matches by name. The fake
+        takes **options, so a renamed key is accepted here and would be
+        a TypeError against the real client -- which is why the mutants
+        that renamed it survived a full run of this file."""
+        record: dict = {}
+        imported(openai_module(record))
+        embedder_from_env("openai", model="m", env={"OPENAI_API_KEY": "k"})
+        assert record["api_key"] == "k"
+
     def test_openai_compatible_endpoints_are_reachable(self, imported):
         """A gateway or a self-hosted vLLM speaks the OpenAI API at a
         different address. The provider name says which SDK, not which
