@@ -396,6 +396,43 @@ class TestEveryRefusalNamesItsProvider:
         assert f"--embed-provider {provider} " in str(caught.value), (
             f"the refusal does not name {provider!r}: {caught.value}")
 
+    @pytest.mark.parametrize("provider", sorted(provider_names()))
+    def test_an_explicit_model_beats_the_environment(self, imported, provider):
+        """`--embed-model` wins over the provider's own variable, and a
+        builder that drops the argument is not a naming bug -- it is the
+        wrong model answering queries.
+
+        Dropping `model` from _model_for() left the environment as the
+        only source: an operator passing --embed-model against a shell
+        that already exports OPENAI_EMBEDDING_MODEL would silently get
+        the exported one, and the model that answers a query would stop
+        being the model that wrote the stored vectors. That is the
+        failure the whole vector surface exists to prevent, and all
+        2819 tests passed with it. The existing coverage supplied the
+        model through the ENVIRONMENT, so this precedence -- the only
+        reason the argument exists -- was never exercised.
+        """
+        client, constructor = self.BUILDERS[provider]
+        seen: dict = {}
+
+        def record(*args, **kwargs):
+            seen["args"], seen["kwargs"] = args, kwargs
+            return client(**kwargs)
+
+        imported(fake_module(**{constructor: record}))
+        spec = providers.PROVIDERS[provider]
+        env = dict(self.FILLED)
+        if spec.model_var:                       # a decoy the flag must beat
+            env[spec.model_var] = "from-the-environment"
+        embedder = embedder_from_env(provider, env=env, model="from-the-flag")
+
+        # sentence-transformers bakes the name into the loaded object and
+        # returns None as the model (Embedder refuses a second, ignorable
+        # copy), so its choice is visible in the constructor instead.
+        chosen = embedder.model or (seen["args"][0] if seen.get("args") else None)
+        assert chosen == "from-the-flag", (
+            f"{provider}: --embed-model was ignored in favour of {chosen!r}")
+
     @pytest.mark.parametrize("provider, missing", [
         (name, var) for name in sorted(provider_names())
         for var in providers.PROVIDERS[name].credentials
