@@ -1,15 +1,18 @@
 # Benchmarks
 
-## hopai vs. a hand-written recursive CTE, and vs. Neo4j
+## hopai vs. Apache AGE, a hand-written recursive CTE, and Neo4j
 
 **[`benchmarks.ipynb`](https://hopai.readthedocs.io/en/latest/benchmarks/benchmarks/)**
 is the main comparison: the same graph, the same nine traversal shapes and
 three aggregations `bench_hopai.py` has run since this library's first
-commit, timed against a hand-written recursive CTE (the honest floor — same
-walk, no SQLAlchemy, no Python-side hydration layer) and against a real
-Neo4j instance loaded through its Python driver. Charts, tables, and the
-methodology notes (including the one asymmetry worth reading the Neo4j
-numbers through) are all in the notebook rather than repeated here.
+commit, timed against Apache AGE, a hand-written recursive CTE (the honest
+floor — same walk, no SQLAlchemy, no Python-side hydration layer) and a
+real Neo4j instance loaded through its Python driver — each swept across
+**three graph sizes** (50k, 500k and 5M edges), so the notebook shows how
+each gap moves with scale rather than what it is at one arbitrary size.
+Charts, tables, and the methodology notes (timeouts, repeats, the one
+asymmetry worth reading the AGE/Neo4j numbers through) are all in the
+notebook rather than repeated here.
 
 ```bash
 python generate_graph.py --nodes 1000000 --seed 42 --out-dir ./data
@@ -24,13 +27,19 @@ through 7 with the default settings). That structure, not a purely random
 graph, is what actually stresses a graph engine — random graphs rarely
 have the convergent fan-in that real dependency graphs do.
 
-`bench_hopai.py` is the standalone CLI version of the notebook's hopai-only
-half: loads the graph and times the same twelve queries — nine traversals
-covering direction, multi-hop bounds, compound chains, `OR`, `NOT`, range
-comparisons, and `OPTIONAL`, plus three aggregations
-(`Count`/`Sum`/`Avg`/`Min`/`Max`) — cold and warm, writing results to
-`bench_results.json`. `raw_cte.py` is the hand-written-CTE half the
-notebook imports; run standalone it's a library, not a script.
+`bench_hopai.py` is the standalone, single-size CLI version of the same
+hopai-only measurement: loads the graph and times the same twelve
+queries — nine traversals covering direction, multi-hop bounds, compound
+chains, `OR`, `NOT`, range comparisons, and `OPTIONAL`, plus three
+aggregations (`Count`/`Sum`/`Avg`/`Min`/`Max`) — cold and warm, writing
+results to `bench_results.json`. `raw_cte.py` is the hand-written-CTE
+query builder both `bench_hopai.py` and the notebook's driver import; run
+standalone it's a library, not a script. `multiscale.py` is that
+driver — it's what actually produced the notebook's numbers, generating
+each tier's graph, loading it into hopai/Postgres, Apache AGE and Neo4j,
+and writing one JSON file per tier to `multiscale_results/`, which the
+notebook reads rather than re-running the full sweep (see the notebook's
+own "Reproducing this" section for exact commands and setup).
 
 `agg_count_4hop` deliberately runs the same chain as
 `forward_bounded_4hop`: the pair shows what `graph.aggregate()` saves by
@@ -148,71 +157,24 @@ document building before a single provider call.
 
 ## Comparing against Apache AGE
 
-Neo4j is covered live in `benchmarks.ipynb` now (see above); Apache AGE
-isn't, and still requires a separate running instance this repo doesn't
-set up for you. The Cypher equivalents for the same nine queries
-(substitute your own label/property names):
+Covered live in `benchmarks.ipynb` now, alongside Neo4j and the raw CTE,
+across all three size tiers — not just whether AGE keeps up, but whether
+the gap widens or narrows as the graph grows. Two findings worth knowing
+before you read the notebook's numbers:
 
-```cypher
-// forward_1hop
-MATCH (a:Node {type:'leaf'})-[:EDGE*1..1]->(m:Node {flag:1}) RETURN count(DISTINCT a)
+- **AGE 1.5.0 has neither `all()` nor list comprehension**, so `edge_or_tag`'s
+  Neo4j form (`WHERE all(r IN relationships(p) WHERE r.tag IN [...])`)
+  doesn't translate directly. `multiscale.py` rewrites it as a `UNION` of
+  one `MATCH` per hop length, each naming its own relationship variables
+  so every edge's `tag` can be filtered directly — correct, verified
+  node-for-node against hopai's own count, but a real limitation of the
+  query language, not a benchmark artifact.
+- **Several bounded and backward-direction shapes don't finish within a
+  90-second statement timeout**, starting at the smallest (50k-edge) tier
+  already — the same behavior the original investigation behind this
+  library found at a different scale. The notebook reports those as
+  `TIMEOUT` rather than omitting the row.
 
-// backward_1hop
-MATCH (h:Node {type:'hub'})<-[:EDGE*1..1]-(d:Node) RETURN count(DISTINCT d)
-
-// forward_bounded_4hop
-MATCH (a:Node {type:'leaf'})-[:EDGE*1..4]->(m:Node {flag:1}) RETURN count(DISTINCT a)
-
-// backward_bounded_3hop
-MATCH (h:Node {type:'hub'})<-[:EDGE*1..3]-(a:Node) RETURN count(DISTINCT a)
-
-// compound_2segment
-MATCH (a:Node {type:'leaf'})-[:EDGE*1..4]->(m:Node {flag:1})
-MATCH (m)-[:EDGE*1..3]->(h:Node {type:'hub'})
-RETURN count(DISTINCT a)
-
-// edge_or_tag -- Neo4j supports all(); AGE (as of 1.5.0) does not and
-// needs the UNWIND+CASE workaround documented in the main investigation
-MATCH p=(a:Node {type:'leaf'})-[:EDGE*1..4]->(m:Node {flag:1})
-WHERE all(r IN relationships(p) WHERE r.tag IN ['p1','p2'])
-RETURN count(DISTINCT a)
-
-// not_filter -- use the NULL-safe form; naive `<> 'leaf'` silently
-// excludes nodes with no `type` property at all on both Neo4j and AGE
-MATCH (h:Node {type:'hub'})<-[:EDGE*1..3]-(a:Node)
-WHERE a.type IS NULL OR a.type <> 'leaf'
-RETURN count(DISTINCT a)
-
-// range_gt
-MATCH (a:Node {type:'leaf'}) WHERE a.priority > 5 RETURN count(a)
-
-// optional_last_hop
-MATCH (h:Node {type:'hub'})<-[:EDGE*1..1]-(a:Node)
-WHERE a.type IS NULL OR a.type <> 'leaf'
-OPTIONAL MATCH (a)-[:EDGE*1..1]->(dep:Node {type:'leaf'})
-RETURN count(DISTINCT a), count(DISTINCT dep)
-```
-
-A note on those `RETURN count(DISTINCT a)` tails now that hopai
-translates aggregation: they aggregate the *start* variable, which hopai
-still refuses (only the last node of a chain can be aggregated — see
-`hopai/cypher.py`). They are written that way because Neo4j and AGE
-count them fine, and on those systems the tail is just "how many rows".
-The three `agg_*` queries in `bench_hopai.py` are the shapes hopai's own
-Cypher front end runs directly, e.g.
-`MATCH (a {type: 'leaf'})-[*1..4]->(m {flag: 1}) RETURN count(DISTINCT m)`.
-
-**A finding worth knowing before you run these on AGE:** in the full
-investigation this library came out of, two of these nine query shapes
-(a bounded backward traversal, and `OPTIONAL` layered on one) did not
-complete on Apache AGE 1.5.0 within a 60-150 second budget, on the exact
-same data that answered in under a second on Neo4j and raw Postgres. Set
-a `statement_timeout` before running these against AGE, or a single
-query can tie up your session indefinitely.
-
-The absolute floor — hand-written recursive CTEs against the same data,
-with none of hopai's own overhead (SQLAlchemy query construction, result
-hydration) — is `raw_cte.py`, exercised and charted against `bench_hopai.py`
-in `benchmarks.ipynb` above. The query shapes hopai itself generates are
-visible without any of this by calling `graph.build_query(...)` and
-inspecting the compiled statement, per the main README.
+The query shapes hopai itself generates are visible without any of this
+by calling `graph.build_query(...)` and inspecting the compiled
+statement, per the main README.

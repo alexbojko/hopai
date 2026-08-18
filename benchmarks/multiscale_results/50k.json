@@ -1,0 +1,378 @@
+{
+  "tier": "50k",
+  "summary": {
+    "total_nodes": 72940,
+    "total_edges": 60526,
+    "hub_id": 31250,
+    "depth_counts": {
+      "0": 1,
+      "1": 15,
+      "2": 75,
+      "3": 225,
+      "4": 675,
+      "5": 1350,
+      "6": 2700,
+      "7": 5400
+    }
+  },
+  "hopai_traversal": {
+    "forward_1hop": {
+      "cold_ms": 63.56069999992542,
+      "warm_ms": 22.000509000008606,
+      "nodes": 0,
+      "edges": 0,
+      "status": "ok"
+    },
+    "backward_1hop": {
+      "cold_ms": 35.36261899989768,
+      "warm_ms": 31.260916000064753,
+      "nodes": 18,
+      "edges": 17,
+      "status": "ok"
+    },
+    "forward_bounded_4hop": {
+      "cold_ms": 512.6611389996469,
+      "warm_ms": 436.2484799999038,
+      "nodes": 10360,
+      "edges": 10134,
+      "status": "ok"
+    },
+    "backward_bounded_3hop": {
+      "cold_ms": 42.55131199988682,
+      "warm_ms": 40.13163599984182,
+      "nodes": 321,
+      "edges": 320,
+      "status": "ok"
+    },
+    "compound_2segment": {
+      "cold_ms": 551.1723849999726,
+      "warm_ms": 437.40157599995655,
+      "nodes": 10453,
+      "edges": 10452,
+      "status": "ok"
+    },
+    "edge_or_tag": {
+      "cold_ms": 385.5280069997207,
+      "warm_ms": 518.3656419999352,
+      "nodes": 10350,
+      "edges": 10125,
+      "status": "ok"
+    },
+    "not_filter": {
+      "cold_ms": 41.479095999875426,
+      "warm_ms": 37.78147799994258,
+      "nodes": 321,
+      "edges": 320,
+      "status": "ok"
+    },
+    "range_gt": {
+      "cold_ms": 69.33186800006297,
+      "warm_ms": 75.66506700004538,
+      "nodes": 3783,
+      "edges": 0,
+      "status": "ok"
+    },
+    "optional_last_hop": {
+      "cold_ms": 38.80848199969478,
+      "warm_ms": 34.42704799999774,
+      "nodes": 18,
+      "edges": 17,
+      "status": "ok"
+    }
+  },
+  "hopai_aggregate": {
+    "agg_count_4hop": {
+      "cold_ms": 62.86043199997948,
+      "warm_ms": 59.2024859997764,
+      "result": {
+        "n": 226
+      },
+      "status": "ok"
+    },
+    "agg_stats_backward_4hop": {
+      "cold_ms": 113.7719919997835,
+      "warm_ms": 88.50061499970252,
+      "result": {
+        "n": 10134,
+        "total": 51334,
+        "mean": 9.499259807549963,
+        "lo": 0,
+        "hi": 19
+      },
+      "status": "ok"
+    },
+    "agg_range_count": {
+      "cold_ms": 19.539780999821232,
+      "warm_ms": 17.543153000133316,
+      "result": {
+        "n": 3783,
+        "mean": 12.499074808353159
+      },
+      "status": "ok"
+    }
+  },
+  "raw_cte_traversal": {
+    "forward_1hop": {
+      "cold_ms": 17.808271999911085,
+      "warm_ms": 23.592766000092524,
+      "nodes": 0,
+      "edges": 0,
+      "status": "ok"
+    },
+    "backward_1hop": {
+      "cold_ms": 6.47445099957622,
+      "warm_ms": 4.168377000041801,
+      "nodes": 18,
+      "edges": 17,
+      "status": "ok"
+    },
+    "forward_bounded_4hop": {
+      "cold_ms": 414.7019779998118,
+      "warm_ms": 219.9359779997394,
+      "nodes": 10360,
+      "edges": 10134,
+      "status": "ok"
+    },
+    "backward_bounded_3hop": {
+      "cold_ms": 18.451298999934806,
+      "warm_ms": 18.04505500012965,
+      "nodes": 321,
+      "edges": 320,
+      "status": "ok"
+    },
+    "compound_2segment": {
+      "cold_ms": 323.1755520000661,
+      "warm_ms": 275.3806389996498,
+      "nodes": 10453,
+      "edges": 10452,
+      "status": "ok"
+    },
+    "edge_or_tag": {
+      "cold_ms": 234.48086799999146,
+      "warm_ms": 272.85728099968765,
+      "nodes": 10350,
+      "edges": 10125,
+      "status": "ok"
+    },
+    "not_filter": {
+      "cold_ms": 21.43277700042745,
+      "warm_ms": 19.491712000217376,
+      "nodes": 321,
+      "edges": 320,
+      "status": "ok"
+    },
+    "range_gt": {
+      "cold_ms": 29.57699600028718,
+      "warm_ms": 41.33673900014401,
+      "nodes": 3783,
+      "edges": 0,
+      "status": "ok"
+    },
+    "optional_last_hop": {
+      "cold_ms": 15.915835000214429,
+      "warm_ms": 11.275670000031823,
+      "nodes": 18,
+      "edges": 17,
+      "status": "ok"
+    }
+  },
+  "raw_cte_aggregate": {
+    "agg_count_4hop": {
+      "cold_ms": 47.76464799988389,
+      "warm_ms": 42.821550000098796,
+      "result": {
+        "n": 226
+      },
+      "status": "ok"
+    },
+    "agg_stats_backward_4hop": {
+      "cold_ms": 65.74137400002655,
+      "warm_ms": 67.29904799976794,
+      "result": {
+        "n": 10134,
+        "total": "51334",
+        "mean": "9.4992598075499630",
+        "lo": "0",
+        "hi": "19"
+      },
+      "status": "ok"
+    },
+    "agg_range_count": {
+      "cold_ms": 12.103853000098752,
+      "warm_ms": 12.518269999873155,
+      "result": {
+        "n": 3783,
+        "mean": "12.4990748083531589"
+      },
+      "status": "ok"
+    }
+  },
+  "age_traversal": {
+    "forward_1hop": {
+      "cold_ms": 638.2935220003674,
+      "warm_ms": 426.1857550000059,
+      "count": 0,
+      "status": "ok"
+    },
+    "backward_1hop": {
+      "cold_ms": 532.7839719998337,
+      "warm_ms": 323.250987999927,
+      "count": 17,
+      "status": "ok"
+    },
+    "forward_bounded_4hop": {
+      "cold_ms": 1324.6012380000138,
+      "warm_ms": 1135.816894999607,
+      "count": 5404,
+      "status": "ok"
+    },
+    "backward_bounded_3hop": {
+      "cold_ms": 3714.5436750001863,
+      "warm_ms": 3714.5436750001863,
+      "count": 320,
+      "status": "ok"
+    },
+    "compound_2segment": {
+      "cold_ms": 1346.6928929997266,
+      "warm_ms": 1337.4873079997087,
+      "count": 5404,
+      "status": "ok"
+    },
+    "edge_or_tag": {
+      "cold_ms": null,
+      "warm_ms": null,
+      "count": null,
+      "status": "timeout"
+    },
+    "not_filter": {
+      "cold_ms": 3443.1358830001955,
+      "warm_ms": 3443.1358830001955,
+      "count": 320,
+      "status": "ok"
+    },
+    "range_gt": {
+      "cold_ms": 7.2624449999239005,
+      "warm_ms": 7.002479000220774,
+      "count": 3783,
+      "status": "ok"
+    },
+    "optional_last_hop": {
+      "cold_ms": null,
+      "warm_ms": null,
+      "count": null,
+      "status": "timeout"
+    }
+  },
+  "age_aggregate": {
+    "agg_count_4hop": {
+      "cold_ms": 1171.6593619999003,
+      "warm_ms": 1118.5056679996705,
+      "result": {
+        "n": 226
+      },
+      "status": "ok"
+    },
+    "agg_stats_backward_4hop": {
+      "cold_ms": null,
+      "warm_ms": null,
+      "result": null,
+      "status": "timeout"
+    },
+    "agg_range_count": {
+      "cold_ms": 12.759477999679802,
+      "warm_ms": 12.350471999980073,
+      "result": {
+        "n": 3783,
+        "mean": 12.499074808353159
+      },
+      "status": "ok"
+    }
+  },
+  "neo4j_traversal": {
+    "forward_1hop": {
+      "cold_ms": 457.04040000009627,
+      "warm_ms": 16.34677499987447,
+      "count": 0,
+      "status": "ok"
+    },
+    "backward_1hop": {
+      "cold_ms": 113.19507700000031,
+      "warm_ms": 11.072066999986419,
+      "count": 17,
+      "status": "ok"
+    },
+    "forward_bounded_4hop": {
+      "cold_ms": 178.82566900016172,
+      "warm_ms": 30.796822999946016,
+      "count": 5404,
+      "status": "ok"
+    },
+    "backward_bounded_3hop": {
+      "cold_ms": 84.62353000004441,
+      "warm_ms": 5.807862999972713,
+      "count": 320,
+      "status": "ok"
+    },
+    "compound_2segment": {
+      "cold_ms": 220.01740999985486,
+      "warm_ms": 19.56457500000397,
+      "count": 5404,
+      "status": "ok"
+    },
+    "edge_or_tag": {
+      "cold_ms": 301.68604899972706,
+      "warm_ms": 56.42412700035493,
+      "count": 5400,
+      "status": "ok"
+    },
+    "not_filter": {
+      "cold_ms": 164.74483199999668,
+      "warm_ms": 7.834257000013167,
+      "count": 320,
+      "status": "ok"
+    },
+    "range_gt": {
+      "cold_ms": 92.0677579997573,
+      "warm_ms": 11.803529000189883,
+      "count": 3783,
+      "status": "ok"
+    },
+    "optional_last_hop": {
+      "cold_ms": 169.4689739997557,
+      "warm_ms": 7.602586999837513,
+      "count": 17,
+      "status": "ok"
+    }
+  },
+  "neo4j_aggregate": {
+    "agg_count_4hop": {
+      "cold_ms": 94.49639100012064,
+      "warm_ms": 22.668737000003603,
+      "result": {
+        "n": 226
+      },
+      "status": "ok"
+    },
+    "agg_stats_backward_4hop": {
+      "cold_ms": 201.18792399989616,
+      "warm_ms": 27.59777800019947,
+      "result": {
+        "n": 10134,
+        "total": 51334,
+        "mean": 9.499259807549958,
+        "lo": 0,
+        "hi": 19
+      },
+      "status": "ok"
+    },
+    "agg_range_count": {
+      "cold_ms": 81.49180600003092,
+      "warm_ms": 15.256317999956082,
+      "result": {
+        "n": 3783,
+        "mean": 12.499074808353141
+      },
+      "status": "ok"
+    }
+  }
+}
