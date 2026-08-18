@@ -494,6 +494,26 @@ class TestTheCommandLine:
         Args.cors = ["http://c.test"]
         assert _origins(Args()) == ["http://c.test"]
 
+    def test_opening_cors_to_any_origin_says_so_out_loud(self, seeded, monkeypatch, capsys):
+        """`--cors '*'` on a server with no authentication means any page
+        in any tab can POST to it. The module docstring says that is a
+        decision an operator makes OUT LOUD -- this is the sentence that
+        says it, and deleting the check that prints it passed 2799
+        tests. A safety notice nothing asserts is a safety notice one
+        refactor away from silence."""
+        self._main(monkeypatch, ["--dsn", dsn_of(seeded), "--graph", seeded.graph,
+                                 "--no-load-schema", "--cors", "*"])
+        warning = capsys.readouterr().err
+        assert "CORS is open to any origin" in warning
+        assert "no authentication" in warning
+
+    def test_a_named_origin_does_not_trigger_the_warning(self, seeded, monkeypatch, capsys):
+        """The other half: a warning that fires for every origin is a
+        warning an operator learns to scroll past."""
+        self._main(monkeypatch, ["--dsn", dsn_of(seeded), "--graph", seeded.graph,
+                                 "--no-load-schema", "--cors", "http://localhost:3000"])
+        assert "CORS is open to any origin" not in capsys.readouterr().err
+
     def test_an_unreadable_database_says_to_name_the_graphs_instead(
             self, monkeypatch, capsys):
         """`--graph` is the way past a database this process cannot

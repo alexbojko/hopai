@@ -344,3 +344,59 @@ class TestTheOtherProviders:
         imported(fake_module(**{constructor: client}))
         with pytest.raises(ProviderError, match=r"needs \$[A-Z_]+_API_KEY"):
             embedder_from_env(provider, env={}, model="m")
+
+
+class TestEveryRefusalNamesItsProvider:
+    """Which provider failed is the first thing an operator needs, and
+    it was the one part of these sentences nothing checked.
+
+    The tests above assert the VARIABLE (`needs $OPENAI_API_KEY`) and
+    the extra (`pip install "hopai[cohere]"`), so the `provider`
+    argument threaded through _need() and _model_for() could be
+    replaced with None and every one of them still passed -- leaving
+    `--embed-provider None needs $AZURE_OPENAI_API_KEY` on the console
+    of someone who set HOPAI_EMBED_PROVIDER and cannot see the flag.
+    Mutation testing surfaced it as a family (_need, _model_for, and
+    every call site that passes the name), so this closes it as one:
+    over PROVIDERS itself, which means a provider added tomorrow is
+    covered without anyone remembering to add a row."""
+
+    #: The client fake and constructor each builder reaches for, so the
+    #: import can be faked far enough to reach the refusal underneath.
+    BUILDERS = {
+        "openai": (FakeOpenAI, "OpenAI"),
+        "azure-openai": (FakeOpenAI, "AzureOpenAI"),
+        "cohere": (FakeCohere, "ClientV2"),
+        "voyage": (FakeVoyage, "Client"),
+        "google": (FakeGoogle, "Client"),
+        "sentence-transformers": (FakeSentenceTransformer, "SentenceTransformer"),
+    }
+
+    @pytest.mark.parametrize("provider", sorted(provider_names()))
+    def test_a_missing_credential_or_model_says_which_provider(self, imported, provider):
+        client, constructor = self.BUILDERS[provider]
+        imported(fake_module(**{constructor: client}))
+        # An empty environment and no --embed-model, so whichever refusal
+        # this provider reaches first -- a credential or the model -- is
+        # the one under test. sentence-transformers needs no credential
+        # and lands on the model; the rest land on a key.
+        with pytest.raises(ProviderError) as caught:
+            embedder_from_env(provider, env={})
+        assert f"--embed-provider {provider} " in str(caught.value), (
+            f"the refusal does not name {provider!r}: {caught.value}")
+
+    @pytest.mark.parametrize("provider", sorted(provider_names()))
+    def test_a_missing_model_says_which_provider(self, imported, provider):
+        """The model refusal specifically, reached by supplying whatever
+        credentials that provider wants -- otherwise every row above
+        would stop at the key and this sentence would stay unchecked."""
+        client, constructor = self.BUILDERS[provider]
+        imported(fake_module(**{constructor: client}))
+        filled = {"OPENAI_API_KEY": "k", "AZURE_OPENAI_API_KEY": "k",
+                  "AZURE_OPENAI_ENDPOINT": "https://r.openai.azure.com",
+                  "COHERE_API_KEY": "k", "VOYAGE_API_KEY": "k", "GOOGLE_API_KEY": "k"}
+        with pytest.raises(ProviderError) as caught:
+            embedder_from_env(provider, env=filled)
+        assert "needs a model" in str(caught.value)
+        assert f"--embed-provider {provider} " in str(caught.value), (
+            f"the model refusal does not name {provider!r}: {caught.value}")
