@@ -1,33 +1,41 @@
 # Benchmarks
 
-## hopai vs. raw Postgres, on the same data
+## hopai vs. a hand-written recursive CTE, and vs. Neo4j
+
+**[`benchmarks.ipynb`](https://hopai.readthedocs.io/en/latest/benchmarks/benchmarks/)**
+is the main comparison: the same graph, the same nine traversal shapes and
+three aggregations `bench_hopai.py` has run since this library's first
+commit, timed against a hand-written recursive CTE (the honest floor — same
+walk, no SQLAlchemy, no Python-side hydration layer) and against a real
+Neo4j instance loaded through its Python driver. Charts, tables, and the
+methodology notes (including the one asymmetry worth reading the Neo4j
+numbers through) are all in the notebook rather than repeated here.
 
 ```bash
 python generate_graph.py --nodes 1000000 --seed 42 --out-dir ./data
 python bench_hopai.py --data-dir ./data --dsn "postgresql+psycopg2://user:pass@host/db"
 ```
 
-`generate_graph.py` produces a graph with a known, verifiable shape: a
-sparse random background DAG plus a deliberately structured "hub"
-subgraph (a widely-shared node with real fan-in across several depth
-levels — 15/75/225/675/1350/2700/5400 nodes at depths 1 through 7 with
-the default settings). That structure, not a purely random graph, is
-what actually stresses a graph engine — random graphs rarely have the
-convergent fan-in that real dependency graphs do.
+`generate_graph.py` (used by the notebook too) produces a graph with a
+known, verifiable shape: a sparse random background DAG plus a deliberately
+structured "hub" subgraph (a widely-shared node with real fan-in across
+several depth levels — 15/75/225/675/1350/2700/5400 nodes at depths 1
+through 7 with the default settings). That structure, not a purely random
+graph, is what actually stresses a graph engine — random graphs rarely
+have the convergent fan-in that real dependency graphs do.
 
-`bench_hopai.py` loads it and times twelve queries — nine traversals
-covering direction, multi-hop bounds, compound chains, `OR`, `NOT`,
-range comparisons, and `OPTIONAL`, plus three aggregations
+`bench_hopai.py` is the standalone CLI version of the notebook's hopai-only
+half: loads the graph and times the same twelve queries — nine traversals
+covering direction, multi-hop bounds, compound chains, `OR`, `NOT`, range
+comparisons, and `OPTIONAL`, plus three aggregations
 (`Count`/`Sum`/`Avg`/`Min`/`Max`) — cold and warm, writing results to
-`bench_results.json`.
+`bench_results.json`. `raw_cte.py` is the hand-written-CTE half the
+notebook imports; run standalone it's a library, not a script.
 
 `agg_count_4hop` deliberately runs the same chain as
 `forward_bounded_4hop`: the pair shows what `graph.aggregate()` saves by
 skipping edge reconstruction and node hydration on identical traversal
-work. In the run recorded during development (default 1M-node graph,
-local Postgres 16) the aggregate answered in 75ms warm against the
-traversal's 653ms — the difference is the `hop_edges`/`edge_rows` CTEs
-and the hydration of ~10k nodes and edges that a count does not need.
+work — see the notebook for the current measured gap.
 
 ## Vector search
 
@@ -138,11 +146,12 @@ refuses above **`MAX_DOCUMENTS` (5000)**. `candidates=` bounds the
 — `candidates=500` over nodes reached 200 ways measured **4.64 s** of
 document building before a single provider call.
 
-## Comparing against Neo4j and Apache AGE
+## Comparing against Apache AGE
 
-These require separate running instances this repo doesn't set up for
-you. The Cypher equivalents for the same nine queries (substitute your
-own label/property names):
+Neo4j is covered live in `benchmarks.ipynb` now (see above); Apache AGE
+isn't, and still requires a separate running instance this repo doesn't
+set up for you. The Cypher equivalents for the same nine queries
+(substitute your own label/property names):
 
 ```cypher
 // forward_1hop
@@ -201,15 +210,9 @@ same data that answered in under a second on Neo4j and raw Postgres. Set
 a `statement_timeout` before running these against AGE, or a single
 query can tie up your session indefinitely.
 
-## bench_postgres_cte -- the honest floor
-
-`bench_hopai.py`'s numbers include hopai's own overhead (SQLAlchemy
-query construction, cycle-protection path tracking). If you want the
-absolute floor -- hand-written recursive CTEs against the same data with
-none of that -- the query shapes hopai generates are visible by
-calling `graph.build_query(...)` and inspecting the compiled statement.
-In the original investigation, raw CTEs were faster than hopai on
-most queries by a factor of 2-5x, and hopai was faster than raw CTEs
-on none -- that gap is the honest price of the API's convenience and
-correctness guarantees (path tracking, dead-end pruning, automatic
-node/edge derivation), not a hidden cost.
+The absolute floor — hand-written recursive CTEs against the same data,
+with none of hopai's own overhead (SQLAlchemy query construction, result
+hydration) — is `raw_cte.py`, exercised and charted against `bench_hopai.py`
+in `benchmarks.ipynb` above. The query shapes hopai itself generates are
+visible without any of this by calling `graph.build_query(...)` and
+inspecting the compiled statement, per the main README.

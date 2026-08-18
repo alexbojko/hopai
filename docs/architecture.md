@@ -592,4 +592,4 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/asyncio.py` | Why `AsyncGraph` is a bridge, not a second implementation, what it deliberately does not cover, and the benchmark numbers behind the design |
 | `hopai/mcp.py` | The tool inventory, the four permission levels, why similarity takes text, and the 1.x/2.x SDK adapter |
 | `tests/conftest.py` | The fixture graph's shape |
-| `benchmarks/README.md` | Measured numbers, including where raw CTEs beat this library 2-5x |
+| `benchmarks/benchmarks.ipynb` | hopai vs. a hand-written recursive CTE and vs. Neo4j, measured, charted; `benchmarks/README.md` indexes the rest (vector search, reranking documents, Apache AGE) |

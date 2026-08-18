@@ -118,6 +118,30 @@ WHAT DOES NOT TRANSLATE, and why:
                               (recognized as a single unit, not by any
                               compositional rule) is what maps exactly
                               onto NOT({"type": "leaf"}).
+  Relationship, not node,     ANOTHER SUBTLE ONE, and this one does NOT
+  uniqueness.                 raise. Real Cypher's `-[:x*1..N]->` forbids
+                              reusing the same RELATIONSHIP twice within
+                              one path -- a NODE may be revisited, through
+                              a second relationship. hopai's cycle guard
+                              (core.py's per-hop `local_path` array) is
+                              NODE-based: no node may repeat within one
+                              Hop's walk, full stop, regardless of which
+                              edge would reach it again. That makes
+                              hopai's answer a SUBSET of Neo4j's whenever
+                              a walk could revisit a node by a second
+                              edge -- never a superset, but not identical
+                              either. benchmarks/README.md's `edge_or_tag`
+                              query (its Cypher form's `all(r IN
+                              relationships(p) WHERE ...)`, above) is
+                              exactly the shape this can show up in: a
+                              hub-and-spoke region where two different
+                              tagged edges both lead back to a node
+                              already on the walk. There is no syntactic
+                              marker to catch and refuse on here, unlike
+                              the NOT case above -- every `*min..max`
+                              pattern is affected equally, so this is a
+                              standing divergence to know about rather
+                              than a per-query refusal to expect.
 
 AGGREGATION: `RETURN count(DISTINCT b)` and friends translate to
 Graph.aggregate(), which aggregates over the distinct nodes the LAST
