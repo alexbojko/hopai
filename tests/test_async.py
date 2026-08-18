@@ -272,6 +272,24 @@ class TestIngestAndMutate:
         assert len(result.nodes) == 2
         assert len(result.edges) == 1
 
+    def test_repointing_and_deleting_by_id_run_on_the_async_engine(
+            self, async_fresh_graph):
+        """The forwarding table above proves the arguments arrive; this
+        proves the rows move. Both, because a delegation can forward
+        perfectly into a call that was never awaited on this engine."""
+        async def body():
+            await async_fresh_graph.add_nodes([{"id": 1}, {"id": 2}, {"id": 3}])
+            await async_fresh_graph.add_edges([{"id": 9, "start_id": 1, "end_id": 2}])
+            moved = await async_fresh_graph.repoint_edge(9, end_id=3)
+            after = await async_fresh_graph.traverse(Start(), Hop(hops=1, optional=True))
+            gone = await async_fresh_graph.delete_nodes(ids=[1], detach=True)
+            return moved, after, gone
+
+        moved, after, gone = run(body())
+        assert moved.updated_edges == 1
+        assert [(e["start_id"], e["end_id"]) for e in after.edges] == [("1", "3")]
+        assert (gone.deleted_nodes, gone.deleted_edges) == (1, 1)
+
     def test_merge_nodes_updates_on_conflict(self, async_fresh_graph, async_admin_graph):
         from hopai import Unique
 
@@ -2095,9 +2113,11 @@ class TestEveryWrapperForwardsEveryArgument:
         "ingest": ("hopai.ingest.Ingestor.ingest", {"document": {"nodes": []}},
                    {"merge_nodes_on": ["mn"], "merge_edges_on": ["me"]}),
         "delete_nodes": ("hopai.mutate.Mutator.delete_nodes", {"where": {"w": 1}},
-                         {"detach": True, "all": True}),
+                         {"detach": True, "all": True, "ids": [3]}),
         "delete_edges": ("hopai.mutate.Mutator.delete_edges", {"where": {"w": 1}},
-                         {"start": {"s": 1}, "end": {"e": 1}, "all": True}),
+                         {"start": {"s": 1}, "end": {"e": 1}, "all": True, "ids": [4]}),
+        "repoint_edge": ("hopai.mutate.Mutator.repoint_edge", {"edge_id": 7},
+                         {"start_id": 8, "end_id": 9}),
         "update_nodes": ("hopai.mutate.Mutator.update_nodes", {"where": {"w": 1}},
                          {"set": {"s": 1}, "remove": ["r"], "replace": True, "all": True}),
         "update_edges": ("hopai.mutate.Mutator.update_edges", {"where": {"w": 1}},
@@ -2112,8 +2132,9 @@ class TestEveryWrapperForwardsEveryArgument:
         "merge_nodes": {"replace": False},
         "merge_edges": {"replace": False},
         "ingest": {"merge_nodes_on": None, "merge_edges_on": None},
-        "delete_nodes": {"detach": False, "all": False},
-        "delete_edges": {"start": None, "end": None, "all": False},
+        "delete_nodes": {"detach": False, "all": False, "ids": None},
+        "delete_edges": {"start": None, "end": None, "all": False, "ids": None},
+        "repoint_edge": {"start_id": None, "end_id": None},
         "update_nodes": {"set": None, "remove": None, "replace": False, "all": False},
         "update_edges": {"start": None, "end": None, "set": None, "remove": None,
                          "replace": False, "all": False},

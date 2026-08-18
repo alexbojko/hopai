@@ -487,17 +487,25 @@ class AsyncGraph:
 
     # -- deleting and updating -----------------------------------------
 
-    async def delete_nodes(self, where=None, detach: bool = False, all: bool = False) -> MutationResult:
+    async def delete_nodes(self, where=None, detach: bool = False, all: bool = False,
+                           ids=None) -> MutationResult:
         async with self._async_engine.begin() as conn:
             return await conn.run_sync(
                 lambda c: self._sync._mutator.delete_nodes(where, detach=detach, all=all,
-                                                            connection=c))
+                                                            ids=ids, connection=c))
 
-    async def delete_edges(self, where=None, start=None, end=None, all: bool = False) -> MutationResult:
+    async def delete_edges(self, where=None, start=None, end=None, all: bool = False,
+                           ids=None) -> MutationResult:
         async with self._async_engine.begin() as conn:
             return await conn.run_sync(
                 lambda c: self._sync._mutator.delete_edges(where, start=start, end=end, all=all,
-                                                            connection=c))
+                                                            ids=ids, connection=c))
+
+    async def repoint_edge(self, edge_id, start_id=None, end_id=None) -> MutationResult:
+        async with self._async_engine.begin() as conn:
+            return await conn.run_sync(
+                lambda c: self._sync._mutator.repoint_edge(edge_id, start_id=start_id,
+                                                            end_id=end_id, connection=c))
 
     async def update_nodes(self, where=None, set=None, remove=None, replace: bool = False,
                            all: bool = False) -> MutationResult:

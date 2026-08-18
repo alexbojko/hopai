@@ -183,6 +183,13 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["hopai*"]
 
+# The explorer page is served from the installed package, so it has to
+# be IN the wheel -- setuptools ships .py and nothing else by default,
+# and a `pip install hopai[http]` whose / route 500s on a missing file
+# is the failure this line exists to prevent.
+[tool.setuptools.package-data]
+hopai = ["ui/*.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["error::DeprecationWarning:hopai.*"]

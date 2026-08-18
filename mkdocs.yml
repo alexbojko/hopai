@@ -166,6 +166,8 @@ nav:
       - hopai.models: api/models.md
       - hopai.asyncio: api/asyncio.md
       - hopai.mcp: api/mcp.md
+      - hopai.http_api: api/http_api.md
+      - hopai.providers: api/providers.md
   - Guides:
       - MCP server: mcp.md
       - HTTP API: http-api.md

@@ -43,17 +43,32 @@ import os
 import sys
 import traceback
 from collections.abc import Callable
+from pathlib import Path
 from typing import Optional
 
+from .constraints import ConstraintViolation
 from .core import Graph
 from .json_api import aggregate_json, traverse_json, vector_search_json
 from .providers import provider_names
 from .vectors import Vector
 
+#: The explorer page, shipped in the wheel as package data. A real file
+#: rather than a string in this module: it is 30KB of HTML, CSS and
+#: JavaScript, and an editor that can lint it is worth more than one
+#: fewer file.
+UI_PAGE = Path(__file__).with_name("ui") / "index.html"
+
 #: Refusals hopai raises on purpose. These are the caller's mistake and
 #: come back as 400 with the message -- which names the fix -- rather
 #: than as a 500 with a stack trace the browser cannot use.
-_BAD_REQUEST = (ValueError, TypeError, KeyError)
+#:
+#: ConstraintViolation is in the list and is NOT a ValueError, which is
+#: why it has to be named: it carries "pass detach=True", "declare a
+#: unique index first", the Postgres constraint that fired and the row
+#: that fired it. Left out, the single most actionable refusal hopai
+#: produces reached the browser as "internal error -- see the server
+#: log". (test_deleting_an_attached_node_without_detach_refuses_by_name)
+_BAD_REQUEST = (ValueError, TypeError, KeyError, ConstraintViolation)
 
 
 def _sdk():
@@ -66,13 +81,13 @@ def _sdk():
         from starlette.applications import Starlette
         from starlette.middleware.cors import CORSMiddleware
         from starlette.requests import Request
-        from starlette.responses import JSONResponse
+        from starlette.responses import HTMLResponse, JSONResponse
         from starlette.routing import Route
     except ImportError as exc:      # pragma: no cover - exercised by the extra's absence
         raise ImportError(
             'the hopai HTTP API needs Starlette -- pip install "hopai[http]"'
         ) from exc
-    return Starlette, CORSMiddleware, Request, JSONResponse, Route
+    return Starlette, CORSMiddleware, Request, JSONResponse, HTMLResponse, Route
 
 
 class Served:
@@ -117,12 +132,12 @@ class Served:
 
 def build_app(graphs, embed: Optional[Callable] = None, cors: Optional[list] = None,
               read_only: bool = False, allow_mutations: bool = False,
-              allow_ddl: bool = False):
+              allow_ddl: bool = False, ui: bool = True):
     """The Starlette application. Separate from serve() so a caller can
     mount it inside their own ASGI app, behind their own authentication
     -- which is the deployment this module cannot provide and should not
     pretend to."""
-    Starlette, CORSMiddleware, Request, JSONResponse, Route = _sdk()
+    Starlette, CORSMiddleware, Request, JSONResponse, HTMLResponse, Route = _sdk()
     served = Served(graphs, read_only=read_only, allow_mutations=allow_mutations,
                     allow_ddl=allow_ddl)
 
@@ -142,13 +157,19 @@ def build_app(graphs, embed: Optional[Callable] = None, cors: Optional[list] = N
         nowhere else to put it."""
         return served.pick(body.get("graph") or request.query_params.get("graph"))
 
-    def handler(run: Callable):
+    def handler(run: Callable, raw: bool = False):
         """Every route's error contract in one place: hopai's own
         refusals become 400 with the sentence that names the fix,
-        anything else is a 500 that is logged rather than leaked."""
+        anything else is a 500 that is logged rather than leaked.
+
+        `raw=True` is for a handler that has already built its own
+        response -- the HTML page. The error contract still applies:
+        a missing page file is a 500 in the log, not a traceback in the
+        browser."""
         async def route(request):
             try:
-                return JSONResponse(await run(request))
+                answer = await run(request)
+                return answer if raw else JSONResponse(answer)
             except _BAD_REQUEST as exc:
                 return JSONResponse({"error": str(exc), "type": type(exc).__name__},
                                     status_code=400)
@@ -210,14 +231,61 @@ def build_app(graphs, embed: Optional[Callable] = None, cors: Optional[list] = N
             return vector_search_json(graph, spec, allow_vectors=True)
         return vector_search_json(graph, spec, allow_vectors=False)
 
+    async def graph_data(request):
+        """The whole graph, in the one call a viewer needs.
+
+        Start() alone returns nodes and no edges; a hop alone prunes
+        isolated nodes as dead ends. `Hop(hops=1, optional=True)` is
+        both -- OPTIONAL keeps the nodes that matched nothing, so this
+        is every node AND every edge in one round trip.
+
+        `limit` caps NODES and then keeps only the edges whose endpoints
+        both survived, so the result is a smaller graph rather than a
+        truncated one with edges pointing at nothing. `truncated` says
+        when that happened, because a viewer silently showing part of a
+        graph is the same lie as a traversal silently returning part of
+        one."""
+        from .hop import Hop, Start
+        graph = graph_of({}, request)
+        limit = int(request.query_params.get("limit") or 2000)
+        result = graph.traverse(Start(), Hop(hops=1, optional=True))
+        nodes, edges = result.nodes, result.edges
+        truncated = len(nodes) > limit
+        if truncated:
+            nodes = nodes[:limit]
+            kept = {node["id"] for node in nodes}
+            edges = [edge for edge in edges
+                     if edge["start_id"] in kept and edge["end_id"] in kept]
+        return {"graph": graph.graph, "nodes": nodes, "edges": edges,
+                "truncated": truncated, "elapsed_ms": result.elapsed_ms}
+
     routes = [
         Route("/health", handler(health)),
+        Route("/graph-data", handler(graph_data)),
         Route("/graphs", handler(graphs_)),
         Route("/schema", handler(schema)),
         Route("/traverse", handler(traverse), methods=["POST"]),
         Route("/aggregate", handler(aggregate), methods=["POST"]),
         Route("/search", handler(search), methods=["POST"]),
     ]
+
+    # -- the explorer page --------------------------------------------
+
+    async def explorer(request):
+        """The graph explorer, served from the package.
+
+        Read on every request rather than cached at import: the file is
+        30KB, this is not a hot path, and an operator editing it to
+        rebrand the page should see the edit on reload rather than
+        wonder which process is holding the old copy."""
+        return HTMLResponse(UI_PAGE.read_text(encoding="utf-8"))
+
+    if ui:
+        # Mounted whatever the permissions are: the page asks /graphs,
+        # which reports them, and hides the buttons for what this server
+        # would refuse. --no-ui is for an operator who wants the JSON
+        # and no page at all.
+        routes.append(Route("/", handler(explorer, raw=True)))
 
     # -- writing, gated by registration rather than by a check ---------
 
@@ -255,8 +323,45 @@ def build_app(graphs, embed: Optional[Callable] = None, cors: Optional[list] = N
         result = graph.cypher(query)
         return result.to_dict() if hasattr(result, "to_dict") else result
 
+    async def delete_nodes(request):
+        """By ID, which is the only way to mean one specific node --
+        `where` filters properties and an id is not one, so
+        where={"id": 7} matches nothing and says nothing."""
+        body = await read(request)
+        graph = graph_of(body, request)
+        ids = body.get("ids")
+        if not ids:
+            raise ValueError("delete: `ids` must be a non-empty list of node ids")
+        result = graph.delete_nodes(ids=ids, detach=bool(body.get("detach")))
+        return {"deleted_nodes": result.deleted_nodes,
+                "deleted_edges": result.deleted_edges}
+
+    async def delete_edges(request):
+        body = await read(request)
+        graph = graph_of(body, request)
+        ids = body.get("ids")
+        if not ids:
+            raise ValueError("delete: `ids` must be a non-empty list of edge ids")
+        return {"deleted_edges": graph.delete_edges(ids=ids).deleted_edges}
+
+    async def repoint_edge(request):
+        body = await read(request)
+        graph = graph_of(body, request)
+        if not body.get("id"):
+            raise ValueError("repoint: `id` must be the edge to move")
+        result = graph.repoint_edge(body["id"], start_id=body.get("start_id"),
+                                    end_id=body.get("end_id"))
+        return {"updated_edges": result.updated_edges}
+
     if served.writes:
         routes.append(Route("/ingest", handler(ingest), methods=["POST"]))
+        routes.append(Route("/edges/repoint", handler(repoint_edge), methods=["POST"]))
+    # Deleting is separate from writing for the same reason it is on the
+    # MCP server: creating a row and destroying one are not the same
+    # power, and a delete does not come back.
+    if served.allow_mutations:
+        routes.append(Route("/nodes/delete", handler(delete_nodes), methods=["POST"]))
+        routes.append(Route("/edges/delete", handler(delete_edges), methods=["POST"]))
     if served.allow_mutations:
         routes.append(Route("/mutate", handler(mutate), methods=["POST"]))
     routes.append(Route("/cypher", handler(cypher), methods=["POST"]))
@@ -348,6 +453,9 @@ def build_parser() -> argparse.ArgumentParser:
                         default=os.environ.get("HOPAI_EMBED_MODEL"),
                         help="The embedding model, or on Azure the DEPLOYMENT name. "
                              "Defaults to $HOPAI_EMBED_MODEL. Never guessed.")
+    parser.add_argument("--ui", action=argparse.BooleanOptionalAction, default=True,
+                        help="Serve the graph explorer at /. --no-ui serves the JSON "
+                             "endpoints only.")
     parser.add_argument("--load-schema", action=argparse.BooleanOptionalAction,
                         default=True, help="Adopt the schema saved in the database.")
     return parser, _resolve_embed
@@ -407,11 +515,12 @@ def main(argv: Optional[list] = None) -> int:
     if "*" in origins:
         print("hopai-api: CORS is open to any origin and there is no authentication "
               "here. Put it behind something before giving it an address.", file=sys.stderr)
-    print(f"hopai-api: serving {sorted(graphs)} on http://{args.host}:{args.port}",
-          file=sys.stderr)
+    where = f"http://{args.host}:{args.port}"
+    print(f"hopai-api: serving {sorted(graphs)} on {where}"
+          + (f" -- explorer at {where}/" if args.ui else ""), file=sys.stderr)
     serve(graphs, host=args.host, port=args.port, embed=embed, cors=origins,
           read_only=args.read_only, allow_mutations=args.allow_mutations,
-          allow_ddl=args.allow_ddl)
+          allow_ddl=args.allow_ddl, ui=args.ui)
     return 0
 
 

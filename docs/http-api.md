@@ -20,11 +20,16 @@ hopai-api --dsn postgresql+psycopg2://user:pass@localhost/db --cors 'http://loca
 | `GET` | `/health` | — | always |
 | `GET` | `/graphs` | — | always |
 | `GET` | `/schema` | `?graph=` | always |
+| `GET` | `/graph-data` | `?graph=`, `?limit=` | always |
+| `GET` | `/` | — | unless `--no-ui` |
 | `POST` | `/traverse` | a traversal spec | always |
 | `POST` | `/aggregate` | a spec plus `aggregates` | always |
 | `POST` | `/search` | a `near` spec, `k`, `where` | always |
 | `POST` | `/cypher` | `{"query": "..."}` | always (gated by classification) |
 | `POST` | `/ingest` | `{"document": {...}}` | writes allowed |
+| `POST` | `/edges/repoint` | `{"id":…, "start_id":…, "end_id":…}` | writes allowed |
+| `POST` | `/nodes/delete` | `{"ids": [...], "detach": true}` | `--allow-mutations` |
+| `POST` | `/edges/delete` | `{"ids": [...]}` | `--allow-mutations` |
 | `POST` | `/mutate` | `{"document": {"operations": [...]}}` | `--allow-mutations` |
 
 The body is exactly the [JSON interface](reference/json-interface.md) spec, plus an
@@ -43,6 +48,61 @@ curl -s localhost:8080/traverse -H 'content-type: application/json' -d '{
  "edges": [{"id": "7", "start_id": "1", "end_id": "2", "properties": {"kind": "knows"}}],
  "elapsed_ms": 13.1}
 ```
+
+## The whole graph in one call
+
+`/graph-data` is what a viewer reads. `Start()` on its own returns nodes and no edges;
+a hop on its own prunes isolated nodes as dead ends. `Start()` plus
+`Hop(hops=1, optional=True)` is both — OPTIONAL keeps the nodes that matched nothing —
+so one round trip is every node *and* every edge.
+
+`limit` caps **nodes**, then keeps only the edges whose endpoints both survived, so what
+comes back is a smaller graph rather than a truncated one with lines pointing at nothing.
+`truncated` says when that happened.
+
+```json
+{"graph": "default", "nodes": [...], "edges": [...],
+ "truncated": false, "elapsed_ms": 8.2}
+```
+
+## Editing by id
+
+`where` filters **properties**, and an id is not one — `where={"id": 7}` is a containment
+test against the JSONB bag, so it matches nothing and says nothing while doing it. Three
+routes address rows by id instead, for a caller holding one specific row:
+
+```bash
+curl -s localhost:8080/edges/repoint -H 'content-type: application/json' \
+     -d '{"id": 7, "end_id": 3}'                  # move one endpoint, keep the other
+curl -s localhost:8080/nodes/delete -H 'content-type: application/json' \
+     -d '{"ids": [12], "detach": true}'           # detach takes its edges with it
+```
+
+Repointing is a **write** and deleting is a **mutation**, the same split the MCP server
+makes: creating a row and destroying one are not the same permission. An empty `ids`
+list refuses — it is what an empty selection looks like, and deleting on it is the
+unrecoverable version of a no-op. Deleting an attached node without `detach` refuses
+too, and the refusal names the flag.
+
+## The graph explorer
+
+`GET /` serves a graph explorer — one self-contained page, no CDN, shipped in the wheel.
+It switches between the graphs the API serves, toggles node types, filters by name and by
+property values, drags and pins nodes, and shows edge labels on demand.
+
+```bash
+hopai-api --dsn postgresql+psycopg2://user:pass@localhost/db --allow-mutations
+# → explorer at http://127.0.0.1:8080/
+```
+
+It reads `/graphs` for the permissions this server was started with and **hides what the
+server would refuse**: no repoint buttons on `--read-only`, and a disabled delete saying
+`--allow-mutations` when deletes are off. Deleting always takes two clicks with a five
+second arming window, and the button names what will go — `delete node + 3 edges` rather
+than `delete node`. Repointing arms first, then takes the next node you click; Escape
+cancels.
+
+`--no-ui` serves the JSON endpoints and no page.
 
 ## Refusals come back whole
 
@@ -140,6 +200,7 @@ app = Starlette(routes=[
 | `--embed` | none | `MODULE:FUNCTION` returning a vector for text |
 | `--embed-provider` | `$HOPAI_EMBED_PROVIDER` | Build the client from the environment |
 | `--embed-model` | `$HOPAI_EMBED_MODEL` | Model, or on Azure the deployment name |
+| `--no-ui` | serves it | Skip the explorer page at `/` |
 | `--no-load-schema` | loads | Skip the saved schema |
 
 ## With Docker
@@ -151,6 +212,7 @@ runs Postgres, this API and the MCP server together:
 cp .env.example .env      # put your embedding credentials in it
 docker compose up -d
 curl localhost:8080/health
+open http://localhost:8080/         # the explorer
 ```
 
 Both services read the same `HOPAI_EMBED_PROVIDER` and credential variables, so one

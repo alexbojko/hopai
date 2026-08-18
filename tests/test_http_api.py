@@ -29,6 +29,11 @@ from hopai import Start, Vector                      # noqa: E402
 from hopai.http_api import Served, build_app         # noqa: E402
 
 
+def dsn_of(graph) -> str:
+    """main() takes a DSN string, and the fixtures hand out a Graph."""
+    return graph.engine.url.render_as_string(hide_password=False)
+
+
 def client(graph, **options) -> TestClient:
     return TestClient(build_app(graph, **options))
 
@@ -149,6 +154,52 @@ class TestPermissionsDecideWhichRoutesExist:
         with pytest.raises(ValueError, match="contradicts"):
             Served(seeded, read_only=True, allow_mutations=True)
 
+    def test_serving_nothing_refuses_rather_than_starting_empty(self):
+        """An API with no graphs answers every request with "no graph
+        named ..." -- a server that started and cannot work."""
+        with pytest.raises(ValueError, match="non-empty"):
+            Served({})
+
+    def test_several_graphs_make_graph_required_and_say_which(self, seeded):
+        """Picking one for the caller would answer a question about a
+        graph they did not name."""
+        api = client({"a": seeded, "b": seeded.in_graph("b")})
+        answer = api.get("/schema")
+        assert answer.status_code == 400
+        assert "['a', 'b']" in answer.json()["error"]
+
+
+class TestSchema:
+    def test_it_reports_no_schema_as_null_rather_than_erroring(self, seeded):
+        body = client(seeded).get("/schema").json()
+        assert body == {"graph": seeded.graph, "schema": None}
+
+    def test_a_declared_schema_comes_back(self, seeded):
+        from hopai import NodeType
+        seeded.define_schema(nodes=[NodeType("person")])
+        body = client(seeded).get("/schema").json()
+        assert "person" in str(body["schema"])
+
+
+class TestAnUnexpectedErrorIsNotLeaked:
+    def test_a_500_carries_no_traceback(self, seeded, monkeypatch, capsys):
+        """The 400 path exists to pass hopai's sentences through. This
+        one is its opposite: an error hopai did not raise on purpose says
+        nothing about the internals, and the traceback goes to the
+        server log where an operator can read it."""
+        import hopai.http_api as module
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("connection string: postgres://user:hunter2@db")
+
+        monkeypatch.setattr(module, "traverse_json", explode)
+        answer = client(seeded).post("/traverse", json={"start": {}})
+        assert answer.status_code == 500
+        assert answer.json() == {"error": "internal error -- see the server log",
+                                 "type": "RuntimeError"}
+        assert "hunter2" not in answer.text
+        assert "hunter2" in capsys.readouterr().err      # the log DOES get it
+
 
 class TestCypherIsGatedByClassificationNotByRouting:
     """One endpoint covers read, write and mutate, so registration cannot
@@ -235,3 +286,232 @@ class TestSearch:
             "near": {"field": "summary", "text": "anything"}})
         assert answer.status_code == 400
         assert "declares no embedder" in answer.json()["error"]
+
+
+class TestGraphDataIsOneCallForAWholeGraph:
+    """The viewer's one read. `Start()` alone returns no edges and a hop
+    alone prunes isolated nodes as dead ends -- only the OPTIONAL hop is
+    both, and a page that lost either would be quietly wrong rather than
+    broken."""
+
+    def test_it_returns_every_node_and_every_edge(self, seeded):
+        body = client(seeded).get("/graph-data").json()
+        assert {node["id"] for node in body["nodes"]} == {"1", "2", "3"}
+        assert len(body["edges"]) == 2
+        assert body["truncated"] is False
+
+    def test_an_isolated_node_survives(self, seeded):
+        """OPTIONAL is the whole reason this is not a plain hop: a node
+        with no edges is exactly what a viewer must still draw."""
+        seeded.add_nodes([{"id": 4, "type": "note", "name": "Loose"}])
+        body = client(seeded).get("/graph-data").json()
+        assert "4" in {node["id"] for node in body["nodes"]}
+
+    def test_edges_carry_the_id_the_page_edits_by(self, seeded):
+        """A page repoints and deletes BY ID. An edge without one is a
+        line it can draw and nothing it can act on."""
+        body = client(seeded).get("/graph-data").json()
+        assert all(edge.get("id") for edge in body["edges"])
+
+    def test_limit_drops_dangling_edges_with_the_nodes(self, seeded):
+        """Capping nodes and keeping their edges would leave lines
+        pointing at nothing. The result is a smaller graph, not a
+        broken one -- and `truncated` says it happened."""
+        body = client(seeded).get("/graph-data?limit=1").json()
+        kept = {node["id"] for node in body["nodes"]}
+        assert len(kept) == 1
+        assert body["truncated"] is True
+        assert all(edge["start_id"] in kept and edge["end_id"] in kept
+                   for edge in body["edges"])
+
+
+class TestTheExplorerPageIsServed:
+    def test_slash_returns_the_page(self, seeded):
+        answer = client(seeded).get("/")
+        assert answer.status_code == 200
+        assert answer.headers["content-type"].startswith("text/html")
+        assert "<title>hopai · graph explorer</title>" in answer.text
+
+    def test_no_ui_leaves_the_json_endpoints_alone(self, seeded):
+        api = client(seeded, ui=False)
+        assert api.get("/").status_code == 404
+        assert api.get("/health").status_code == 200
+
+    def test_the_page_is_self_contained(self, seeded):
+        """No CDN: the whole point of shipping it in the wheel is that it
+        works on a laptop with no internet and inside a container with no
+        egress. An external <script> or <link> would make the page a
+        network dependency the library promises not to have."""
+        import re
+        page = client(seeded).get("/").text
+        assert not re.search(r'<(script|link)[^>]+(src|href)="(https?:)?//', page)
+
+    def test_the_page_ships_in_the_package(self):
+        """Declared as package-data in pyproject.toml. Without that line
+        `pip install hopai[http]` installs the module and not the file,
+        and / 500s on a server that looked fine in the repository."""
+        from hopai.http_api import UI_PAGE
+        assert UI_PAGE.exists() and UI_PAGE.name == "index.html"
+
+
+class TestEditingByIdIsGatedLikeEveryOtherWrite:
+    """The page's two destructive powers. Repointing is a WRITE (it moves
+    an edge that already exists); deleting is a MUTATION -- the same
+    split mcp.py makes, for the same reason: creating a row and
+    destroying one are not the same permission."""
+
+    def test_repoint_needs_writes(self, seeded):
+        assert client(seeded, read_only=True).post(
+            "/edges/repoint", json={"id": 1}).status_code == 404
+
+    def test_deleting_needs_allow_mutations(self, seeded):
+        api = client(seeded)          # the default: writes, no mutations
+        assert api.post("/nodes/delete", json={"ids": [1]}).status_code == 404
+        assert api.post("/edges/delete", json={"ids": [1]}).status_code == 404
+
+    def test_repoint_moves_one_end_and_leaves_the_other(self, seeded):
+        edge = client(seeded).get("/graph-data").json()["edges"][0]
+        answer = client(seeded).post("/edges/repoint",
+                                     json={"id": edge["id"], "end_id": 3})
+        assert answer.status_code == 200
+        assert answer.json()["updated_edges"] == 1
+        after = next(e for e in client(seeded).get("/graph-data").json()["edges"]
+                     if e["id"] == edge["id"])
+        assert (after["start_id"], after["end_id"]) == (edge["start_id"], "3")
+
+    def test_repoint_without_an_id_refuses_rather_than_guessing(self, seeded):
+        answer = client(seeded).post("/edges/repoint", json={"end_id": 3})
+        assert answer.status_code == 400
+        assert "id" in answer.json()["error"]
+
+    def test_deleting_with_no_ids_refuses(self, seeded):
+        """An empty list is what an empty selection looks like. Deleting
+        on it is the unrecoverable version of a no-op."""
+        api = client(seeded, allow_mutations=True)
+        for route in ("/nodes/delete", "/edges/delete"):
+            answer = api.post(route, json={"ids": []})
+            assert answer.status_code == 400
+            assert "non-empty" in answer.json()["error"]
+
+    def test_deleting_a_node_by_id_takes_its_edges_with_it(self, seeded):
+        answer = client(seeded, allow_mutations=True).post(
+            "/nodes/delete", json={"ids": [2], "detach": True})
+        assert answer.json() == {"deleted_nodes": 1, "deleted_edges": 2}
+        assert {n["id"] for n in client(seeded).get("/graph-data").json()["nodes"]} == {"1", "3"}
+
+    def test_deleting_an_attached_node_without_detach_refuses_by_name(self, seeded):
+        """Cascading instead would leave exactly the corruption the
+        composite foreign key exists to prevent, so the refusal names
+        the flag rather than doing it anyway."""
+        answer = client(seeded, allow_mutations=True).post(
+            "/nodes/delete", json={"ids": [2]})
+        assert answer.status_code == 400
+        assert "detach" in answer.json()["error"]
+
+    def test_deleting_an_edge_by_id_leaves_its_endpoints(self, seeded):
+        api = client(seeded, allow_mutations=True)
+        edge = api.get("/graph-data").json()["edges"][0]
+        assert api.post("/edges/delete", json={"ids": [edge["id"]]}).json() == {
+            "deleted_edges": 1}
+        assert len(api.get("/graph-data").json()["nodes"]) == 3
+
+
+class TestTheCommandLine:
+    """`hopai-api`'s parsing, with nothing served. main() is where the
+    graphs, the vector fields and the embedder are assembled, and every
+    mistake it can catch is one an operator makes at 3am with a compose
+    file -- so each refusal is asserted by the sentence it prints, not
+    just by the exit code."""
+
+    def _main(self, monkeypatch, argv, **stub):
+        """Run main() with serve() replaced. What is under test is
+        everything BEFORE the server starts."""
+        from hopai import http_api
+        captured = {}
+
+        def fake_serve(graphs, **options):
+            captured["graphs"] = graphs
+            captured["options"] = options
+
+        monkeypatch.setattr(http_api, "serve", fake_serve)
+        for name, value in stub.items():
+            monkeypatch.setattr(http_api, name, value)
+        code = http_api.main(argv)
+        return code, captured
+
+    def test_it_serves_every_graph_it_was_named(self, seeded, monkeypatch):
+        code, captured = self._main(monkeypatch, [
+            "--dsn", dsn_of(seeded), "--graph", seeded.graph, "--no-load-schema"])
+        assert code == 0
+        assert sorted(captured["graphs"]) == [seeded.graph]
+
+    def test_no_dsn_names_both_ways_to_give_one(self, monkeypatch, capsys):
+        monkeypatch.delenv("HOPAI_DSN", raising=False)
+        with pytest.raises(SystemExit):
+            self._main(monkeypatch, [])
+        assert "--dsn or set HOPAI_DSN" in capsys.readouterr().err
+
+    def test_a_vector_naming_an_unserved_graph_refuses(self, seeded, monkeypatch, capsys):
+        """Silently ignoring it would leave the field undeclared and
+        every search on it answering "no such field" much later."""
+        with pytest.raises(SystemExit):
+            self._main(monkeypatch, ["--dsn", dsn_of(seeded), "--graph", seeded.graph,
+                                     "--vector", "elsewhere:nodes:bio:3"])
+        assert "does not serve" in capsys.readouterr().err
+
+    def test_a_vector_field_is_declared_on_the_graph_it_names(self, seeded, monkeypatch):
+        _, captured = self._main(monkeypatch, [
+            "--dsn", dsn_of(seeded), "--graph", seeded.graph, "--no-load-schema",
+            "--vector", "nodes:bio:4"])
+        graph = captured["graphs"][seeded.graph]
+        assert graph.vectors["nodes"]["bio"].dimensions == 4
+
+    def test_ui_is_on_by_default_and_no_ui_turns_it_off(self, seeded, monkeypatch):
+        _, on = self._main(monkeypatch, ["--dsn", dsn_of(seeded), "--graph", seeded.graph,
+                                         "--no-load-schema"])
+        _, off = self._main(monkeypatch, ["--dsn", dsn_of(seeded), "--graph", seeded.graph,
+                                          "--no-load-schema", "--no-ui"])
+        assert on["options"]["ui"] is True
+        assert off["options"]["ui"] is False
+
+    def test_permissions_reach_the_app_as_given(self, seeded, monkeypatch):
+        _, captured = self._main(monkeypatch, [
+            "--dsn", dsn_of(seeded), "--graph", seeded.graph, "--no-load-schema",
+            "--allow-mutations", "--allow-ddl"])
+        assert captured["options"]["allow_mutations"] is True
+        assert captured["options"]["allow_ddl"] is True
+
+    def test_cors_comes_from_the_flag_then_the_environment_then_nothing(
+            self, seeded, monkeypatch):
+        from hopai.http_api import _origins
+
+        class Args:
+            cors = None
+        monkeypatch.delenv("HOPAI_API_CORS", raising=False)
+        assert _origins(Args()) == []
+        monkeypatch.setenv("HOPAI_API_CORS", "http://a.test, http://b.test")
+        assert _origins(Args()) == ["http://a.test", "http://b.test"]
+        Args.cors = ["http://c.test"]
+        assert _origins(Args()) == ["http://c.test"]
+
+    def test_an_unreadable_database_says_to_name_the_graphs_instead(
+            self, monkeypatch, capsys):
+        """`--graph` is the way past a database this process cannot
+        enumerate, so the refusal names it rather than only reporting
+        the driver error."""
+        with pytest.raises(SystemExit):
+            self._main(monkeypatch,
+                       ["--dsn", "postgresql+psycopg2://nobody:x@127.0.0.1:1/none"])
+        assert "Pass --graph" in capsys.readouterr().err
+
+    def test_an_embed_provider_that_cannot_be_built_fails_before_the_database(
+            self, monkeypatch, capsys):
+        """Exit 2 with the sentence, not a traceback -- and BEFORE any
+        connection, so a missing key is not diagnosed as a database
+        problem."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(SystemExit):
+            self._main(monkeypatch, ["--dsn", "postgresql+psycopg2://u:p@127.0.0.1:1/x",
+                                     "--embed-provider", "openai",
+                                     "--embed-model", "text-embedding-3-small"])
+        assert "--embed-provider openai needs" in capsys.readouterr().err

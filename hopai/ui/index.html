@@ -1,0 +1,857 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hopai · graph explorer</title>
+<!-- Inline, because this page is served from one file and a
+     /favicon.ico request the API does not route is a 404 in
+     every visitor's console. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23f4ecd8'/%3E%3Ccircle cx='9' cy='11' r='3.5' fill='%23c58a8a'/%3E%3Ccircle cx='23' cy='9' r='3.5' fill='%238faa86'/%3E%3Ccircle cx='16' cy='23' r='3.5' fill='%238aa4c5'/%3E%3Cg stroke='%23413a2f' stroke-width='1.5' opacity='.55'%3E%3Cpath d='M9 11 L23 9'/%3E%3Cpath d='M23 9 L16 23'/%3E%3Cpath d='M9 11 L16 23'/%3E%3C/g%3E%3C/svg%3E">
+<style>
+  :root {
+    --paper:      #f4ecd8;
+    --paper-warm: #efe4cc;
+    --paper-deep: #e6d8b8;
+    --rule:       #cdbb95;
+    --ink:        #413a2f;
+    --ink-soft:   #6b6152;
+    --ink-faint:  #9b8f79;
+    --rose:       #c58a8a;
+    --sage:       #8faa86;
+    --sky:        #8aa4c5;
+    --sand:       #c7ab6e;
+    --lilac:      #a690c0;
+    --teal:       #7fb3ab;
+    --clay:       #c99070;
+    --olive:      #a3a173;
+    --danger:     #b4635a;
+    --shadow:     rgba(90,74,45,.18);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+                 "Liberation Mono", monospace;
+    font-size: 13px; color: var(--ink); background: var(--paper);
+    /* Paper grain: two cheap gradients rather than an image, so the page
+       stays one file and works with no network. */
+    background-image:
+      radial-gradient(circle at 20% 10%, rgba(255,255,255,.55), transparent 45%),
+      radial-gradient(circle at 85% 80%, rgba(205,187,149,.25), transparent 50%);
+    overflow: hidden;
+  }
+  button, input, select { font: inherit; color: inherit; }
+
+  #app { display: grid; grid-template-rows: auto 1fr auto; height: 100%; }
+
+  /* ---- header ---------------------------------------------------- */
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 8px 14px; border-bottom: 1px solid var(--rule);
+    background: var(--paper-warm);
+  }
+  .brand { font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+  .brand .cursor {
+    display: inline-block; width: .55em; height: 1em; margin-left: 2px;
+    background: var(--ink); vertical-align: -.15em; animation: blink 1.1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  header label { color: var(--ink-soft); text-transform: uppercase;
+                 letter-spacing: .1em; font-size: 11px; }
+  .stats { margin-left: auto; color: var(--ink-soft); font-size: 12px; }
+  .stats b { color: var(--ink); font-weight: 700; }
+
+  select, input[type=text] {
+    background: var(--paper); border: 1px solid var(--rule); border-radius: 2px;
+    padding: 4px 7px; min-width: 0;
+  }
+  select:focus, input:focus { outline: 2px solid var(--sky); outline-offset: -1px; }
+
+  button {
+    background: var(--paper); border: 1px solid var(--rule); border-radius: 2px;
+    padding: 4px 9px; cursor: pointer; text-transform: uppercase;
+    letter-spacing: .08em; font-size: 11px;
+  }
+  button:hover:not(:disabled) { background: var(--paper-deep); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.armed { background: var(--sand); border-color: var(--clay); color: #fff; }
+  button.danger { border-color: var(--danger); color: var(--danger); }
+  button.danger.confirm { background: var(--danger); color: #fff; }
+
+  /* ---- body ------------------------------------------------------ */
+  #body { display: grid; grid-template-columns: 264px 1fr; min-height: 0; }
+  aside {
+    border-right: 1px solid var(--rule); background: var(--paper-warm);
+    overflow-y: auto; padding: 10px 12px 24px;
+  }
+  aside h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .14em;
+    color: var(--ink-soft); margin: 16px 0 7px; font-weight: 700;
+    border-bottom: 1px dashed var(--rule); padding-bottom: 4px;
+  }
+  aside h2:first-child { margin-top: 2px; }
+  .row { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+  .row input[type=text] { flex: 1; }
+  .check {
+    display: flex; align-items: center; gap: 7px; padding: 3px 4px;
+    cursor: pointer; border-radius: 2px; user-select: none;
+  }
+  .check:hover { background: var(--paper-deep); }
+  .swatch { width: 11px; height: 11px; border-radius: 50%; flex: none;
+            border: 1px solid rgba(0,0,0,.18); }
+  .check .count { margin-left: auto; color: var(--ink-faint); font-size: 11px; }
+  .check.off { opacity: .42; }
+  .hint { color: var(--ink-faint); font-size: 11px; line-height: 1.5; margin: 6px 0 0; }
+
+  .propfilter { display: grid; grid-template-columns: 1fr 1fr auto; gap: 4px;
+                margin-bottom: 4px; }
+  .propfilter input { min-width: 0; }
+  .propfilter button { padding: 2px 6px; }
+
+  /* ---- canvas ---------------------------------------------------- */
+  #stage { position: relative; min-width: 0; }
+  canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+  canvas.dragging { cursor: grabbing; }
+  canvas.arming { cursor: crosshair; }
+  #empty {
+    position: absolute; inset: 0; display: none; place-items: center;
+    color: var(--ink-faint); text-align: center; padding: 30px; line-height: 1.7;
+  }
+  #empty.show { display: grid; }
+
+  #inspector {
+    position: absolute; right: 12px; top: 12px; width: 260px; max-height: calc(100% - 24px);
+    overflow-y: auto; background: var(--paper-warm); border: 1px solid var(--rule);
+    border-radius: 3px; box-shadow: 0 6px 18px var(--shadow); padding: 10px 12px;
+    display: none;
+  }
+  #inspector.show { display: block; }
+  #inspector h3 { margin: 0 0 6px; font-size: 11px; letter-spacing: .14em;
+                  text-transform: uppercase; color: var(--ink-soft); }
+  #inspector dl { margin: 0 0 10px; display: grid; grid-template-columns: auto 1fr;
+                  gap: 2px 8px; font-size: 12px; }
+  #inspector dt { color: var(--ink-faint); }
+  #inspector dd { margin: 0; overflow-wrap: anywhere; }
+  .actions { display: flex; flex-wrap: wrap; gap: 5px; }
+
+  footer {
+    border-top: 1px solid var(--rule); background: var(--paper-warm);
+    padding: 5px 14px; font-size: 11px; color: var(--ink-soft);
+    display: flex; gap: 14px; align-items: center;
+  }
+  #status.error { color: var(--danger); }
+  #status.ok { color: var(--sage); }
+  .spacer { margin-left: auto; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <span class="brand">hopai<span class="cursor"></span></span>
+    <label for="graph">graph</label>
+    <select id="graph"></select>
+    <button id="reload" title="Reload from the database">reload</button>
+    <label class="check" style="padding:0">
+      <input type="checkbox" id="edgeLabels"> edge labels
+    </label>
+    <span class="stats" id="stats"></span>
+  </header>
+
+  <div id="body">
+    <aside>
+      <h2>node types</h2>
+      <div id="types"></div>
+      <p class="hint" id="typesHint">Click a type to hide or show it.</p>
+
+      <h2>filter by name</h2>
+      <div class="row">
+        <input type="text" id="nameFilter" placeholder="substring…" autocomplete="off">
+      </div>
+      <p class="hint">Matches <code>name</code>, <code>title</code>, or <code>label</code>.</p>
+
+      <h2>filter by property</h2>
+      <div id="propFilters"></div>
+      <button id="addProp">+ add filter</button>
+      <p class="hint">Key and value. Value is a substring match; leave it
+        empty to keep every node that has the key at all.</p>
+
+      <h2>layout</h2>
+      <div class="row">
+        <button id="reheat">re-run</button>
+        <button id="fit">fit view</button>
+      </div>
+      <p class="hint">Drag a node to pin it. Double-click it to release.</p>
+    </aside>
+
+    <div id="stage">
+      <canvas id="canvas"></canvas>
+      <div id="empty"></div>
+      <div id="inspector"></div>
+    </div>
+  </div>
+
+  <footer>
+    <span id="status">ready</span>
+    <span class="spacer"></span>
+    <span id="perm"></span>
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+const API = location.origin;
+const PALETTE = ["#c58a8a","#8faa86","#8aa4c5","#c7ab6e","#a690c0",
+                 "#7fb3ab","#c99070","#a3a173"];
+
+const state = {
+  graphs: [], graph: null, permissions: {},
+  nodes: [], edges: [], byId: new Map(),
+  hidden: new Set(),            // node types switched off
+  nameFilter: "", propFilters: [],
+  showEdgeLabels: false,
+  selection: null,              // {kind:"node"|"edge", id}
+  repoint: null,                // {edgeId, end:"start"|"end"} while armed
+  view: { x: 0, y: 0, k: 1 },
+  alpha: 0,
+  fitWhenCool: false,           // frame the graph once the layout settles
+};
+
+const el = (id) => document.getElementById(id);
+const canvas = el("canvas");
+const ctx = canvas.getContext("2d");
+
+function status(message, kind) {
+  const node = el("status");
+  node.textContent = message;
+  node.className = kind || "";
+}
+
+async function api(path, options) {
+  const answer = await fetch(API + path, options);
+  const body = await answer.json().catch(() => ({}));
+  if (!answer.ok) {
+    // hopai's refusals are sentences that name the fix, so show the
+    // sentence rather than the status code.
+    throw new Error(body.error || (answer.status + " " + answer.statusText));
+  }
+  return body;
+}
+
+const post = (path, body) => api(path, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify(Object.assign({ graph: state.graph }, body)),
+});
+
+/* ---- data ------------------------------------------------------- */
+
+function nodeLabel(node) {
+  const p = node.properties || {};
+  return String(p.name ?? p.title ?? p.label ?? p.type ?? node.id);
+}
+function nodeType(node) {
+  const p = node.properties || {};
+  return String(p.type ?? p.label ?? p.kind ?? "—");
+}
+function edgeLabel(edge) {
+  const p = edge.properties || {};
+  return String(p.kind ?? p.type ?? p.label ?? "");
+}
+
+const typeColours = new Map();
+function colourFor(type) {
+  if (!typeColours.has(type)) {
+    typeColours.set(type, PALETTE[typeColours.size % PALETTE.length]);
+  }
+  return typeColours.get(type);
+}
+
+async function loadGraphs() {
+  const body = await api("/graphs");
+  state.graphs = body.graphs.map((g) => g.graph);
+  state.permissions = body.permissions || {};
+  const select = el("graph");
+  select.innerHTML = "";
+  for (const name of state.graphs) {
+    const option = document.createElement("option");
+    option.value = option.textContent = name;
+    select.appendChild(option);
+  }
+  el("perm").textContent =
+    "writes " + (state.permissions.writes ? "on" : "off") +
+    " · deletes " + (state.permissions.mutations ? "on" : "off");
+  if (state.graphs.length) {
+    state.graph = state.graphs[0];
+    select.value = state.graph;
+    await loadGraph();
+  } else {
+    showEmpty("No graphs in this database yet.");
+  }
+}
+
+async function loadGraph() {
+  status("loading " + state.graph + "…");
+  const body = await api("/graph-data?graph=" + encodeURIComponent(state.graph));
+  const previous = new Map(state.nodes.map((n) => [n.id, n]));
+  const width = canvas.clientWidth || 800, height = canvas.clientHeight || 600;
+
+  state.nodes = body.nodes.map((raw) => {
+    const old = previous.get(raw.id);
+    return {
+      id: raw.id, properties: raw.properties || {},
+      // Keep positions across a reload so the picture does not jump.
+      x: old ? old.x : width / 2 + (Math.random() - .5) * 320,
+      y: old ? old.y : height / 2 + (Math.random() - .5) * 320,
+      vx: 0, vy: 0, pinned: old ? old.pinned : false, r: 7,
+    };
+  });
+  state.byId = new Map(state.nodes.map((n) => [n.id, n]));
+  state.edges = body.edges
+    .map((raw) => ({
+      id: raw.id, properties: raw.properties || {},
+      source: state.byId.get(raw.start_id), target: state.byId.get(raw.end_id),
+      start_id: raw.start_id, end_id: raw.end_id,
+    }))
+    .filter((e) => e.source && e.target);
+
+  state.selection = null;
+  renderTypes();
+  renderInspector();
+  reheat();
+  state.fitWhenCool = true;
+  status(body.truncated
+    ? "showing the first " + state.nodes.length + " nodes — the graph is larger"
+    : "loaded " + state.graph, body.truncated ? "" : "ok");
+  updateStats();
+}
+
+/* ---- filtering --------------------------------------------------- */
+
+function visibleNode(node) {
+  if (state.hidden.has(nodeType(node))) return false;
+  if (state.nameFilter && !nodeLabel(node).toLowerCase()
+        .includes(state.nameFilter.toLowerCase())) return false;
+  for (const f of state.propFilters) {
+    if (!f.key) continue;
+    const value = node.properties[f.key];
+    if (value === undefined) return false;
+    if (f.value && !String(value).toLowerCase().includes(f.value.toLowerCase())) {
+      return false;
+    }
+  }
+  return true;
+}
+const visibleEdge = (edge) => visibleNode(edge.source) && visibleNode(edge.target);
+
+function updateStats() {
+  const nodes = state.nodes.filter(visibleNode).length;
+  const edges = state.edges.filter(visibleEdge).length;
+  el("stats").innerHTML =
+    "<b>" + nodes + "</b>/" + state.nodes.length + " nodes · " +
+    "<b>" + edges + "</b>/" + state.edges.length + " edges";
+}
+
+function renderTypes() {
+  const counts = new Map();
+  for (const node of state.nodes) {
+    const type = nodeType(node);
+    counts.set(type, (counts.get(type) || 0) + 1);
+  }
+  const host = el("types");
+  host.innerHTML = "";
+  for (const [type, count] of [...counts].sort((a, b) => b[1] - a[1])) {
+    const off = state.hidden.has(type);
+    const row = document.createElement("div");
+    row.className = "check" + (off ? " off" : "");
+    row.innerHTML =
+      '<span class="swatch" style="background:' + colourFor(type) + '"></span>' +
+      '<span>' + escapeHtml(type) + '</span>' +
+      '<span class="count">' + count + '</span>';
+    row.onclick = () => {
+      if (state.hidden.has(type)) state.hidden.delete(type);
+      else state.hidden.add(type);
+      renderTypes(); updateStats(); reheat();
+    };
+    host.appendChild(row);
+  }
+  el("typesHint").style.display = counts.size ? "" : "none";
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function renderPropFilters() {
+  const host = el("propFilters");
+  host.innerHTML = "";
+  state.propFilters.forEach((filter, index) => {
+    const row = document.createElement("div");
+    row.className = "propfilter";
+    const key = document.createElement("input");
+    key.type = "text"; key.placeholder = "key"; key.value = filter.key;
+    const value = document.createElement("input");
+    value.type = "text"; value.placeholder = "value"; value.value = filter.value;
+    const drop = document.createElement("button");
+    drop.textContent = "×"; drop.title = "Remove this filter";
+    key.oninput = () => { filter.key = key.value.trim(); updateStats(); reheat(); };
+    value.oninput = () => { filter.value = value.value.trim(); updateStats(); reheat(); };
+    drop.onclick = () => {
+      state.propFilters.splice(index, 1);
+      renderPropFilters(); updateStats(); reheat();
+    };
+    row.append(key, value, drop);
+    host.appendChild(row);
+  });
+}
+
+/* ---- force layout ------------------------------------------------ */
+
+function reheat() { state.alpha = 1; }
+
+function tick() {
+  if (state.alpha > 0.005) {
+    const nodes = state.nodes.filter(visibleNode);
+    const alpha = state.alpha;
+    const width = canvas.clientWidth, height = canvas.clientHeight;
+    const cx = width / 2, cy = height / 2;
+
+    // Repulsion, over a uniform grid so this stays linear-ish instead of
+    // O(n²) -- the difference between smooth and a slideshow at a few
+    // hundred nodes.
+    const cell = 70, grid = new Map();
+    for (const node of nodes) {
+      const key = ((node.x / cell) | 0) + ":" + ((node.y / cell) | 0);
+      if (!grid.has(key)) grid.set(key, []);
+      grid.get(key).push(node);
+    }
+    for (const node of nodes) {
+      const gx = (node.x / cell) | 0, gy = (node.y / cell) | 0;
+      for (let ix = -1; ix <= 1; ix++) for (let iy = -1; iy <= 1; iy++) {
+        const bucket = grid.get((gx + ix) + ":" + (gy + iy));
+        if (!bucket) continue;
+        for (const other of bucket) {
+          if (other === node) continue;
+          let dx = node.x - other.x, dy = node.y - other.y;
+          let d2 = dx * dx + dy * dy;
+          if (d2 === 0) { dx = Math.random() - .5; dy = Math.random() - .5; d2 = 1; }
+          if (d2 > cell * cell * 4) continue;
+          const force = 900 / d2;
+          const d = Math.sqrt(d2);
+          node.vx += (dx / d) * force * alpha;
+          node.vy += (dy / d) * force * alpha;
+        }
+      }
+    }
+    // Springs along visible edges.
+    for (const edge of state.edges) {
+      if (!visibleEdge(edge)) continue;
+      const a = edge.source, b = edge.target;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const d = Math.hypot(dx, dy) || 1;
+      const force = (d - 110) * 0.02 * alpha;
+      const fx = (dx / d) * force, fy = (dy / d) * force;
+      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+    }
+    // A whisper of gravity, so disconnected pieces do not drift away.
+    for (const node of nodes) {
+      node.vx += (cx - node.x) * 0.0012 * alpha;
+      node.vy += (cy - node.y) * 0.0012 * alpha;
+      if (node.pinned || node === drag.node) { node.vx = node.vy = 0; continue; }
+      node.vx *= 0.86; node.vy *= 0.86;
+      node.x += node.vx; node.y += node.vy;
+    }
+    state.alpha *= 0.985;
+    // Frame it once, when the layout has stopped moving. Fitting on the
+    // first frame would zoom to the random starting scatter; fitting
+    // every frame would fight the user's own pan.
+    if (state.fitWhenCool && state.alpha < 0.06) {
+      state.fitWhenCool = false;
+      fit();
+    }
+  }
+  draw();
+  requestAnimationFrame(tick);
+}
+
+/* ---- drawing ----------------------------------------------------- */
+
+function resize() {
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = canvas.clientWidth * ratio;
+  canvas.height = canvas.clientHeight * ratio;
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+}
+
+const toScreen = (node) => ({
+  x: node.x * state.view.k + state.view.x,
+  y: node.y * state.view.k + state.view.y,
+});
+
+function draw() {
+  const width = canvas.clientWidth, height = canvas.clientHeight;
+  ctx.clearRect(0, 0, width, height);
+  const k = state.view.k;
+  const selected = state.selection;
+
+  ctx.lineWidth = 1;
+  for (const edge of state.edges) {
+    if (!visibleEdge(edge)) continue;
+    const a = toScreen(edge.source), b = toScreen(edge.target);
+    const isSelected = selected && selected.kind === "edge" && selected.id === edge.id;
+    ctx.strokeStyle = isSelected ? "#b4635a" : "rgba(107,97,82,.42)";
+    ctx.lineWidth = isSelected ? 2.2 : 1.1;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+
+    // Arrow head, so direction is readable at a glance.
+    const angle = Math.atan2(b.y - a.y, b.x - a.x);
+    const tipX = b.x - Math.cos(angle) * (edge.target.r * k + 3);
+    const tipY = b.y - Math.sin(angle) * (edge.target.r * k + 3);
+    ctx.beginPath();
+    ctx.moveTo(tipX, tipY);
+    ctx.lineTo(tipX - Math.cos(angle - .38) * 8, tipY - Math.sin(angle - .38) * 8);
+    ctx.lineTo(tipX - Math.cos(angle + .38) * 8, tipY - Math.sin(angle + .38) * 8);
+    ctx.closePath();
+    ctx.fillStyle = isSelected ? "#b4635a" : "rgba(107,97,82,.42)";
+    ctx.fill();
+
+    if (state.showEdgeLabels && k > 0.55) {
+      const text = edgeLabel(edge);
+      if (text) {
+        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+        ctx.font = "10px ui-monospace, Menlo, monospace";
+        const w = ctx.measureText(text).width;
+        ctx.fillStyle = "rgba(244,236,216,.85)";
+        ctx.fillRect(mx - w / 2 - 3, my - 7, w + 6, 13);
+        ctx.fillStyle = "#6b6152";
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(text, mx, my);
+      }
+    }
+  }
+
+  for (const node of state.nodes) {
+    if (!visibleNode(node)) continue;
+    const p = toScreen(node);
+    const radius = node.r * k;
+    const isSelected = selected && selected.kind === "node" && selected.id === node.id;
+
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, radius + (isSelected ? 3 : 0), 0, Math.PI * 2);
+    ctx.fillStyle = colourFor(nodeType(node));
+    ctx.fill();
+    ctx.lineWidth = isSelected ? 2.5 : 1;
+    ctx.strokeStyle = isSelected ? "#413a2f" : "rgba(65,58,47,.35)";
+    ctx.stroke();
+
+    if (node.pinned) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, radius + 5, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(65,58,47,.35)";
+      ctx.setLineDash([2, 3]); ctx.stroke(); ctx.setLineDash([]);
+    }
+    if (k > 0.5) {
+      ctx.font = "11px ui-monospace, Menlo, monospace";
+      ctx.fillStyle = "#413a2f";
+      ctx.textAlign = "center"; ctx.textBaseline = "top";
+      ctx.fillText(nodeLabel(node), p.x, p.y + radius + 4);
+    }
+  }
+}
+
+/* ---- interaction ------------------------------------------------- */
+
+const drag = { node: null, panning: false, lastX: 0, lastY: 0, moved: false };
+
+function nodeAt(x, y) {
+  for (let i = state.nodes.length - 1; i >= 0; i--) {
+    const node = state.nodes[i];
+    if (!visibleNode(node)) continue;
+    const p = toScreen(node);
+    if (Math.hypot(p.x - x, p.y - y) <= node.r * state.view.k + 5) return node;
+  }
+  return null;
+}
+
+function edgeAt(x, y) {
+  for (const edge of state.edges) {
+    if (!visibleEdge(edge)) continue;
+    const a = toScreen(edge.source), b = toScreen(edge.target);
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const len2 = dx * dx + dy * dy;
+    if (!len2) continue;
+    let t = ((x - a.x) * dx + (y - a.y) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const px = a.x + t * dx, py = a.y + t * dy;
+    if (Math.hypot(px - x, py - y) < 6) return edge;
+  }
+  return null;
+}
+
+canvas.addEventListener("pointerdown", (event) => {
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left, y = event.clientY - rect.top;
+  drag.moved = false;
+  // The user is now driving the view; do not yank it out from under
+  // them when the layout finishes cooling.
+  state.fitWhenCool = false;
+
+  if (state.repoint) {                       // armed: the next node wins
+    const target = nodeAt(x, y);
+    if (target) { applyRepoint(target); return; }
+  }
+  const node = nodeAt(x, y);
+  if (node) {
+    drag.node = node;
+    canvas.classList.add("dragging");
+    canvas.setPointerCapture(event.pointerId);
+    select({ kind: "node", id: node.id });
+    return;
+  }
+  const edge = edgeAt(x, y);
+  if (edge) { select({ kind: "edge", id: edge.id }); return; }
+
+  select(null);
+  drag.panning = true; drag.lastX = event.clientX; drag.lastY = event.clientY;
+  canvas.classList.add("dragging");
+  canvas.setPointerCapture(event.pointerId);
+});
+
+canvas.addEventListener("pointermove", (event) => {
+  const rect = canvas.getBoundingClientRect();
+  drag.moved = true;
+  if (drag.node) {
+    drag.node.x = (event.clientX - rect.left - state.view.x) / state.view.k;
+    drag.node.y = (event.clientY - rect.top - state.view.y) / state.view.k;
+    reheat();
+  } else if (drag.panning) {
+    state.view.x += event.clientX - drag.lastX;
+    state.view.y += event.clientY - drag.lastY;
+    drag.lastX = event.clientX; drag.lastY = event.clientY;
+  }
+});
+
+function endDrag() {
+  if (drag.node && drag.moved) drag.node.pinned = true;   // dropped where you put it
+  drag.node = null; drag.panning = false;
+  canvas.classList.remove("dragging");
+}
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+
+canvas.addEventListener("dblclick", (event) => {
+  const rect = canvas.getBoundingClientRect();
+  const node = nodeAt(event.clientX - rect.left, event.clientY - rect.top);
+  if (node) { node.pinned = false; reheat(); }
+});
+
+canvas.addEventListener("wheel", (event) => {
+  state.fitWhenCool = false;
+  event.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left, y = event.clientY - rect.top;
+  const factor = Math.exp(-event.deltaY * 0.0015);
+  const k = Math.max(0.15, Math.min(4, state.view.k * factor));
+  state.view.x = x - (x - state.view.x) * (k / state.view.k);
+  state.view.y = y - (y - state.view.y) * (k / state.view.k);
+  state.view.k = k;
+}, { passive: false });
+
+function fit() {
+  const nodes = state.nodes.filter(visibleNode);
+  if (!nodes.length) return;
+  const xs = nodes.map((n) => n.x), ys = nodes.map((n) => n.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const width = canvas.clientWidth, height = canvas.clientHeight;
+  const k = Math.max(0.15, Math.min(2,
+    0.85 * Math.min(width / (maxX - minX + 120), height / (maxY - minY + 120))));
+  state.view.k = k;
+  state.view.x = width / 2 - ((minX + maxX) / 2) * k;
+  state.view.y = height / 2 - ((minY + maxY) / 2) * k;
+}
+
+/* ---- selection and editing --------------------------------------- */
+
+function select(selection) {
+  state.selection = selection;
+  if (state.repoint && (!selection || selection.kind !== "edge")) cancelRepoint();
+  renderInspector();
+}
+
+function showEmpty(message) {
+  const node = el("empty");
+  node.textContent = message;
+  node.classList.toggle("show", Boolean(message));
+}
+
+function renderInspector() {
+  const host = el("inspector");
+  const selection = state.selection;
+  if (!selection) { host.classList.remove("show"); host.innerHTML = ""; return; }
+  host.classList.add("show");
+
+  if (selection.kind === "node") {
+    const node = state.byId.get(selection.id);
+    if (!node) { host.classList.remove("show"); return; }
+    host.innerHTML =
+      "<h3>node · " + escapeHtml(node.id) + "</h3><dl>" +
+      Object.entries(node.properties).map(([k, v]) =>
+        "<dt>" + escapeHtml(k) + "</dt><dd>" + escapeHtml(
+          typeof v === "object" ? JSON.stringify(v) : v) + "</dd>").join("") +
+      "</dl><div class='actions'></div>";
+    const actions = host.querySelector(".actions");
+    // The label says what will actually be destroyed. hopai refuses to
+    // delete a node that still has edges unless detach=True, and a
+    // button that quietly supplies detach would take those edges with
+    // it without ever saying so -- which is the "never accidentally"
+    // half of this panel's job.
+    const attached = state.edges.filter(
+      (e) => e.start_id === node.id || e.end_id === node.id).length;
+    actions.appendChild(dangerButton(
+      attached ? "delete node + " + attached + (attached === 1 ? " edge" : " edges")
+               : "delete node",
+      async () => {
+        await post("/nodes/delete", { ids: [node.id], detach: attached > 0 });
+        // Reload FIRST: loadGraph() reports what it loaded, so a
+        // confirmation set before it is overwritten a second later and
+        // the one destructive action in this panel appears to say
+        // nothing at all.
+        await loadGraph();
+        status("deleted node " + node.id, "ok");
+      }));
+  } else {
+    const edge = state.edges.find((e) => e.id === selection.id);
+    if (!edge) { host.classList.remove("show"); return; }
+    host.innerHTML =
+      "<h3>edge · " + escapeHtml(edge.id) + "</h3><dl>" +
+      "<dt>from</dt><dd>" + escapeHtml(nodeLabel(edge.source)) + "</dd>" +
+      "<dt>to</dt><dd>" + escapeHtml(nodeLabel(edge.target)) + "</dd>" +
+      Object.entries(edge.properties).map(([k, v]) =>
+        "<dt>" + escapeHtml(k) + "</dt><dd>" + escapeHtml(
+          typeof v === "object" ? JSON.stringify(v) : v) + "</dd>").join("") +
+      "</dl><div class='actions'></div>";
+    const actions = host.querySelector(".actions");
+    if (state.permissions.writes) {
+      actions.appendChild(armButton("repoint start", edge, "start"));
+      actions.appendChild(armButton("repoint end", edge, "end"));
+    }
+    if (state.permissions.mutations) {
+      actions.appendChild(dangerButton("delete edge", async () => {
+        await post("/edges/delete", { ids: [edge.id] });
+        await loadGraph();
+        status("deleted edge " + edge.id, "ok");
+      }));
+    }
+  }
+}
+
+/** Two clicks, always. The first arms the button and starts a five second
+ *  window; the second does it. Nothing here deletes on one click. */
+function dangerButton(label, run) {
+  const button = document.createElement("button");
+  button.className = "danger";
+  button.textContent = label;
+  if (!state.permissions.mutations) {
+    button.disabled = true;
+    button.title = "This API was started without --allow-mutations";
+    return button;
+  }
+  let armed = false, timer = null;
+  button.onclick = async () => {
+    if (!armed) {
+      armed = true;
+      button.classList.add("confirm");
+      button.textContent = "click again to confirm";
+      timer = setTimeout(() => {
+        armed = false; button.classList.remove("confirm"); button.textContent = label;
+      }, 5000);
+      return;
+    }
+    clearTimeout(timer);
+    button.disabled = true;
+    try { await run(); } catch (error) { status(error.message, "error"); }
+  };
+  return button;
+}
+
+function armButton(label, edge, end) {
+  const button = document.createElement("button");
+  button.textContent = label;
+  const armedNow = state.repoint && state.repoint.edgeId === edge.id
+                   && state.repoint.end === end;
+  if (armedNow) { button.classList.add("armed"); button.textContent = "click a node…"; }
+  button.onclick = () => {
+    if (armedNow) { cancelRepoint(); return; }
+    state.repoint = { edgeId: edge.id, end };
+    canvas.classList.add("arming");
+    status("click the node to become this edge's " + end, "");
+    renderInspector();
+  };
+  return button;
+}
+
+function cancelRepoint() {
+  state.repoint = null;
+  canvas.classList.remove("arming");
+  status("ready");
+}
+
+async function applyRepoint(target) {
+  const { edgeId, end } = state.repoint;
+  cancelRepoint();
+  try {
+    await post("/edges/repoint",
+      end === "start" ? { id: edgeId, start_id: target.id }
+                      : { id: edgeId, end_id: target.id });
+    const moved = nodeLabel(target);
+    await loadGraph();
+    status("repointed edge " + edgeId + " " + end + " → " + moved, "ok");
+  } catch (error) {
+    status(error.message, "error");
+  }
+  renderInspector();
+}
+
+/* ---- wiring ------------------------------------------------------ */
+
+el("graph").onchange = async (event) => {
+  state.graph = event.target.value;
+  state.hidden.clear();
+  try { await loadGraph(); } catch (e) { status(e.message, "error"); }
+};
+el("reload").onclick = async () => {
+  try { await loadGraph(); } catch (e) { status(e.message, "error"); }
+};
+el("edgeLabels").onchange = (event) => { state.showEdgeLabels = event.target.checked; };
+el("nameFilter").oninput = (event) => {
+  state.nameFilter = event.target.value.trim();
+  updateStats(); reheat();
+};
+el("addProp").onclick = () => {
+  state.propFilters.push({ key: "", value: "" });
+  renderPropFilters();
+};
+el("reheat").onclick = () => {
+  for (const node of state.nodes) node.pinned = false;
+  reheat();
+};
+el("fit").onclick = fit;
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") { cancelRepoint(); select(null); }
+});
+window.addEventListener("resize", resize);
+
+resize();
+renderPropFilters();
+requestAnimationFrame(tick);
+loadGraphs().catch((error) => {
+  status(error.message, "error");
+  showEmpty("Could not reach the API at " + API + "\n\n" + error.message);
+});
+</script>
+</body>
+</html>
