@@ -168,6 +168,7 @@ nav:
       - hopai.mcp: api/mcp.md
   - Guides:
       - MCP server: mcp.md
+      - HTTP API: http-api.md
   - Internals:
       - Architecture: architecture.md
       - Testing: testing.md

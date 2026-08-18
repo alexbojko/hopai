@@ -1,0 +1,13 @@
+.git
+.github
+tests
+notebooks
+benchmarks
+docs
+site
+mutants
+.cache
+**/__pycache__
+*.pyc
+.coverage*
+htmlcov

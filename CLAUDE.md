@@ -195,7 +195,8 @@ read.** When a design question comes up, these decide it, in order:
 
 ```bash
 pip install -e ".[dev]"
-docker compose up -d      # Postgres matching the default DSN
+docker compose up -d db   # Postgres matching the default DSN
+docker compose up -d      # ...plus the HTTP API and the MCP server
 pytest tests/ -v
 ruff check .
 

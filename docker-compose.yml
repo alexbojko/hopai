@@ -1,30 +1,42 @@
-# A throwaway PostgreSQL for running the test suite.
+# The whole stack, for building against or demonstrating hopai:
 #
-#   docker compose up -d          # start it
-#   pytest tests/                 # the default DSN points here already
-#   docker compose down           # stop it; nothing is kept
+#   cp .env.example .env      # then put your embedding credentials in it
+#   docker compose up -d      # Postgres + the JSON HTTP API + the MCP server
 #
-# Storage is tmpfs and durability is switched off: this database exists
-# for the length of a test run, and the suite recreates the `hopai_test`
-# schema from scratch on every session anyway. Do not point anything you
-# care about at it.
+#   curl localhost:8080/health
 #
-# Benchmarks are a different job -- generate_graph.py makes a million
-# nodes and wants a real disk. Run those against your own instance and
-# pass --dsn, see benchmarks/README.md.
+# Just the database, which is what the test suite wants and all it wants
+# (the default DSN in tests/conftest.py already points here):
+#
+#   docker compose up -d db
+#   pytest tests/
+#
+# NOTHING HERE IS PRODUCTION. There is no authentication in front of
+# either service, CORS is open, and the API is started with every
+# permission including filter-matched deletes and DDL. That is a
+# deliberate choice for a machine you are developing on, and a bad one
+# anywhere a browser you do not control can reach it -- see the comments
+# on the `api` service before exposing this.
+
+name: hopai
 
 services:
   db:
     image: postgres:16-alpine
-    container_name: hopai-test-db
+    container_name: hopai-db
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: testpass
-      POSTGRES_DB: hopai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-testpass}
+      POSTGRES_DB: ${POSTGRES_DB:-hopai}
     ports:
-      - "5432:5432"
-    tmpfs:
-      - /var/lib/postgresql/data
+      - "${POSTGRES_PORT:-5432}:5432"
+    # A named volume rather than the tmpfs this file used to carry: the
+    # services above it are for building a UI against, and a database
+    # that forgets everything on `docker compose restart` makes that
+    # miserable. Durability is still off -- this is a development
+    # database, and losing it to a hard kill costs nothing that matters.
+    volumes:
+      - hopai-data:/var/lib/postgresql/data
     command:
       - postgres
       - -c
@@ -34,7 +46,101 @@ services:
       - -c
       - full_page_writes=off
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d hopai"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${POSTGRES_DB:-hopai}"]
       interval: 2s
       timeout: 3s
       retries: 15
+
+  # The JSON HTTP API -- what an HTML page talks to. A browser cannot
+  # reasonably speak MCP (JSON-RPC over a streaming transport, with
+  # session negotiation), which is why this exists alongside it.
+  api:
+    build:
+      context: .
+      args:
+        HOPAI_EXTRAS: ${HOPAI_EXTRAS:-http,mcp,openai}
+    container_name: hopai-api
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      HOPAI_DSN: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:-testpass}@db:5432/${POSTGRES_DB:-hopai}
+      HOPAI_API_HOST: 0.0.0.0
+      HOPAI_API_PORT: 8080
+      # Any origin, so a page opened from file:// or served from
+      # anywhere can call it. Safe only because nothing outside this
+      # machine can reach the published port below.
+      HOPAI_API_CORS: "*"
+      # Embeddings. Set HOPAI_EMBED_PROVIDER in .env and the matching
+      # credentials come from the same file -- no command to change.
+      # Unset, the API still serves everything except search-by-text.
+      HOPAI_EMBED_PROVIDER: ${HOPAI_EMBED_PROVIDER:-}
+      HOPAI_EMBED_MODEL: ${HOPAI_EMBED_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-}
+      AZURE_OPENAI_EMBEDDING_DEPLOYMENT: ${AZURE_OPENAI_EMBEDDING_DEPLOYMENT:-}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+    # 127.0.0.1 on the host side ON PURPOSE: 0.0.0.0 inside the
+    # container is how the process is reachable from the network
+    # namespace, and binding the published port to loopback is what
+    # keeps "every permission, no auth" a local decision rather than a
+    # LAN-wide one. Change this and you are publishing a graph anyone on
+    # the network can DETACH DELETE.
+    ports:
+      - "127.0.0.1:${HOPAI_API_PORT:-8080}:8080"
+    # --allow-mutations and --allow-ddl are passed HERE rather than being
+    # the library's default: `hopai-api` on its own writes but does not
+    # delete by filter or run DDL. This compose file is for a UI you are
+    # building, where you want the whole surface.
+    command: >
+      hopai-api
+      --vector ${HOPAI_VECTOR_TARGET:-nodes}:${HOPAI_VECTOR_FIELD:-summary}:${HOPAI_VECTOR_DIMENSIONS:-1536}
+      --allow-mutations
+      --allow-ddl
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health').status==200 else 1)\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # The MCP server over HTTP, for Claude Desktop / Claude Code / Cursor:
+  #   {"mcpServers": {"hopai": {"url": "http://127.0.0.1:8000/mcp"}}}
+  mcp:
+    build:
+      context: .
+      args:
+        HOPAI_EXTRAS: ${HOPAI_EXTRAS:-http,mcp,openai}
+    container_name: hopai-mcp
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      HOPAI_DSN: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:-testpass}@db:5432/${POSTGRES_DB:-hopai}
+      HOPAI_EMBED_PROVIDER: ${HOPAI_EMBED_PROVIDER:-}
+      HOPAI_EMBED_MODEL: ${HOPAI_EMBED_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-}
+      AZURE_OPENAI_EMBEDDING_DEPLOYMENT: ${AZURE_OPENAI_EMBEDDING_DEPLOYMENT:-}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+    ports:
+      - "127.0.0.1:${HOPAI_MCP_PORT:-8000}:8000"
+    command: >
+      hopai-mcp
+      --transport http --host 0.0.0.0 --port 8000
+      --vector ${HOPAI_VECTOR_TARGET:-nodes}:${HOPAI_VECTOR_FIELD:-summary}:${HOPAI_VECTOR_DIMENSIONS:-1536}
+      --allow-mutations
+    restart: unless-stopped
+
+volumes:
+  hopai-data:
