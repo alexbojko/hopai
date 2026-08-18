@@ -213,14 +213,18 @@ ceiling answer neither question precisely.
 WHY THE CHECK RUNS AFTER THE READ, NOT BEFORE IT. The obvious design
 counts first -- run `aggregate_graph`'s `Count()` over the same
 start/hops, refuse before touching the traversal at all if it is over
-the ceiling. That was measured and rejected, and not on performance: it
+the ceiling.
+
+That was measured and rejected, and not on performance: it
 is WRONG. `Count()` aggregates the LAST hop's matched nodes only
 (hopai/core.py's build_aggregate_query, and the CLAUDE.md invariant
 that names it), while the subgraph a traversal actually reports is the
 union of every node on every hop's matching edges -- deliberately
 bigger, so a hop spanning several edges reports all of them and dead
 ends still show the nodes that led to them. The two numbers are not the
-same question. Measured on benchmarks/generate_graph.py's hub data,
+same question.
+
+Measured on benchmarks/generate_graph.py's hub data,
 `forward_bounded_4hop` returns 10,350 nodes while `Count()` over the
 IDENTICAL chain reports 225 -- a 46x undercount, and unboundedly worse
 with a broad early hop narrowed by a late filter (a synthetic hub-then-

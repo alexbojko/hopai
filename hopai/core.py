@@ -423,25 +423,28 @@ class Graph:
         define_schema()/define_vectors() on the new handle to state one
         up front.
 
-        Vectors are the one exception to "starts blank", and only
-        LAZILY: the vec_* columns are physical storage SHARED by every
-        graph in the table (only the dimension CHECK is per-graph), so
-        a field this new handle's own graph already had migrated by
-        some OTHER handle is not actually unknown, just not yet read
-        back. Rather than eagerly querying the catalog here -- which
-        would cost every in_graph() call a round trip even when nothing
-        that follows ever touches a vector, and would make an offline
-        Graph() (query building never connects; see the module docstring
-        and Graph.build_query()) try to connect just from being handed a
-        new graph name -- the returned handle only sets a flag
-        (`_vectors_lazy`). vector_search()/vector_search_many() check it
-        and call load_vectors() themselves, once, the first time they
-        actually need a connection anyway. Anything else that needs
-        vectors (set_vectors(), migrate_vectors(), ...) is unaffected by
-        the flag and still refuses by name until you call
-        define_vectors() or load_vectors() explicitly -- the lazy path
-        exists for the READ side this issue was filed about, not as a
-        blanket auto-declare."""
+        Vectors are the one exception to "starts blank", and only LAZILY: the
+        vec_* columns are physical storage SHARED by every graph in the table
+        (only the dimension CHECK is per-graph), so a field this new handle's
+        own graph already had migrated by some OTHER handle is not actually
+        unknown, just not yet read back.
+
+        Rather than eagerly querying the catalog here -- which would cost every
+        in_graph() call a round trip even when nothing that follows ever
+        touches a vector, and would make an offline Graph() (query building
+        never connects; see the module docstring and Graph.build_query()) try
+        to connect just from being handed a new graph name -- the returned
+        handle only sets a flag (`_vectors_lazy`).
+
+        vector_search()/vector_search_many() check it and call load_vectors()
+        themselves, once, the first time they actually need a connection
+        anyway.
+
+        Anything else that needs vectors (set_vectors(), migrate_vectors(),
+        ...) is unaffected by the flag and still refuses by name until you call
+        define_vectors() or load_vectors() explicitly -- the lazy path exists
+        for the READ side this issue was filed about, not as a blanket
+        auto-declare."""
         handle = Graph(self.engine, graph=graph, node_table=self.nodes_tbl,
                        edge_table=self.edges_tbl, node_id_col=self.node_id_col,
                        edge_id_col=self.edge_id_col, edge_start_col=self.edge_start_col,
@@ -1588,21 +1591,27 @@ class Graph:
             # -> [{"id": "1", "similarity": 0.93, "properties": {...},
             #      "similarities": {"summary": 0.93}, "boosts": {}}, ...]
 
-        Several Near specs combine into one weighted score
-        (multivector search); `where` is the same filter language as
-        traversal and is applied BEFORE ranking, so a selective filter
-        makes the search cheaper, never slower. Edge results also
-        carry start_id/end_id. Rows are ordered most-similar first;
-        ids are strings, like every other result. `boost` adds
-        property terms to the score for hybrid retrieval; a boosted
-        `similarity` is the combined score and can exceed 1, and
-        reordering with `k` changes which rows come back. Every hit
-        also reports `similarities` (per Near field, keyed by name --
-        `None` where that field's vector is missing, even if
-        missing="zero" scored it 0 in the combined total) and `boosts`
-        (per Boost, keyed by property), so a caller tuning weights can
-        see what actually drove a result rather than only the sum. The
-        cost model and every design refusal live in hopai/vectors.py.
+        Several Near specs combine into one weighted score (multivector
+        search); `where` is the same filter language as traversal and is
+        applied BEFORE ranking, so a selective filter makes the search cheaper,
+        never slower.
+
+        Edge results also carry start_id/end_id.
+
+        Rows are ordered most-similar first; ids are strings, like every other
+        result.
+
+        `boost` adds property terms to the score for hybrid retrieval; a
+        boosted `similarity` is the combined score and can exceed 1, and
+        reordering with `k` changes which rows come back.
+
+        Every hit also reports `similarities` (per Near field, keyed by name --
+        `None` where that field's vector is missing, even if missing="zero"
+        scored it 0 in the combined total) and `boosts` (per Boost, keyed by
+        property), so a caller tuning weights can see what actually drove a
+        result rather than only the sum.
+
+        The cost model and every design refusal live in hopai/vectors.py.
 
         `rerank=Rerank(client, document_from='...', candidates=50)` adds
         the third retrieval stage: `candidates` rows are fetched instead

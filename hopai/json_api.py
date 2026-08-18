@@ -46,10 +46,14 @@ property paths the policy publishes -- the filter's output IS the
 document, and the document is posted to a third party.
 
 A near spec takes "text" OR "vector", and the difference is the whole
-LLM story. "text" is embedded by the field itself, with the client the
+LLM story.
+
+"text" is embedded by the field itself, with the client the
 application declared -- so the query embedding comes from the same
 model that wrote the stored ones, and a tool-calling model can fill it
-in as truthfully as any filter. "vector" is DELIBERATELY the one key
+in as truthfully as any filter.
+
+"vector" is DELIBERATELY the one key
 parsed and never advertised: asked for floats a model invents
 plausible ones, and an invented embedding finds confidently wrong
 neighbors. It exists for HTTP/config callers holding real vectors, and

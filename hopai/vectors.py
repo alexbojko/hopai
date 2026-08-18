@@ -33,17 +33,23 @@ once per candidate row, as a LATERAL:
 
 That is EXACT cosine similarity over every candidate row -- no index
 can serve an exact ORDER BY similarity, so none is created and none is
-pretended. The cost model, measured rather than hoped
+pretended.
+
+The cost model, measured rather than hoped
 (benchmarks/bench_vectors.py; Postgres 16, one core): the executor
 pays roughly 0.13 microseconds per vector element, so one candidate
 costs about dimensions x 0.13us -- ~0.05ms per 384-dim row, ~0.2ms per
 1536-dim row, and an unfiltered scan of 20,000 384-dim vectors lands
-near one second. "Candidates" is what is left AFTER the `where=`
+near one second.
+
+"Candidates" is what is left AFTER the `where=`
 filter and the graph discriminator, both served by the existing
 indexes -- and because the search is exact, filtering costs nothing
 extra: the filtered-vector-search that approximate indexes struggle
 with (filter first, rank the survivors) is simply how every search
-here runs. A few thousand filtered candidates answer interactively;
+here runs.
+
+A few thousand filtered candidates answer interactively;
 tens of thousands per query is the practical ceiling. Past it, this
 feature is the wrong tool: the columns are ordinary Postgres columns,
 and a manual `ALTER TABLE ... USING vec_x::vector(d)` moves them to
@@ -124,15 +130,20 @@ one shape; a mixed batch is refused rather than silently re-ranked.
 
 HYBRID RANKING adds a non-similarity term with Boost(property,
 weight): the score becomes sum(w_i * sim_i) + sum(w_j * boost_j).
+
 A boost cannot push a row past a min_similarity floor (thresholds
 read each field's own similarity, not the combined score) -- but it
 DOES reorder, so with k it changes which rows come back, and the
 `similarity` in each result is then the combined score, which can
-exceed 1. By default each boost is rescaled into [0, 1] -- similarity's
+exceed 1.
+
+By default each boost is rescaled into [0, 1] -- similarity's
 own scale, not its sign -- with a min-max window function over the
 candidate set before it is weighted, so `weight` means what it says
 regardless of the property's own scale -- a raw view count would otherwise not
-boost a cosine ranking, it would replace it. `Boost(..., scale="raw")`
+boost a cosine ranking, it would replace it.
+
+`Boost(..., scale="raw")`
 is the unbounded, unscaled escape hatch. See Boost.
 
 A boost that dominates the ranking should be visible, not discovered
@@ -231,6 +242,7 @@ class Vector:
              Near(field, text=...) resolves against it, and
              embed_stale() fills the gaps. Without one the field is
              still perfectly usable; you supply the floats.
+
     source:  which PROPERTY holds the text to embed, defaulting to the
              field's own name. `Vector("title", 768, embed=...)` reads
              each row's "title" property, which is what the name says
@@ -319,12 +331,15 @@ class Near:
                      recall. Resolved when the query is built, because
                      only then is the graph (and so the field's
                      embedder) known.
+
     text:            the same thing, said explicitly. Use it when the
                      string might otherwise be mistaken for something
                      to parse -- it is the only way to embed a string
                      that looks like a serialized vector.
+
     weight:          this field's coefficient in the combined score
                      (only meaningful when several Near are combined).
+
     min_similarity:  drop rows whose similarity ON THIS FIELD is below
                      the bound -- a filter, applied before k, but AFTER
                      every candidate has already been scanned and
@@ -335,6 +350,7 @@ class Near:
                      candidate. where= is what actually cuts cost, by
                      removing rows before they reach the LATERAL; see
                      the module docstring's cost model.
+
     missing:         "exclude" (default) drops rows lacking this
                      field's vector; "zero" scores them 0 here and
                      lets other fields carry the row.

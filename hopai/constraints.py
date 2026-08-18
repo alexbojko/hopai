@@ -30,15 +30,17 @@ for free, so they are a first-class feature here rather than a footnote.
 WHAT EACH ONE COMPILES TO -- worth knowing, because the semantics are
 Postgres's, not an abstraction over it:
 
-  Unique(*keys)        CREATE UNIQUE INDEX ON t ((properties->>'k'), ...)
-  Unique(..., where=)  ...the same, with a partial WHERE. This is the one
-                       Neo4j has no equivalent for at any price: "email is
-                       unique among nodes of type person" is a partial
-                       index, and a partial index is just an index.
-  Required(*keys)      CHECK (properties ?& array['k', ...])
-  PropertyType(k, t)   CHECK (jsonb_typeof(properties->'k') = t)
-  Check(filter)        CHECK (<the filter, compiled by resolve()>)
-  Index(*keys)         CREATE INDEX ON t ((properties->>'k'), ...)
+```
+Unique(*keys)        CREATE UNIQUE INDEX ON t ((properties->>'k'), ...)
+Unique(..., where=)  ...the same, with a partial WHERE. This is the one
+                      Neo4j has no equivalent for at any price: "email is
+                      unique among nodes of type person" is a partial
+                      index, and a partial index is just an index.
+Required(*keys)      CHECK (properties ?& array['k', ...])
+PropertyType(k, t)   CHECK (jsonb_typeof(properties->'k') = t)
+Check(filter)        CHECK (<the filter, compiled by resolve()>)
+Index(*keys)         CREATE INDEX ON t ((properties->>'k'), ...)
+```
 
 TWO SEMANTICS TO KNOW, both inherited from SQL and both the behavior you
 want once stated:

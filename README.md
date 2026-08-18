@@ -221,7 +221,6 @@ tier of this table that is structurally unable to go stale:
 | Read/write pipelines, multi-graph internals, gotchas | — | [architecture.md](https://hopai.readthedocs.io/en/latest/architecture/) |
 | Fixtures, coverage gate, mutation testing | — | [testing.md](https://hopai.readthedocs.io/en/latest/testing/) |
 | release-please, PyPI trusted publishing | — | [releasing.md](https://hopai.readthedocs.io/en/latest/releasing/) |
-| hopai vs. a hand-written recursive CTE, vs. Neo4j | [`benchmarks.ipynb`](https://hopai.readthedocs.io/en/latest/benchmarks/benchmarks/) | `benchmarks/README.md` |
 
 See [`notebooks/README.md`](notebooks/README.md) for how to run the
 notebooks yourself against a throwaway database.

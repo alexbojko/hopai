@@ -5,6 +5,8 @@ The filter language used everywhere a `where=` or `via=` argument is
 accepted. Two equivalent forms:
 
   Python form (import and use directly):
+
+      ```
       {"type": "person"}                        equality
       {"type": "person", "active": True}        AND of keys, same dict
       {"type": ["person", "company"]}           OR of values, one key (IN-like)
@@ -17,9 +19,12 @@ accepted. Two equivalent forms:
                                                  receiving the real column and
                                                  returning a real SQLAlchemy
                                                  boolean expression
+      ```
 
   JSON form (for callers who can't or shouldn't write Python -- LLM tool
   calls, a future HTTP/MCP layer, config files):
+
+      ```
       {"type": "person"}
       {"and": [{"type": "person"}, {"active": true}]}
       {"or": [{"type": "person"}, {"type": "company"}]}
@@ -29,6 +34,7 @@ accepted. Two equivalent forms:
       {"lt": ["age", 65]}
       {"lte": ["age", 65]}
       {"between": ["age", 18, 65]}
+      ```
 
   parse_filter() converts JSON form into the Python objects above; both
   forms compile through the exact same `resolve()` function, so there is

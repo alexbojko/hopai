@@ -100,7 +100,9 @@ A NATIVE ASYNC CLIENT (openai.AsyncOpenAI(), cohere.AsyncClientV2(), a
 plain `async def` callable, ...) is matched the same way as its sync
 counterpart -- module name plus attribute shape, `inspect.
 iscoroutinefunction` telling the async method of a client apart from
-its sync namesake -- and is awaited directly. A CLIENT WITH NO
+its sync namesake -- and is awaited directly.
+
+A CLIENT WITH NO
 RECOGNIZED ASYNC SHAPE (a plain OpenAI() sync client, SentenceTransformer,
 ...) falls back to `asyncio.to_thread()`. That fallback is legitimate
 HERE specifically because these are all socket-bound provider calls
