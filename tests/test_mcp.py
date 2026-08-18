@@ -2404,6 +2404,32 @@ class TestMaxNodesLive:
     run, deliberately, because running it is the only way to know the
     real count."""
 
+    def test_the_search_hint_is_added_to_the_refusal_not_substituted_for_it(self):
+        """On a server that CAN search, the refusal gains a sentence
+        about start.search -- it does not become that sentence.
+
+        `message += ...` mutated to `message = ...` passed the whole
+        suite: the refusal still raised, still mentioned a real lever,
+        and read plausibly -- while having thrown away the count, the
+        ceiling, the reason a truncated subgraph is refused at all, and
+        the narrowing advice. A model reading it would be told to
+        rank by relevance without ever being told what went wrong.
+        That is the exact defect this library says is the worst thing
+        it can produce, and nothing objected."""
+        from hopai.mcp import _max_nodes_message
+
+        plain = _max_nodes_message("traverse_graph", 1200, 500, can_search=False)
+        with_search = _max_nodes_message("traverse_graph", 1200, 500, can_search=True)
+
+        # The whole refusal survives, and the hint is strictly appended.
+        assert with_search.startswith(plain)
+        assert len(with_search) > len(plain)
+        assert "start.search" in with_search and "start.search" not in plain
+        # Named explicitly, because startswith() alone would pass on a
+        # message that lost its first half if `plain` lost it too.
+        for owed in ("1,200", "500", "truncated subgraph is not a subgraph"):
+            assert owed in plain and owed in with_search
+
     def test_a_traversal_under_the_ceiling_succeeds_normally(self, fresh_graph):
         fresh_graph.add_nodes([{"id": i, "type": "leaf"} for i in range(5)])
         result = named(fresh_graph, read_only=True, max_nodes=10)["traverse_graph"].call(

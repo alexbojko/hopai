@@ -2052,6 +2052,18 @@ class TestStrictSchemaOptionReachesTheGraph:
             run(async_fresh_graph.mutate_cypher(
                 "MATCH (a:person) SET a.active = true", strict_schema=True))
 
+    def test_cypher_dispatches_mutate_with_options(self, async_fresh_graph):
+        """The fourth branch. The three below covered write, aggregate
+        and traverse, and this row was simply missing -- test_mutate_cypher
+        above calls mutate_cypher() directly, so nothing exercised
+        cypher()'s dispatch INTO it. Mutation testing found the hole:
+        deleting `**options` from that one branch passed the whole
+        suite, which would silently drop strict_schema on exactly the
+        queries that destroy rows."""
+        with pytest.raises(CypherError, match="strict_schema"):
+            run(async_fresh_graph.cypher(
+                "MATCH (a:person) SET a.active = true", strict_schema=True))
+
     def test_cypher_dispatches_write_with_options(self, async_fresh_graph):
         with pytest.raises(CypherError, match="strict_schema"):
             run(async_fresh_graph.cypher(
@@ -2164,3 +2176,37 @@ class TestEveryWrapperForwardsEveryArgument:
         seen = self._record(monkeypatch, target)
         run(getattr(async_graph, name)(**required))
         _consume(seen["passed"], self.DEFAULTS[name], name)
+
+    @pytest.mark.parametrize("name", sorted(CALLS))
+    def test_the_transactions_own_connection_is_what_arrives(
+            self, async_graph, monkeypatch, name):
+        """`connection=c` is the argument that makes these wrappers
+        ASYNC, and it is the one the two tests above cannot see: they
+        match values, and a connection is whatever the transaction
+        happened to open.
+
+        Dropped, the sync method opens its own connection off the sync
+        engine and does the write anyway -- so the row lands, every
+        assertion about it holds, and the whole suite passes while the
+        call has silently left the async engine's transaction. Which
+        means it no longer rolls back with it, and a batch that fails
+        halfway leaves the rows that landed.
+
+        Found by mutation testing on AsyncGraph.repoint_edge: the mutant
+        that deletes `connection=c` survived 2789 passing tests. Written
+        over the CALLS table rather than for that one method, so a
+        wrapper added to the table is covered the day it is added."""
+        from sqlalchemy.engine import Connection
+
+        target, required, optional = self.CALLS[name]
+        seen: dict = {}
+
+        def recorder(self, *args, **kwargs):
+            seen["connection"] = kwargs.get("connection")
+            return "recorded"
+
+        monkeypatch.setattr(target, recorder)
+        run(getattr(async_graph, name)(**required, **optional))
+        assert isinstance(seen.get("connection"), Connection), (
+            f"AsyncGraph.{name}() did not hand the sync call the connection its "
+            f"own transaction opened, so the write runs outside it")
