@@ -92,6 +92,13 @@ plugins:
 markdown_extensions:
   - admonition
   - attr_list
+  # GitHub's renderer processes markdown inside a raw HTML block by default
+  # (why `<div align="center">` + a heading + badges works there); Python-
+  # Markdown does not, unless the block opts in with `markdown="1"` -- so
+  # the README's title block rendered as literal, un-rendered source text
+  # on the docs site until this was added. Requires the opt-in attribute on
+  # the tag itself; enabling the extension alone changes nothing.
+  - md_in_html
   - toc:
       permalink: true
       # GitHub-compatible anchors, so that ONE README serves both renderers.
