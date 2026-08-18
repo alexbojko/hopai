@@ -144,8 +144,13 @@ class TestMissingPackage:
         operator gets. azure-openai maps to the `openai` extra, which is
         the pairing worth pinning: the package is not named for the
         provider."""
-        with pytest.raises(ProviderError, match=rf'pip install "hopai\[{extra}\]"'):
+        with pytest.raises(ProviderError, match=rf'pip install "hopai\[{extra}\]"') as caught:
             embedder_from_env(provider, env={}, model="m")
+        # And which provider asked for it. This path is the one
+        # TestEveryRefusalNamesItsProvider structurally cannot cover --
+        # it fakes _import, so the real refusal below it is never built,
+        # and `_import(..., None)` survived a green suite because of it.
+        assert f"--embed-provider {provider} " in str(caught.value)
 
 
 class TestCredentials:
@@ -372,6 +377,12 @@ class TestEveryRefusalNamesItsProvider:
         "sentence-transformers": (FakeSentenceTransformer, "SentenceTransformer"),
     }
 
+    #: Everything any provider reads, so one variable can be emptied
+    #: while the rest stay filled.
+    FILLED = {"OPENAI_API_KEY": "k", "AZURE_OPENAI_API_KEY": "k",
+              "AZURE_OPENAI_ENDPOINT": "https://r.openai.azure.com",
+              "COHERE_API_KEY": "k", "VOYAGE_API_KEY": "k", "GOOGLE_API_KEY": "k"}
+
     @pytest.mark.parametrize("provider", sorted(provider_names()))
     def test_a_missing_credential_or_model_says_which_provider(self, imported, provider):
         client, constructor = self.BUILDERS[provider]
@@ -384,6 +395,27 @@ class TestEveryRefusalNamesItsProvider:
             embedder_from_env(provider, env={})
         assert f"--embed-provider {provider} " in str(caught.value), (
             f"the refusal does not name {provider!r}: {caught.value}")
+
+    @pytest.mark.parametrize("provider, missing", [
+        (name, var) for name in sorted(provider_names())
+        for var in providers.PROVIDERS[name].credentials
+    ])
+    def test_every_credential_it_reads_refuses_by_name(self, imported, provider, missing):
+        """One row per (provider, variable), not per provider.
+
+        azure-openai reads two, and _need() is called for them in order
+        -- so an empty environment always stops at the first, and the
+        SECOND call site's provider argument was never exercised.
+        `_need(env, "AZURE_OPENAI_ENDPOINT", None)` survived a green
+        suite for exactly that reason. Filling every variable except
+        the one under test reaches each call site in turn."""
+        client, constructor = self.BUILDERS[provider]
+        imported(fake_module(**{constructor: client}))
+        env = {key: value for key, value in self.FILLED.items() if key != missing}
+        with pytest.raises(ProviderError) as caught:
+            embedder_from_env(provider, env=env, model="m")
+        assert f"--embed-provider {provider} needs ${missing}" in str(caught.value), (
+            f"the refusal for {missing} does not name {provider!r}: {caught.value}")
 
     @pytest.mark.parametrize("provider", sorted(provider_names()))
     def test_a_missing_model_says_which_provider(self, imported, provider):
