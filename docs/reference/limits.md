@@ -29,6 +29,22 @@
   limiting. A cache belongs to the application and a rate limiter
   belongs to the client, which already has one configured the way you
   wanted it.
+- Reranking doesn't fuse rank lists, cache, or carry its own `top_n` —
+  `candidates=` bounds the input and `k`/`keep` bounds the output, on
+  purpose kept from overlapping (see [Reranking](reranking.md)).
+  `document_from=` is restricted to a **total** jq subset: no recursion
+  (`def`), no generator (`range`), no loop (`while`/`until`/`repeat`/
+  `recurse`/`..`), no fold (`reduce`/`foreach`), no re-entry
+  (`label`/`break`), no module loading, and no `env`/`$ENV`/`input` —
+  deliberate and structural, not a temporary gap, since libjq holds the
+  GIL uninterruptibly for the length of one evaluation and `abort()`s on
+  memory exhaustion rather than raising. `build_documents()` refuses
+  above `MAX_DOCUMENTS` (5000) rather than growing unbounded, and
+  `per_path=True` can reach that bound fast — it bills one document per
+  *(node, route)*, and the route count is the graph's answer, not an
+  option's. A reranked traversal's provider calls are serial by nature
+  across steps — hop N+1's candidates are whatever hop N left, so there
+  is nothing to parallelize until the previous step's rerank returns.
 - A cycle-protection path array is carried on every recursive row. Cheap
   at moderate depth, measurably not-cheap on single-segment traversals
   past roughly 10 hops — see `benchmarks/` for the actual numbers rather

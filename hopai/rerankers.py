@@ -534,26 +534,32 @@ class Rerank:
                     "Raft: a consensus protocol". Inline it at the call
                     site; `document_from=doc` hides the only part a
                     reader needs to see.
+
     candidates:     how many hits reach the reranker, before k/keep
                     truncates. An INPUT bound; k is the output bound,
                     and the two never overlap.
+
     per_path:       False (default) is one call per distinct NODE, whose
                     document may quote every path that reached it;
                     True is one call per (node, path), and the node's
                     score is the MAX over its paths. See below.
+
     max_paths:      how many paths one document may quote. A visible cap
                     rather than a silent truncation. Not consulted under
                     per_path=True, where a document carries exactly one
                     path by construction -- there the paths become
                     DOCUMENTS instead, which is what MAX_DOCUMENTS
                     bounds.
+
     model:          required for providers that take one, refused for
                     those that do not -- the judgement Embedder makes,
                     for the same reason: a silently chosen model is a
                     silently different ranking, and the caller cannot
                     see it happened.
+
     batch_size:     documents per provider call; defaults to the
                     provider's own cap.
+
     retries/backoff: `embeddings.py`'s policy, same defaults, same
                     full-jitter behaviour. Yours and hopai's MULTIPLY.
 

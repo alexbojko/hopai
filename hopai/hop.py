@@ -8,6 +8,7 @@ The traversal spec. Deliberately split into two types instead of one:
                                            concepts don't apply to a
                                            starting point, so the type
                                            doesn't offer them.
+
   Hop(where=..., via=..., hops=...)    -- one step of the walk.
 
 A single `Hop`-for-everything design (what earlier versions of this
@@ -282,34 +283,45 @@ class Hop:
     matched nodes.
 
     where:      filter on the node reached by this hop (None = no filter)
+
     via:        filter on every edge traversed during this hop (None = any edge)
+
     hops:       how many real edges this hop may span -- an int for an exact
                 count, or a (min, max) tuple for a range. Default 1.
+
     direction:  "forward" (follow start_id -> end_id) or "backward"
                 (follow end_id -> start_id, i.e. "what points to this")
+
     optional:   if True, nodes that reach this point in the chain are kept
                 even if this hop finds nothing for them (Cypher's
                 OPTIONAL MATCH). Only valid on the LAST hop in a chain --
                 see Graph.traverse() for why.
+
     label:      a name for your own reference; not used to build SQL.
+
     near:       rank the nodes this hop reaches by vector similarity --
                 Near(field, vector) specs against NODE vector fields
                 (edges walk by `via`; rank those with via_near). With
                 `keep`, only the most similar reached nodes continue
                 the chain and are reported: a semantic beam.
+
     keep:       how many of the most similar reached nodes to keep.
                 (The number of EDGES a hop spans is `hops`.)
+
     via_near:   rank the EDGES this hop walks, against edge vector
                 fields -- the `via` of similarity. With via_keep, each
                 node follows only its via_keep most similar edges (a
                 beam per source node, not a global truncation);
                 without it, a Near's min_similarity filters which
                 edges are worth walking at all.
+
     via_keep:   how many of the most similar edges to follow FROM EACH
                 node reached so far.
+
     boost:      Boost(property, weight) terms added to the node
                 ranking `near` creates. Reorders; never changes which
                 nodes qualify. Edge beams have no boost term.
+
     rerank:     a Rerank(...) that re-scores the nodes THIS hop reached,
                 by reading them against the query, before the next hop
                 walks. This is the step-wise beam: a candidate here is

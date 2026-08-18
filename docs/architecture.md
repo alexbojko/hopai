@@ -420,19 +420,23 @@ The bridge only covers *database* I/O — SQLAlchemy's own calls yield back to t
 from inside the greenlet, but an arbitrary blocking call made from `fn` does not, and
 just holds the one event-loop thread until it returns. An embedding provider's HTTP call
 is exactly that: reachable from `Near(text=...)` on every read path and from a text row
-in `set_vectors()` (issue #74). `hopai/embeddings.py`'s `Embedder` grew an `aembed_*()`
+in `set_vectors()` (issue #74).
+
+`hopai/embeddings.py`'s `Embedder` grew an `aembed_*()`
 twin of every `embed_*()` method for this — native async when the client has one
 (`openai.AsyncOpenAI()` and siblings, matched by the same module-name-plus-shape rule as
 the sync client, `inspect.iscoroutinefunction` telling a client's async method apart from
 its sync namesake of the same name) and `asyncio.to_thread()` otherwise, since a provider
 SDK blocked on a socket releases the GIL (the same reasoning does **not** extend to a
 CPU-bound C extension, which a thread pool would leave the loop starved for anyway).
+
 `AsyncGraph.traverse()`/`aggregate()`/`vector_search()`/`vector_search_many()` await
 `vectors.py`'s `aresolve_*()` helpers and `set_vectors()` awaits `aplan_vector_writes()`
 — all of it *before* `run_sync()`/`begin()` runs, so every `Near`/row `fn` ever sees
 already carries a plain vector and the sync functions below make no provider call of
 their own. A call with no `text=` is handed back untouched, so the sync path and the
 emitted SQL are unchanged.
+
 `tests/test_async.py::TestTextEmbeddingStaysOffTheLoop` is the measurement: an
 independent loop task made zero progress during a provider call before this.
 
@@ -592,4 +596,4 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/asyncio.py` | Why `AsyncGraph` is a bridge, not a second implementation, what it deliberately does not cover, and the benchmark numbers behind the design |
 | `hopai/mcp.py` | The tool inventory, the four permission levels, why similarity takes text, and the 1.x/2.x SDK adapter |
 | `tests/conftest.py` | The fixture graph's shape |
-| `benchmarks/README.md` | Measured numbers, including where raw CTEs beat this library 2-5x |
+| `benchmarks/benchmarks.ipynb` | hopai vs. a hand-written recursive CTE and vs. Neo4j, measured, charted; `benchmarks/README.md` indexes the rest (vector search, reranking documents, Apache AGE) |

@@ -33,6 +33,7 @@ WRITES, and the three places they stop short of Cypher:
                           famous footgun, so a relationship MERGE here
                           requires both endpoints to be bound already:
                           MATCH or MERGE the nodes, then the edge.
+
   MERGE needs an index.   The conflict keys are every property in the
                           pattern (which is what Cypher matches on), and
                           a unique index must cover exactly them.
@@ -40,6 +41,7 @@ WRITES, and the three places they stop short of Cypher:
                           belongs in ON CREATE SET. Cypher itself needs
                           no index and races instead; the error here
                           names the Unique() to declare.
+
   MATCH before a write.   Binds single nodes by their properties, one
                           lookup each. It does not traverse -- a write
                           driven by a multi-hop match is a different
@@ -55,32 +57,39 @@ means in front of them:
                          which is what Cypher means by it too: `MATCH
                          (a:person) SET a.active = false` updates every
                          person.
+
   One node or one rel.   The pattern is a single node, or a single
                          relationship whose endpoints may be filtered.
                          Changing the rows a multi-hop pattern reached
                          is a traversal driving a write, and refuses.
+
   `SET x = {...}`        replaces every property, so it refuses unless
                          the map carries the property a label or
                          relationship type maps onto: Cypher's SET never
                          erases a label, and a relationship's type
                          cannot be changed at all, but here both are
                          ordinary properties and would go.
+
   `SET x.k = null`       REMOVES the property, as it does in Cypher --
                          not a stored JSON null, which Cypher would
                          consider absent and `Required` would consider
                          present.
+
   SET and REMOVE order.  Applied in order, last writer wins per
                          property, so `SET a.x = 1 REMOVE a.x` and
                          `REMOVE a.x SET a.x = 1` differ, as they do in
                          Cypher.
+
   Labels ignored.        `node_label_key=None` discards labels. On the
                          read path that widens a result set; in front of
                          a DELETE it would widen it to the whole graph,
                          so a query whose only constraint was discarded
                          refuses instead of matching everything.
+
   One change per query.  `DELETE a, r`, a SET and a DELETE together, or
                          a CREATE and a DELETE together, each refuse and
                          name the split.
+
   A plain RETURN after a mutation is parsed and ignored, exactly as it
   is after a write; an aggregating one refuses, because the result of a
   mutation is a MutationResult and not a number.
@@ -102,12 +111,17 @@ WHAT DOES NOT TRANSLATE, and why:
                               Graph.aggregate() call -- see AGGREGATION
                               below for exactly which spellings, and why
                               the rest refuse.
+
   Cross-variable OR.          `WHERE a.x = 1 OR b.y = 2` spans two hops'
                               filters; a Hop filter binds one node.
+
   Unbounded `*`.              `max_hops` drives the recursion guard, so
                               `-[*]->` needs `*1..N` or max_var_length=.
+
   Undirected `-[]-`.          Hop.direction is forward or backward only.
+
   Disjoint patterns.          One linear chain, per the library's scope.
+
   Bare `<>` and `NOT x = y`.  THE SUBTLE ONE. Cypher evaluates
                               `a.type <> 'leaf'` to NULL when `type` is
                               missing, dropping that row; hopai's
@@ -119,6 +133,31 @@ WHAT DOES NOT TRANSLATE, and why:
                               compositional rule) is what maps exactly
                               onto NOT({"type": "leaf"}).
 
+  Relationship, not node,     ANOTHER SUBTLE ONE, and this one does NOT
+  uniqueness.                 raise. Real Cypher's `-[:x*1..N]->` forbids
+                              reusing the same RELATIONSHIP twice within
+                              one path -- a NODE may be revisited, through
+                              a second relationship. hopai's cycle guard
+                              (core.py's per-hop `local_path` array) is
+                              NODE-based: no node may repeat within one
+                              Hop's walk, full stop, regardless of which
+                              edge would reach it again. That makes
+                              hopai's answer a SUBSET of Neo4j's whenever
+                              a walk could revisit a node by a second
+                              edge -- never a superset, but not identical
+                              either. benchmarks/README.md's `edge_or_tag`
+                              query (its Cypher form's `all(r IN
+                              relationships(p) WHERE ...)`, above) is
+                              exactly the shape this can show up in: a
+                              hub-and-spoke region where two different
+                              tagged edges both lead back to a node
+                              already on the walk. There is no syntactic
+                              marker to catch and refuse on here, unlike
+                              the NOT case above -- every `*min..max`
+                              pattern is affected equally, so this is a
+                              standing divergence to know about rather
+                              than a per-query refusal to expect.
+
 AGGREGATION: `RETURN count(DISTINCT b)` and friends translate to
 Graph.aggregate(), which aggregates over the distinct nodes the LAST
 step of the chain matched. Cypher, however, aggregates over result ROWS
@@ -129,8 +168,10 @@ semantics exist:
                       Cypher spells it `WITH DISTINCT b RETURN avg(b.age)`,
                       and that exact WITH form is accepted as a unit
                       (like the null-safe negation idiom).
+
   per distinct value  equal values collapse first. Cypher's
                       `avg(DISTINCT b.age)` -- accepted, exact.
+
   per path            a node reachable two ways counts twice. Cypher's
                       bare `avg(b.age)` when hops are involved. hopai
                       does not track path multiplicity across hops, so
@@ -138,6 +179,7 @@ semantics exist:
                       per-node question.
 
 Consequences, each a one-line rule:
+
   - `count(DISTINCT b)` is exact (the distinct nodes ARE the count).
   - `min`/`max` are exact bare or DISTINCT -- multiplicity cannot
     change an extremum.

@@ -14,10 +14,14 @@ repo_name: alexbojko/hopai
 copyright: MIT-licensed
 
 # Three tiers, three different guarantees against going stale.
-# docs/index.md and docs/notebooks are symlinks to README.md and notebooks/,
-# so there is exactly one copy of the landing page and the executed examples
-# -- editing the README or a notebook IS editing the site, and neither may
-# gain a second copy anywhere else. docs/reference/*.md are real files: a
+# docs/index.md, docs/notebooks and docs/benchmarks are symlinks to
+# README.md, notebooks/ and benchmarks/, so there is exactly one copy of
+# the landing page and the executed examples -- editing the README or a
+# notebook IS editing the site, and neither may gain a second copy anywhere
+# else. benchmarks/benchmarks.ipynb is executed and committed by hand, not
+# by CI (it needs a real Neo4j instance, which nothing here provisions),
+# so it is a snapshot rather than a standing regression check -- the
+# notebook's own intro says so. docs/reference/*.md are real files: a
 # deliberate SECOND place, holding the guide prose (semantics, gotchas, error
 # messages) neither a notebook nor a docstring is the right shape for --
 # reviewed like any other doc, not regenerated. docs/api/*.md are real files
@@ -87,11 +91,18 @@ plugins:
       # A "download this notebook" link on every notebook page: the whole
       # point of documentation that runs is that a reader can run it.
       include_source: true
-      ignore: ["notebooks/demo_graph.py"]
+      ignore: ["notebooks/demo_graph.py", "benchmarks/*.py"]
 
 markdown_extensions:
   - admonition
   - attr_list
+  # GitHub's renderer processes markdown inside a raw HTML block by default
+  # (why `<div align="center">` + a heading + badges works there); Python-
+  # Markdown does not, unless the block opts in with `markdown="1"` -- so
+  # the README's title block rendered as literal, un-rendered source text
+  # on the docs site until this was added. Requires the opt-in attribute on
+  # the tag itself; enabling the extension alone changes nothing.
+  - md_in_html
   - toc:
       permalink: true
       # GitHub-compatible anchors, so that ONE README serves both renderers.
@@ -120,6 +131,9 @@ nav:
       - 08 · Under the hood: notebooks/08_under_the_hood.ipynb
       - 09 · Vector search: notebooks/09_vector_search.ipynb
       - 10 · Reranking: notebooks/10_reranking.ipynb
+  - Benchmarks:
+      - hopai vs. raw CTEs, vs. Neo4j: benchmarks/benchmarks.ipynb
+      - All benchmarks: benchmarks/README.md
   - Reference:
       - Schema: reference/schema.md
       - Many graphs, one database: reference/multi-graph.md

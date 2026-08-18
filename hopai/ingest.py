@@ -23,11 +23,15 @@ a property.**
 
 The nested form is what a traversal returns, so a result can be fed
 straight back into another graph without reshaping. The flat form is what
-a person or a model writes by hand. Identity keys are `id` for nodes and
+a person or a model writes by hand.
+
+Identity keys are `id` for nodes and
 `id`, `start_id`, `end_id` for edges -- plus, on a Graph built over a
 custom table, every EXTRA COLUMN that table carries (Graph's
 node_extra_cols/edge_extra_cols, discovered from the table itself; see
-models.py's "EXTENDING THE MODEL"). `add_nodes([{"id": 1, "user_id": 7,
+models.py's "EXTENDING THE MODEL").
+
+`add_nodes([{"id": 1, "user_id": 7,
 "type": "person"}])` writes `user_id` to its own real column the same
 way it writes `id`, never into `properties` -- and merge_nodes()/
 merge_edges() refresh an extra column's value on conflict, same as

@@ -186,13 +186,16 @@ class Property:
     values     allowed values (an Enum's members, or spelled directly);
                enforced as an IN (...) CHECK and rendered as JSON
                Schema's "enum".
+
     format     JSON Schema format annotation ("date-time", "date");
                validated by the generated pydantic model, NOT by the
                database -- a format regex CHECK is deliberately absent.
+
     unique     no two rows of THIS type share the value: compiles to a
                partial unique index, the per-type uniqueness Postgres
                gives away. Never inferred -- observed distinctness is
                not declared uniqueness.
+
     properties a nested object schema, when json_type is "object". The
                representations recurse; enforcement checks only the
                top-level jsonb_typeof -- stated here, not silent."""

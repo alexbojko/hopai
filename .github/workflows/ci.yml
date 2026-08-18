@@ -132,8 +132,24 @@ jobs:
   # Coverage gates the PR; mutation testing rides along in the same job so
   # both land in ONE sticky comment. Two jobs would mean two comments, or
   # an artifact hand-off just to merge two numbers.
+  #
+  # pull_request only, never push: a required check gates a PR at merge
+  # time, and re-running it on the push the merge itself makes re-checks
+  # nothing -- the PR already had to pass it. That includes the push
+  # release-please's own "chore(main): release x.y.z" PR makes when it's
+  # merged, which is the moment that most wanted this trimmed: it touches
+  # no `hopai/*.py`, so mutation had nothing to do anyway, but the job
+  # still spent several minutes on a full pytest+coverage run to reach
+  # that conclusion, on every single release. The old behavior wasn't
+  # "run and find nothing" either, it was quietly broken the same way for
+  # a different reason: `github.event.pull_request.base.sha` is unset on
+  # a push event, so the scope step's `CHANGED` was unconditionally empty
+  # and mutation was ALREADY a no-op on push -- just an accidental one,
+  # reported with a misleading "no files changed" note, while coverage
+  # still paid the full job's cost for nothing.
   quality:
     name: coverage + mutation
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read

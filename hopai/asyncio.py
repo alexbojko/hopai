@@ -36,20 +36,25 @@ same functions the sync Graph calls directly.
 THE BRIDGE ONLY COVERS DATABASE I/O -- SQLAlchemy's own calls yield
 back to the loop from inside the greenlet, but an ARBITRARY blocking
 call does not, and just holds the event loop's one thread until it
-returns. An embedding provider's HTTP call is exactly that: reachable
-from Near(text=...) and from a text row in set_vectors(), and, before
+returns.
+
+An embedding provider's HTTP call is exactly that: reachable from
+Near(text=...) and from a text row in set_vectors(), and, before
 issue #74, made straight from inside fn -- on the loop's own thread,
 for every concurrent traverse()/aggregate()/vector_search()/
-set_vectors() in the process, for the length of the round trip. Every
-method below that can carry text now resolves it FIRST, awaited,
+set_vectors() in the process, for the length of the round trip.
+
+Every method below that can carry text now resolves it FIRST, awaited,
 before fn ever runs: traverse()/aggregate()/vector_search()/
 vector_search_many() call hopai/vectors.py's aresolve_*() helpers,
 set_vectors() calls aplan_vector_writes() -- both await
 Embedder.aembed_*(), which reaches the provider's own async client
 when there is one and asyncio.to_thread() otherwise (see hopai/
-embeddings.py). By the time fn runs, every Near/row it sees already
-carries a plain vector, so the sync functions below make no provider
-call of their own and need no changes to stay correct.
+embeddings.py).
+
+By the time fn runs, every Near/row it sees already carries a plain
+vector, so the sync functions below make no provider call of their own
+and need no changes to stay correct.
 
 RERANKING IS THE SECOND NETWORK CALL ON THE READ PATH (issue #73) and
 lands in exactly the same trap, from the other end: it scores rows the
@@ -69,34 +74,42 @@ platform hopai supports.
 MEASURED, NOT ASSUMED, before this was written: a throwaway benchmark
 compared this design against asyncio.to_thread() (the shape
 LangChain's `ainvoke` default takes -- wrap the unmodified sync call
-in a thread pool). Both delivered real concurrency. The greenlet
-bridge did it on a CONSTANT ONE OS THREAD regardless of how many
-traversals were in flight; the thread-pool version held one thread per
-in-flight call, climbing with concurrency (27 -> 46 -> 76 across the
-sizes tested). Wall-clock did NOT consistently favor the greenlet
-path -- the thread pool was sometimes faster, and the gap widened at
-higher concurrency, most likely because each AsyncSession.run_sync()
-call's own setup (session open/close, greenlet spawn) is paid
-serially on the one event-loop thread. So the case for this design is
-the resource ceiling a thread-pool wrapper eventually hits in a real
-server (a cap to size, memory and scheduling cost per thread), not a
-guaranteed speed win -- worth knowing before assuming "async" alone
-answers a concurrency question.
+in a thread pool). Both delivered real concurrency.
+
+The greenlet bridge did it on a CONSTANT ONE OS THREAD regardless of
+how many traversals were in flight; the thread-pool version held one
+thread per in-flight call, climbing with concurrency (27 -> 46 -> 76
+across the sizes tested).
+
+Wall-clock did NOT consistently favor the greenlet path -- the thread
+pool was sometimes faster, and the gap widened at higher concurrency,
+most likely because each AsyncSession.run_sync() call's own setup
+(session open/close, greenlet spawn) is paid serially on the one
+event-loop thread.
+
+So the case for this design is the resource ceiling a thread-pool
+wrapper eventually hits in a real server (a cap to size, memory and
+scheduling cost per thread), not a guaranteed speed win -- worth
+knowing before assuming "async" alone answers a concurrency question.
 
 WHAT THIS DOES NOT COVER, ON PURPOSE: schema and constraint
 declaration -- create_schema(), drop_schema(), define_constraints(),
 drop_constraints(), enforce_schema(), save_schema(), load_schema(),
-infer_schema(), schema_violations(), add_networkx(). These are
-one-time setup/admin calls with no concurrency to gain (issue #45's
-own list of what needs async does not name them either), and
-AsyncGraph's wrapped Graph runs on the async engine's SYNC FACADE
+infer_schema(), schema_violations(), add_networkx().
+
+These are one-time setup/admin calls with no concurrency to gain
+(issue #45's own list of what needs async does not name them either),
+and AsyncGraph's wrapped Graph runs on the async engine's SYNC FACADE
 (AsyncEngine.sync_engine), which is only safe to execute against
-INSIDE a greenlet run_sync() spawns. Calling one of these here raises
-a clear error naming the fix, rather than either quietly reaching the
-sync facade outside that bridge (SQLAlchemy's own MissingGreenlet,
-correct but unhelpful out of context) or silently returning something
-async-unsafe. Run them through a plain Graph on the same database
-instead -- once, at start-up, same as today:
+INSIDE a greenlet run_sync() spawns.
+
+Calling one of these here raises a clear error naming the fix, rather
+than either quietly reaching the sync facade outside that bridge
+(SQLAlchemy's own MissingGreenlet, correct but unhelpful out of
+context) or silently returning something async-unsafe.
+
+Run them through a plain Graph on the same database instead -- once,
+at start-up, same as today:
 
     from hopai import Graph
     Graph("postgresql+psycopg2://user:pass@host/db").create_schema()
