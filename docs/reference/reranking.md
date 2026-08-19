@@ -47,8 +47,13 @@ caps what it may spend. `tool_schemas()` leaves `rerank` out of the
 traversal/aggregation tool definitions unless you pass
 `tool_schemas(rerank=True)`. Over MCP it's the same shape: the operator
 configures `serve(rerank=..., rerank_fields=[...], max_candidates=...)`
-in Python, and a model chooses only `document_from` (within the published
-fields) and `candidates` (within the ceiling).
+in Python — or the matching `--rerank-provider` / `--rerank-model` /
+`--rerank-document-from` / `--rerank-field` flags, see
+[the MCP guide](../mcp.md#reranking) — and a model chooses only
+`document_from` (within the published fields) and `candidates` (within
+the ceiling). The flags reach the same three arguments; what they cannot
+do is hand hopai a client your own code configured, which is why the
+Python spelling stays.
 
 **A model may write `document_from` itself.** Field selection is a
 retrieval decision a model is well placed to make, unlike an embedding it

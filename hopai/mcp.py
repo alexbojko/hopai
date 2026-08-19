@@ -154,6 +154,23 @@ and billed per document -- so `rerank=` is the operator's, exactly as
           rerank_fields=["properties.title", "properties.summary"],
           max_candidates=100)
 
+...or from a command line, in the same three spellings `--embed` has,
+plus the two a Rerank needs that an embedder has no equivalent of:
+
+    hopai-mcp --dsn ... \
+      --rerank-provider sentence-transformers \
+      --rerank-model cross-encoder/ms-marco-MiniLM-L-6-v2 \
+      --rerank-document-from '.properties.title' \
+      --rerank-field properties.title --rerank-field properties.summary
+
+`--rerank-document-from` and `--rerank-field` are REQUIRED with a
+reranker and have no defaults, which is the CLI saying out loud what
+RerankPolicy already refuses to guess: what counts as the document, and
+which properties may leave the building. `--rerank-provider` accepts
+fewer names than `--embed-provider` -- a reranker reads a query and a
+document TOGETHER, so only the vendors offering that are listed, and
+naming one that only embeds refuses saying so.
+
 The CLIENT is never model-supplied; what a model supplies is
 `document_from`, a jq filter projecting one candidate into the one
 string the reranker reads, and `candidates`, how many to spend. Both
@@ -291,7 +308,15 @@ from .json_api import (
     refuse_vectors, traverse_json, vector_search_json,
 )
 from .models import DEFAULT_GRAPH
-from .providers import ProviderError, describe, embedder_from_env, provider_names
+# Rerank at module level costs nothing new: json_api above already imports
+# it (RerankPolicy type-checks against it), and rerankers.py imports no
+# provider package of its own -- the property that made `import hopai`
+# provider-free is unchanged.
+from .rerankers import Rerank
+from .providers import (
+    ProviderError, describe, describe_rerank, embedder_from_env, provider_names,
+    rerank_client_from_env, rerank_provider_names,
+)
 from .vectors import Vector
 
 #: Server-level guidance, sent to the client at connection time. What a
@@ -1724,26 +1749,41 @@ def _vector(value: str):
     return graph, target, Vector(field, int(dimensions))
 
 
-def _callable(value: str):
-    """--embed mypackage.embeddings:embed -> the function itself."""
-    module_name, _, attribute = value.partition(":")
-    if not module_name or not attribute:
-        raise argparse.ArgumentTypeError(
-            f"--embed takes MODULE:FUNCTION, e.g. myapp.embeddings:embed -- got {value!r}")
-    import importlib
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError as exc:
-        raise argparse.ArgumentTypeError(
-            f"--embed: cannot import {module_name!r} -- {exc}") from exc
-    try:
-        function = getattr(module, attribute)
-    except AttributeError as exc:
-        raise argparse.ArgumentTypeError(
-            f"--embed: {module_name!r} has no attribute {attribute!r}") from exc
-    if not callable(function):
-        raise argparse.ArgumentTypeError(f"--embed: {value} is not callable")
-    return function
+def _callable_for(flag: str, example: str):
+    """A MODULE:FUNCTION parser whose refusals name `flag`.
+
+    A factory rather than one shared function, because argparse's
+    `type=` takes the value and nothing else -- so the flag has to be
+    closed over. That was worth fixing rather than living with: --rerank
+    reused this and inherited --embed's wording, which sent an operator
+    who mistyped a reranker path to a flag they were not using. "Errors
+    that name the fix" is only true if they name the RIGHT one."""
+    def parse(value: str):
+        module_name, _, attribute = value.partition(":")
+        if not module_name or not attribute:
+            raise argparse.ArgumentTypeError(
+                f"{flag} takes MODULE:FUNCTION, e.g. {example} -- got {value!r}")
+        import importlib
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as exc:
+            raise argparse.ArgumentTypeError(
+                f"{flag}: cannot import {module_name!r} -- {exc}") from exc
+        try:
+            function = getattr(module, attribute)
+        except AttributeError as exc:
+            raise argparse.ArgumentTypeError(
+                f"{flag}: {module_name!r} has no attribute {attribute!r}") from exc
+        if not callable(function):
+            raise argparse.ArgumentTypeError(f"{flag}: {value} is not callable")
+        return function
+    return parse
+
+
+#: --embed's spelling of the above, kept under its own name because
+#: build_parser() reads better naming the flag once.
+_callable = _callable_for("--embed", "myapp.embeddings:embed")
+_rerank_callable = _callable_for("--rerank", "myapp.reranking:score")
 
 
 def _max_nodes(value: str) -> Optional[int]:
@@ -1755,6 +1795,57 @@ def _max_nodes(value: str) -> Optional[int]:
     if not value.isdigit() or int(value) <= 0:
         raise argparse.ArgumentTypeError(
             f"--max-nodes must be a positive integer or 'none', got {value!r}")
+    return int(value)
+
+
+#: "no --max-candidates was passed", distinct from both a number and the
+#: None that `--max-candidates none` means. See the flag's own comment.
+_UNSET = object()
+
+
+def _rerank_field(value: str) -> str:
+    """One --rerank-field, rejected empty rather than published as one.
+
+    An empty path in the allowlist is not a narrower allowlist, it is a
+    path nothing can match plus a list that LOOKS configured -- and
+    `--rerank-field ""` is what a shell produces from an unset variable
+    in an entrypoint script, which is exactly where nobody is reading
+    the output."""
+    cleaned = value.strip()
+    if not cleaned:
+        raise argparse.ArgumentTypeError(
+            "--rerank-field takes a property path like properties.title, got an empty "
+            "string -- an unset variable in a startup script looks like this")
+    return cleaned
+
+
+def _fields_from_env() -> list:
+    """$HOPAI_RERANK_FIELDS, comma-separated, as the default allowlist.
+
+    Every other flag here has an environment spelling and this one had
+    none, which broke the case providers.py exists for: a container
+    handed its configuration by an orchestrator could set the provider,
+    the model and the filter, then still have to pass a command-line
+    argument for the allowlist alone.
+
+    Comma-separated rather than repeated, because an environment
+    variable cannot repeat. Blank entries are dropped rather than
+    published -- `properties.title,` is a trailing comma, not a request
+    to allow the empty path."""
+    raw = os.environ.get("HOPAI_RERANK_FIELDS") or ""
+    return [field.strip() for field in raw.split(",") if field.strip()]
+
+
+def _max_candidates(value: str) -> Optional[int]:
+    """--max-candidates 200, or 'none' to remove the ceiling -- the
+    twin of _max_nodes(), for the bill rather than the response size.
+    See the module docstring's RERANKING section: rerankers price per
+    document, so this is the number that decides an invoice."""
+    if value.strip().lower() in ("none", "unlimited"):
+        return None
+    if not value.isdigit() or int(value) <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--max-candidates must be a positive integer or 'none', got {value!r}")
     return int(value)
 
 
@@ -1825,6 +1916,65 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-provider-help", action="store_true",
                         help="Print which environment variables each provider reads, "
                              "and exit.")
+    # Reranking, in the same three spellings as embedding -- plus the two
+    # arguments a Rerank needs that an embedder has no equivalent of. A
+    # reranker was serve()-only until now, which made a cross-encoder a
+    # Python-entrypoint feature while a bi-encoder was a flag: the same
+    # Hugging Face hub, two different ergonomics, for no reason a reader
+    # could point at.
+    parser.add_argument("--rerank", type=_rerank_callable, metavar="MODULE:FUNCTION",
+                        help="A function taking (query, documents) and returning one "
+                             "score per document, in the order given. Reranking is off "
+                             "without this or --rerank-provider, and no tool advertises "
+                             "a rerank parameter.")
+    parser.add_argument("--rerank-provider", metavar="NAME",
+                        default=os.environ.get("HOPAI_RERANK_PROVIDER"),
+                        help="Build the reranking client from environment variables "
+                             "instead of --rerank. One of: "
+                             f"{', '.join(rerank_provider_names())}. Defaults to "
+                             "$HOPAI_RERANK_PROVIDER. Fewer names than "
+                             "--embed-provider: only some vendors rerank.")
+    parser.add_argument("--rerank-model", metavar="NAME",
+                        default=os.environ.get("HOPAI_RERANK_MODEL"),
+                        help="The reranking model -- on sentence-transformers the "
+                             "CrossEncoder to load, e.g. "
+                             "cross-encoder/ms-marco-MiniLM-L-6-v2. Only with "
+                             "--rerank-provider. Defaults to $HOPAI_RERANK_MODEL, then "
+                             "to the provider's own variable. Never guessed.")
+    parser.add_argument("--rerank-document-from", metavar="JQ",
+                        default=os.environ.get("HOPAI_RERANK_DOCUMENT_FROM"),
+                        help="A jq filter projecting one candidate into the single "
+                             "string the reranker reads, e.g. '.properties.title'. "
+                             "Required with a reranker: there is no sensible default "
+                             "for what a document IS. A tool call may override it, "
+                             "within --rerank-field.")
+    # default=None, not the environment's list: `action="append"` APPENDS
+    # to whatever default it is given, so seeding it would make a flag
+    # ADD to $HOPAI_RERANK_FIELDS instead of replacing it -- the opposite
+    # of the rule every other pair here follows, where the flag beats the
+    # variable. main() reads the variable only when no flag was passed.
+    parser.add_argument("--rerank-field", action="append", type=_rerank_field,
+                        default=None, metavar="PATH",
+                        help="A property path a model-written document_from may read, "
+                             "e.g. properties.title. Repeat for each. Required with a "
+                             "reranker and deliberately has no 'everything' spelling: "
+                             "the filter's output is POSTed to the reranker, so "
+                             "properties.ssn is one accepted filter away unless the "
+                             "paths are named. Pass --rerank-field properties if the "
+                             "whole bag really is the decision.")
+    # _UNSET, not the ceiling itself: 'none' resolves to None and so does
+    # a plain default, so a default-valued argument could not be told
+    # from `--max-candidates none` -- and the inert-flag guard below
+    # would either miss an explicit value or fire on every server that
+    # never mentioned reranking. main() resolves the sentinel.
+    parser.add_argument("--max-candidates", type=_max_candidates,
+                        default=_UNSET, metavar="N|none",
+                        help="The ceiling on how many candidates one tool call may send "
+                             f"to the reranker (default {DEFAULT_MAX_CANDIDATES}). "
+                             "Rerankers bill per document. 'none' removes the ceiling.")
+    parser.add_argument("--rerank-provider-help", action="store_true",
+                        help="Print which environment variables each reranking provider "
+                             "reads, and exit.")
     parser.add_argument("--load-schema", action=argparse.BooleanOptionalAction, default=True,
                         help="Adopt the schema saved in the database, if there is one "
                              "(default). --no-load-schema skips the lookup.")
@@ -1876,6 +2026,90 @@ def _resolve_embed(parser, args):
     return embedder.embed_query, embedder
 
 
+def _resolve_rerank(parser, args) -> Optional[Any]:
+    """The Rerank serve() takes, or None -- built at start-up, out loud,
+    for the same reason _resolve_embed() is.
+
+    Returns just the Rerank; `rerank_fields` and `max_candidates` are
+    separate serve() arguments and main() passes args.rerank_field and
+    args.max_candidates straight through. They are not folded in here
+    because tools() is the one place that turns the three into a
+    RerankPolicy, and building a second one on the way would mean two
+    sites deciding what an allowlist means.
+
+    EVERYTHING OFF BY DEFAULT. With no --rerank and no
+    --rerank-provider this returns None and no tool advertises a rerank
+    parameter at all -- the permission is which surface exists, which is
+    the same rule the Python path follows."""
+    # The flag beats the variable, and does not add to it: a passed
+    # --rerank-field means argparse built a list, so the environment is
+    # read only when it did not. Written back onto args so the serve()
+    # call downstream reads one resolved allowlist rather than repeating
+    # this.
+    if args.rerank_field is None:
+        args.rerank_field = _fields_from_env()
+    # Resolved unconditionally, and BEFORE the early return below, so no
+    # caller ever reads the sentinel off args -- `passed` is what the
+    # inert-flag guard needs, not the sentinel itself surviving.
+    passed_ceiling = args.max_candidates is not _UNSET
+    if not passed_ceiling:
+        args.max_candidates = DEFAULT_MAX_CANDIDATES
+    if args.rerank and args.rerank_provider:
+        parser.error("--rerank and --rerank-provider both say where reranking comes "
+                     "from -- pass one. --rerank points at your own function; "
+                     "--rerank-provider builds a client from the environment")
+    if not args.rerank and not args.rerank_provider:
+        # Every other rerank flag is inert without a reranker, and
+        # silence would let an operator believe reranking was configured
+        # when the tools do not even advertise it.
+        for flag, value in (("--rerank-model", args.rerank_model),
+                            ("--rerank-document-from", args.rerank_document_from),
+                            ("--rerank-field", args.rerank_field or None),
+                            # `is not _UNSET`, not truthiness: `--max-candidates
+                            # none` resolves to None, which is a deliberate
+                            # choice and has to refuse here like any other.
+                            ("--max-candidates", passed_ceiling or None)):
+            if value:
+                parser.error(f"{flag} needs a reranker to configure -- pass --rerank or "
+                             f"--rerank-provider, or drop {flag}")
+        return None
+    if args.rerank_model and not args.rerank_provider:
+        parser.error("--rerank-model only means something with --rerank-provider. Your "
+                     "own --rerank function chooses its own model")
+    if not args.rerank_document_from:
+        parser.error(
+            "a reranker needs --rerank-document-from: a jq filter turning one candidate "
+            "into the one string it reads, e.g. --rerank-document-from '.properties.title'. "
+            "There is no default, because what counts as the document is the whole "
+            "retrieval decision")
+    if not args.rerank_field:
+        parser.error(
+            "a reranker needs --rerank-field: the property paths a model-written "
+            "document_from may read, e.g. --rerank-field properties.title. There is no "
+            "'everything' spelling on purpose -- the filter's output is POSTed to the "
+            "reranker, so --rerank-field properties.ssn is one accepted filter away "
+            "unless the paths are named. Pass --rerank-field properties if the whole "
+            "bag really is the decision")
+    client, model = args.rerank, None
+    if args.rerank_provider:
+        try:
+            client, model = rerank_client_from_env(args.rerank_provider,
+                                                   model=args.rerank_model)
+        except ProviderError as exc:
+            parser.error(str(exc))
+    try:
+        # candidates= is left at Rerank's own default: it is the one
+        # number a tool call is expected to choose per query, and
+        # --max-candidates is what bounds that choice.
+        return Rerank(client, model=model, document_from=args.rerank_document_from)
+    except (TypeError, ValueError) as exc:
+        # A bad jq filter, a client shape Rerank does not accept, or a
+        # model= for a CrossEncoder. Each already names its own fix; an
+        # operator reading container logs should see that sentence rather
+        # than a traceback through argparse.
+        parser.error(str(exc))
+
+
 def main(argv: Optional[list] = None) -> int:
     """`hopai-mcp`. Builds the graphs from the arguments and serves them."""
     parser = build_parser()
@@ -1887,7 +2121,17 @@ def main(argv: Optional[list] = None) -> int:
         print("\nPass --embed-provider NAME. The model is never guessed: give "
               "--embed-model or\nthe provider's own model variable.")
         return 0
+    if args.rerank_provider_help:
+        print("Reranking providers and the environment variables each one reads:\n")
+        for name in rerank_provider_names():
+            print(f"  {describe_rerank(name)}")
+        print("\nPass --rerank-provider NAME, with --rerank-document-from and at least "
+              "one\n--rerank-field. Fewer names than --embed-provider: a reranker reads "
+              "a query\nand a document together, which is a different model from the one "
+              "that embeds.")
+        return 0
     embed, embedder = _resolve_embed(parser, args)
+    rerank = _resolve_rerank(parser, args)
     if not args.dsn:
         parser.error("no database to serve -- pass --dsn or set HOPAI_DSN")
 
@@ -1961,7 +2205,13 @@ def main(argv: Optional[list] = None) -> int:
     serve(graphs, transport=args.transport, host=args.host, port=args.port, path=args.path,
           name=args.name, read_only=args.read_only, allow_ddl=args.allow_ddl,
           allow_mutations=args.allow_mutations, embed=embed,
-          strict_schema=args.strict_schema, max_nodes=args.max_nodes)
+          strict_schema=args.strict_schema, max_nodes=args.max_nodes,
+          # rerank_fields/max_candidates only reach tools() when there IS a
+          # reranker: it refuses rerank_fields= without one, and passing the
+          # argparse default of [] would turn "no reranking configured" into
+          # that refusal for every server that never asked for reranking.
+          **({"rerank": rerank, "rerank_fields": args.rerank_field,
+              "max_candidates": args.max_candidates} if rerank is not None else {}))
     return 0
 
 
