@@ -171,6 +171,59 @@ def _refuse_near(value: Any, at: str = "") -> None:
         )
 
 
+def resolve_via(column, via: Any, edge_type_declared: bool = False):
+    """`via=` compiled -- everything resolve() already understands, PLUS
+    the STORED_IN shorthand: `via="KNOWS"` means "this edge's declared
+    type (its 'kind' property) equals this string". A bare string is
+    the one shape resolve()'s dict-of-equalities grammar has no other
+    use for at the `via=` position, so it is free to mean this without
+    colliding with anything a caller could already write.
+
+    It compiles to a DIFFERENT expression than the equivalent dict form
+    `via={"kind": "KNOWS"}` on purpose: `properties ->> 'kind' =
+    'KNOWS'`, text equality, rather than the `properties @> '{"kind":
+    ...}'::jsonb` containment test resolve()'s dict branch emits. Only
+    the `->>` shape can be served by a functional btree index on
+    `(graph_id, properties ->> 'kind')` -- see Graph.define_edge_type()
+    -- because containment can only ever use the whole-properties GIN
+    index, which is exactly the cost issue #80 was filed about: a
+    twelve-way `kind` vocabulary sharing one general-purpose index with
+    every other property in the table, re-tested on every hop of a
+    recursive walk.
+
+    `edge_type_declared` -- True once Graph.define_edge_type() has run
+    -- additionally upgrades the ORDINARY dict form to the same fast
+    shape, but ONLY when it is unambiguously an exact match on 'kind'
+    alone: a single key, named 'kind', holding a plain string (never a
+    list -- `{"kind": ["a", "b"]}` is an OR the `->>` equality cannot
+    express, and never merged with another key -- `{"kind": "x", "at":
+    1}` is an AND `->>` equality alone cannot express either). This is
+    what lets Cypher's `[:TYPE]` -- which already compiles to exactly
+    `{"kind": "TYPE"}`, see cypher.py's `_add_rel` -- benefit from a
+    declared edge type with no change to cypher.py at all: the two
+    front ends were already emitting the one shape this recognizes.
+
+    On a Graph that never calls define_edge_type(), a dict-form via=
+    compiles to EXACTLY the SQL it always has -- CLAUDE.md's no-
+    regression rule for a feature nothing opted into. The STORED_IN
+    shorthand is unaffected by the flag either way: it is new syntax
+    with no prior behavior to regress, so it always compiles to the
+    fast shape, index or no index -- an index only changes how fast
+    the (still correct) query runs."""
+    if isinstance(via, str):
+        if not via:
+            raise ValueError(
+                "via='' is empty -- via=<name> is shorthand for \"this edge's declared "
+                "type (its 'kind' property) equals <name>\", so an empty string names no "
+                "type. Pass via={'kind': '...'} or drop via= to match any edge"
+            )
+        return column["kind"].astext == via
+    if (edge_type_declared and isinstance(via, dict) and set(via) == {"kind"}
+            and isinstance(via["kind"], str)):
+        return column["kind"].astext == via["kind"]
+    return resolve(column, via)
+
+
 def resolve(column, filt: Any):
     """Compile a filter (Python form) into a real SQLAlchemy boolean
     expression bound to `column`. This is the single code path every

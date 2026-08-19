@@ -8,6 +8,14 @@
   (`RETURN b.city, count(b)`), no edge-property aggregates, no
   `stddev`/percentiles, no lexicographic `min`/`max` on strings — each
   refuses with a message rather than approximating.
+- A relation with its own identity, or one spanning more than two
+  participants — a "link table", in relational terms — has no single-edge
+  equivalent: every edge here connects exactly two nodes and carries no
+  identity beyond its properties. This is a property-graph limit, not a
+  hopai one (the same holds in Neo4j and every `MATCH (a)-[r]->(b)` Cypher
+  dialect); the standard answer is to reify the relation as its own node —
+  see [Graph schema](graph-schema.md#relations-with-their-own-identity) for
+  the worked example.
 - Deletes and updates select rows by their properties (`where=`) or by
   where a traversal arrived is still refused: `MATCH (a)-[:knows]->(b)
   DELETE b` refuses rather than guessing which of the two readings you

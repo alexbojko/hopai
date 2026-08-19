@@ -300,7 +300,14 @@ class Hop:
 
     where:      filter on the node reached by this hop (None = no filter)
 
-    via:        filter on every edge traversed during this hop (None = any edge)
+    via:        filter on every edge traversed during this hop (None = any
+                edge). A plain dict, e.g. {"kind": "friend"} -- or the
+                STORED_IN shorthand, a bare non-empty string, e.g.
+                via="friend", equivalent to via={"kind": "friend"} but
+                compiled to a text-equality expression a declared edge
+                type's btree index can serve (see Graph.define_edge_type())
+                instead of the JSONB containment test the dict form uses.
+                See filters.resolve_via().
 
     hops:       how many real edges this hop may span -- an int for an exact
                 count, or a (min, max) tuple for a range. Default 1.

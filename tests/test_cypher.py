@@ -934,6 +934,28 @@ class TestSyntaxErrors:
 # ---------------------------------------------------------------------
 
 class TestAgainstFixtureGraph:
+    def test_declared_edge_type_speeds_up_the_rel_type_filter(self, fresh_graph):
+        """[:TYPE] already compiles to exactly {"kind": "TYPE"} (see
+        TestPatternTranslation.test_label_type_and_props) -- once the
+        graph declares its edge type, that dict form rides the same
+        `->>` equality a declared edge type's btree index serves,
+        instead of JSONB containment, with NO change to cypher.py: the
+        upgrade lives entirely in filters.resolve_via(), keyed off the
+        Graph, and Cypher was already emitting the one shape it reads."""
+        from sqlalchemy.dialects import postgresql
+
+        fresh_graph.add_nodes([{"id": 1, "type": "leaf"}, {"id": 2, "type": "hub"}])
+        fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}])
+        fresh_graph.define_edge_type()
+        start, hops = cypher_to_traversal("MATCH (a)-[:knows]->(b) RETURN b")
+        sql = str(fresh_graph.build_query(start, hops).compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+        assert "properties ->> 'kind') = 'knows'" in sql
+        assert "@>" not in sql
+
+        result = traverse_cypher(fresh_graph, "MATCH (a)-[:knows]->(b) RETURN b")
+        assert {n["id"] for n in result.nodes} == {"1", "2"}
+
     def test_dead_end_excluded_by_rel_type(self, graph):
         """The Cypher spelling of test_hopai.py's
         test_dead_end_excluded_when_edge_kind_filtered -- n4's only edge

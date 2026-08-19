@@ -45,7 +45,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 from sqlalchemy.schema import CreateIndex
 
-from .filters import resolve
+from .filters import resolve, resolve_via
 from .hop import Hop, Start
 from .models import DEFAULT_GRAPH, EDGE_IDENTITY_KEYS, NODE_IDENTITY_KEYS, Edge, Node
 from .vectors import VECTOR_COLUMN_PREFIX
@@ -134,6 +134,69 @@ def _reads_paths(document_from: str, unknown: bool) -> bool:
     except Exception:
         return unknown
     return any(path == "paths" or path.startswith("paths.") for path in read)
+
+
+def _rerank_property_projection(document_from: str) -> Optional[frozenset]:
+    """Which top-level `properties` keys a reranked step's probe may
+    fetch in place of the whole JSONB column, or None to fetch it whole.
+
+    ISSUE #77. `_rerank_properties()` used to SELECT the entire
+    `properties` column for every candidate -- and every node on a
+    route, when paths are read -- only for `Rerank.build_documents()`
+    to throw most of it away moments later via
+    `rerankers._projection_paths()`/`_pruned()`: decoding several MB of
+    JSONB on the greenlet bridge's own thread (hopai/asyncio.py's
+    run_sync()) to read one title. This answers the same question one
+    layer earlier, at the SQL that fetches the row, so Postgres sends
+    and psycopg decodes only what the filter can use.
+
+    `_projection_paths()` is reused rather than restated -- a filter
+    reading `.`, or one `jqsafe` cannot parse at all (every
+    `trusted=True` filter), already answers `_WHOLE_ROW` there, and
+    this defers to the same answer for the same reason.
+
+    Two refusals are ADDED on top, both because this projects the SQL
+    fetch rather than a Python view and so cannot make _pruned()'s
+    per-ROW judgement calls at compile time, before any row exists:
+
+      - a path landing on `properties` itself (the whole bag), or one
+        going past a single level under it (`properties.a.b`), needs
+        the exact non-object-intermediate and ambiguous-dotted-key
+        rulings `_pruned()` makes per row -- this SQL cannot make them,
+        so it defers to fetching the column whole, exactly as before
+        this fix;
+      - a path touching `.paths` projects a DIFFERENT set of node
+        dicts -- every node on every candidate's route, not just the
+        candidate -- and `_rerank_properties()` fetches candidates and
+        route nodes with ONE shared query, so a key this filter needs
+        for a route node could not be told apart from one it does not.
+        (In practice this never narrows anyway: a document_from that
+        reads `.paths` reports a "paths"-rooted path here too, or is
+        unparseable and already hit `_WHOLE_ROW` above -- so wanting
+        path context and staying prunable never both hold.)
+
+    CORRECT AND SLOW BEATS FAST AND WRONG, the same principle
+    `_projection_paths()` states for itself: every case this cannot see
+    through keeps today's whole-column fetch rather than guess."""
+    from .rerankers import _WHOLE_ROW, _projection_paths
+
+    paths = _projection_paths(document_from)
+    if paths is _WHOLE_ROW:
+        return None
+    keys: set = set()
+    for path in paths:
+        if path in ("id", "similarity", "similarities", "boosts"):
+            continue                      # not sourced from `properties` at all
+        if path == "properties":
+            return None                   # the whole bag, verbatim -- _pruned()'s to keep
+        if path.startswith("properties."):
+            rest = path[len("properties."):]
+            if "." in rest:
+                return None               # deeper than one level -- _pruned()'s job, not SQL's
+            keys.add(rest)
+            continue
+        return None                       # ".paths" (or anything else) -- see docstring
+    return frozenset(keys)
 
 
 def _rerank_documents(candidates: list, rerank) -> list:
@@ -399,6 +462,13 @@ class Graph:
         self.graph_col = graph_col
         self._schema = None
         self._vectors = None
+        # Set True only by define_edge_type() -- resolve_via() reads it
+        # to decide whether an ordinary via={"kind": "..."} filter (not
+        # just the via="..." shorthand) may also compile to the ->>
+        # equality a declared edge type's btree index serves. A plain
+        # Graph() keeps this False, so a graph that never declared one
+        # keeps emitting the exact SQL it always has.
+        self._edge_type_declared = False
         # Set True only by in_graph() (see its docstring): lets
         # search()/search_many() populate this handle's registry from
         # the database, on first use, instead of leaving it blank for
@@ -619,7 +689,8 @@ class Graph:
                         array([edge_id_col]).label("local_edges"),
                     )
                     .select_from(et.join(prev_match, join_col == prev_match.c.node_id))
-                    .where(and_(self._scoped(et), resolve(et.c.properties, hop.via)))
+                    .where(and_(self._scoped(et),
+                               resolve_via(et.c.properties, hop.via, self._edge_type_declared)))
                 )
             walk = walk_base.cte(f"walk_{i}", recursive=True)
             w = walk.alias()
@@ -664,7 +735,7 @@ class Graph:
                         and_(
                             w.c.depth < hop.max_hops,
                             self._scoped(e),
-                            resolve(e.c.properties, hop.via),
+                            resolve_via(e.c.properties, hop.via, self._edge_type_declared),
                             sa_not_(e_move == sa_any_(w.c.local_path)),
                         )
                     )
@@ -934,6 +1005,69 @@ class Graph:
                     detach_constraint(target.table, kind, name)
                     dropped.append(name)
         return dropped
+
+    # -- edge type --------------------------------------------------------
+
+    def define_edge_type(self) -> str:
+        """Declare 'kind' as this graph's edge type -- the property
+        every Cypher `[:TYPE]` pattern already reads (cypher.py's
+        `edge_type_key`, default 'kind') and infer_schema() already
+        derives edge kinds from. Declaring it does two things:
+
+          - creates a guaranteed btree index on `(graph_id, properties
+            ->> 'kind')` -- narrow, unlike the whole-properties GIN
+            index every other property filter shares, so a `kind`
+            equality re-tested on every hop of a recursive walk gets an
+            index built for exactly that lookup (issue #80: twelve
+            named edge types sharing one general-purpose GIN index);
+          - switches `via={"kind": "..."}` -- a plain string, alone --
+            onto the SQL that index serves. `filters.resolve_via()` is
+            where this actually happens, checked there rather than
+            coerced here, and it is what lets Cypher's `[:TYPE]`
+            benefit too: `_add_rel()` already compiles it to exactly
+            that shape, so nothing in cypher.py has to change.
+
+        `via=<name>` (the STORED_IN shorthand -- see hop.py's `Hop.via`)
+        already compiles to this same fast SQL with or without this
+        declaration; only the ORDINARY dict form's SQL shape changes,
+        and only once this has been called. A Graph that never calls
+        this keeps emitting the exact SQL it always has -- CLAUDE.md's
+        no-regression rule for a feature nothing opted into.
+
+        Idempotent like define_constraints() -- CREATE INDEX IF NOT
+        EXISTS under the hood, so this belongs next to create_schema()
+        in a start-up path and costs nothing to call twice. Works on a
+        caller-supplied edge_table= exactly as it does on the default
+        table: it is built on the same Index(...) machinery
+        constraints.py already generalizes over both, with no new
+        column and so nothing for a custom table to be missing.
+
+        Run `ANALYZE edges` after calling this against a table that
+        already holds rows -- CREATE INDEX does not update planner
+        statistics on its own, and a plan chosen from stale stats
+        (measured: the bulk-load case, right after add_edges()) can
+        pick a worse join order than the one it replaced, the opposite
+        of the point. A freshly created, still-empty table needs no
+        such step; the statistics accumulate as it is written to.
+
+        Returns the index name."""
+        from .constraints import Index
+        applied = self.define_constraints(edges=[Index("kind")])
+        self._edge_type_declared = True
+        return applied[0]
+
+    @property
+    def edge_type_declared(self) -> bool:
+        """Whether define_edge_type() has run on this handle -- an
+        in-memory flag, not a database read, so it costs nothing to
+        check before deciding whether a via=<name> shorthand or a
+        {"kind": ...} filter is riding on an index or not. Mirrors the
+        existence-check `.schema`/`.vectors` already are: False on a
+        fresh handle, even one whose database another handle already
+        declared this on -- re-declare on THIS handle if you need the
+        true answer, the same rule load_vectors() documents for
+        vectors."""
+        return self._edge_type_declared
 
     # -- graph schema ---------------------------------------------------
 
@@ -1997,7 +2131,8 @@ class Graph:
 
         wanted = set(routes)
         wanted.update(node_id for paths in routes.values() for path in paths for node_id in path)
-        properties = self._rerank_properties(session, node_id_col, wanted)
+        keys = _rerank_property_projection(rerank.document_from)
+        properties = self._rerank_properties(session, node_id_col, wanted, keys=keys)
 
         def hydrate(node_id):
             return {"id": str(node_id), "properties": properties.get(str(node_id), {})}
@@ -2019,13 +2154,33 @@ class Graph:
             candidates.append((node_id, candidate))
         return candidates
 
-    def _rerank_properties(self, session, node_id_col, node_ids: set) -> dict:
+    def _rerank_properties(self, session, node_id_col, node_ids: set,
+                           keys: Optional[frozenset] = None) -> dict:
         """Properties for every node a step's documents mention -- the
         candidates and, when paths are read, the nodes on them -- in ONE
-        statement, keyed by the string id every result already uses."""
+        statement, keyed by the string id every result already uses.
+
+        `keys=None` fetches the `properties` column whole, exactly as
+        before issue #77. A `keys=` frozenset (from
+        `_rerank_property_projection()`, possibly empty) fetches a
+        JSONB object built from only those top-level keys --
+        `jsonb_build_object('title', properties -> 'title', ...)` --
+        so Postgres sends, and psycopg decodes, only the bytes
+        `document_from` can read instead of the row's own worst case.
+        An empty `keys` still issues one query per candidate id (a
+        filter that reads none of `.properties` still needs to know
+        which candidates matched), just with an empty object back."""
         if not node_ids:
             return {}
-        query = select(cast(node_id_col, String).label("id"), self.nodes_tbl.c.properties).where(
+        if keys is None:
+            properties_expr = self.nodes_tbl.c.properties
+        else:
+            args = []
+            for key in sorted(keys):
+                args.extend((key, self.nodes_tbl.c.properties[key]))
+            properties_expr = func.jsonb_build_object(*args)
+        query = select(cast(node_id_col, String).label("id"),
+                      properties_expr.label("properties")).where(
             and_(self._scoped(self.nodes_tbl), node_id_col.in_(sorted(node_ids, key=str))))
         return {row.id: row.properties for row in session.execute(query).all()}
 

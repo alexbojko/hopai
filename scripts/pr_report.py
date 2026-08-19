@@ -238,21 +238,10 @@ def render_mutation(stats: dict, found: list, note: str, attempted: bool = False
         return "\n".join(["### 🧬 Mutation testing — not run", "", note])
 
     total, killed = stats.get("total", 0), stats.get("killed", 0)
-    score = (killed / total * 100) if total else 0.0
-    lines = [
-        f"### 🧬 Mutation score {score:.0f}%  ({killed}/{total} killed)",
-        "",
-        f"{note}  Advisory — this never blocks the merge, "
-        f"but every survivor needs triage (see CLAUDE.md).",
-    ]
 
     odd = {name: stats.get(name, 0) for name in
            ("timeout", "suspicious", "no_tests", "skipped", "segfault")}
     odd = {name: count for name, count in odd.items() if count}
-    if odd:
-        lines += ["", "Not a verdict either way: "
-                  + ", ".join(f"**{count} {name}**" for name, count in odd.items())
-                  + "."]
 
     # Mutants mutmut generated but never reached a verdict on. A run
     # stopped by its budget exports a `total` with every count at zero,
@@ -262,6 +251,38 @@ def render_mutation(stats: dict, found: list, note: str, attempted: bool = False
     # this project refuses everywhere else, and it is worse here because
     # a reader takes it as evidence the tests are strong.
     unchecked = total - killed - len(found) - sum(odd.values())
+
+    if unchecked > 0:
+        # A percentage computed only over the mutants that happened to
+        # finish is not a mutation score -- "63% (4084/6477 killed)"
+        # skims as "roughly passing" when a third of the scope (2121
+        # mutants here) has no verdict at all, and two runs of the same
+        # commit can print different percentages depending only on
+        # where the harness stopped. So the warning IS the headline;
+        # there is no percentage left to skim past it with.
+        lines = [
+            f"### ⚠️ Mutation testing incomplete — {unchecked} of {total} "
+            f"mutant(s) never reached a verdict",
+            "",
+            f"{note}  {killed}/{total} killed so far. That is a harness that "
+            f"stopped, not a suite that caught everything: treat this run as "
+            f"**no evidence** about the unreached mutants rather than as a "
+            f"pass. Advisory either way — this never blocks the merge, but "
+            f"every survivor still needs triage (see CLAUDE.md). See the job log.",
+        ]
+    else:
+        score = (killed / total * 100) if total else 0.0
+        lines = [
+            f"### 🧬 Mutation score {score:.0f}%  ({killed}/{total} killed)",
+            "",
+            f"{note}  Advisory — this never blocks the merge, "
+            f"but every survivor needs triage (see CLAUDE.md).",
+        ]
+
+    if odd:
+        lines += ["", "Not a verdict either way: "
+                  + ", ".join(f"**{count} {name}**" for name, count in odd.items())
+                  + "."]
 
     if found:
         # Folded by default: on a large PR this is the longest thing in
@@ -276,11 +297,6 @@ def render_mutation(stats: dict, found: list, note: str, attempted: bool = False
     elif total and unchecked <= 0:
         lines += ["", "No survivors — every mutant on the changed lines was caught."]
 
-    if unchecked > 0:
-        lines += ["", f"⚠️ **{unchecked} of {total} mutant(s) never reached a verdict** — "
-                  f"neither killed nor survived. That is a harness that stopped, not a "
-                  f"suite that caught everything: treat this run as **no evidence** about "
-                  f"the changed lines rather than as a pass. See the job log."]
     return "\n".join(lines)
 
 

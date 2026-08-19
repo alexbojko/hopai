@@ -326,6 +326,129 @@ class TestLifecycle:
         assert indexes(fresh_graph) == {}
 
 
+class TestDeclaredEdgeType:
+    """Graph.define_edge_type() -- issue #80's guaranteed btree index on
+    (graph_id, properties ->> 'kind'), the narrow index a `kind`
+    equality can use instead of falling back to the whole-properties
+    GIN index every other property filter shares."""
+
+    def test_declares_a_functional_btree_on_graph_id_and_kind(self, fresh_graph):
+        name = fresh_graph.define_edge_type()
+        assert name == "ix_edges_kind"
+        definition = indexes(fresh_graph)["ix_edges_kind"]
+        assert "UNIQUE" not in definition
+        assert "graph_id" in definition
+        assert "(properties ->> 'kind'::text)" in definition
+
+    def test_it_is_the_exact_index_define_constraints_would_make(self, fresh_graph):
+        """No second naming scheme: Index("kind") through
+        define_constraints() directly produces the identical index name
+        and DDL, so a caller who already knows constraints.py gets no
+        surprise from reaching for the dedicated call instead."""
+        table = f"{fresh_graph.edges_tbl.schema}.edges" if fresh_graph.edges_tbl.schema else "edges"
+        assert fresh_graph.constraint_ddl(edges=[Index("kind")]) == [
+            f'CREATE INDEX IF NOT EXISTS "ix_edges_kind" ON {table} '
+            "(graph_id, (properties ->> 'kind'))"
+        ]
+
+    def test_flips_the_declared_flag(self, fresh_graph):
+        assert fresh_graph.edge_type_declared is False
+        fresh_graph.define_edge_type()
+        assert fresh_graph.edge_type_declared is True
+
+    def test_declaring_twice_is_a_no_op(self, fresh_graph):
+        """Idempotent like define_constraints() -- safe next to
+        create_schema() in a start-up path."""
+        first = fresh_graph.define_edge_type()
+        second = fresh_graph.define_edge_type()
+        assert first == second == "ix_edges_kind"
+        assert len([n for n in indexes(fresh_graph) if n == "ix_edges_kind"]) == 1
+
+    def test_declared_flag_is_per_handle_not_per_database(self, fresh_graph):
+        """An IN-MEMORY flag, not a database read -- the same
+        existence-check contract `.schema`/`.vectors` already keep. A
+        second handle over the SAME already-declared database still
+        answers False until IT calls define_edge_type()."""
+        from hopai import Graph
+        fresh_graph.define_edge_type()
+        second_handle = Graph(fresh_graph.engine)
+        assert second_handle.edge_type_declared is False
+
+    def test_works_on_a_caller_supplied_edge_table(self, write_engine):
+        """No new column, so nothing for a custom edge_table= to be
+        missing -- the same generality Index()/Unique() already have
+        over an arbitrary table, see constraints.py's module docstring."""
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        from hopai import Graph
+
+        with write_engine.begin() as conn:
+            conn.execute(text("DROP SCHEMA IF EXISTS hopai_custom_edge_type CASCADE"))
+            conn.execute(text("CREATE SCHEMA hopai_custom_edge_type"))
+        meta = MetaData(schema="hopai_custom_edge_type")
+        nodes = Table("nodes", meta, Column("id", BigInteger, primary_key=True),
+                      Column("graph_id", Text, nullable=False, server_default="default"),
+                      Column("properties", JSONB, nullable=False, server_default="{}"))
+        edges = Table("edges", meta, Column("id", BigInteger, primary_key=True),
+                      Column("graph_id", Text, nullable=False, server_default="default"),
+                      Column("start_id", BigInteger, nullable=False),
+                      Column("end_id", BigInteger, nullable=False),
+                      Column("properties", JSONB, nullable=False, server_default="{}"))
+        meta.create_all(write_engine)
+        graph = Graph(write_engine, node_table=nodes, edge_table=edges)
+        name = graph.define_edge_type()
+        with write_engine.connect() as conn:
+            found = conn.execute(text(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = 'hopai_custom_edge_type' "
+                "AND indexname = :name"), {"name": name}).first()
+        assert found is not None
+
+
+class TestViaStoredInShorthand:
+    """via=<name> (Hop.via as a bare string) end to end: same results as
+    via={"kind": <name>}, and -- once define_edge_type() has run --
+    equal to it in the sense that both compile through the exact same
+    fast path (filters.resolve_via(), pinned in tests/test_query_shape.py's
+    TestResolveVia and TestQueryStructure)."""
+
+    def test_matches_the_same_edges_as_the_dict_form(self, fresh_graph):
+        from hopai import Hop, Start
+        fresh_graph.add_nodes([{"id": 1, "type": "leaf"}, {"id": 2, "type": "hub"},
+                               {"id": 3, "type": "hub"}])
+        fresh_graph.add_edges([
+            {"start_id": 1, "end_id": 2, "kind": "knows"},
+            {"start_id": 1, "end_id": 3, "kind": "wrong_kind"},
+        ])
+        by_dict = fresh_graph.traverse(Start(where={"type": "leaf"}), Hop(via={"kind": "knows"}))
+        by_shorthand = fresh_graph.traverse(Start(where={"type": "leaf"}), Hop(via="knows"))
+        assert {n["id"] for n in by_dict.nodes} == {n["id"] for n in by_shorthand.nodes} == {"1", "2"}
+        assert ({(e["start_id"], e["end_id"]) for e in by_dict.edges}
+                == {(e["start_id"], e["end_id"]) for e in by_shorthand.edges})
+
+    def test_matches_the_same_edges_once_edge_type_is_declared(self, fresh_graph):
+        """The point of define_edge_type(): the ordinary dict form and
+        the shorthand agree not just on RESULTS (the test above, true
+        regardless) but on which SQL shape reaches the database."""
+        from hopai import Hop, Start
+        fresh_graph.define_edge_type()
+        fresh_graph.add_nodes([{"id": 1, "type": "leaf"}, {"id": 2, "type": "hub"}])
+        fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}])
+        by_dict = fresh_graph.traverse(Start(where={"type": "leaf"}), Hop(via={"kind": "knows"}))
+        by_shorthand = fresh_graph.traverse(Start(where={"type": "leaf"}), Hop(via="knows"))
+        assert {n["id"] for n in by_dict.nodes} == {n["id"] for n in by_shorthand.nodes} == {"1", "2"}
+
+    def test_json_api_accepts_the_bare_string_shorthand(self, fresh_graph):
+        from hopai import traverse_json
+        fresh_graph.add_nodes([{"id": 1, "type": "leaf"}, {"id": 2, "type": "hub"}])
+        fresh_graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "knows"}])
+        result = traverse_json(fresh_graph, {
+            "start": {"where": {"type": "leaf"}},
+            "hops": [{"via": "knows"}],
+        })
+        assert {n["id"] for n in result["nodes"]} == {"1", "2"}
+
+
 class TestNaming:
     def test_names_are_deterministic(self, offline_graph):
         assert (offline_graph.constraint_ddl(nodes=[Unique("a", "b")])
