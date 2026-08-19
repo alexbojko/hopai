@@ -1993,10 +1993,24 @@ def _prepare_pgvector_search_many_query(graph, queries, target: str, k: Optional
             "missing mode. Only the vectors may differ. Group the queries by shape and call "
             "search_many() once per group"
         )
+    # This label can never be read: `parsed` is non-empty (_as_query_list
+    # refuses an empty batch), so the loop above already ran
+    # validate_boosts on the SAME `boost` and raised there if it was going
+    # to -- which is why the mutation run's mutant on this one is
+    # equivalent, while the loop's is a real gap with a test. Kept
+    # spelled out rather than passed down from above so the AST pin in
+    # TestVectorCallerNamesArePinned still sees a literal here.
     boosts = validate_boosts(boost, "vector_search_many()")
     template = validated[0]
     one = template[0]
     table = _table(graph, target)
+    # The type argument decides nothing HERE and is passed anyway:
+    # validate_nears() above resolved this field through _field(), so
+    # define_vectors()/load_vectors() has already attached the column --
+    # _attach() can only return the existing one, which is why the
+    # mutation run's `None` in this position is equivalent rather than
+    # untested. It stays because ARRAY(REAL) is the wrong thing for a
+    # pgvector handle to fall back on the day that stops holding.
     column = _attach(table, VECTOR_COLUMN_PREFIX + one.field, _column_type(graph))
     dimensions = len(one.vector)
 
@@ -2977,6 +2991,13 @@ def load_vectors(graph, connection=None) -> dict:
                     declared_dims = conn.execute(_VECTOR_DIMS, {
                         "table": table.name, "column": column_name, "schema": table.schema,
                     }).scalar()
+                    # `<= 0` rather than `< 0` reads as the wider guard and
+                    # is the same guard: atttypmod is -1 for an unsized
+                    # `vector` and for every non-vector column, and
+                    # pgvector refuses `vector(0)` outright ("dimensions
+                    # for type vector must be at least 1"), so 0 is a value
+                    # the catalog cannot hold -- which is why the mutation
+                    # run's `< 0` here is equivalent rather than untested.
                     if declared_dims is None or declared_dims <= 0:
                         continue
                     registry[target_name][name] = Vector(name, int(declared_dims))

@@ -183,6 +183,12 @@ class Vector(UserDefinedType):
         def process(value):
             if value is None or not isinstance(value, str):
                 return value
+            # str.strip takes a SET of characters, and pgvector's text form
+            # contains only digits, '-', '+', '.', 'e', ',' and the two
+            # brackets -- so widening this set with any letter the form
+            # cannot hold strips exactly the same two characters. That is
+            # why the mutation run's "XX[]XX" here is equivalent rather
+            # than untested; the two brackets are what has to stay.
             inner = value.strip().strip("[]")
             if not inner:
                 return []
@@ -413,6 +419,14 @@ def ensure_available(conn) -> tuple:
 
 
 def create_extension_ddl() -> str:
+    # Lower case is the spelling, not a case that matters: an unquoted
+    # extension name folds to lower case in the server, so
+    # `... IF NOT EXISTS VECTOR` creates the same `vector` extension --
+    # verified against pgvector 0.8.0 on an empty database, which is why
+    # the mutation run's uppercase twin of this line is equivalent. The
+    # TEXT is still pinned by a test, because the rest of it is not
+    # (dropping IF NOT EXISTS would break every re-run of
+    # migrate_vectors()).
     return "CREATE EXTENSION IF NOT EXISTS vector"
 
 

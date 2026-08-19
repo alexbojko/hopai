@@ -79,26 +79,45 @@ uniform random vectors — see `benchmarks/README.md` for the full tables):
 
 | rows × dims | exact | pgvector | speedup | recall@10 |
 | --- | ---: | ---: | ---: | ---: |
-| 2 000 × 384 | 127 ms | 4.7 ms | 27× | 0.74 |
-| 20 000 × 384 | 1 057 ms | 5.8 ms | 183× | **0.21** |
-| 100 000 × 384 | 5 011 ms | 6.5 ms | 770× | **0.05** |
+| 2 000 × 384 | 118 ms | 4.1 ms | 29× | 0.73 |
+| 20 000 × 384 | 1 021 ms | 4.2 ms | 240× | **0.25** |
+| 100 000 × 384 | 4 655 ms | 4.8 ms | 979× | **0.06** |
 
-At pgvector's default `ef_search=40`, a 20k-row search returned *two of the
-ten* true nearest neighbours. Uniform random vectors in 384 dimensions are
-near the worst case an ANN index can be handed — every distance looks alike
-— and real embeddings cluster, which helps:
+At pgvector's default `ef_search=40`, a 20k-row search returned a quarter of
+the true top ten. Uniform random vectors in 384 dimensions are near the worst
+case an ANN index can be handed — everything is nearly orthogonal, so the top
+k is a near-tie — and real embeddings cluster, which helps. Both levers,
+measured at 20 000 × 384:
 
-| 20 000 × 384 | pgvector | recall@10 | top-1 found |
+| | pgvector | recall@10 | similarity ratio |
 | --- | ---: | ---: | ---: |
-| uniform, `ef_search=40` (default) | 5.8 ms | 0.21 | 15% |
-| clustered, `ef_search=40` | 4.1 ms | 0.39 | 40% |
-| uniform, `ef_search=200` | 8.9 ms | 0.61 | 85% |
-| clustered, `ef_search=200` | 4.1 ms | 0.67 | 70% |
+| uniform, `ef_search=40` (default) | 4.2 ms | 0.25 | 0.89 |
+| clustered, `ef_search=40` | 3.5 ms | 0.40 | 0.91 |
+| uniform, `ef_search=200` | 9.4 ms | 0.59 | 0.97 |
+| clustered, `ef_search=200` | 5.0 ms | 0.60 | 0.95 |
 
-`hnsw.ef_search` is the lever — 40 → 200 roughly tripled recall here for
-under 2× the time, and it is an ordinary Postgres setting you can raise on
-your own connection. Writes cost **2–5× more** under this backend (every
-write maintains the index), and building the index on 100k × 384 took ~158 s.
+The *similarity ratio* — mean cosine of what came back over mean cosine of the
+true top-k — stays at 0.89–0.97 while recall sits at 0.25, which says most of
+what recall counts as a "miss" is a neighbour that was very nearly as close.
+That is a real consolation and not a full one: if you need *the* nearest
+neighbour rather than *a* near one, recall is the number that matters.
+
+**`hnsw.ef_search` is the dial, and hopai does not wrap it.** It is an
+ordinary Postgres GUC — set it on your own connection (`SET hnsw.ef_search =
+200`, or a SQLAlchemy `connect` event listener). Raising it 40 → 200 roughly
+doubled recall here for about 2× the time, still ~99× faster than exact.
+
+Two more costs, both measured: writes run **2–5× slower** (every write
+maintains the index), and building the index on 100 000 × 384 took ~120 s and
+195 MB.
+
+**The planner can decline the index, and did.** At 20 000 × 768 it costed a
+sequential scan at 1122.81 against the HNSW scan's 1193.47 — 6% apart in the
+estimate, 25× apart in reality (138 ms vs 5.6 ms). The answers were exact and
+recall was 1.00, so this is a performance surprise rather than a correctness
+one, but it means "I added the index" is not the same as "the index is being
+used". `EXPLAIN` is the check; `benchmarks/bench_pgvector.py` records
+`pgvector_uses_index` per configuration for exactly this reason.
 
 This is the whole trade, and it is why this is not the default.
 

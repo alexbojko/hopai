@@ -150,56 +150,80 @@ under it by name.
   `migrate_vectors()` performs.
 - **`set_vectors_*_seconds`** — the same vectors written under each
   backend; the pgvector column maintains its index on every write.
-- **`fewer_than_k_filter`** — pass/fail, never a timing.
+- **`fewer_than_k_filter`** — the completeness property as pass/fail,
+  plus what enforcing it costs.
 - **`pgvector_uses_index`** — the scan node `EXPLAIN` actually chose.
+  Recorded rather than assumed, and the section below is why.
 
 ### Measured
 
-Postgres 16.14, pgvector 0.8.0, **a shared 4-vCPU container** —
-`shared_buffers` 128MB, `work_mem` 4MB, `maintenance_work_mem` 64MB,
-HNSW at its defaults (`m=16`, `ef_construction=64`, `ef_search=40`),
-k=10, 20 query vectors, 5 warm repeats. Absolute milliseconds on a box
-like this are noisy and do not transfer; the exact-vs-pgvector ratio at
-a given size roughly does. Uniform random vectors, the same dataset
-shape `bench_vectors.py` generates.
+Commit `dd6a783`, Postgres 16.14, pgvector 0.8.0, **a shared 4-vCPU
+container** — `shared_buffers` 128MB, `work_mem` 4MB,
+`maintenance_work_mem` 64MB, HNSW at its defaults (`m=16`,
+`ef_construction=64`, `ef_search=40`), k=10, 20 query vectors, 5 warm
+repeats, uniform random vectors (the dataset shape `bench_vectors.py`
+generates). Absolute milliseconds on a box like this are noisy and do
+not transfer; the exact-vs-pgvector ratio at a given size roughly does.
+The commit matters more than usual here: this backend's search path
+changed twice while these numbers were being taken, and the whole set
+was re-run against one commit rather than stitched together.
 
 | rows × dims | exact | pgvector | | recall@10 | sim ratio |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 2 000 × 384 | 127.3 ms | 4.7 ms | **27×** | 0.74 | 0.97 |
-| 20 000 × 384 | 1057.0 ms | 5.8 ms | **183×** | 0.21 | 0.88 |
-| 100 000 × 384 | 5010.6 ms | 6.5 ms | **770×** | 0.05 | 0.81 |
-| 20 000 × 768 | 1841.4 ms | 6.9 ms | **268×** | 0.12 | 0.84 |
+| 2 000 × 384 | 117.7 ms | 4.1 ms | **29×** | 0.73 | 0.97 |
+| 20 000 × 384 | 1020.7 ms | 4.2 ms | **240×** | 0.25 | 0.89 |
+| 100 000 × 384 | 4654.6 ms | 4.8 ms | **979×** | 0.06 | 0.79 |
+| 20 000 × 768 | 1990.9 ms | 103.9 ms | **19×** | 1.00 | 1.00 |
 
 The same searches `where=`-filtered to ~25% of rows:
 
 | rows × dims | exact | pgvector | | recall@10 | sim ratio |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 2 000 × 384 | 37.6 ms | 4.6 ms | **8×** | 0.70 | 0.95 |
-| 20 000 × 384 | 301.0 ms | 4.6 ms | **65×** | 0.22 | 0.83 |
-| 100 000 × 384 | 1444.7 ms | 12.5 ms | **115×** | 0.10 | 0.77 |
-| 20 000 × 768 | 481.2 ms | 33.3 ms | **14×** | 1.00 | 1.00 |
+| 2 000 × 384 | 33.1 ms | 4.1 ms | **8×** | 0.70 | 0.94 |
+| 20 000 × 384 | 314.0 ms | 6.7 ms | **47×** | 0.23 | 0.85 |
+| 100 000 × 384 | 1452.4 ms | 5.7 ms | **255×** | 0.07 | 0.75 |
+| 20 000 × 768 | 499.5 ms | 33.4 ms | **15×** | 1.00 | 1.00 |
 
-That last row is not a typo and is worth more than the three above it:
-at 768 dims the planner **did not use the HNSW index** for the filtered
-search (`EXPLAIN` chose a bitmap scan on the properties GIN index and
-sorted), so the answer came back exact — recall 1.00 — and still 14×
-faster than the exact backend, because pgvector's `<=>` over a
-`vector(d)` column is far cheaper than `unnest`+`sum` over a `real[]`
-one even with no index involved. Which of the two you get is the
-planner's decision, not the library's, which is why
-`pgvector_uses_index` is recorded per configuration rather than assumed.
+**The 768-dim rows are the most useful measurement in this file.** Both
+of them came back with `pgvector_uses_index: false` — recall 1.00
+because the planner **declined the HNSW index** and answered exactly:
+a sequential scan for the unfiltered search, a bitmap scan on the
+properties GIN index for the filtered one. `EXPLAIN ANALYZE` on the same
+20 000 × 768 data, with `enable_seqscan` forced off for comparison, says
+why:
+
+| plan | planner's estimate | actual |
+| --- | ---: | ---: |
+| Seq Scan + top-N sort (what it chose) | 1122.81 | 138.3 ms |
+| HNSW Index Scan (`enable_seqscan=off`) | 1193.47 | 5.6 ms |
+
+The estimates differ by 6% and the reality by **25×**. An HNSW scan's
+estimated start-up cost grows with dimensionality (588 at 384 dims,
+1173 at 768) while a sequential scan's estimate barely moves, so
+somewhere between those widths the planner crosses over and quietly
+stops using the index the extension was installed for. It is marginal
+enough to flip on statistics alone: an earlier run of the same
+configuration, on a commit two changes back, chose the index for the
+unfiltered search and the seq scan only for the filtered one. Nothing
+about this is silent-and-wrong — a declined index gives *exact* answers,
+still 15–19× faster than the exact backend because pgvector's `<=>`
+beats `unnest`+`sum` even unindexed — but a caller who adopted this
+backend for its index deserves to know it may not be running.
+`SET enable_seqscan = off` around the query, or a lower
+`random_page_cost`, is the lever; hopai does not pull it.
 
 The write and build costs, which belong in the same accounting:
 
 | rows × dims | index build | index size | `set_vectors` exact | `set_vectors` pgvector |
 | --- | ---: | ---: | ---: | ---: |
-| 2 000 × 384 | 0.7 s | 3.9 MB | 2.5 s | 5.2 s |
-| 20 000 × 384 | 5.0 s | 39.1 MB | 29.7 s | 84.3 s |
-| 100 000 × 384 | 158.1 s | 195.3 MB | 129.5 s | 612.7 s |
+| 2 000 × 384 | 0.7 s | 3.9 MB | 2.3 s | 5.3 s |
+| 20 000 × 384 | 5.2 s | 39.1 MB | 23.3 s | 80.4 s |
+| 100 000 × 384 | 119.9 s | 195.3 MB | 114.9 s | 544.8 s |
+| 20 000 × 768 | 28.7 s | 78.1 MB | 39.3 s | 125.3 s |
 
 Writes cost **2–5× more** under this backend — every `set_vectors()`
 maintains the graph — and the 100k index build is an upper bound rather
-than a fair figure: 100k × 384 float4 is ~150MB of vectors against
+than a fair figure: 100k × 384 float4 is ~150MB of vectors against a
 `maintenance_work_mem` of 64MB, so it built on disk. Raising that
 setting is the first thing to try before quoting this number as the
 cost of the index.
@@ -210,68 +234,88 @@ both backends. That is not the index being complete — an HNSW scan
 applies `where=` to the candidates its walk reaches and can come back
 short of the rows that match, which `hnsw.iterative_scan` reduces and
 does not close. It is hopai **completing** a short filtered result with
-a second exact query (`vectors._pgvector_needs_completion()`), so the
-line below is the price of that guarantee, next to the same search when
-the filter is wide enough to fill k:
+a second exact query (`vectors._pgvector_needs_completion()`), and the
+completion is close to free at every size measured:
 
-### Recall < 1.0 is the whole trade, and 0.21 is what the defaults gave
+| rows × dims | exact | pgvector (index + completion) |
+| --- | ---: | ---: |
+| 2 000 × 384 | 5.1 ms | 6.3 ms |
+| 20 000 × 384 | 4.6 ms | 5.5 ms |
+| 100 000 × 384 | 5.3 ms | 6.7 ms |
+| 20 000 × 768 | 5.4 ms | 6.2 ms |
+
+Flat, and about a millisecond over the exact backend, because the
+completion query is an exact scan of *the rows the filter matched* —
+two of them — not of the table. The case that triggers completion is
+a selective filter, and a selective filter is exactly the case where
+re-asking exactly is cheap. It is the wide-filter-but-still-short case
+that would cost, and no configuration here produced one.
+
+### Recall < 1.0 is the whole trade, and 0.25 is what the defaults gave
 
 The speedups above are real and the recall beside them is real. On this
 dataset, at the settings hopai actually runs, **a 20k-row 384-dim search
-returned 2 of the 10 true nearest neighbors** and the exact backend's
-own top hit was in the result only 15% of the time. Three things move
-that number, all measured at 20 000 × 384:
+returned 2–3 of the 10 true nearest neighbors**, and the exact backend's
+own top hit was in the result 25% of the time. Two things move that
+number — the data and `ef_search` — both measured at 20 000 × 384:
 
 | dataset / setting | pgvector | recall@10 | sim ratio | top-1 found |
 | --- | ---: | ---: | ---: | ---: |
-| uniform, `ef_search=40` (the default) | 5.8 ms | 0.21 | 0.88 | 15% |
-| clustered (`--clusters 64`), `ef_search=40` | 4.1 ms | 0.39 | 0.89 | 40% |
-| uniform, `ef_search=200` | 8.9 ms | 0.61 | 0.97 | 85% |
-| clustered, `ef_search=200` | 4.1 ms | 0.67 | 0.97 | 70% |
+| uniform, `ef_search=40` (the default) | 4.2 ms | 0.25 | 0.89 | 25% |
+| clustered (`--clusters 64`), `ef_search=40` | 3.5 ms | 0.40 | 0.91 | 50% |
+| uniform, `ef_search=200` | 9.4 ms | 0.59 | 0.97 | 55% |
+| clustered, `ef_search=200` | 5.0 ms | 0.60 | 0.95 | 65% |
 
 - **The dataset is a floor, not a forecast.** Uniform random vectors in
   high dimension are near-orthogonal: every candidate sits at almost the
-  same distance, so there is little structure for HNSW to navigate and
-  the true top-10 is a near-tie. Real embeddings are clustered, which
-  `--clusters N` imitates and which nearly doubled recall here. Read the
-  uniform rows as a worst case and measure your own corpus before
-  trusting either.
-- **`similarity_ratio` says how much of that miss matters.** At
-  `ef_search=200` recall is 0.61 while the ratio is 0.97 — mostly
+  same distance, so there is little structure for HNSW's graph to
+  navigate and the true top-10 is a near-tie. Real embeddings are
+  clustered, which `--clusters N` imitates and which raised recall by
+  more than half here. Read the uniform rows as a worst case, and
+  measure your own corpus before trusting either.
+- **`similarity_ratio` says how much of the miss matters.** At
+  `ef_search=200` recall is 0.59 while the ratio is 0.97 — mostly
   *different* neighbors that are *nearly as close*, which for retrieval
-  feeding an LLM is a different situation from the 0.81 ratio the 100k
+  feeding an LLM is a different situation from the 0.79 ratio the 100k
   row shows, where the index genuinely returned worse rows.
-- **`ef_search` is the dial, and hopai does not expose it.** Tripling it
-  bought 3× the recall for 1.5× the latency and still ran 117× faster
-  than the exact backend. hopai sets `hnsw.iterative_scan` (correctness)
-  and leaves `ef_search` at the server's 40, so a caller who needs more
-  recall has to set it themselves on the connection — which is what
-  `--ef-search` in this script does, and is worth knowing before
-  adopting the backend.
+- **`ef_search` is the dial, and hopai does not expose it.** Five times
+  the default bought 2.4× the recall for 2.2× the latency, still 99×
+  faster than the exact backend. hopai sets `hnsw.iterative_scan`
+  (correctness) and leaves `ef_search` at the server's 40, so a caller
+  who needs more recall has to set it on the connection themselves —
+  which is what this script's `--ef-search` does, and is worth knowing
+  before adopting the backend.
+- **Recall moves between index builds.** HNSW construction is not
+  deterministic: the identical 20 000 × 384 uniform configuration
+  measured 0.21 and 0.25 on two builds. Treat one run's recall as ±0.05,
+  not as a constant.
 
 ### When it is worth it
 
 There is **no latency crossover to wait for**. The exact scan costs
-~0.13 µs per element (`rows × dims`), the indexed search costs a roughly
-flat 4–13 ms, so they meet at about 40 000 elements — around a hundred
-rows at 384 dims. Above any size worth indexing, the index wins on
-latency, and by 100k rows it is not close.
+~0.13 µs per element (`rows × dims`); an index-served search costs a
+roughly flat 4–7 ms, so they meet at about 35 000 elements — around a
+hundred rows at 384 dims. Above any size worth indexing at all, the
+index wins on latency, and by 100k rows it is not close (979×).
 
 So the decision is never "is it faster". It is:
 
-- **Can you afford an approximate answer at all?** If a missing
-  neighbor is a wrong answer rather than a slightly worse one, stay on
-  the exact backend — it is not merely correct, it is the only one of
-  the two that can say so.
-- **Are you past the exact backend's comfortable range?** A 5-second
-  unfiltered search at 100k × 384 is not a live query path, and
-  `where=` only helps if your filters are selective (25% still cost
-  1.4 s there). That is the situation this backend exists for.
-- **Do you need multivector or `boost=`?** They are refused here, and
-  the exact backend answers them correctly with no extension.
-- **Are you willing to tune?** The out-of-the-box recall measured above
-  is poor. Budget for measuring your own corpus and raising
-  `ef_search` — the backend's speed is free, its quality is not.
+- **Can you afford an approximate answer?** If a missing neighbor is a
+  wrong answer rather than a slightly worse one, stay on the exact
+  backend — it is not merely correct, it is the only one of the two that
+  can say so. `where=` is complete under both (see above); it is the
+  *ranking* that goes approximate.
+- **Are you past the exact backend's comfortable range?** A 4.7-second
+  unfiltered search at 100k × 384 is not a live query path, and `where=`
+  only helps if the filter is selective — 25% still cost 1.45 s there.
+  That is the situation this backend exists for.
+- **Do you need multivector or `boost=`?** Refused here; the exact
+  backend answers them correctly and needs no extension.
+- **Are you willing to tune, and to check?** Out-of-the-box recall
+  measured poor on synthetic data, and at 768 dims the planner did not
+  use the index at all. Budget for measuring your own corpus, raising
+  `ef_search`, and reading `EXPLAIN` — the speed is free, the quality
+  and the plan are not.
 
 ## Building reranker documents
 
