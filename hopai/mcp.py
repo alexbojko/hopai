@@ -1749,26 +1749,41 @@ def _vector(value: str):
     return graph, target, Vector(field, int(dimensions))
 
 
-def _callable(value: str):
-    """--embed mypackage.embeddings:embed -> the function itself."""
-    module_name, _, attribute = value.partition(":")
-    if not module_name or not attribute:
-        raise argparse.ArgumentTypeError(
-            f"--embed takes MODULE:FUNCTION, e.g. myapp.embeddings:embed -- got {value!r}")
-    import importlib
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError as exc:
-        raise argparse.ArgumentTypeError(
-            f"--embed: cannot import {module_name!r} -- {exc}") from exc
-    try:
-        function = getattr(module, attribute)
-    except AttributeError as exc:
-        raise argparse.ArgumentTypeError(
-            f"--embed: {module_name!r} has no attribute {attribute!r}") from exc
-    if not callable(function):
-        raise argparse.ArgumentTypeError(f"--embed: {value} is not callable")
-    return function
+def _callable_for(flag: str, example: str):
+    """A MODULE:FUNCTION parser whose refusals name `flag`.
+
+    A factory rather than one shared function, because argparse's
+    `type=` takes the value and nothing else -- so the flag has to be
+    closed over. That was worth fixing rather than living with: --rerank
+    reused this and inherited --embed's wording, which sent an operator
+    who mistyped a reranker path to a flag they were not using. "Errors
+    that name the fix" is only true if they name the RIGHT one."""
+    def parse(value: str):
+        module_name, _, attribute = value.partition(":")
+        if not module_name or not attribute:
+            raise argparse.ArgumentTypeError(
+                f"{flag} takes MODULE:FUNCTION, e.g. {example} -- got {value!r}")
+        import importlib
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as exc:
+            raise argparse.ArgumentTypeError(
+                f"{flag}: cannot import {module_name!r} -- {exc}") from exc
+        try:
+            function = getattr(module, attribute)
+        except AttributeError as exc:
+            raise argparse.ArgumentTypeError(
+                f"{flag}: {module_name!r} has no attribute {attribute!r}") from exc
+        if not callable(function):
+            raise argparse.ArgumentTypeError(f"{flag}: {value} is not callable")
+        return function
+    return parse
+
+
+#: --embed's spelling of the above, kept under its own name because
+#: build_parser() reads better naming the flag once.
+_callable = _callable_for("--embed", "myapp.embeddings:embed")
+_rerank_callable = _callable_for("--rerank", "myapp.reranking:score")
 
 
 def _max_nodes(value: str) -> Optional[int]:
@@ -1907,7 +1922,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Python-entrypoint feature while a bi-encoder was a flag: the same
     # Hugging Face hub, two different ergonomics, for no reason a reader
     # could point at.
-    parser.add_argument("--rerank", type=_callable, metavar="MODULE:FUNCTION",
+    parser.add_argument("--rerank", type=_rerank_callable, metavar="MODULE:FUNCTION",
                         help="A function taking (query, documents) and returning one "
                              "score per document, in the order given. Reranking is off "
                              "without this or --rerank-provider, and no tool advertises "

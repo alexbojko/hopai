@@ -3572,6 +3572,34 @@ class TestRerankProvider:
         assert "MODULE:FUNCTION" in printed
         assert "'not-a-module-path'" in printed
 
+    @pytest.mark.parametrize("value", ["not-a-module-path", "nosuchmod:fn",
+                                       "os.path:sep"])
+    def test_a_bad_rerank_path_names_rerank_and_never_embed(self, capsys, value):
+        """Each refusal names the flag the operator is actually using.
+
+        --rerank reuses --embed's MODULE:FUNCTION parser, and that
+        parser used to hardcode `--embed` in all four of its messages --
+        so `--rerank nosuchmod:fn` answered "--embed: cannot import
+        'nosuchmod'", sending the reader to a flag they had not typed.
+        Parametrized across the three shapes because each one is a
+        separate message: a malformed spec, an unimportable module, and
+        a name that resolves to something not callable."""
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--rerank", value])
+        printed = capsys.readouterr().err.split("error: ", 1)[1]
+        assert "--rerank" in printed
+        assert "--embed" not in printed
+
+    def test_the_embed_spelling_still_names_embed(self, capsys):
+        """The other half of the fix: making --rerank name itself must
+        not have renamed --embed's own refusal, which is what a shared
+        parser rewritten carelessly would do."""
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--embed", "not-a-module-path"])
+        printed = capsys.readouterr().err.split("error: ", 1)[1]
+        assert "--embed takes MODULE:FUNCTION" in printed
+        assert "myapp.embeddings:embed" in printed
+
     # -- the model reaches the client ---------------------------------
 
     def test_the_resolved_model_reaches_the_rerank(self, monkeypatch):
