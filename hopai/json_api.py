@@ -40,6 +40,12 @@ are REFUSED rather than ignored, because `top_k`/`limit`/`filter` are
 the names a model reaches for and silently dropping one answers a
 different question than the one asked.
 
+`start` also accepts `ids`, a list of node ids to seed from directly --
+ANDed with `where` when both are given. `where` filters PROPERTIES, and
+an id is not one: `{"where": {"id": 7}}` is a JSONB containment test
+that matches nothing. `ids` is the one way to seed from a specific row
+you already hold, the read-side counterpart of mutate.py's `ids=`.
+
 A `rerank` spec is {"document_from": <jq filter>, "candidates": N} and
 NEVER a client: a reranker holds an API key and a socket, neither of
 which travels in JSON. The reranker is the caller's, handed to these
@@ -99,7 +105,7 @@ from .vectors import parse_boost, parse_near
 #: different question than the one asked -- unfiltered, or with the
 #: default k. parse_near/parse_aggregate are strict one level down;
 #: this is the same rule at the top.
-_START_KEYS = {"where", "label", "near", "keep", "boost", "rerank"}
+_START_KEYS = {"where", "ids", "label", "near", "keep", "boost", "rerank"}
 _HOP_KEYS = {"where", "via", "hops", "direction", "optional", "label",
              "near", "keep", "via_near", "via_keep", "boost", "rerank"}
 _SEARCH_KEYS = {"near", "target", "k", "where", "boost", "rerank"}
@@ -474,6 +480,7 @@ def spec_to_traversal(spec: dict, rerank: Optional[RerankPolicy] = None) -> tupl
     _check_keys(start_spec, _START_KEYS, '"start"')
     start = Start(
         where=parse_filter(start_spec.get("where")),
+        ids=start_spec.get("ids"),
         label=start_spec.get("label"),
         near=_near_of(start_spec),
         keep=start_spec.get("keep"),
@@ -847,6 +854,16 @@ TRAVERSE_TOOL_SCHEMA: dict = {
                 "description": "The seed set of nodes to begin from.",
                 "properties": {
                     "where": {"type": "object", "description": "Filter on starting nodes."},
+                    "ids": {
+                        "type": "array",
+                        "items": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+                        "description": (
+                            "Seed from these specific node ids directly, instead of (or "
+                            "as well as) `where`. `where` filters PROPERTIES, and an id "
+                            "is not one -- {\"where\": {\"id\": 7}} matches nothing. "
+                            "Combines with `where` as AND."
+                        ),
+                    },
                     "near": _near_schema(
                         "Rank the starting nodes by similarity to some text instead of "
                         "(or as well as) filtering them. Needs `keep`."),
@@ -980,6 +997,16 @@ AGGREGATE_TOOL_SCHEMA: dict = {
                 "description": "The seed set of nodes to begin from.",
                 "properties": {
                     "where": {"type": "object", "description": "Filter on starting nodes."},
+                    "ids": {
+                        "type": "array",
+                        "items": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+                        "description": (
+                            "Seed from these specific node ids directly, instead of (or "
+                            "as well as) `where`. `where` filters PROPERTIES, and an id "
+                            "is not one -- {\"where\": {\"id\": 7}} matches nothing. "
+                            "Combines with `where` as AND."
+                        ),
+                    },
                     "near": _near_schema(
                         "Rank the starting nodes by similarity to some text instead of "
                         "(or as well as) filtering them. Needs `keep`."),

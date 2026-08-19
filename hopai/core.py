@@ -75,6 +75,21 @@ def _pinned(id_expr, pins: Optional[dict], index: int) -> tuple:
     return (id_expr.in_(pins[index]),)
 
 
+def _ided(id_expr, ids: Optional[list]) -> tuple:
+    """`(id IN (...),)` for Start(ids=...), or `()` when ids=None.
+
+    Same splat trick as _pinned above, for the same reason: a Start
+    with no ids= emits the exact seed condition it always has. `None`
+    means "no id filter" (like where=None); an explicit `[]` compiles
+    to `.in_([])`, which SQLAlchemy renders as an always-false clause --
+    an explicit empty selection matches nothing, the same as
+    `where={"some_key": []}` already does for an empty OR-of-values."""
+    if ids is None:
+        return ()
+    from .vectors import _coerce_id
+    return (id_expr.in_([_coerce_id(one) for one in ids]),)
+
+
 def _rerank_steps(start: Start, hops: list) -> list:
     """Every step carrying a rerank=, in CHAIN order: (index, spec).
 
@@ -601,6 +616,7 @@ class Graph:
         node_id_col = getattr(nt.c, self.node_id_col)
 
         seed_condition = and_(self._scoped(nt), resolve(nt.c.properties, start.where),
+                              *_ided(node_id_col, start.ids),
                               *_pinned(node_id_col, pins, -1))
         if start.near is not None:
             # Similarity-seeded: the seed CTE becomes "the k most
@@ -1784,11 +1800,17 @@ class Graph:
 
     def merge_nodes(self, rows: list, on: list, replace: bool = False) -> int:
         """Insert nodes, updating any that already match on `on`.
-        Requires a unique index over those keys -- see Unique()."""
+        Requires a unique index over those keys -- see Unique(). `on`
+        may include Col("id") to merge on the node's own id column
+        (already unique per graph, no index needed) instead of a
+        property; a bare "id" string refuses, naming Col("id") -- see
+        hopai.constraints for why a bare string colliding with a real
+        column is always treated as a mistake."""
         return self._ingestor.merge_nodes(rows, on=on, replace=replace)
 
     def merge_edges(self, rows: list, on: list, replace: bool = False) -> int:
-        """Insert edges, updating any that already match on `on`."""
+        """Insert edges, updating any that already match on `on`. Same
+        Col("id") support as merge_nodes()."""
         return self._ingestor.merge_edges(rows, on=on, replace=replace)
 
     def ingest(self, document: dict, merge_nodes_on: Optional[list] = None,
@@ -1797,7 +1819,11 @@ class Graph:
 
         Nodes are written before edges, so an edge in the same document
         may reference a node created by it. This is the call an agent
-        makes -- see INGEST_TOOL_SCHEMA."""
+        makes -- see INGEST_TOOL_SCHEMA. Unlike merge_nodes()/
+        merge_edges()'s own `on=`, the bare string "id" here (or any
+        other real column name) targets that column directly: JSON has
+        no way to spell Col("id"), so this JSON-safe document form
+        translates it for you (see hopai.ingest.parse_on())."""
         return self._ingestor.ingest(document, merge_nodes_on, merge_edges_on)
 
     def write_cypher(self, query: str, **options):
@@ -1868,7 +1894,8 @@ class Graph:
         A node that still has edges cannot be deleted: pass detach=True
         to delete its edges with it (Cypher's DETACH DELETE). A call with
         no filter raises rather than emptying the graph -- say it on
-        purpose with all=True, or call clear()."""
+        purpose with all=True, or call clear(). `ids=` targets specific
+        rows by their id column instead of (or alongside) `where`."""
         return self._mutator.delete_nodes(where, detach=detach, all=all, ids=ids)
 
     def repoint_edge(self, edge_id, start_id=None, end_id=None):
@@ -1902,25 +1929,28 @@ class Graph:
                                           ids=ids)
 
     def update_nodes(self, where=None, set=None, remove=None, replace: bool = False,
-                     all: bool = False):
+                     all: bool = False, ids=None):
         """Update every node matching `where`. `set` is merged over the
         existing properties, leaving anything it does not mention alone;
         `remove` drops keys; `replace=True` makes `set` the whole
         property bag. Returns a MutationResult.
 
             graph.update_nodes(where={"type": "person"}, set={"active": False})
-        """
+
+        `ids=` targets specific rows by their id column instead of (or
+        alongside) `where`, with the same rules as delete_nodes()."""
         return self._mutator.update_nodes(where, set=set, remove=remove,
-                                          replace=replace, all=all)
+                                          replace=replace, all=all, ids=ids)
 
     def update_edges(self, where=None, start=None, end=None, set=None, remove=None,
-                     replace: bool = False, all: bool = False):
+                     replace: bool = False, all: bool = False, ids=None):
         """Update every edge matching `where`, with the same set/remove/
         replace semantics as update_nodes() and the same endpoint
         filters as delete_edges() -- including that they are filters
-        rather than references. Returns a MutationResult."""
+        rather than references. `ids=` names specific edges instead,
+        with the same rules as delete_edges(). Returns a MutationResult."""
         return self._mutator.update_edges(where, start=start, end=end, set=set,
-                                          remove=remove, replace=replace, all=all)
+                                          remove=remove, replace=replace, all=all, ids=ids)
 
     def clear(self):
         """Delete every node and edge in THIS graph, in one transaction.

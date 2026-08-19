@@ -1225,15 +1225,18 @@ def _ingest_tool(served: Served, schema: dict) -> ToolSpec:
         "type": "array",
         "items": {"type": "string"},
         "description": (
-            "UPDATE instead of insert: property keys identifying an existing node. A node "
-            "matching on these keys has the new properties merged over its old ones; one "
-            "that matches nothing is created. Needs a unique index on exactly these keys."
+            "UPDATE instead of insert: keys identifying an existing node. A node matching "
+            "on these keys has the new properties merged over its old ones; one that "
+            "matches nothing is created. Most keys are property names and need a unique "
+            "index declared on exactly those keys first -- 'id' is the exception: it "
+            "targets the node's own id column directly (already unique per graph, no "
+            "index to declare) rather than a JSONB property called 'id'."
         ),
     }
     schema["parameters"]["properties"]["merge_edges_on"] = {
         "type": "array",
         "items": {"type": "string"},
-        "description": "The same for edges.",
+        "description": "The same for edges. 'id' targets the edge's own id column.",
     }
     return ToolSpec(schema["name"], schema["description"], schema["parameters"], ingest_graph)
 

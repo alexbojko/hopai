@@ -154,4 +154,12 @@ Edge = Table(
                          name="fk_edges_start_same_graph"),
     ForeignKeyConstraint(["end_id", "graph_id"], ["nodes.id", "nodes.graph_id"],
                          name="fk_edges_end_same_graph"),
+    # UNIQUE(id, graph_id) mirrors the nodes table's own -- id alone is
+    # already the primary key, so this exists solely so merge_edges(on=
+    # [Col("id")]) has a matching unique index to infer an ON CONFLICT
+    # target from (constraints.py's _Target.scope_index() always leads
+    # with graph_id). Without it, an id-keyed re-import of edges (the
+    # same natural-key workflow merge_edges() already supports for
+    # properties) has no way to conflict on the row's own id.
+    UniqueConstraint("id", "graph_id", name="uq_edges_id_graph"),
 )
