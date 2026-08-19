@@ -16,10 +16,13 @@ the HNSW index answers approximately, and a speedup quoted without the
 recall it bought is the misleading number CLAUDE.md's "refuse, don't
 approximate" ethos exists to prevent. So the exact backend's top-k is
 taken as ground truth and recall@k is reported beside every latency.
-Also checked, as a pass/fail rather than a timing: a filter matching
-FEWER than k rows must return every matching row under both backends
--- what pgvector 0.8's `hnsw.iterative_scan = strict_order` buys and
-the reason hopai sets it (see hopai/pgvector.py).
+Also checked, as a pass/fail beside its cost: a filter matching FEWER
+than k rows must return every matching row under both backends. An
+HNSW scan can come back short of the rows that match, which
+`hnsw.iterative_scan` reduces and does not close, so hopai completes a
+short filtered result with a second exact query -- the count says the
+guarantee holds and the timing says what holding it costs (see
+hopai/pgvector.py).
 
 Only single-`Near` searches are measured, because they are the only
 ones this backend serves: multivector and `boost=` are refused under
@@ -197,13 +200,12 @@ def rebuild_index(engine, table, column: str) -> dict:
     index_ddl(), not a hand-written CREATE INDEX, so a change to the
     index hopai builds shows up here).
 
-    The DROP is spelled out here rather than taken from
-    pg.drop_index_ddl(), which emits the index name UNQUALIFIED and so
-    resolves it through search_path -- correct for the ordinary caller
-    whose tables are on the path, a silent no-op for this benchmark's
-    throwaway schema, which is not. It cost a whole first run: the drop
-    hit nothing, CREATE INDEX IF NOT EXISTS found the index already
-    there, and 'index_build_seconds' came back 0.0 at every size.
+    The DROP is spelled out here, schema-qualified, rather than built
+    from pg.index_name() alone: an unqualified index name resolves
+    through search_path, which this benchmark's throwaway schema is not
+    on, so the drop hits nothing, CREATE INDEX IF NOT EXISTS finds the
+    index still there, and `index_build_seconds` comes back 0.0 at every
+    size. That is what a first run of this file reported.
     """
     index = pg.index_name(table.name, column)
     qualified = f'"{table.schema}"."{table.name}"'
@@ -295,21 +297,34 @@ def recall(exact: Graph, approx: Graph, queries: list, k: int, where=None) -> di
             "queries": len(scores)}
 
 
-def fewer_than_k(exact: Graph, approx: Graph, query: list, k: int) -> dict:
-    """The correctness property, as pass/fail: a filter matching fewer
-    than k rows returns ALL of them under both backends.
+def fewer_than_k(exact: Graph, approx: Graph, query: list, k: int, repeats: int) -> dict:
+    """The correctness property as pass/fail, plus what it costs: a
+    filter matching fewer than k rows must return ALL of them under both
+    backends.
 
-    This is what pgvector >= 0.8's iterative scan buys and what hopai
-    refuses an older server over -- below it the HNSW scan applies
-    `where=` to a fixed candidate window and returns fewer rows than
-    match, reporting success. A timing here would say nothing; the
-    count is the whole result."""
+    An HNSW scan applies `where=` to the candidates its graph walk
+    reaches, so a selective filter can come back short of the rows that
+    actually match -- and hopai cannot tell "only two matched" from "the
+    index gave up at two" by looking at the rows. `hnsw.iterative_scan`
+    (the reason for the 0.8 floor) reduces that and does not close it,
+    so the backend COMPLETES a short filtered result with a second,
+    exact query. The counts are therefore expected to pass by
+    construction; what is worth measuring is the price, which is why
+    this is timed as well. Compare it against the 25%-filtered search,
+    which returns a full k and pays nothing extra."""
     got_exact = exact.vector_search(Near(EXACT_FIELD, query), k=k, where=RARE_FILTER)
     got_approx = approx.vector_search(Near(PGVECTOR_FIELD, query), k=k, where=RARE_FILTER)
+    exact_seconds = timed(
+        lambda: exact.vector_search(Near(EXACT_FIELD, query), k=k, where=RARE_FILTER), repeats)
+    approx_seconds = timed(
+        lambda: approx.vector_search(Near(PGVECTOR_FIELD, query), k=k, where=RARE_FILTER),
+        repeats)
     return {"expected": RARE_ROWS, "exact": len(got_exact), "pgvector": len(got_approx),
             "pass": len(got_exact) == RARE_ROWS and len(got_approx) == RARE_ROWS,
             "same_ids": sorted(h["id"] for h in got_exact) == sorted(
-                h["id"] for h in got_approx)}
+                h["id"] for h in got_approx),
+            "exact_ms": round(exact_seconds * 1000, 1),
+            "pgvector_ms": round(approx_seconds * 1000, 1)}
 
 
 def measure(engine, rows: int, dims: int, args) -> dict:
@@ -365,7 +380,7 @@ def measure(engine, rows: int, dims: int, args) -> dict:
 
     result["recall_unfiltered"] = recall(exact, approx, queries, args.k)
     result["recall_filtered_25pct"] = recall(exact, approx, queries, args.k, where=FILTER)
-    result["fewer_than_k_filter"] = fewer_than_k(exact, approx, query, args.k)
+    result["fewer_than_k_filter"] = fewer_than_k(exact, approx, query, args.k, args.repeats)
     # Not a timing, and the reason it is here: a pgvector search that
     # fell back to a sequential scan returns identical rows at the exact
     # backend's cost.
