@@ -3310,6 +3310,37 @@ class TestEdgeBeamShape:
                                                 via_keep=3)]), literal_binds=True)
         assert sql.count('{"kind": "cites"}') == 2
 
+    def test_via_stored_in_shorthand_composes_with_via_near_too(self, vg):
+        """edge_beam() resolves `via` through resolve_via(), same as the
+        plain (non-ranked) walk terms in core.py -- so the STORED_IN
+        shorthand filters what the beam ranks, not just what an
+        ordinary via= dict filters."""
+        sql = norm(vg.build_query(Start(), [Hop(via="cites", hops=(1, 2),
+                                                via_near=Near("rel", [1.0, 0.0, 0.0]),
+                                                via_keep=3)]), literal_binds=True)
+        assert sql.count("properties ->> 'kind') = 'cites'") == 2
+        assert "@>" not in sql
+
+    def test_via_dict_form_upgrades_in_the_beam_too_once_declared(self, vg):
+        """edge_beam() passes graph._edge_type_declared into resolve_via()
+        as a THIRD argument, separate from `via` itself -- the same
+        upgrade TestViaStoredInShorthand pins for the plain (non-ranked)
+        walk terms in core.py, but nothing exercised it for the beam
+        before now. Dropping that argument silently falls back to
+        resolve_via()'s edge_type_declared=False default: every result
+        stays correct (both SQL shapes match the same rows), so only a
+        shape assertion -- not a results comparison -- can tell the
+        beam actually reached for the index issue #80 added, instead of
+        always compiling the ordinary `via={"kind": ...}` dict form to
+        the old whole-properties containment test regardless of what
+        the graph has declared."""
+        vg._edge_type_declared = True
+        sql = norm(vg.build_query(Start(), [Hop(via={"kind": "cites"}, hops=(1, 2),
+                                                via_near=Near("rel", [1.0, 0.0, 0.0]),
+                                                via_keep=3)]), literal_binds=True)
+        assert sql.count("properties ->> 'kind') = 'cites'") == 2
+        assert "@>" not in sql
+
     def test_edges_without_a_vector_are_filtered_before_the_cosine(self, vg):
         """The same shape the batch path needed, for the same reason.
         Dropping these guards changes no ANSWER -- the beam's own

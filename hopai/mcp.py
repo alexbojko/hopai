@@ -915,6 +915,13 @@ def _describe_tool(served: Served, read_only: bool, allow_ddl: bool, allow_mutat
             "schema": schema.to_json() if schema is not None else None,
             "schema_mermaid": schema.to_mermaid() if schema is not None else None,
             "vector_fields": vectors,
+            # Whether via="<name>"/via={"kind": "<name>"} rides on a
+            # dedicated index (Graph.define_edge_type()) rather than the
+            # whole-properties GIN one -- an in-memory flag, so this
+            # costs no extra query. The kind VOCABULARY itself (which
+            # names actually appear) is what infer_schema reports; this
+            # is only whether the lookup is a fast one.
+            "edge_type_declared": graph.edge_type_declared,
             # Two capabilities, not one: search_similar needs an
             # embedder (tools() refuses one without a field to rank),
             # while seeding a traversal additionally needs a NODE

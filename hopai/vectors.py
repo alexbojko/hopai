@@ -212,7 +212,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, DOUBLE_PRECISION, REAL
 from sqlalchemy.exc import IntegrityError, ProgrammingError
 
 from .constraints import ConstraintViolation, _compile_check, _slug, _Target
-from .filters import resolve
+from .filters import resolve, resolve_via
 
 #: Every vector field lives in a real column named after itself with
 #: this prefix -- a fixed prefix rather than the bare field name, so a
@@ -1384,7 +1384,8 @@ def edge_beam(graph, edge_alias, join_expr, anchor_expr, move_col, id_col, via,
         select(id_col.label("edge_id"), move_col.label("move_id"), *columns)
         .select_from(_with_laterals(edge_alias, laterals))
         .where(join_expr == anchor_expr, graph._scoped(edge_alias),
-               resolve(edge_alias.c.properties, via), *guards, *extra)
+               resolve_via(edge_alias.c.properties, via, graph._edge_type_declared),
+               *guards, *extra)
         # The anchor (the seed CTE, or the walk's own recursive
         # reference) belongs to the ENCLOSING query. Left to infer,
         # SQLAlchemy copies it into this FROM clause instead -- which

@@ -45,7 +45,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 from sqlalchemy.schema import CreateIndex
 
-from .filters import resolve
+from .filters import resolve, resolve_via
 from .hop import Hop, Start
 from .models import DEFAULT_GRAPH, EDGE_IDENTITY_KEYS, NODE_IDENTITY_KEYS, Edge, Node
 from .vectors import VECTOR_COLUMN_PREFIX
@@ -447,6 +447,13 @@ class Graph:
         self.graph_col = graph_col
         self._schema = None
         self._vectors = None
+        # Set True only by define_edge_type() -- resolve_via() reads it
+        # to decide whether an ordinary via={"kind": "..."} filter (not
+        # just the via="..." shorthand) may also compile to the ->>
+        # equality a declared edge type's btree index serves. A plain
+        # Graph() keeps this False, so a graph that never declared one
+        # keeps emitting the exact SQL it always has.
+        self._edge_type_declared = False
         # Set True only by in_graph() (see its docstring): lets
         # search()/search_many() populate this handle's registry from
         # the database, on first use, instead of leaving it blank for
@@ -666,7 +673,8 @@ class Graph:
                         array([edge_id_col]).label("local_edges"),
                     )
                     .select_from(et.join(prev_match, join_col == prev_match.c.node_id))
-                    .where(and_(self._scoped(et), resolve(et.c.properties, hop.via)))
+                    .where(and_(self._scoped(et),
+                               resolve_via(et.c.properties, hop.via, self._edge_type_declared)))
                 )
             walk = walk_base.cte(f"walk_{i}", recursive=True)
             w = walk.alias()
@@ -711,7 +719,7 @@ class Graph:
                         and_(
                             w.c.depth < hop.max_hops,
                             self._scoped(e),
-                            resolve(e.c.properties, hop.via),
+                            resolve_via(e.c.properties, hop.via, self._edge_type_declared),
                             sa_not_(e_move == sa_any_(w.c.local_path)),
                         )
                     )
@@ -981,6 +989,69 @@ class Graph:
                     detach_constraint(target.table, kind, name)
                     dropped.append(name)
         return dropped
+
+    # -- edge type --------------------------------------------------------
+
+    def define_edge_type(self) -> str:
+        """Declare 'kind' as this graph's edge type -- the property
+        every Cypher `[:TYPE]` pattern already reads (cypher.py's
+        `edge_type_key`, default 'kind') and infer_schema() already
+        derives edge kinds from. Declaring it does two things:
+
+          - creates a guaranteed btree index on `(graph_id, properties
+            ->> 'kind')` -- narrow, unlike the whole-properties GIN
+            index every other property filter shares, so a `kind`
+            equality re-tested on every hop of a recursive walk gets an
+            index built for exactly that lookup (issue #80: twelve
+            named edge types sharing one general-purpose GIN index);
+          - switches `via={"kind": "..."}` -- a plain string, alone --
+            onto the SQL that index serves. `filters.resolve_via()` is
+            where this actually happens, checked there rather than
+            coerced here, and it is what lets Cypher's `[:TYPE]`
+            benefit too: `_add_rel()` already compiles it to exactly
+            that shape, so nothing in cypher.py has to change.
+
+        `via=<name>` (the STORED_IN shorthand -- see hop.py's `Hop.via`)
+        already compiles to this same fast SQL with or without this
+        declaration; only the ORDINARY dict form's SQL shape changes,
+        and only once this has been called. A Graph that never calls
+        this keeps emitting the exact SQL it always has -- CLAUDE.md's
+        no-regression rule for a feature nothing opted into.
+
+        Idempotent like define_constraints() -- CREATE INDEX IF NOT
+        EXISTS under the hood, so this belongs next to create_schema()
+        in a start-up path and costs nothing to call twice. Works on a
+        caller-supplied edge_table= exactly as it does on the default
+        table: it is built on the same Index(...) machinery
+        constraints.py already generalizes over both, with no new
+        column and so nothing for a custom table to be missing.
+
+        Run `ANALYZE edges` after calling this against a table that
+        already holds rows -- CREATE INDEX does not update planner
+        statistics on its own, and a plan chosen from stale stats
+        (measured: the bulk-load case, right after add_edges()) can
+        pick a worse join order than the one it replaced, the opposite
+        of the point. A freshly created, still-empty table needs no
+        such step; the statistics accumulate as it is written to.
+
+        Returns the index name."""
+        from .constraints import Index
+        applied = self.define_constraints(edges=[Index("kind")])
+        self._edge_type_declared = True
+        return applied[0]
+
+    @property
+    def edge_type_declared(self) -> bool:
+        """Whether define_edge_type() has run on this handle -- an
+        in-memory flag, not a database read, so it costs nothing to
+        check before deciding whether a via=<name> shorthand or a
+        {"kind": ...} filter is riding on an index or not. Mirrors the
+        existence-check `.schema`/`.vectors` already are: False on a
+        fresh handle, even one whose database another handle already
+        declared this on -- re-declare on THIS handle if you need the
+        true answer, the same rule load_vectors() documents for
+        vectors."""
+        return self._edge_type_declared
 
     # -- graph schema ---------------------------------------------------
 
