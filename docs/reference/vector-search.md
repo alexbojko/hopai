@@ -72,9 +72,35 @@ It is opt-in because it is a real dependency: the `vector` extension
 must be installed in the server. No Python package is added — the type
 is rendered as SQL text and the operator as `<=>`.
 
-**What you give up.** An HNSW index answers *approximately*: it can miss
-a true nearest neighbor, and no setting makes that absolute. That is the
-whole trade, and it is the reason this is not the default.
+**What you give up: recall, and more of it than "approximate" suggests.**
+An HNSW index can miss a true nearest neighbor, and no setting makes that
+absolute. Measured (`benchmarks/bench_pgvector.py`, unfiltered `k=10`,
+uniform random vectors — see `benchmarks/README.md` for the full tables):
+
+| rows × dims | exact | pgvector | speedup | recall@10 |
+| --- | ---: | ---: | ---: | ---: |
+| 2 000 × 384 | 127 ms | 4.7 ms | 27× | 0.74 |
+| 20 000 × 384 | 1 057 ms | 5.8 ms | 183× | **0.21** |
+| 100 000 × 384 | 5 011 ms | 6.5 ms | 770× | **0.05** |
+
+At pgvector's default `ef_search=40`, a 20k-row search returned *two of the
+ten* true nearest neighbours. Uniform random vectors in 384 dimensions are
+near the worst case an ANN index can be handed — every distance looks alike
+— and real embeddings cluster, which helps:
+
+| 20 000 × 384 | pgvector | recall@10 | top-1 found |
+| --- | ---: | ---: | ---: |
+| uniform, `ef_search=40` (default) | 5.8 ms | 0.21 | 15% |
+| clustered, `ef_search=40` | 4.1 ms | 0.39 | 40% |
+| uniform, `ef_search=200` | 8.9 ms | 0.61 | 85% |
+| clustered, `ef_search=200` | 4.1 ms | 0.67 | 70% |
+
+`hnsw.ef_search` is the lever — 40 → 200 roughly tripled recall here for
+under 2× the time, and it is an ordinary Postgres setting you can raise on
+your own connection. Writes cost **2–5× more** under this backend (every
+write maintains the index), and building the index on 100k × 384 took ~158 s.
+
+This is the whole trade, and it is why this is not the default.
 
 **What you keep: `where=` still means `where=`.** That one is not free,
 and it is the most important thing on this page.
