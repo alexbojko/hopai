@@ -243,17 +243,19 @@ jobs:
 
       - name: Resolve mutation scope
         id: scope
-        # Mutate only the functions/methods this PR's DIFF actually
-        # touched, never every mutant a changed file happens to contain.
-        # Checking is the expensive half of a mutation run (it reruns the
-        # test suite once per mutant), so a five-line fix inside a large,
-        # well-covered function used to check hundreds of unrelated
-        # mutants in that same file -- scripts/mutation_scope.py computes
-        # the precise set of top-level functions/methods whose line span
-        # overlaps a changed line, which is the finest granularity
-        # mutmut's own naming exposes (see that script's docstring), and
-        # `mutmut run`'s positional MUTANT_NAMES filters checking down to
-        # exactly those.
+        # Mutate ONLY the lines this PR's diff changed. A full run over
+        # hopai/ is ~10000 mutants and every one of them reruns the test
+        # suite, so it is not a slower report, it is one that never
+        # finishes -- runs kept hitting the wall-clock budget with
+        # thousands unchecked and had to lead with "no evidence".
+        #
+        # Two narrowings off one diff, applied at different stages:
+        #   changed-lines JSON -> scripts/mutation_run.py, which drives
+        #     mutmut's per-line generation filter so a mutant is only
+        #     ever CREATED on a changed line
+        #   fnmatch patterns   -> `mutmut run`'s MUTANT_NAMES, bounding
+        #     what gets CHECKED, per changed function
+        # See scripts/mutation_scope.py for why the second is coarser.
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -266,42 +268,46 @@ jobs:
           if [ -z "${CHANGED// /}" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "note=No files under \`hopai/\` changed, so there was nothing to mutate." >> "$GITHUB_OUTPUT"
-          else
-            PATTERNS=$(python scripts/mutation_scope.py "${BASE_SHA}" HEAD ${CHANGED})
-            if [ -z "${PATTERNS// /}" ]; then
-              echo "run=false" >> "$GITHUB_OUTPUT"
-              echo "note=Changed lines under \`hopai/\` touched no function body (docstrings, comments or module-level statements only), so there was nothing to mutate." >> "$GITHUB_OUTPUT"
-            else
-              FN_COUNT=$(echo "${PATTERNS}" | wc -w | tr -d ' ')
-              FILE_COUNT=$(echo "${CHANGED}" | wc -w | tr -d ' ')
-              echo "run=true" >> "$GITHUB_OUTPUT"
-              echo "note=Scope: ${FN_COUNT} changed function(s)/method(s) across ${FILE_COUNT} file(s) under \`hopai/\`." >> "$GITHUB_OUTPUT"
-              {
-                echo "patterns<<MUTATION_SCOPE_PATTERNS_EOF"
-                echo "${PATTERNS}"
-                echo "MUTATION_SCOPE_PATTERNS_EOF"
-              } >> "$GITHUB_OUTPUT"
-              # Narrow source_paths in the checked-out copy too, so mutmut
-              # only GENERATES mutants for files this PR touched at all.
-              # The committed value covers the whole package for local
-              # runs; `hopai` stays in also_copy, so the package is still
-              # whole in the mutants tree (without it every test dies on
-              # an import error).
-              #
-              # The paths MUST be newline-separated (the ini continuation
-              # format also_copy uses): mutmut reads a space-separated line
-              # as ONE path that does not exist, mutates 0 files, and still
-              # exits 0 -- so every multi-file PR silently reported
-              # "not run" instead of any verdict.
-              python - "$CHANGED" <<'PY'
+            exit 0
+          fi
+          PATTERNS=$(python scripts/mutation_scope.py "${BASE_SHA}" HEAD ${CHANGED})
+          python scripts/mutation_scope.py --changed-lines "${BASE_SHA}" HEAD ${CHANGED} \
+            > mutation-changed-lines.json
+          LINE_COUNT=$(python -c "import json;print(sum(len(v) for v in json.load(open('mutation-changed-lines.json')).values()))")
+          if [ -z "${PATTERNS// /}" ] || [ "${LINE_COUNT}" = "0" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "note=Changed lines under \`hopai/\` touched no function body (docstrings, comments or module-level statements only), so there was nothing to mutate." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          FN_COUNT=$(echo "${PATTERNS}" | wc -w | tr -d ' ')
+          FILE_COUNT=$(echo "${CHANGED}" | wc -w | tr -d ' ')
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "note=Scope: ${LINE_COUNT} changed line(s) in ${FN_COUNT} function(s)/method(s) across ${FILE_COUNT} file(s) under \`hopai/\`. Only changed lines are mutated." >> "$GITHUB_OUTPUT"
+          {
+            echo "patterns<<MUTATION_SCOPE_PATTERNS_EOF"
+            echo "${PATTERNS}"
+            echo "MUTATION_SCOPE_PATTERNS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          # Narrow source_paths too. Not needed for correctness any more
+          # (a file absent from the changed-lines map gets no mutants),
+          # but it is what keeps the coverage gather in
+          # store_lines_covered_by_tests() from walking the whole package.
+          # The committed value covers it all for local runs; `hopai`
+          # stays in also_copy, so the package is still whole in the
+          # mutants tree (without it every test dies on an import error).
+          #
+          # The paths MUST be newline-separated (the ini continuation
+          # format also_copy uses): mutmut reads a space-separated line
+          # as ONE path that does not exist, mutates 0 files, and still
+          # exits 0 -- so every multi-file PR silently reported
+          # "not run" instead of any verdict.
+          python - "$CHANGED" <<'PY'
           import re, sys
           paths = "\n    ".join(sys.argv[1].split())
           config = open("setup.cfg").read()
           open("setup.cfg", "w").write(
               re.sub(r"^source_paths = .*$", f"source_paths = {paths}", config, count=1, flags=re.M))
           PY
-            fi
-          fi
 
       - name: Run mutation testing
         if: steps.scope.outputs.run == 'true'
@@ -312,8 +318,13 @@ jobs:
           MUTATION_SCOPE_PATTERNS: ${{ steps.scope.outputs.patterns }}
         run: |
           set -uo pipefail
+          # Not `mutmut run`: scripts/mutation_run.py is that same run with
+          # mutation restricted to the changed lines. It refuses loudly if
+          # the mutmut internals it drives have moved, rather than quietly
+          # mutating whole files again.
           run_mutmut() {
-            timeout "${MUTATION_BUDGET_SECONDS}" mutmut run "$@" 2>&1 | tee mutmut_run.log
+            timeout "${MUTATION_BUDGET_SECONDS}" \
+              python scripts/mutation_run.py mutation-changed-lines.json "$@" 2>&1 | tee mutmut_run.log
             return "${PIPESTATUS[0]}"
           }
           # shellcheck disable=SC2086 -- each line is one fnmatch pattern
@@ -323,12 +334,12 @@ jobs:
           status=$?
           if [ "$status" != 0 ] && [ "$status" != 124 ] \
              && grep -q "Filtered for specific mutants, but nothing matches" mutmut_run.log; then
-            # The changed function(s) generated no mutants to check at all
-            # -- e.g. a line mutate_only_covered_lines already excludes as
-            # uncovered. mutmut asserts rather than reporting zero, so the
-            # file-level scope (still narrowed by source_paths above) is
-            # the honest fallback, not a crashed, empty report.
-            echo "::notice::no mutants matched the changed-function scope; falling back to the file-level scope"
+            # Every changed line was one mutmut generates nothing for --
+            # uncovered, or not an expression it mutates. mutmut asserts on
+            # an empty filter rather than reporting zero, so re-run without
+            # the MUTANT_NAMES gate to get that honest zero. Still bounded
+            # to the changed lines: generation is restricted either way.
+            echo "::notice::no mutants were generated on the changed lines; re-running unfiltered to report that"
             run_mutmut
             status=$?
           fi

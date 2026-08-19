@@ -1,36 +1,37 @@
 #!/usr/bin/env python3
 """
-Compute which mutants a PR's diff actually needs checked.
+Work out what a PR's diff actually changed, for mutmut to mutate.
 
     python scripts/mutation_scope.py <base-sha> <head-ref> <changed-file>...
+    python scripts/mutation_scope.py --changed-lines <base> <head> <file>...
 
-Prints mutmut-compatible fnmatch patterns, space-separated, on stdout --
-one `<module>.<mangled-name>__mutmut_*` per top-level function or method
-whose line span overlaps a changed line. Diagnostics (which file
-produced which patterns) go to stderr.
+Two outputs off the same diff, because mutmut needs both to be told
+"only what this PR touched", at two different stages:
 
-`setup.cfg`'s `source_paths` already narrows which FILES get mutants
-generated at all, but every mutant mutmut generates for a covered line
-in a 300-line function still gets CHECKED even when the diff only
-touched five of those lines -- checking is the expensive half (it reruns
-the test suite once per mutant), so a five-line fix in a large,
-well-covered function paid for hundreds of unrelated mutants. This
-computes the finer-grained scope: the exact set of functions/methods the
-diff touched, passed to `mutmut run` as positional MUTANT_NAMES so only
-mutants inside those functions are ever checked.
+`--changed-lines` prints `{"<path>": [line, ...]}` as JSON -- the lines
+the diff touched. `scripts/mutation_run.py` feeds this to mutmut's
+per-line generation filter, so a mutant is only ever CREATED on a
+changed line. This is the one that matters: a full run over `hopai/` is
+~10000 mutants, and mutating only the changed lines of a small PR is a
+few dozen.
 
-Function-level, not line-level, because that is the finest granularity
-mutmut's own naming exposes -- it mangles every mutant of a function as
-`<module>.<mangled-name>__mutmut_<N>` with no per-line identifier, and a
-nested/inner function's mutants are attributed to the enclosing
-top-level function's name rather than named separately. A one-line
-change inside a ten-line function checks that function's mutants, not
-the file's -- there is nothing finer to ask mutmut for.
+The default output prints mutmut-compatible fnmatch patterns,
+space-separated -- one `<module>.<mangled-name>__mutmut_*` per top-level
+function or method whose line span overlaps a changed line. These go to
+`mutmut run` as positional MUTANT_NAMES, which filters what gets
+CHECKED. Function-level, because that is the finest granularity mutmut's
+naming exposes: it mangles every mutant as `<name>__mutmut_<N>` with no
+per-line identifier. It is the coarser of the two, and it is kept as a
+second gate so that a stale `mutants/` tree carried over from an earlier
+run cannot smuggle in mutants from a line this PR never touched.
+
+Diagnostics (which file produced what) go to stderr in both modes.
 """
 
 from __future__ import annotations
 
 import ast
+import json
 import re
 import subprocess
 import sys
@@ -118,12 +119,35 @@ def resolve_scope(base: str, head: str, paths: list[str], cwd: str | None = None
     return sorted(set(all_patterns))
 
 
+def changed_lines_by_file(
+    base: str, head: str, paths: list[str], cwd: str | None = None
+) -> dict[str, list[int]]:
+    """`{path: sorted changed line numbers}`, skipping files the diff
+    touched but left with no line numbers to mutate."""
+    result: dict[str, list[int]] = {}
+    for path in paths:
+        changed = changed_line_numbers(base, head, path, cwd=cwd)
+        print(f"{path}: {len(changed)} changed line(s)", file=sys.stderr)
+        if changed:
+            result[path] = sorted(changed)
+    return result
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) < 3:
-        print("usage: mutation_scope.py <base-sha> <head-ref> <changed-file>...", file=sys.stderr)
+    args = argv[1:]
+    as_json = False
+    if args and args[0] == "--changed-lines":
+        as_json = True
+        args = args[1:]
+    if len(args) < 2:
+        print("usage: mutation_scope.py [--changed-lines] <base-sha> <head-ref> <changed-file>...",
+              file=sys.stderr)
         return 2
-    base, head, *paths = argv[1:]
-    print(" ".join(resolve_scope(base, head, paths)))
+    base, head, *paths = args
+    if as_json:
+        print(json.dumps(changed_lines_by_file(base, head, paths)))
+    else:
+        print(" ".join(resolve_scope(base, head, paths)))
     return 0
 
 

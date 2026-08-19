@@ -18,7 +18,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from mutation_scope import resolve_scope  # noqa: E402
+from mutation_run import narrow, restrict_to  # noqa: E402
+from mutation_scope import changed_lines_by_file, resolve_scope  # noqa: E402
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -139,3 +140,93 @@ class TestFunctionScoping:
         head = _commit(repo, "touch")
 
         assert resolve_scope(base, head, ["sub/mod.py"], cwd=str(repo)) == ["sub.mod.x_alpha__mutmut_*"]
+
+
+class TestChangedLines:
+    """The per-line map is the one that bounds how many mutants get
+    CREATED, so an over-wide answer here is the whole cost back."""
+
+    def test_only_the_touched_line_is_reported(self, repo):
+        (repo / "pkg.py").write_text("a = 1\nb = 2\nc = 3\n")
+        base = _commit(repo, "base")
+        (repo / "pkg.py").write_text("a = 1\nb = 20\nc = 3\n")
+        head = _commit(repo, "touch line 2")
+
+        assert changed_lines_by_file(base, head, ["pkg.py"], cwd=str(repo)) == {"pkg.py": [2]}
+
+    def test_a_file_the_diff_left_unchanged_is_absent_entirely(self, repo):
+        """Present-with-empty-list would mutate nothing, but absent is what
+        mutmut reads as 'no mutants for this file' -- keep them the same."""
+        (repo / "a.py").write_text("x = 1\n")
+        (repo / "b.py").write_text("y = 1\n")
+        base = _commit(repo, "base")
+        (repo / "a.py").write_text("x = 2\n")
+        head = _commit(repo, "touch a only")
+
+        assert changed_lines_by_file(base, head, ["a.py", "b.py"], cwd=str(repo)) == {"a.py": [1]}
+
+
+class TestCoveredLinesNarrowing:
+    """mutmut skips any node whose start line is missing from this map, and
+    hands back an empty set for a file the map omits -- so getting the
+    intersection wrong silently mutates everything or nothing."""
+
+    def test_the_intersection_keeps_only_lines_that_are_both_covered_and_changed(self):
+        covered = {"/w/mutants/pkg.py": {1, 2, 3, 4}}
+        restrict = {"/w/mutants/pkg.py": {3, 4, 99}}
+
+        assert narrow(covered, restrict) == {"/w/mutants/pkg.py": {3, 4}}
+
+    def test_a_covered_file_the_diff_never_touched_is_emptied_not_dropped(self):
+        """Dropping the key makes get_covered_lines_for_file return an empty
+        set anyway, but only because it defaults that way -- pin the value."""
+        covered = {"/w/mutants/touched.py": {1}, "/w/mutants/other.py": {1, 2}}
+
+        assert narrow(covered, {"/w/mutants/touched.py": {1}}) == {
+            "/w/mutants/touched.py": {1},
+            "/w/mutants/other.py": set(),
+        }
+
+    def test_no_coverage_map_means_the_changed_lines_stand_alone(self):
+        """mutate_only_covered_lines off leaves _covered_lines None; the
+        changed lines are then the whole restriction, not a no-op."""
+        restrict = {"/w/mutants/pkg.py": {5}}
+
+        assert narrow(None, restrict) == restrict
+
+    def test_keys_are_absolute_and_under_the_mutants_tree(self):
+        """mutmut looks the map up by the path it copied the source to, not
+        the repo-relative one -- a mismatch yields zero mutants and a report
+        that reads like a clean sweep."""
+        key = next(iter(restrict_to({"hopai/core.py": [1]})))
+
+        assert key == str((Path("mutants") / "hopai/core.py").absolute())
+
+
+class TestMutmutInternalsStillMatch:
+    """Restricting mutation to changed lines drives mutmut internals, not
+    its CLI. If an upgrade moves them, this must fail HERE -- the failure
+    mode in CI is a run that mutates nothing and reports a clean sweep."""
+
+    def test_the_shape_guard_passes_against_the_installed_mutmut(self):
+        pytest.importorskip("mutmut", reason="mutmut is the [mutation] extra, not [dev]")
+        from mutation_run import _assert_shape
+
+        _assert_shape()  # raises SystemExit naming what moved
+
+    def test_mutmut_reads_back_a_key_this_wrapper_writes(self):
+        """The one assumption whose breakage looks like success: mutmut's
+        own reader must find the lines under the key restrict_to() builds."""
+        pytest.importorskip("mutmut", reason="mutmut is the [mutation] extra, not [dev]")
+        from mutmut.code_coverage import get_covered_lines_for_file
+
+        path = "hopai/core.py"
+
+        assert get_covered_lines_for_file(path, restrict_to({path: [4, 9]})) == {4, 9}
+
+    def test_a_file_absent_from_the_map_gets_no_lines(self):
+        """This is what makes an untouched file generate zero mutants."""
+        pytest.importorskip("mutmut", reason="mutmut is the [mutation] extra, not [dev]")
+        from mutmut.code_coverage import get_covered_lines_for_file
+
+        assert get_covered_lines_for_file("hopai/untouched.py", restrict_to({"hopai/core.py": [1]})) == set()
