@@ -710,8 +710,16 @@ class TestAggregationRefusals:
             agg("MATCH (a)-[]->(b) RETURN zz.city, count(DISTINCT b)")
 
     def test_group_by_more_than_one_property_refused(self):
-        with pytest.raises(CypherError, match="more than one property"):
+        """The message must NAME the properties that collided, not just
+        report that some did: "(None)" or "()" still matches "more than
+        one property" while telling the caller nothing about which of
+        their keys to combine, and a rewrite the error does not name is
+        one the caller has to go and work out for themselves."""
+        with pytest.raises(CypherError, match="more than one property") as excinfo:
             agg("MATCH (a)-[]->(b) RETURN b.city, b.name, count(DISTINCT b)")
+
+        assert "b.city" in str(excinfo.value)
+        assert "b.name" in str(excinfo.value)
 
     def test_group_by_alias_refused(self):
         """The grouping key's result name is always its property name,

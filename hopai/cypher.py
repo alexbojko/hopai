@@ -1503,7 +1503,7 @@ class _Translator:
 
         group_by = None
         if ret.group_by is not None:
-            group_by = self._translate_group_by(ret.group_by, last_var)
+            group_by = self._translate_group_by(ret.group_by)
             if group_by in aggregates:
                 raise CypherError(
                     f"the grouping key {ret.group_by.var}.{group_by} lands on the same "
@@ -1512,13 +1512,20 @@ class _Translator:
                 )
         return aggregates, group_by
 
-    def _translate_group_by(self, item: _ProjectItem, last_var: Optional[str]) -> str:
+    def _translate_group_by(self, item: _ProjectItem) -> str:
         """The property name Graph.aggregate(group_by=...) should group
         by, enforcing the SAME "last node only" restriction
         _translate_aggregate() enforces on an aggregate's own variable --
         a mid-chain grouping key could sort counts under groups that
         include nodes with no continuation to the chain's end, the exact
-        thing that restriction already exists to rule out."""
+        thing that restriction already exists to rule out.
+
+        No `last_var` parameter, unlike _translate_aggregate(): that one
+        needs it to spell a suggested `WITH DISTINCT <var>` rewrite, and
+        this one decides "is it the last node" from self.node_index
+        against self.nodes instead. Taking it and never reading it made
+        every value for it interchangeable, which is a signature that
+        lies about what the check depends on."""
         if item.var in self.rel_index or item.var in self.path_vars:
             raise CypherError(
                 f"grouping by a relationship property ({item.var}.{item.key}) is not "

@@ -1087,6 +1087,50 @@ class TestValidationRunsBeforeEmbedding:
             run(body())
         assert calls == []
 
+    def test_a_bad_group_by_is_refused_before_embedding(self, async_fresh_graph):
+        """build_aggregate_query() validates group_by a second time, deep
+        inside the session, so a bad one is refused either way and the
+        RAISE alone proves nothing about the early check. What the early
+        `validate_aggregate_spec(..., group_by=group_by)` in
+        AsyncGraph.aggregate() buys is the refusal arriving before the
+        provider round trip -- drop group_by from it and the mistake
+        costs an embedding call first, exactly what this class exists to
+        prevent. Only `calls == []` pins that."""
+        calls = []
+
+        def embed(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=embed)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.aggregate(
+                Start(near=Near("summary", text="q"), keep=1),
+                aggregates={"type": Count()}, group_by="type")
+
+        with pytest.raises(ValueError, match="collides with the aggregate result"):
+            run(body())
+        assert calls == []
+
+    def test_a_non_string_group_by_is_refused_before_embedding(self, async_fresh_graph):
+        calls = []
+
+        def embed(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=embed)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.aggregate(
+                Start(near=Near("summary", text="q"), keep=1),
+                aggregates={"n": Count()}, group_by=5)
+
+        with pytest.raises(TypeError, match="group_by must be a string"):
+            run(body())
+        assert calls == []
+
 
 class TestRerankingStaysOffTheLoop:
     """Issue #73's provider call, held to issue #74's rule.
