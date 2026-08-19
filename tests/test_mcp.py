@@ -2404,6 +2404,32 @@ class TestMaxNodesLive:
     run, deliberately, because running it is the only way to know the
     real count."""
 
+    def test_the_search_hint_is_added_to_the_refusal_not_substituted_for_it(self):
+        """On a server that CAN search, the refusal gains a sentence
+        about start.search -- it does not become that sentence.
+
+        `message += ...` mutated to `message = ...` passed the whole
+        suite: the refusal still raised, still mentioned a real lever,
+        and read plausibly -- while having thrown away the count, the
+        ceiling, the reason a truncated subgraph is refused at all, and
+        the narrowing advice. A model reading it would be told to
+        rank by relevance without ever being told what went wrong.
+        That is the exact defect this library says is the worst thing
+        it can produce, and nothing objected."""
+        from hopai.mcp import _max_nodes_message
+
+        plain = _max_nodes_message("traverse_graph", 1200, 500, can_search=False)
+        with_search = _max_nodes_message("traverse_graph", 1200, 500, can_search=True)
+
+        # The whole refusal survives, and the hint is strictly appended.
+        assert with_search.startswith(plain)
+        assert len(with_search) > len(plain)
+        assert "start.search" in with_search and "start.search" not in plain
+        # Named explicitly, because startswith() alone would pass on a
+        # message that lost its first half if `plain` lost it too.
+        for owed in ("1,200", "500", "truncated subgraph is not a subgraph"):
+            assert owed in plain and owed in with_search
+
     def test_a_traversal_under_the_ceiling_succeeds_normally(self, fresh_graph):
         fresh_graph.add_nodes([{"id": i, "type": "leaf"} for i in range(5)])
         result = named(fresh_graph, read_only=True, max_nodes=10)["traverse_graph"].call(
@@ -2812,3 +2838,139 @@ class TestSearchLive:
         with pytest.raises(UnsafeFilter) as exc:
             spec.call(start=self.seed_start(document_from=".properties.ssn", candidates=5))
         assert "properties.ssn" in str(exc.value) and "properties.title" in str(exc.value)
+
+
+class TestEmbedProvider:
+    """`--embed-provider NAME` -- the alternative to --embed for a
+    process with no application around it to build a client.
+
+    Everything here resolves BEFORE the database is touched, which is the
+    behaviour being pinned as much as the messages: a server that starts
+    without its embedder and fails on the first search has moved a
+    configuration mistake into somebody's query."""
+
+    OFFLINE = "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline"
+
+    def test_the_help_lists_every_provider_and_its_variables(self, capsys):
+        assert main(["--embed-provider-help"]) == 0
+        printed = capsys.readouterr().out
+        for name in ("openai", "azure-openai", "cohere", "voyage", "google"):
+            assert name in printed
+        assert "$AZURE_OPENAI_EMBEDDING_DEPLOYMENT" in printed
+
+    def test_the_two_spellings_refuse_together(self):
+        """Both say where embeddings come from, and honouring one would
+        silently ignore the other."""
+        with pytest.raises(SystemExit):
+            main(["--dsn", self.OFFLINE, "--embed", "os.path:join",
+                  "--embed-provider", "openai"])
+
+    def test_a_model_without_a_provider_refuses(self):
+        """--embed-model configures nothing on its own: an --embed
+        function picks its own model."""
+        with pytest.raises(SystemExit):
+            main(["--dsn", self.OFFLINE, "--embed-model", "text-embedding-3-small"])
+
+    def test_an_unknown_provider_refuses_before_the_database(self, capsys):
+        with pytest.raises(SystemExit):
+            main(["--dsn", self.OFFLINE, "--embed-provider", "azure"])
+        assert "unknown embedding provider" in capsys.readouterr().err
+
+    def test_a_missing_credential_names_the_variable(self, monkeypatch, capsys):
+        """The whole point of failing here: the operator reading this is
+        looking at container logs, and the message is the fix."""
+        import hopai.mcp as mcp
+
+        def refuse(provider, model=None):
+            from hopai.providers import ProviderError
+            raise ProviderError("--embed-provider openai needs $OPENAI_API_KEY and it "
+                                "is unset or empty. Export it before starting.")
+
+        monkeypatch.setattr(mcp, "embedder_from_env", refuse)
+        with pytest.raises(SystemExit):
+            main(["--dsn", self.OFFLINE, "--embed-provider", "openai"])
+        assert "$OPENAI_API_KEY" in capsys.readouterr().err
+
+    @staticmethod
+    def _served(monkeypatch):
+        """Run main() far enough to see what reached serve(), without a
+        database: --graph skips the lookup and --no-load-schema the read."""
+        import hopai.mcp as mcp
+
+        seen = {}
+        monkeypatch.setattr(mcp, "serve", lambda graphs, **options: seen.update(options))
+
+        class FakeEmbedder:
+            def embed_query(self, text):
+                return [1.0, 0.0]
+
+        def build(provider, model=None):
+            seen["asked"] = (provider, model)
+            return FakeEmbedder()
+
+        monkeypatch.setattr(mcp, "embedder_from_env", build)
+        return seen
+
+    def test_the_query_side_of_the_embedder_is_what_serve_gets(self, monkeypatch):
+        """serve(embed=) takes ONE string and returns one vector, and a
+        search is on the QUERY side of the document/query asymmetry --
+        so it is embed_query that is handed over, not the Embedder and
+        not embed_documents."""
+        seen = self._served(monkeypatch)
+        main(["--dsn", self.OFFLINE, "--graph", "default", "--no-load-schema",
+              "--embed-provider", "openai", "--embed-model", "text-embedding-3-small"])
+        assert seen["asked"] == ("openai", "text-embedding-3-small")
+        assert seen["embed"]("anything") == [1.0, 0.0]
+
+    def test_the_provider_can_come_from_the_environment(self, monkeypatch):
+        """Which is what lets a container be configured entirely by env
+        vars, with no command line to change."""
+        monkeypatch.setenv("HOPAI_EMBED_PROVIDER", "cohere")
+        monkeypatch.setenv("HOPAI_EMBED_MODEL", "embed-v4.0")
+        seen = self._served(monkeypatch)
+        main(["--dsn", self.OFFLINE, "--graph", "default", "--no-load-schema"])
+        assert seen["asked"] == ("cohere", "embed-v4.0")
+
+    def test_without_any_of_it_there_is_simply_no_embedder(self, monkeypatch):
+        seen = self._served(monkeypatch)
+        main(["--dsn", self.OFFLINE, "--graph", "default", "--no-load-schema"])
+        assert seen["embed"] is None
+
+    def test_the_provider_embedder_is_attached_to_the_declared_fields(self, monkeypatch):
+        """--vector says a field's name and size; --embed-provider builds
+        a client. Putting them together is what lets a CLI-configured
+        server answer `near: {"field": ..., "text": ...}` at all.
+
+        Without it a container could only ever use start.search, because
+        --vector alone declares a field with no embedder and the field
+        refuses text -- which is exactly the gap this closes."""
+        import hopai.mcp as mcp
+
+        seen = {}
+        monkeypatch.setattr(mcp, "serve", lambda graphs, **options: seen.update(
+            graphs=graphs, **options))
+
+        # A real Embedder over a plain callable, not a stub with an
+        # embed_query attribute: Vector(embed=...) validates the client
+        # shape, and a stub that only looks right to this test would
+        # prove the attachment happened without proving it is usable.
+        from hopai import Embedder
+        embedder = Embedder(lambda texts: [[1.0, 0.0, 0.0] for _ in texts])
+        monkeypatch.setattr(mcp, "embedder_from_env", lambda provider, model=None: embedder)
+        main(["--dsn", self.OFFLINE, "--graph", "default", "--no-load-schema",
+              "--vector", "nodes:summary:3", "--embed-provider", "openai"])
+
+        declared = seen["graphs"]["default"].vectors["nodes"]["summary"]
+        assert declared.dimensions == 3
+        assert declared.embed is not None
+
+    def test_without_a_provider_a_declared_field_has_no_embedder(self, monkeypatch):
+        """The other half: --vector on its own still declares a field that
+        takes floats, so nothing about the no-embedder path changed."""
+        import hopai.mcp as mcp
+
+        seen = {}
+        monkeypatch.setattr(mcp, "serve", lambda graphs, **options: seen.update(graphs=graphs))
+        main(["--dsn", self.OFFLINE, "--graph", "default", "--no-load-schema",
+              "--vector", "nodes:summary:3"])
+        assert seen["graphs"]["default"].vectors["nodes"]["summary"].embed is None

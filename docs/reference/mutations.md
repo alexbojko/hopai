@@ -46,6 +46,35 @@ failure and this one would empty the graph.
 pointing at a node that no longer exists is exactly the corruption it
 was added to prevent.
 
+## Naming one specific row
+
+`where=` filters properties, and **an id is not a property** — it is a
+column. `where={"id": 7}` is a containment test against the JSONB bag,
+so it matches nothing and says nothing about why. `ids=` is how a caller
+already holding a row names it:
+
+```python
+graph.delete_nodes(ids=[12, 13], detach=True)
+graph.delete_edges(ids=[7])
+```
+
+An empty list refuses exactly as an empty filter does — it is what an
+empty selection looks like, and `all=True` stays the only opt-in. Given
+both, `ids=` and `where=` narrow **together**: a union would delete rows
+the caller named neither way.
+
+Moving an edge is not an update — `set=` writes properties, and an
+edge's endpoints are real columns:
+
+```python
+graph.repoint_edge(7, end_id=3)      # one endpoint; the other stays
+```
+
+One `UPDATE`, so the edge keeps its id and its properties and there is no
+window where it does not exist. Nothing checks that the new endpoint
+belongs to this graph, because the composite foreign key already does:
+Postgres refuses the write rather than this code remembering to look.
+
 The same operations translate from Cypher (`SET`/`REMOVE`/`DELETE`/`DETACH
 DELETE`) and compile from one JSON document, `{"operations": [...]}`
 (`MUTATE_TOOL_SCHEMA` is the ready-made tool definition), run in order as one

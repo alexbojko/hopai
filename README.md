@@ -144,6 +144,9 @@ full reference lives.
   tool schema), and a Cypher subset all compile through the same builder.
 - 🔌 **An MCP server in one command** — `hopai-mcp` exposes reading, writing,
   schema and similarity tools, with permissions deciding which tools exist.
+- 🌐 **An HTTP API and a graph explorer** — `hopai-api` serves the same
+  operations as JSON for a browser, and a self-contained page at `/` that
+  draws the graph, filters it, and edits it under the same permissions.
 - 🔐 **Constraints Neo4j puts behind an enterprise licence** — unique,
   composite, partial, existence, type and CHECK constraints on JSONB.
 - 🧲 **Similarity-seeded traversal** — find the nodes closest in meaning to
@@ -218,6 +221,7 @@ tier of this table that is structurally unable to go stale:
 | Cypher as input syntax | [`04_json_and_cypher`](notebooks/04_json_and_cypher.ipynb) | [Cypher](https://hopai.readthedocs.io/en/latest/reference/cypher/) |
 | What this doesn't do (yet), and why each refusal is a refusal | — | [Limits](https://hopai.readthedocs.io/en/latest/reference/limits/) |
 | MCP server — client setup, every tool, every flag | — | [Full guide](https://hopai.readthedocs.io/en/latest/mcp/) |
+| HTTP API and the graph explorer | — | [Full guide](https://hopai.readthedocs.io/en/latest/http-api/) |
 | Read/write pipelines, multi-graph internals, gotchas | — | [architecture.md](https://hopai.readthedocs.io/en/latest/architecture/) |
 | Fixtures, coverage gate, mutation testing | — | [testing.md](https://hopai.readthedocs.io/en/latest/testing/) |
 | release-please, PyPI trusted publishing | — | [releasing.md](https://hopai.readthedocs.io/en/latest/releasing/) |
@@ -241,6 +245,27 @@ inference/declaration, and similarity search. **Permissions decide which
 tools exist**: `--read-only` registers reading only, the default adds
 writing, `--allow-mutations` adds deleting, `--allow-ddl` adds
 `enforce_schema`. 📖 **[Full guide](https://hopai.readthedocs.io/en/latest/mcp/)**.
+
+## 🌐 HTTP API and graph explorer
+
+A browser cannot reasonably speak MCP — that is JSON-RPC with session
+negotiation over a streaming transport — so the same operations are served
+as ordinary JSON, plus a graph explorer at `/`:
+
+```bash
+pip install "hopai[http]"
+hopai-api --dsn postgresql+psycopg2://user:pass@localhost/db --allow-mutations
+# → explorer at http://127.0.0.1:8080/
+```
+
+Switch graphs, toggle node types, filter by name or by property values, drag
+and pin nodes, show edge labels, repoint an edge, delete a row. The page reads
+the permissions the server was started with and **hides what it would refuse**;
+every delete takes two clicks and names what will go. The whole page is one
+file with no CDN, shipped in the wheel. 📖
+**[Full guide](https://hopai.readthedocs.io/en/latest/http-api/)**.
+
+`docker compose up -d` brings up Postgres, this API and the MCP server together.
 
 ## ⏱️ Async
 

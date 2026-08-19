@@ -1726,7 +1726,8 @@ class Graph:
             self._mutator_cache = Mutator(self)
         return self._mutator_cache
 
-    def delete_nodes(self, where=None, detach: bool = False, all: bool = False):
+    def delete_nodes(self, where=None, detach: bool = False, all: bool = False,
+                     ids=None):
         """Delete every node matching `where` -- the same filter language
         a traversal uses. Returns a MutationResult.
 
@@ -1734,9 +1735,22 @@ class Graph:
         to delete its edges with it (Cypher's DETACH DELETE). A call with
         no filter raises rather than emptying the graph -- say it on
         purpose with all=True, or call clear()."""
-        return self._mutator.delete_nodes(where, detach=detach, all=all)
+        return self._mutator.delete_nodes(where, detach=detach, all=all, ids=ids)
 
-    def delete_edges(self, where=None, start=None, end=None, all: bool = False):
+    def repoint_edge(self, edge_id, start_id=None, end_id=None):
+        """Move one edge to different endpoints, by id.
+
+            graph.repoint_edge(edge["id"], end_id=other["id"])
+
+        Not something `update_edges` can do: `set=` writes properties,
+        and an edge's endpoints are real columns. One UPDATE, so the
+        edge keeps its id and its properties and never briefly does not
+        exist. The composite foreign key refuses an endpoint outside
+        this graph -- Postgres enforces it, nothing here has to check."""
+        return self._mutator.repoint_edge(edge_id, start_id=start_id, end_id=end_id)
+
+    def delete_edges(self, where=None, start=None, end=None, all: bool = False,
+                     ids=None):
         """Delete every edge matching `where`, optionally restricted to
         edges whose endpoints match `start`/`end`:
 
@@ -1748,8 +1762,10 @@ class Graph:
         exactly one node and ambiguity raises.
 
         Returns a MutationResult. Deleting an edge never affects the
-        nodes it connected."""
-        return self._mutator.delete_edges(where, start=start, end=end, all=all)
+        nodes it connected. `ids=` names specific edges instead, with
+        the same rules as delete_nodes()."""
+        return self._mutator.delete_edges(where, start=start, end=end, all=all,
+                                          ids=ids)
 
     def update_nodes(self, where=None, set=None, remove=None, replace: bool = False,
                      all: bool = False):

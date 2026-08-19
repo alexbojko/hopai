@@ -154,6 +154,61 @@ vector. `--vector` declares a field as `[GRAPH:]TARGET:NAME:DIMENSIONS` and is
 repeatable — vector fields are per-handle, so a CLI server has no other way to know
 about them.
 
+### Or name a provider and let the environment supply the rest
+
+`--embed` needs a Python function to point at, which a container does not have. Name a
+provider instead and hopai builds the client from environment variables:
+
+```bash
+export OPENAI_API_KEY=sk-...
+hopai-mcp --dsn ... --vector nodes:summary:1536 \
+          --embed-provider openai --embed-model text-embedding-3-small
+```
+
+```bash
+export AZURE_OPENAI_API_KEY=...
+export AZURE_OPENAI_ENDPOINT=https://my-resource.openai.azure.com
+export AZURE_OPENAI_EMBEDDING_DEPLOYMENT=my-embedding-deployment
+hopai-mcp --dsn ... --vector nodes:summary:3072 --embed-provider azure-openai
+```
+
+| Provider | Reads |
+| --- | --- |
+| `openai` | `$OPENAI_API_KEY`, `$OPENAI_EMBEDDING_MODEL`. Optional `$OPENAI_BASE_URL`, `$OPENAI_ORG_ID` |
+| `azure-openai` | `$AZURE_OPENAI_API_KEY`, `$AZURE_OPENAI_ENDPOINT`, `$AZURE_OPENAI_EMBEDDING_DEPLOYMENT`. Optional `$AZURE_OPENAI_API_VERSION` |
+| `cohere` | `$COHERE_API_KEY`, `$COHERE_EMBEDDING_MODEL` |
+| `voyage` | `$VOYAGE_API_KEY`, `$VOYAGE_EMBEDDING_MODEL` |
+| `google` | `$GOOGLE_API_KEY` (or `$GEMINI_API_KEY`), `$GOOGLE_EMBEDDING_MODEL` |
+| `sentence-transformers` | `$SENTENCE_TRANSFORMERS_MODEL`. Runs locally, no credentials |
+
+`hopai-mcp --embed-provider-help` prints that table. The provider and model can also come
+from `$HOPAI_EMBED_PROVIDER` and `$HOPAI_EMBED_MODEL`, so a container is configured
+entirely by environment with no command to change.
+
+!!! warning "On Azure, the model is the DEPLOYMENT name"
+    `$AZURE_OPENAI_EMBEDDING_DEPLOYMENT` is the deployment you created in the portal,
+    which is often **not** the same string as the model it serves. Passing the model
+    name where Azure wants the deployment is the usual way this configuration fails.
+
+**Everything that can be wrong is wrong at start-up**, out loud, naming the fix — an
+unknown provider, a package that is not installed, a variable that is not set, a model
+that was never chosen. A server that starts without a working embedder and only finds
+out on the first search has turned a configuration mistake into somebody's failed query,
+somewhere else, later.
+
+```
+hopai-mcp: error: --embed-provider azure-openai needs $AZURE_OPENAI_ENDPOINT and it is
+unset or empty. Export it before starting. It is the resource URL, e.g.
+https://my-resource.openai.azure.com
+```
+
+The model is never defaulted, for the reason the whole vector surface exists to protect:
+the model answering a query has to be the model that wrote the stored vectors, and
+picking one on your behalf returns confidently wrong neighbours with nothing to see.
+
+`--embed-provider` also **attaches its embedder to the fields `--vector` declares**, so
+`near: {"field": ..., "text": ...}` works from a container too — not only `start.search`.
+
 With both set, `search_similar` is registered and the traversal tools grow a
 `start.search` that seeds the walk from the most similar nodes:
 

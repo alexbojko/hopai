@@ -284,6 +284,8 @@ from .json_api import (
     refuse_vectors, traverse_json, vector_search_json,
 )
 from .models import DEFAULT_GRAPH
+from .providers import ProviderError, describe, embedder_from_env, provider_names
+from .vectors import Vector
 
 #: Server-level guidance, sent to the client at connection time. What a
 #: model has to know before its first call and cannot see in any single
@@ -1757,6 +1759,26 @@ def build_parser() -> argparse.ArgumentParser:
                         help="A function taking text and returning a vector. Without it "
                              "there is no search by meaning -- a model cannot supply an "
                              "embedding itself.")
+    # The alternative to --embed for a process with no application around
+    # it: name a provider and let hopai build the client from the
+    # environment. Both spellings end at the same `embed` callable; see
+    # hopai/providers.py for the variables each name reads.
+    parser.add_argument("--embed-provider", metavar="NAME",
+                        default=os.environ.get("HOPAI_EMBED_PROVIDER"),
+                        help="Build the embedding client from environment variables "
+                             "instead of --embed. One of: "
+                             f"{', '.join(provider_names())}. Defaults to "
+                             "$HOPAI_EMBED_PROVIDER. Credentials come from that "
+                             "provider's own variables -- run --embed-provider-help "
+                             "to see which.")
+    parser.add_argument("--embed-model", metavar="NAME",
+                        default=os.environ.get("HOPAI_EMBED_MODEL"),
+                        help="The embedding model, or on Azure the DEPLOYMENT name. "
+                             "Only with --embed-provider. Defaults to $HOPAI_EMBED_MODEL, "
+                             "then to the provider's own variable. Never guessed.")
+    parser.add_argument("--embed-provider-help", action="store_true",
+                        help="Print which environment variables each provider reads, "
+                             "and exit.")
     parser.add_argument("--load-schema", action=argparse.BooleanOptionalAction, default=True,
                         help="Adopt the schema saved in the database, if there is one "
                              "(default). --no-load-schema skips the lookup.")
@@ -1769,10 +1791,57 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_embed(parser, args):
+    """The `embed` callable, from --embed or from --embed-provider.
+
+    Resolved BEFORE the database is touched and before a single tool is
+    registered, because the alternative is a server that starts happily
+    and fails on somebody's first search -- a configuration mistake
+    surfacing later, elsewhere, as a broken query. Everything that can
+    be wrong here (unknown name, missing package, unset variable, no
+    model) is wrong at start-up, out loud, naming the fix.
+
+    Returns (embed, embedder). `embed` is the server-level callable
+    serve() takes -- one string in, one vector out. `embedder` is the
+    Embedder behind it, or None for --embed, and it is separate because
+    it can do something the callable cannot: be attached to the vector
+    FIELDS, which is what makes `near: {"field": ..., "text": ...}` work
+    on a server configured entirely from a command line. Without that a
+    container could only ever use start.search."""
+    if args.embed and args.embed_provider:
+        parser.error("--embed and --embed-provider both say where embeddings come from "
+                     "-- pass one. --embed points at your own function; "
+                     "--embed-provider builds a client from the environment")
+    if args.embed_model and not args.embed_provider:
+        parser.error("--embed-model only means something with --embed-provider. Your own "
+                     "--embed function chooses its own model")
+    if not args.embed_provider:
+        return args.embed, None
+    try:
+        embedder = embedder_from_env(args.embed_provider, model=args.embed_model)
+    except ProviderError as exc:
+        # parser.error rather than a traceback: the reader is an operator
+        # looking at container logs, and the message already names the
+        # variable to export. A stack trace would bury it.
+        parser.error(str(exc))
+    # embed_query, not the Embedder: serve(embed=) takes ONE string and
+    # returns one vector, and this is the query side of the asymmetry --
+    # the side a search is on.
+    return embedder.embed_query, embedder
+
+
 def main(argv: Optional[list] = None) -> int:
     """`hopai-mcp`. Builds the graphs from the arguments and serves them."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.embed_provider_help:
+        print("Embedding providers and the environment variables each one reads:\n")
+        for name in provider_names():
+            print(f"  {describe(name)}")
+        print("\nPass --embed-provider NAME. The model is never guessed: give "
+              "--embed-model or\nthe provider's own model variable.")
+        return 0
+    embed, embedder = _resolve_embed(parser, args)
     if not args.dsn:
         parser.error("no database to serve -- pass --dsn or set HOPAI_DSN")
 
@@ -1819,6 +1888,14 @@ def main(argv: Optional[list] = None) -> int:
     for name, graph in graphs.items():
         fields = [(target, field) for chosen, target, field in args.vector
                   if chosen in (None, name)]
+        if embedder is not None:
+            # --vector declares a name and a size; --embed-provider built
+            # a client. Putting them together is what lets a CLI server
+            # answer `near: {"field": ..., "text": ...}` at all -- the
+            # field embeds its own text, and start.search stops being the
+            # only way in from a container.
+            fields = [(target, Vector(field.name, field.dimensions, embed=embedder))
+                      for target, field in fields]
         if fields:
             graph.define_vectors(
                 nodes=[field for target, field in fields if target == "nodes"],
@@ -1837,7 +1914,7 @@ def main(argv: Optional[list] = None) -> int:
 
     serve(graphs, transport=args.transport, host=args.host, port=args.port, path=args.path,
           name=args.name, read_only=args.read_only, allow_ddl=args.allow_ddl,
-          allow_mutations=args.allow_mutations, embed=args.embed,
+          allow_mutations=args.allow_mutations, embed=embed,
           strict_schema=args.strict_schema, max_nodes=args.max_nodes)
     return 0
 

@@ -85,6 +85,10 @@ from sqlalchemy.dialects.postgresql import JSONB, array
 from sqlalchemy.exc import IntegrityError
 
 from .constraints import ConstraintViolation
+# The same coercion the vector writes use: results carry ids as
+# strings, and a caller handing one straight back should not have to
+# remember to int() it.
+from .vectors import _coerce_id
 from .filters import parse_filter, resolve
 from .ingest import constraint_violation, one_transaction
 
@@ -201,7 +205,7 @@ class Mutator:
         """Whether a filter constrains nothing. `{}` is not "no filter
         given" to resolve() -- it compiles to TRUE, which is precisely
         the accident this returns True for."""
-        return filt is None or (isinstance(filt, dict) and not filt)
+        return filt is None or (isinstance(filt, (dict, list, tuple)) and not filt)
 
     def _guard(self, filters: list, call: str, what: str, all: bool) -> None:
         """The unfiltered-mutation refusal, in one place so every entry
@@ -240,7 +244,7 @@ class Mutator:
         it is the whole predicate when the filter is empty too."""
         return [] if self.g.graph_col is None else [self.g._scoped(table)]
 
-    def _node_conditions(self, where) -> list:
+    def _node_conditions(self, where, ids=None) -> list:
         """The node rows a mutation targets: the graph, then the filter.
 
         A blank filter is left out rather than resolved to TRUE -- it is
@@ -251,9 +255,16 @@ class Mutator:
         conditions = self._scope(nt)
         if not self._blank(where):
             conditions.append(resolve(nt.c.properties, where))
+        if not self._blank(ids):
+            # The one way to address a SPECIFIC row. `where` filters
+            # properties and an id is not a property -- where={"id": 7}
+            # matches nothing and says nothing, which is the trap this
+            # closes for any caller holding ids from a traversal result.
+            conditions.append(getattr(nt.c, self.g.node_id_col).in_(
+                [_coerce_id(one) for one in ids]))
         return conditions
 
-    def _edge_conditions(self, where, start, end) -> list:
+    def _edge_conditions(self, where, start, end, ids=None) -> list:
         """The edge rows a mutation targets: its own properties, plus
         optional filters on the nodes at either end.
 
@@ -265,25 +276,29 @@ class Mutator:
         conditions = self._scope(et)
         if not self._blank(where):
             conditions.append(resolve(et.c.properties, where))
+        if not self._blank(ids):
+            conditions.append(getattr(et.c, self.g.edge_id_col).in_(
+                [_coerce_id(one) for one in ids]))
         for column, filt in ((self.g.edge_start_col, start), (self.g.edge_end_col, end)):
             if not self._blank(filt):
                 conditions.append(getattr(et.c, column).in_(self._node_ids(filt)))
         return conditions
 
-    def _node_ids(self, filt):
+    def _node_ids(self, filt, ids=None):
         """The ids of this graph's nodes matching `filt`, as a subquery.
         Scoped like every other read: an unscoped one would let an
         endpoint filter match a node belonging to another graph."""
         nt = self.g.nodes_tbl
-        return select(getattr(nt.c, self.g.node_id_col)).where(*self._node_conditions(filt))
+        return select(getattr(nt.c, self.g.node_id_col)).where(
+            *self._node_conditions(filt, ids))
 
     # -- statements -----------------------------------------------------
 
-    def delete_nodes_statement(self, where=None, all: bool = False):
-        self._guard([where], "delete_nodes", "node", all)
-        return delete(self.g.nodes_tbl).where(*self._node_conditions(where))
+    def delete_nodes_statement(self, where=None, all: bool = False, ids=None):
+        self._guard([where, ids], "delete_nodes", "node", all)
+        return delete(self.g.nodes_tbl).where(*self._node_conditions(where, ids))
 
-    def detach_statement(self, where=None, all: bool = False):
+    def detach_statement(self, where=None, all: bool = False, ids=None):
         """Every edge incident to the nodes `where` matches, in either
         direction. Run before the node delete and in the same
         transaction, so no caller of this library can insert an edge
@@ -291,17 +306,19 @@ class Mutator:
         supposed to prevent. It narrows that window rather than closing
         it: under READ COMMITTED a concurrent session can still commit
         an edge that the node delete then trips over."""
-        self._guard([where], "delete_nodes", "node", all)
+        self._guard([where, ids], "delete_nodes", "node", all)
         et = self.g.edges_tbl
-        matched = self._node_ids(where)
+        matched = self._node_ids(where, ids)
         return delete(et).where(*self._scope(et), or_(
             getattr(et.c, self.g.edge_start_col).in_(matched),
             getattr(et.c, self.g.edge_end_col).in_(matched),
         ))
 
-    def delete_edges_statement(self, where=None, start=None, end=None, all: bool = False):
-        self._guard([where, start, end], "delete_edges", "edge", all)
-        return delete(self.g.edges_tbl).where(*self._edge_conditions(where, start, end))
+    def delete_edges_statement(self, where=None, start=None, end=None, all: bool = False,
+                               ids=None):
+        self._guard([where, start, end, ids], "delete_edges", "edge", all)
+        return delete(self.g.edges_tbl).where(
+            *self._edge_conditions(where, start, end, ids))
 
     def update_nodes_statement(self, where=None, set=None, remove=None,
                                replace: bool = False, all: bool = False):
@@ -320,14 +337,14 @@ class Mutator:
     # -- execution ------------------------------------------------------
 
     def delete_nodes(self, where=None, detach: bool = False, all: bool = False,
-                     connection=None) -> MutationResult:
+                     connection=None, ids=None) -> MutationResult:
         started = time.perf_counter()
         _flag(detach, "delete_nodes", "detach")
         # The statements are built before the transaction opens: a
         # refusal (no filter, contradictory arguments) should raise
         # without having taken a connection out of the pool.
-        detach_statement = self.detach_statement(where, all) if detach else None
-        statement = self.delete_nodes_statement(where, all)
+        detach_statement = self.detach_statement(where, all, ids) if detach else None
+        statement = self.delete_nodes_statement(where, all, ids)
         with one_transaction(self.g, connection) as conn:
             edges = conn.execute(detach_statement).rowcount if detach else 0
             try:
@@ -337,10 +354,54 @@ class Mutator:
         return MutationResult(deleted_nodes=nodes, deleted_edges=edges,
                               elapsed_ms=(time.perf_counter() - started) * 1000)
 
-    def delete_edges(self, where=None, start=None, end=None, all: bool = False,
+    def repoint_edge(self, edge_id, start_id=None, end_id=None,
                      connection=None) -> MutationResult:
+        """Move one edge to different endpoints, by id.
+
+        Not expressible as an update: `set=` writes PROPERTIES, and an
+        edge's endpoints are real columns -- which is the point of them.
+        One UPDATE rather than a delete and an insert, so the edge keeps
+        its id and its properties and there is no window where it does
+        not exist.
+
+        Nothing checks that the new endpoints are nodes of this graph,
+        because the composite foreign key already does: an edge can only
+        ever join two nodes of its own graph, and Postgres refuses the
+        write rather than this code remembering to look."""
         started = time.perf_counter()
-        statement = self.delete_edges_statement(where, start, end, all)
+        statement = self.repoint_edge_statement(edge_id, start_id, end_id)
+        with one_transaction(self.g, connection) as conn:
+            try:
+                moved = conn.execute(statement).rowcount
+            except IntegrityError as exc:
+                raise ValueError(
+                    f"repoint_edge({edge_id!r}): no node with that id in graph "
+                    f"{self.g.graph!r} -- an edge cannot leave its own graph, and the "
+                    f"foreign key refused it ({exc.orig})") from exc
+        return MutationResult(updated_edges=moved,
+                              elapsed_ms=(time.perf_counter() - started) * 1000)
+
+    def repoint_edge_statement(self, edge_id, start_id=None, end_id=None):
+        """The UPDATE, with no connection -- so the graph discriminator
+        can be asserted on with nothing running, the same way every
+        other statement in this class is."""
+        if start_id is None and end_id is None:
+            raise ValueError(
+                "repoint_edge() was given neither start_id nor end_id, so there is "
+                "nothing to move -- name at least one endpoint")
+        values = {}
+        if start_id is not None:
+            values[self.g.edge_start_col] = _coerce_id(start_id)
+        if end_id is not None:
+            values[self.g.edge_end_col] = _coerce_id(end_id)
+        return (update(self.g.edges_tbl)
+                .where(*self._edge_conditions(None, None, None, [edge_id]))
+                .values(**values))
+
+    def delete_edges(self, where=None, start=None, end=None, all: bool = False,
+                     connection=None, ids=None) -> MutationResult:
+        started = time.perf_counter()
+        statement = self.delete_edges_statement(where, start, end, all, ids)
         with one_transaction(self.g, connection) as conn:
             deleted = conn.execute(statement).rowcount
         return MutationResult(deleted_edges=deleted,

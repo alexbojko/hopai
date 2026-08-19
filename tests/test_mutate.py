@@ -1225,3 +1225,127 @@ class TestCypherExecution:
     def test_the_plan_can_be_reviewed_before_it_runs(self, people):
         cypher_to_mutations("MATCH (n) DETACH DELETE n")
         assert len(properties_of(people)) == 4
+
+
+class TestAddressingRowsById:
+    """`ids=` exists because `where=` filters PROPERTIES and an id is not
+    one: `where={"id": 7}` is a containment test against the JSONB bag,
+    it matches nothing, and it says nothing while doing it. Any caller
+    holding a specific row -- a UI with a node selected, a script that
+    just inserted one -- had no way to name it before this.
+    """
+
+    def _ids(self, graph) -> dict:
+        found = graph.traverse(Start(), Hop(hops=1, optional=True))
+        return {node["properties"]["name"]: node["id"] for node in found.nodes}
+
+    def test_deleting_by_id_touches_exactly_that_row(self, people):
+        ids = self._ids(people)
+        result = people.delete_nodes(ids=[ids["Carol"]], detach=True)
+        assert (result.deleted_nodes, result.deleted_edges) == (1, 1)
+        assert names(people) == {"Alice", "Bob", "Acme"}
+
+    def test_an_id_is_not_a_property(self, people):
+        """The reason this parameter had to exist. Kept as a test rather
+        than a comment: if `where` ever grew id handling, `ids=` would
+        be a second way to do one thing and this would say so."""
+        assert people.delete_nodes(where={"id": self._ids(people)["Carol"]},
+                                   detach=True).deleted_nodes == 0
+
+    def test_several_ids_at_once(self, people):
+        ids = self._ids(people)
+        assert people.delete_nodes(ids=[ids["Carol"], ids["Acme"]],
+                                   detach=True).deleted_nodes == 2
+
+    def test_an_id_that_is_a_string_is_the_same_id(self, people):
+        """The page sends whatever JSON carried -- ids arrive as strings
+        over HTTP whatever the column type is."""
+        assert people.delete_nodes(ids=[str(self._ids(people)["Acme"])],
+                                   detach=True).deleted_nodes == 1
+
+    def test_an_empty_ids_list_refuses_like_an_empty_filter(self, people):
+        """An empty list is what an empty selection looks like, and it is
+        the same unrecoverable mistake `where={}` is. `all=True` stays
+        the only opt-in."""
+        with pytest.raises(ValueError, match="all=True"):
+            people.delete_nodes(ids=[])
+        assert names(people) == {"Alice", "Bob", "Carol", "Acme"}
+
+    def test_ids_and_a_filter_narrow_together(self, people):
+        """AND, not OR -- both are constraints on the same row, and a
+        union would delete rows the caller named neither way."""
+        ids = self._ids(people)
+        assert people.delete_nodes(ids=[ids["Carol"]],
+                                   where={"type": "company"}).deleted_nodes == 0
+
+    def test_deleting_an_edge_by_id(self, people):
+        found = people.traverse(Start(), Hop(hops=1, optional=True))
+        edge = next(e for e in found.edges if e["properties"].get("kind") == "works_at")
+        assert people.delete_edges(ids=[edge["id"]]).deleted_edges == 1
+        assert kinds(people) == ["knows", "knows"]
+
+    def test_an_empty_edge_ids_list_refuses_too(self, people):
+        with pytest.raises(ValueError, match="all=True"):
+            people.delete_edges(ids=[])
+
+    def test_the_id_predicate_is_scoped_to_the_graph(self, offline_graph):
+        """Node ids are a GLOBAL primary key, so an id from another
+        graph is a perfectly valid id -- the discriminator is the only
+        thing stopping `ids=` from reaching across graphs."""
+        sql = norm(Mutator(offline_graph.in_graph("marketing"))
+                   .delete_nodes_statement(ids=[7, 8]))
+        assert "graph_id = 'marketing'" in sql
+        assert "IN (7, 8)" in sql
+
+
+class TestRepointingAnEdge:
+    """Moving an edge's endpoint is not expressible as an update: `set=`
+    writes PROPERTIES, and an edge's endpoints are real columns. A UI
+    that lets you drag an arrow from one node to another has nothing
+    else to call."""
+
+    def _edge(self, graph, kind):
+        found = graph.traverse(Start(), Hop(hops=1, optional=True))
+        by_id = {node["id"]: node["properties"]["name"] for node in found.nodes}
+        edge = next(e for e in found.edges if e["properties"].get("kind") == kind)
+        return edge, by_id
+
+    def test_moving_the_end_leaves_the_start(self, people):
+        edge, by_id = self._edge(people, "works_at")
+        carol = next(i for i, name in by_id.items() if name == "Carol")
+        assert people.repoint_edge(edge["id"], end_id=carol).updated_edges == 1
+        moved, by_id = self._edge(people, "works_at")
+        assert (by_id[moved["start_id"]], by_id[moved["end_id"]]) == ("Alice", "Carol")
+
+    def test_moving_the_start_leaves_the_end(self, people):
+        edge, by_id = self._edge(people, "works_at")
+        bob = next(i for i, name in by_id.items() if name == "Bob")
+        assert people.repoint_edge(edge["id"], start_id=bob).updated_edges == 1
+        moved, by_id = self._edge(people, "works_at")
+        assert (by_id[moved["start_id"]], by_id[moved["end_id"]]) == ("Bob", "Acme")
+
+    def test_naming_neither_end_refuses(self, people):
+        """Nothing to do is not the same as doing nothing quietly: a
+        repoint that moved no endpoint is a caller who forgot an
+        argument, and a 1-row "updated" would hide it."""
+        edge, _ = self._edge(people, "works_at")
+        with pytest.raises(ValueError, match="start_id|end_id"):
+            people.repoint_edge(edge["id"])
+
+    def test_an_endpoint_in_another_graph_is_refused_by_the_database(self, people):
+        """The composite foreign key (start_id, graph_id) -> (nodes.id,
+        nodes.graph_id) already makes a cross-graph edge impossible, so
+        repointing does not re-check it in Python -- it lets the
+        constraint fire. This test is what says that is deliberate."""
+        other = people.in_graph("elsewhere")
+        other.add_nodes([{"type": "person", "name": "Elsewhere"}])
+        stranger = other.traverse(Start()).nodes[0]["id"]
+        edge, _ = self._edge(people, "works_at")
+        with pytest.raises(Exception) as exc:
+            people.repoint_edge(edge["id"], end_id=stranger)
+        assert "graph" in str(exc.value).lower()
+
+    def test_it_is_scoped_to_the_graph(self, offline_graph):
+        sql = norm(Mutator(offline_graph.in_graph("marketing"))
+                   .repoint_edge_statement(4, end_id=9))
+        assert "graph_id = 'marketing'" in sql
