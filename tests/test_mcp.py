@@ -170,6 +170,29 @@ class _Stub:
         return {}
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_hopai_configuration(monkeypatch):
+    """No $HOPAI_* server configuration inherited from the shell.
+
+    build_parser() reads these for its defaults and _resolve_rerank()
+    reads $HOPAI_RERANK_FIELDS at resolve time, so a developer who
+    exported one to try a reranker configures a server in every test
+    that asserts there is none. Exporting $HOPAI_RERANK_FIELDS alone
+    fails 17 tests in TestCommandLine and TestEmbedProvider -- and, far
+    worse, makes the refusal tests that assert only `SystemExit` pass
+    for the wrong reason.
+
+    File-wide rather than per-class because main() reads every one of
+    these on every run: a class that never mentions reranking is exactly
+    the class that would not think to clear it. Tests that WANT a
+    variable set it themselves with monkeypatch.setenv, which runs
+    after this."""
+    for name in ("HOPAI_RERANK_PROVIDER", "HOPAI_RERANK_MODEL",
+                 "HOPAI_RERANK_DOCUMENT_FROM", "HOPAI_RERANK_FIELDS",
+                 "HOPAI_EMBED_PROVIDER", "HOPAI_EMBED_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture()
 def vector_graph() -> Graph:
     g = offline()
@@ -1756,6 +1779,27 @@ class TestCommandLine:
             main([])
         assert "--dsn or set HOPAI_DSN" in capsys.readouterr().err
 
+    def test_a_rerank_refusal_reaches_the_operator_through_main(
+            self, monkeypatch, capsys):
+        """main() must hand _resolve_rerank the REAL parser, because
+        every refusal in there is a parser.error() call. Passing None
+        instead turns each one into an AttributeError climbing out of
+        main -- a traceback where the design promises a sentence naming
+        the fix, and precisely the failure this whole module's error
+        handling exists to avoid.
+
+        A mutant doing exactly that (`_resolve_rerank(None, args)`)
+        survived: no test reached a rerank refusal through main(), only
+        through _resolve_rerank() directly, where the parser is supplied
+        by the test itself."""
+        monkeypatch.delenv("HOPAI_RERANK_FIELDS", raising=False)
+        with pytest.raises(SystemExit):
+            main(["--dsn", "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+                  "--rerank-provider", "sentence-transformers",
+                  "--rerank-model", "cross-encoder/ms-marco-MiniLM-L-6-v2"])
+        line = capsys.readouterr().err.strip().splitlines()[-1]
+        assert "error: a reranker needs --rerank-document-from" in line
+
     def test_the_missing_dsn_refusal_names_the_flag_and_the_variable_end_to_end(
             self, monkeypatch, capsys):
         """The message names BOTH ways to supply a DSN, and it is the
@@ -3082,23 +3126,11 @@ class TestRerankProvider:
     OFFLINE = "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline"
     MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-    @pytest.fixture(autouse=True)
-    def _no_ambient_configuration(self, monkeypatch):
-        """build_parser() reads $HOPAI_RERANK_* for its defaults, so a
-        shell that exports one would configure a reranker in a test that
-        asserts there is none.
-
-        $HOPAI_RERANK_FIELDS is on the list for the sharper version of
-        the same reason: it is read at RESOLVE time rather than as a
-        parser default, so an inherited one would hand an allowlist to
-        every test here that asserts the "needs --rerank-field" refusal
-        -- and would let a reranker build in a test that passed no
-        --rerank-field at all, which is a spurious PASS rather than a
-        noisy failure. Every test that wants it sets it itself."""
-        for name in ("HOPAI_RERANK_PROVIDER", "HOPAI_RERANK_MODEL",
-                     "HOPAI_RERANK_DOCUMENT_FROM", "HOPAI_RERANK_FIELDS",
-                     "HOPAI_EMBED_PROVIDER", "HOPAI_EMBED_MODEL"):
-            monkeypatch.delenv(name, raising=False)
+    # Every $HOPAI_RERANK_* variable is cleared by this file's autouse
+    # _no_ambient_hopai_configuration -- which matters most here, since
+    # an inherited $HOPAI_RERANK_FIELDS would let a reranker build in a
+    # test that passed no --rerank-field at all. Each test below that
+    # wants one sets it itself.
 
     @staticmethod
     def cross_encoder_module(monkeypatch) -> dict:
@@ -3315,13 +3347,21 @@ class TestRerankProvider:
     def test_a_rerank_model_with_your_own_function_refuses(self, capsys):
         """--rerank-model selects a model at a vendor; a function you
         wrote chooses its own, so honouring the flag is impossible and
-        ignoring it is worse."""
+        ignoring it is worse.
+
+        Anchored at BOTH ends, for the reason
+        test_the_missing_dsn_refusal_names_the_flag_and_the_variable_end_to_end
+        gives: a substring in the middle goes on passing against a
+        message whose edges have been rewritten -- and the second half
+        is the half that says WHY, which is what stops an operator
+        reaching for --rerank-provider to make the refusal go away."""
         with pytest.raises(SystemExit):
             self.resolved(["--rerank", "os.path:join", "--rerank-model", self.MODEL,
                            "--rerank-document-from", ".properties.title",
                            "--rerank-field", "properties.title"])
-        assert "--rerank-model only means something with --rerank-provider" in \
-            capsys.readouterr().err
+        line = capsys.readouterr().err.strip().splitlines()[-1]
+        assert "error: --rerank-model only means something with --rerank-provider." in line
+        assert line.endswith("Your own --rerank function chooses its own model")
 
     @pytest.mark.parametrize("flag, value", [
         ("--rerank-model", MODEL),

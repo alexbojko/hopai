@@ -693,20 +693,28 @@ class TestARerankRefusalNamesTheRerankFlags:
         "sentence-transformers": (FakeCrossEncoder, "CrossEncoder"),
     }
 
-    @pytest.mark.parametrize("provider, extra", [
-        ("cohere", "cohere"), ("voyage", "voyageai"),
-        ("sentence-transformers", "sentence-transformers"),
+    @pytest.mark.parametrize("provider, extra, module", [
+        ("cohere", "cohere", "cohere"), ("voyage", "voyageai", "voyageai"),
+        ("sentence-transformers", "sentence-transformers", "sentence_transformers"),
     ])
     def test_a_missing_package_names_the_rerank_flag_and_the_pip_extra(
-            self, absent, provider, extra):
+            self, absent, provider, extra, module):
         """The real message, from the real _import() -- the one path the
         faked-import tests below structurally cannot reach, since they
-        replace the function that raises it."""
+        replace the function that raises it.
+
+        The MODULE NAME is asserted exactly, not just that the sentence
+        has a shape: the name each builder passes to _import() is an
+        import-time string literal, so a wrong one still raises
+        ImportError and still produces a perfectly-formed refusal -- one
+        naming a module the operator cannot install. `voyageai` is the
+        case that makes this concrete: the provider is spelled `voyage`
+        and the package is not."""
         absent(providers.RERANK_PROVIDERS[provider].package)
         with pytest.raises(ProviderError) as caught:
             rerank_client_from_env(provider, model="m", env={})
         message = str(caught.value)
-        assert f"--rerank-provider {provider} needs the " in message
+        assert f"--rerank-provider {provider} needs the {module!r} package" in message
         assert f'pip install "hopai[{extra}]"' in message
         assert "--embed-provider" not in message
 
@@ -724,6 +732,12 @@ class TestARerankRefusalNamesTheRerankFlags:
         assert f"--rerank-provider {provider} needs ${missing} and it is unset or " \
                "empty. Export it before starting." in message
         assert "--embed-provider" not in message
+        # And it ENDS there. `extra_help` is _need()'s one optional
+        # argument, appended straight onto the sentence with no
+        # separator; no reranking credential passes it, so anything after
+        # the full stop is text that arrived from somewhere other than
+        # this call -- which a containment assertion cannot see.
+        assert message.endswith("Export it before starting.")
 
     @pytest.mark.parametrize("provider, variable, example", [
         ("cohere", "COHERE_RERANK_MODEL", "rerank-v3.5"),
