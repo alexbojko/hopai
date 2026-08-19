@@ -505,8 +505,8 @@ class TestAggregateJsonPythonEquivalence:
         with pytest.raises(ValueError, match="matched nodes are already distinct"):
             Count(distinct=True)
 
-    def test_spec_to_aggregation_returns_the_full_triple(self):
-        start, hops, aggregates = spec_to_aggregation({
+    def test_spec_to_aggregation_returns_the_full_quadruple(self):
+        start, hops, aggregates, group_by = spec_to_aggregation({
             "start": {"where": {"type": "person"}},
             "hops": [{"via": {"kind": "friend"}, "hops": [1, 4]}],
             "aggregates": {"n": {"fn": "count"}, "mean": {"fn": "avg", "property": "age"}},
@@ -514,6 +514,20 @@ class TestAggregateJsonPythonEquivalence:
         assert start.where == {"type": "person"}
         assert (hops[0].min_hops, hops[0].max_hops) == (1, 4)
         assert repr(aggregates["n"]) == "Count()" and repr(aggregates["mean"]) == "Avg('age')"
+        assert group_by is None
+
+    def test_spec_to_aggregation_carries_group_by_through(self):
+        start, hops, aggregates, group_by = spec_to_aggregation({
+            "start": {"where": {"type": "person"}},
+            "aggregates": {"n": {"fn": "count"}},
+            "group_by": "city",
+        })
+        assert group_by == "city"
+
+    def test_spec_group_by_must_be_a_string(self):
+        with pytest.raises(ValueError, match='"group_by" must be a property name string'):
+            spec_to_aggregation({"start": {"where": {"a": 1}},
+                                 "aggregates": {"n": {"fn": "count"}}, "group_by": 5})
 
     @pytest.mark.parametrize("spec", [
         {"start": {"where": {"a": 1}}},
@@ -547,12 +561,28 @@ class TestAggregateToolSchema:
             parse_aggregate({"fn": fn, "property": "age"})  # must not raise
 
     def test_an_example_from_the_schema_translates(self):
-        start, hops, aggregates = spec_to_aggregation({
+        start, hops, aggregates, group_by = spec_to_aggregation({
             "start": {"where": {"type": "person"}},
             "hops": [{"via": {"kind": "friend"}, "hops": [1, 4], "direction": "forward"}],
             "aggregates": {"friends": {"fn": "count"}},
         })
         assert start.where and len(hops) == 1 and list(aggregates) == ["friends"]
+        assert group_by is None
+
+    def test_group_by_is_advertised_as_a_top_level_string(self):
+        """group_by is a key spec_to_aggregation() reads (see the test
+        above) -- unadvertised, a model would have no way to discover
+        the grouping feature exists at all."""
+        properties = AGGREGATE_TOOL_SCHEMA["parameters"]["properties"]
+        assert properties["group_by"]["type"] == "string"
+
+    def test_a_group_by_example_from_the_schema_translates(self):
+        start, hops, aggregates, group_by = spec_to_aggregation({
+            "start": {"where": {"type": "person"}},
+            "aggregates": {"n": {"fn": "count"}},
+            "group_by": "city",
+        })
+        assert group_by == "city"
 
 
 # ---------------------------------------------------------------------
@@ -875,7 +905,7 @@ class TestSpecSuppliedReranking:
         seen = {}
 
         class StubGraph:
-            def aggregate(self, start, *hops, aggregates):
+            def aggregate(self, start, *hops, aggregates, group_by=None):
                 seen["start"] = start
                 return {"n": 0}
 
@@ -952,7 +982,7 @@ class TestSpecSuppliedReranking:
         against no policy at all -- so a spec that traverse_json()
         accepts refuses here, and the reranking an operator configured
         never reaches the step whose nodes are counted."""
-        start, _, aggregates = spec_to_aggregation(
+        start, _, aggregates, _ = spec_to_aggregation(
             {"start": {"near": {"field": "s", "text": "x"}, "keep": 3,
                        "rerank": {"document_from": ".properties.body", "candidates": 20}},
              "aggregates": {"n": {"fn": "count"}}},

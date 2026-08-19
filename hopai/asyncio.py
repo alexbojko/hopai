@@ -318,14 +318,15 @@ class AsyncGraph:
             return await session.run_sync(
                 lambda s: self._sync._traverse_with_session(s, start, hops, pins=pins))
 
-    async def aggregate(self, start: Start, *hops: Hop, aggregates: dict) -> dict:
+    async def aggregate(self, start: Start, *hops: Hop, aggregates: dict,
+                        group_by: Optional[str] = None):
         from .core import validate_aggregate_spec
-        validate_aggregate_spec(list(hops), aggregates)
+        validate_aggregate_spec(list(hops), aggregates, group_by=group_by)
         start, hops, pins = await self._reranked(start, list(hops))
         async with AsyncSession(self._async_engine) as session:
             return await session.run_sync(
                 lambda s: self._sync._aggregate_with_session(s, start, hops, aggregates,
-                                                             pins=pins))
+                                                             group_by=group_by, pins=pins))
 
     async def vector_search(self, *near, target: str = "nodes", k: int = 10, where=None,
                             boost=None, rerank=None) -> list:
@@ -557,9 +558,9 @@ class AsyncGraph:
         if any(isinstance(c, _WriteClause) for c in clauses):
             return await self.write_cypher(query, **options)
         if any(isinstance(c, _ReturnClause) for c in clauses):
-            start, hops, aggregates = cypher_to_aggregation(
+            start, hops, aggregates, group_by = cypher_to_aggregation(
                 query, **resolve_strict(self._sync, dict(options)))
-            return await self.aggregate(start, *hops, aggregates=aggregates)
+            return await self.aggregate(start, *hops, aggregates=aggregates, group_by=group_by)
         start, hops = cypher_to_traversal(query, **resolve_strict(self._sync, dict(options)))
         return await self.traverse(start, *hops)
 

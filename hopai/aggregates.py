@@ -24,6 +24,16 @@ forms, exactly like filters:
   all three front ends compile through the one resolve_aggregate() --
   never add a second compilation path.
 
+GROUPING: `group_by="city"` (`Graph.aggregate(..., group_by=...)`,
+`{"group_by": "city"}` in JSON, `RETURN b.city, count(b)` in Cypher) runs
+every aggregate once per distinct value of a property on the SAME final
+-step nodes the aggregates already run over -- resolve_group_by() below
+does the grouping-key extraction, resolve_aggregate() still does the
+aggregates themselves, and core.py's build_aggregate_query() is the only
+place the two combine into one GROUP BY. There is no separate grouped
+code path to keep in sync: grouping constrains which rows an aggregate
+sees per call, never how resolve_aggregate() computes one.
+
 WHAT THE NUMBERS MEAN -- this is the part worth reading twice, because
 "aggregate over a traversal" can mean three different things:
 
@@ -136,6 +146,20 @@ def _numeric_value(column, key: str):
     do with missing values -- and PropertyType('key', 'number') is the
     constraint that keeps such rows out in the first place."""
     return case((func.jsonb_typeof(column[key]) == "number", cast(column[key].astext, Numeric)))
+
+
+def resolve_group_by(column, key: str):
+    """The GROUP BY key for a grouped aggregation: a final-step property
+    as text, NULL when the key is missing or holds an explicit JSON
+    null -- the same ->> (astext) idiom Count(property)/resolve_aggregate()
+    use above, so "no value for this property" groups together as one
+    group rather than being silently dropped from every group (a bare
+    `->` would make a JSON null indistinguishable from the string
+    `"null"`, and a missing key would drop the row from the GROUP BY
+    entirely instead of forming its own group)."""
+    if not isinstance(key, str):
+        raise TypeError(f"group_by must be a string property key, got {key!r}")
+    return column[key].astext
 
 
 def resolve_aggregate(column, agg: Any):

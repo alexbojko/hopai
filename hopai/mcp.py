@@ -1047,10 +1047,12 @@ def _aggregate_tool(served: Served, schema: dict, embed: Optional[Callable],
     schema["parameters"]["properties"].update(_graph_key(served))
 
     def aggregate_graph(start: dict, aggregates: dict, hops: Optional[list] = None,
-                        graph: Optional[str] = None) -> dict:
+                        group_by: Optional[str] = None, graph: Optional[str] = None) -> dict:
         chosen = served.pick(graph, "aggregate_graph")
         spec = {"start": _seed(chosen, embed, start, "aggregate_graph"),
                 "hops": hops or [], "aggregates": aggregates}
+        if group_by is not None:
+            spec["group_by"] = group_by
         refuse_vectors({"hops": spec["hops"]}, "aggregate_graph")
         # Reranked aggregates run over the reranked SURVIVORS, which is
         # still "the nodes the last step matched" -- see Graph.aggregate.

@@ -188,9 +188,27 @@ Consequences, each a one-line rule:
   - Only the LAST node of the chain can be aggregated: a mid-chain
     match may include nodes with no continuation to the chain's end,
     which Cypher would not count. Reverse the pattern instead.
-  - Mixing aggregates with plain return items is grouping (GROUP BY),
-    which hopai does not have yet; relationship-variable aggregates and
-    collect()/stdev()/percentiles are not supported yet either.
+  - Mixing aggregates with plain return items is grouping (GROUP BY) --
+    ACCEPTED for exactly one shape: a single `<lastvar>.<property>`
+    projection alongside the aggregate(s), e.g. `RETURN b.city,
+    count(b)`. It compiles to `Graph.aggregate(..., group_by="city")`,
+    grouping the SAME last-step nodes the aggregate(s) already run over.
+    Every other mixed projection still refuses by the same reasoning as
+    a bare aggregate:
+      * a WHOLE node (`RETURN b, count(b)`) -- there is no property to
+        group by, and grouping by node identity is just the ungrouped
+        count restated with extra syntax.
+      * a property on anything but the LAST node (`RETURN a.city,
+        count(b)`) -- exactly the mid-chain restriction above, applied
+        to the grouping key instead of the aggregate: `a` may include
+        rows with no continuation to `b`, so grouping by it would sort
+        counts under groups Cypher would not agree contain them.
+      * a relationship or path variable's property -- aggregation over
+        relationships is not supported yet either (see above).
+      * more than one plain projection -- hopai groups by a single
+        property; combine the keys upstream or run separate queries.
+    relationship-variable aggregates and collect()/stdev()/percentiles
+    are not supported yet either.
 
 LABELS: hopai has no label concept -- a node is its JSONB properties. So
 `(a:person)` compiles to a property test, `{node_label_key: "person"}`,
@@ -205,7 +223,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from sqlalchemy import not_ as _sa_not
 
@@ -416,12 +434,26 @@ class _AggItem:
 
 
 @dataclass
+class _ProjectItem:
+    """A plain `var.key` projection alongside an aggregate in RETURN:
+    `RETURN b.city, count(b)`'s `b.city`. The ONLY plain shape RETURN
+    accepts next to an aggregate -- it names the grouping key of a
+    grouped aggregation (see AGGREGATION in the module docstring). A
+    bare variable with no `.key` (`RETURN b, count(b)`) is not this --
+    there is no property to group by, so that keeps refusing exactly as
+    it did before grouping existed."""
+    var: str
+    key: str
+
+
+@dataclass
 class _ReturnClause:
     """An aggregating RETURN, possibly prefixed by `WITH DISTINCT var`.
     A RETURN with no aggregates never becomes a clause -- it is parsed
     and ignored, since the subgraph is the result either way."""
-    items: list              # [_AggItem, ...], never empty
+    items: list                          # [_AggItem, ...], never empty
     distinct_var: Optional[str]
+    group_by: Optional[_ProjectItem] = None
 
 
 #: The aggregate functions Graph.aggregate() computes.
@@ -589,16 +621,27 @@ class _Parser:
                 self._next()
             return None
 
-        items = [self._parse_return_item()]
+        raw_items = [self._parse_return_item()]
         while self._at_punct(","):
             self._next()
-            items.append(self._parse_return_item())
+            raw_items.append(self._parse_return_item())
         t = self._peek()
         if t.kind == "name" and t.value.upper() in _UNSUPPORTED_CLAUSES:
             raise CypherError(_UNSUPPORTED_CLAUSES[t.value.upper()])
         if t.kind != "eof":
             raise CypherError(f"unexpected {self._describe(t)} at position {t.pos}")
-        return _ReturnClause(items=items, distinct_var=distinct_var)
+
+        items = [i for i in raw_items if isinstance(i, _AggItem)]
+        group_items = [i for i in raw_items if isinstance(i, _ProjectItem)]
+        if len(group_items) > 1:
+            named = ", ".join(f"{g.var}.{g.key}" for g in group_items)
+            raise CypherError(
+                f"RETURN groups by more than one property ({named}) -- hopai groups by a "
+                f"single property. Combine them into one property upstream, or run "
+                f"separate queries"
+            )
+        return _ReturnClause(items=items, distinct_var=distinct_var,
+                             group_by=group_items[0] if group_items else None)
 
     def _sees_aggregate(self) -> bool:
         """Whether the rest of the query contains an aggregate call --
@@ -609,14 +652,16 @@ class _Parser:
                 return True
         return False
 
-    def _parse_return_item(self) -> _AggItem:
+    def _parse_return_item(self):
+        """One RETURN item once an aggregate is known to be present:
+        either an aggregate call, or (the one plain shape allowed
+        alongside one -- see AGGREGATION in the module docstring) a
+        `var.key` projection naming the grouping key of a grouped
+        aggregation. Anything else, including a bare variable with no
+        `.key`, still refuses: there is no property there to group by."""
         t = self._peek()
         if t.kind != "name" or not (self._peek(1).kind == "punct" and self._peek(1).value == "("):
-            raise CypherError(
-                f"RETURN mixes an aggregate with a plain item at position {t.pos} -- that "
-                f"is grouped aggregation (GROUP BY), which hopai does not support yet. "
-                f"Either aggregate every item, or drop the aggregates and take the subgraph"
-            )
+            return self._parse_group_item()
         fn = self._next().value.lower()
         if fn not in _TRANSLATED_AGGREGATES:
             raise CypherError(
@@ -643,6 +688,35 @@ class _Parser:
             self._next()
             alias = self._expect_name()
         return _AggItem(fn=fn, var=var, key=key, distinct=distinct, alias=alias)
+
+    def _parse_group_item(self) -> _ProjectItem:
+        """`var.key`, the grouping key of a grouped aggregation -- the
+        one plain RETURN item allowed next to an aggregate. Anything
+        else here is refused: a bare `var` (`RETURN b, count(b)`) names
+        a whole node, not a property to group by, and the grouping key
+        has no alias of its own -- its result name is always the
+        property name, matching how Graph.aggregate(group_by=...)
+        already names it, so `AS` here would promise a rename nothing
+        downstream honors."""
+        t = self._peek()
+        if t.kind != "name":
+            raise CypherError(f"unexpected {self._describe(t)} at position {t.pos} in RETURN")
+        var = self._next().value
+        if not self._at_punct("."):
+            raise CypherError(
+                f"RETURN mixes an aggregate with the plain item {var!r} at position {t.pos} "
+                f"-- a whole node cannot be a grouping key. Write `{var}.<property>` to group "
+                f"by one of its properties, or drop {var} and take the ungrouped aggregate"
+            )
+        self._next()   # '.'
+        key = self._expect_name()
+        if self._at_kw("AS"):
+            raise CypherError(
+                f"RETURN {var}.{key} AS ... is not supported -- a grouping key's result name "
+                f"is always its property name ({key!r}), matching "
+                f"Graph.aggregate(group_by=...). Drop the alias"
+            )
+        return _ProjectItem(var=var, key=key)
 
     # -- MATCH ----------------------------------------------------------
 
@@ -1392,11 +1466,12 @@ class _Translator:
 
     # -- aggregating RETURN ----------------------------------------------
 
-    def emit_aggregates(self, ret: _ReturnClause) -> dict:
-        """The {name: aggregate} dict a _ReturnClause means, or a
-        CypherError naming the rewrite when its Cypher meaning is not
-        exactly what Graph.aggregate() computes -- see AGGREGATION in
-        the module docstring for the rules being enforced here."""
+    def emit_aggregates(self, ret: _ReturnClause) -> tuple:
+        """The ({name: aggregate}, group_by) pair a _ReturnClause means
+        -- group_by is None for a plain (ungrouped) aggregating RETURN
+        -- or a CypherError naming the rewrite when its Cypher meaning is
+        not exactly what Graph.aggregate() computes -- see AGGREGATION
+        in the module docstring for the rules being enforced here."""
         last_var = self.nodes[-1].var
         if self.optional_hop is not None:
             raise CypherError(
@@ -1425,7 +1500,42 @@ class _Translator:
                     f"alias: `{item.fn}(...) AS other_name`"
                 )
             aggregates[name] = self._translate_aggregate(item, last_var, per_node)
-        return aggregates
+
+        group_by = None
+        if ret.group_by is not None:
+            group_by = self._translate_group_by(ret.group_by, last_var)
+            if group_by in aggregates:
+                raise CypherError(
+                    f"the grouping key {ret.group_by.var}.{group_by} lands on the same "
+                    f"result key as an aggregate named {group_by!r} -- give that aggregate "
+                    f"an alias (`... AS other_name`) so the two don't collide"
+                )
+        return aggregates, group_by
+
+    def _translate_group_by(self, item: _ProjectItem, last_var: Optional[str]) -> str:
+        """The property name Graph.aggregate(group_by=...) should group
+        by, enforcing the SAME "last node only" restriction
+        _translate_aggregate() enforces on an aggregate's own variable --
+        a mid-chain grouping key could sort counts under groups that
+        include nodes with no continuation to the chain's end, the exact
+        thing that restriction already exists to rule out."""
+        if item.var in self.rel_index or item.var in self.path_vars:
+            raise CypherError(
+                f"grouping by a relationship property ({item.var}.{item.key}) is not "
+                f"supported yet -- group by a property on the node at the end of the hop "
+                f"instead"
+            )
+        if item.var not in self.node_index:
+            raise CypherError(f"unknown variable {item.var!r} in RETURN")
+        if self.node_index[item.var] != len(self.nodes) - 1:
+            raise CypherError(
+                f"only the LAST node of the chain can be a grouping key, and {item.var!r} "
+                f"is not it: hopai does not track which mid-chain nodes lie on a complete "
+                f"path, so grouping by {item.var}.{item.key} here would sort counts under "
+                f"groups Cypher would not agree contain them. Reverse the pattern so "
+                f"{item.var} comes last, or run a separate query"
+            )
+        return item.key
 
     def _translate_aggregate(self, item: _AggItem, last_var: Optional[str], per_node: bool):
         from .aggregates import Avg, Count, Max, Min, Sum
@@ -2315,9 +2425,12 @@ def cypher_to_aggregation(
     schema=None,
 ) -> tuple:
     """Translate an aggregating Cypher MATCH into
-    `(Start, [Hop, ...], {name: aggregate})` -- the exact arguments of
-    `Graph.aggregate()`. Exposed separately from aggregate_cypher() so
-    you can inspect or adjust the translation before running it.
+    `(Start, [Hop, ...], {name: aggregate}, group_by)` -- the exact
+    arguments of `Graph.aggregate()`. `group_by` is `None` for a plain
+    (ungrouped) aggregating RETURN, and the property name (a string) for
+    `RETURN <lastvar>.<property>, <aggregate>(...)`. Exposed separately
+    from aggregate_cypher() so you can inspect or adjust the translation
+    before running it.
 
     Takes the same keyword options as cypher_to_traversal(), refuses the
     same things, and additionally refuses aggregation spellings whose
@@ -2331,12 +2444,12 @@ def cypher_to_aggregation(
             "this query has no aggregating RETURN -- run it with "
             "graph.traverse_cypher() (or graph.cypher(), which picks for you)"
         )
-    aggregates = translator.emit_aggregates(ret)
+    aggregates, group_by = translator.emit_aggregates(ret)
     start, hops = translator.emit()
     if schema is not None:
         from .schema import validate_traversal
         validate_traversal(schema, start, hops, node_label_key, edge_type_key)
-    return start, hops, aggregates
+    return start, hops, aggregates, group_by
 
 
 def resolve_strict(graph: Graph, options: dict) -> dict:
@@ -2367,7 +2480,7 @@ def traverse_cypher(graph: Graph, query: str, **options) -> Subgraph:
     return graph.traverse(start, *hops)
 
 
-def aggregate_cypher(graph: Graph, query: str, **options) -> dict:
+def aggregate_cypher(graph: Graph, query: str, **options) -> Union[dict, list]:
     """Run an aggregation written in Cypher.
 
         aggregate_cypher(graph, '''
@@ -2379,6 +2492,17 @@ def aggregate_cypher(graph: Graph, query: str, **options) -> dict:
     Result keys are the `AS` aliases where given, else `fn` or
     `fn_property` (`count`, `avg_age`). Accepts the same keyword options
     as cypher_to_traversal().
+
+        aggregate_cypher(graph, '''
+            MATCH (a:person)-[:friend]->(b) RETURN b.city, count(b)
+        ''')
+        # -> [{"city": "Berlin", "count": 2}, {"city": None, "count": 1}, ...]
+
+    A plain property projection alongside the aggregate(s) groups by it
+    -- see AGGREGATION in the module docstring -- and the result becomes
+    a LIST of per-group dicts instead of one, exactly as
+    `Graph.aggregate(group_by=...)` returns.
     """
-    start, hops, aggregates = cypher_to_aggregation(query, **resolve_strict(graph, dict(options)))
-    return graph.aggregate(start, *hops, aggregates=aggregates)
+    start, hops, aggregates, group_by = cypher_to_aggregation(
+        query, **resolve_strict(graph, dict(options)))
+    return graph.aggregate(start, *hops, aggregates=aggregates, group_by=group_by)

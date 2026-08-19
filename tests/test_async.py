@@ -135,6 +135,13 @@ class TestSameAnswerAsSync:
         async_result = run(async_graph.aggregate(start, aggregates={"n": Count()}))
         assert async_result == sync_result
 
+    def test_aggregate_group_by(self, graph, async_graph):
+        start = Start()
+        sync_result = graph.aggregate(start, aggregates={"n": Count()}, group_by="type")
+        async_result = run(async_graph.aggregate(start, aggregates={"n": Count()},
+                                                  group_by="type"))
+        assert async_result == sync_result
+
     def test_a_reranked_traversal_answers_the_same_either_way(
             self, async_fresh_graph, async_admin_graph):
         """AsyncGraph has its OWN rerank driver -- the probes go through
@@ -243,6 +250,16 @@ class TestSameAnswerAsSync:
         sync_result = graph.cypher(query)
         async_result = run(async_graph.cypher(query))
         assert async_result == sync_result
+
+    def test_cypher_grouped_aggregate(self, graph, async_graph):
+        """AsyncGraph.cypher()'s own dispatch unpacks cypher_to_aggregation's
+        group_by too -- dropped there, this would run the ungrouped
+        aggregate instead and return a dict where a list was asked for."""
+        query = "MATCH (a) RETURN a.type, count(a)"
+        sync_result = graph.cypher(query)
+        async_result = run(async_graph.cypher(query))
+        key = lambda row: (row["type"] is None, row["type"])
+        assert sorted(async_result, key=key) == sorted(sync_result, key=key)
 
     def test_cypher_aggregate_carries_its_hops(self, graph, async_graph):
         """The case above has no hops, so it cannot see cypher()'s
