@@ -35,8 +35,16 @@ def tr(query: str, **options):
 def agg(query: str, **options) -> dict:
     """The {name: aggregate-repr} dict a query translates to -- reprs for
     the same reason filters are compared by repr()."""
-    _, _, aggregates = cypher_to_aggregation(query, **options)
+    _, _, aggregates, _ = cypher_to_aggregation(query, **options)
     return {name: repr(a) for name, a in aggregates.items()}
+
+
+def agg_grouped(query: str, **options) -> tuple:
+    """Like agg(), plus the group_by key a grouped RETURN translates to
+    -- kept separate from agg() so every existing (ungrouped) assertion
+    stays a plain dict comparison."""
+    _, _, aggregates, group_by = cypher_to_aggregation(query, **options)
+    return {name: repr(a) for name, a in aggregates.items()}, group_by
 
 
 def bounds(hop: Hop) -> tuple:
@@ -583,10 +591,39 @@ class TestAggregationTranslation:
         assert agg("MATCH (a)-[]->(b) RETURN count(DISTINCT b) AS n, "
                    "min(b.age) AS youngest") == {"n": "Count()", "youngest": "Min('age')"}
 
+    def test_group_by_last_node_property_is_accepted(self):
+        """`RETURN b.city, count(b)` -- the issue's own example -- groups
+        by a property on the LAST node, next to a per-node aggregate."""
+        aggregates, group_by = agg_grouped("MATCH (a)-[]->(b) RETURN b.city, count(DISTINCT b)")
+        assert aggregates == {"count": "Count()"} and group_by == "city"
+
+    def test_group_by_works_with_multiple_aggregates(self):
+        aggregates, group_by = agg_grouped(
+            "MATCH (a)-[]->(b) WITH DISTINCT b RETURN b.city, count(b), avg(b.age)"
+        )
+        assert aggregates == {"count": "Count()", "avg_age": "Avg('age')"}
+        assert group_by == "city"
+
+    def test_group_by_order_of_items_does_not_matter(self):
+        """The grouping projection may come after the aggregate too --
+        Cypher does not mandate an order among RETURN items."""
+        aggregates, group_by = agg_grouped(
+            "MATCH (a)-[]->(b) RETURN count(DISTINCT b), b.city"
+        )
+        assert aggregates == {"count": "Count()"} and group_by == "city"
+
+    def test_group_by_with_no_hops(self):
+        """No hops means no path multiplicity, so a bare aggregate is
+        exact even grouped -- the same zero-hop exception plain
+        aggregation gets."""
+        aggregates, group_by = agg_grouped("MATCH (a:leaf) RETURN a.priority, count(a)")
+        assert aggregates == {"count": "Count()"} and group_by == "priority"
+
     def test_translation_returns_the_traversal_too(self):
-        start, hops, aggregates = cypher_to_aggregation(
+        start, hops, aggregates, group_by = cypher_to_aggregation(
             "MATCH (a:person)-[:friend*1..4]->(b {active: true}) RETURN count(DISTINCT b)"
         )
+        assert group_by is None
         assert start.where == {"type": "person"}
         assert (hops[0].min_hops, hops[0].max_hops) == (1, 4)
         assert repr(hops[0].where) == repr({"active": True})
@@ -648,12 +685,52 @@ class TestAggregationRefusals:
         with pytest.raises(CypherError, match="unknown variable"):
             agg("MATCH (a)-[]->(b) RETURN count(DISTINCT zz)")
 
-    def test_mixing_aggregates_with_projection_is_grouping(self):
-        """`RETURN b.city, count(DISTINCT b)` means GROUP BY, a feature
-        hopai does not have -- silently computing the global count would
-        answer a different question."""
-        with pytest.raises(CypherError, match="GROUP BY"):
+    def test_whole_node_projection_is_not_a_grouping_key(self):
+        """`RETURN b.city, count(b)` groups by a property (below); a
+        WHOLE node next to an aggregate (`RETURN b, count(DISTINCT b)`)
+        is not that -- there is no property there to group by, so this
+        keeps refusing exactly as it did before grouping existed."""
+        with pytest.raises(CypherError, match="grouping key"):
             agg("MATCH (a)-[]->(b) RETURN b, count(DISTINCT b)")
+
+    def test_group_by_mid_chain_property_refused(self):
+        """The invariant grouping must not weaken: `a` is mid-chain (the
+        last node is `c`), so grouping by a.city could sort counts under
+        groups that include nodes with no continuation to `c` -- exactly
+        what the plain-aggregate mid-chain refusal already rules out."""
+        with pytest.raises(CypherError, match="LAST node(.|\n)*grouping key"):
+            agg("MATCH (a)-[]->(b)-[]->(c) RETURN a.city, count(DISTINCT c)")
+
+    def test_group_by_relationship_property_refused(self):
+        with pytest.raises(CypherError, match="relationship property"):
+            agg("MATCH (a)-[r:knows]->(b) RETURN r.since, count(DISTINCT b)")
+
+    def test_group_by_unknown_variable_refused(self):
+        with pytest.raises(CypherError, match="unknown variable"):
+            agg("MATCH (a)-[]->(b) RETURN zz.city, count(DISTINCT b)")
+
+    def test_group_by_more_than_one_property_refused(self):
+        """The message must NAME the properties that collided, not just
+        report that some did: "(None)" or "()" still matches "more than
+        one property" while telling the caller nothing about which of
+        their keys to combine, and a rewrite the error does not name is
+        one the caller has to go and work out for themselves."""
+        with pytest.raises(CypherError, match="more than one property") as excinfo:
+            agg("MATCH (a)-[]->(b) RETURN b.city, b.name, count(DISTINCT b)")
+
+        assert "b.city" in str(excinfo.value)
+        assert "b.name" in str(excinfo.value)
+
+    def test_group_by_alias_refused(self):
+        """The grouping key's result name is always its property name,
+        matching Graph.aggregate(group_by=...) -- an alias here would
+        promise a rename nothing downstream honors."""
+        with pytest.raises(CypherError, match="result name is always its property name"):
+            agg("MATCH (a)-[]->(b) RETURN b.city AS c, count(DISTINCT b)")
+
+    def test_group_by_colliding_with_an_aggregate_key_refused(self):
+        with pytest.raises(CypherError, match="lands on the same"):
+            agg("MATCH (a)-[]->(b) RETURN b.city, count(DISTINCT b) AS city")
 
     def test_unsupported_aggregate_functions_name_the_supported_ones(self):
         with pytest.raises(CypherError, match="avg, count, max, min, sum"):
@@ -1086,6 +1163,23 @@ class TestAgainstFixtureGraph:
         result = graph.cypher("MATCH (a:leaf) RETURN count(a)")
         assert result == {"count": 4}
 
+    def test_grouped_aggregation_matches_python_api_exactly(self, graph):
+        """RETURN b.type, count(b) -- the issue's own example -- against
+        every node in the fixture: matches the Python group_by= call row
+        for row, list included."""
+        from hopai import Count
+
+        via_cypher = aggregate_cypher(graph, "MATCH (a) RETURN a.type, count(a) AS n")
+        via_python = graph.aggregate(Start(), aggregates={"n": Count()}, group_by="type")
+        key = lambda row: (row["type"] is None, row["type"])
+        assert (sorted(via_cypher, key=key) == sorted(via_python, key=key)
+               == [{"type": "hub", "n": 1}, {"type": "leaf", "n": 4}, {"type": None, "n": 2}])
+
+    def test_grouped_aggregation_dispatches_through_graph_cypher(self, graph):
+        result = graph.cypher("MATCH (a:leaf) RETURN a.priority, count(a)")
+        assert isinstance(result, list)
+        assert {"priority": None, "count": 1} in result  # n4-deadend, no priority
+
 
 class TestOptionForwarding:
     """Every dispatching entry point takes the same keyword options as
@@ -1123,7 +1217,7 @@ class TestOptionForwarding:
         options: without node_label_key=None the label filters, without
         edge_type_key=None the type filters, and without max_var_length
         the unbounded `*` raises."""
-        start, hops, aggregates = cypher_to_aggregation(
+        start, hops, aggregates, _ = cypher_to_aggregation(
             "MATCH (a:leaf)-[r:knows*]->(b) RETURN count(DISTINCT b)",
             node_label_key=None, edge_type_key=None, max_var_length=3,
         )

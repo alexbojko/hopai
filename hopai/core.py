@@ -339,9 +339,10 @@ def validate_optional_positions(hops: list) -> None:
             )
 
 
-def validate_aggregate_spec(hops: list, aggregates: dict) -> None:
-    """aggregates must be a non-empty dict, and no hop may be optional=True
-    -- see Graph.build_aggregate_query(). Same reason as
+def validate_aggregate_spec(hops: list, aggregates: dict, group_by: Optional[str] = None) -> None:
+    """aggregates must be a non-empty dict, no hop may be optional=True,
+    and group_by (when given) must not collide with an aggregate's own
+    result name -- see Graph.build_aggregate_query(). Same reason as
     validate_optional_positions(): AsyncGraph.aggregate() runs this
     before resolving any Near(text=...) in the chain."""
     if not isinstance(aggregates, dict) or not aggregates:
@@ -349,6 +350,15 @@ def validate_aggregate_spec(hops: list, aggregates: dict) -> None:
             "aggregates must be a non-empty dict naming each result, e.g. "
             "{'friends': Count(), 'avg_age': Avg('age')}"
         )
+    if group_by is not None:
+        if not isinstance(group_by, str):
+            raise TypeError(f"group_by must be a string property key, got {group_by!r}")
+        if group_by in aggregates:
+            raise ValueError(
+                f"group_by={group_by!r} collides with the aggregate result also named "
+                f"{group_by!r} -- rename that aggregate's key so the grouping value and "
+                f"the aggregate's value don't land on the same name"
+            )
     for i, hop in enumerate(hops):
         if hop.optional:
             raise ValueError(
@@ -950,17 +960,25 @@ class Graph:
         return node_selects[0].union(*node_selects[1:], *edge_selects)
 
     def build_aggregate_query(self, start: Start, hops: list, aggregates: dict,
-                              pins: Optional[dict] = None):
+                              group_by: Optional[str] = None, pins: Optional[dict] = None):
         """The single statement Graph.aggregate() runs: the same
         seed/walk/match chain as build_query, with the aggregates
         computed over the final match instead of the subgraph being
         reported. None of the edge-reconstruction CTEs (`hop_edges_*`,
         `all_edges`, `edge_rows`) are emitted -- an aggregation needs no
         edges, so it is strictly less work than the traversal it
-        summarizes."""
-        from .aggregates import resolve_aggregate
+        summarizes.
 
-        validate_aggregate_spec(hops, aggregates)
+        `group_by`, when given, is a property name read off the SAME
+        final-step nodes the aggregates already run over -- there is no
+        separate variable naming a different step, so "group by a
+        mid-chain or edge property" is not a shape this signature can
+        even express, rather than a case checked for and refused (Cypher's
+        RETURN, which DOES let a caller name any step, enforces that
+        restriction itself in cypher.py before it ever reaches here)."""
+        from .aggregates import resolve_aggregate, resolve_group_by
+
+        validate_aggregate_spec(hops, aggregates, group_by=group_by)
 
         nt = self.nodes_tbl
         node_id_col = getattr(nt.c, self.node_id_col)
@@ -975,8 +993,24 @@ class Graph:
             resolve_aggregate(nt.c.properties, agg).label(name)
             for name, agg in aggregates.items()
         ]
-        return select(*columns).select_from(
-            final.join(nt, and_(node_id_col == final.c.node_id, self._scoped(nt)))
+        join = final.join(nt, and_(node_id_col == final.c.node_id, self._scoped(nt)))
+        if group_by is None:
+            return select(*columns).select_from(join)
+        # Grouped by the same expression it is later read back through,
+        # not by the label: Postgres allows GROUP BY/ORDER BY a SELECT
+        # label, but naming the expression itself is what makes this
+        # correct regardless of how a future refactor spells the label.
+        # ORDER BY is added for a reason no other read path here has --
+        # everywhere else "unordered" is the documented contract
+        # (docs/reference), but a caller comparing a LIST of grouped rows
+        # needs a stable order to compare against, and grouping is a small
+        # number of rows either way.
+        group_expr = resolve_group_by(nt.c.properties, group_by)
+        return (
+            select(group_expr.label(group_by), *columns)
+            .select_from(join)
+            .group_by(group_expr)
+            .order_by(group_expr)
         )
 
     # -- schema ---------------------------------------------------------
@@ -2087,22 +2121,36 @@ class Graph:
     # -- execution ------------------------------------------------------
 
     def _aggregate_with_session(self, session, start: Start, hops: list, aggregates: dict,
-                                pins: Optional[dict] = None) -> dict:
+                                group_by: Optional[str] = None,
+                                pins: Optional[dict] = None) -> Union[dict, list]:
         """The aggregate work itself, given an OPEN session. aggregate()
         opens one and calls this directly; AsyncGraph.aggregate()
         (hopai/asyncio.py) reaches the SAME function through
         AsyncSession.run_sync() -- one implementation, two callers, so
         sync and async can never disagree about what an aggregate
         answers."""
-        query = self.build_aggregate_query(start, hops, aggregates, pins=pins)
-        row = session.execute(query).one()
-        # strict= is unobservable here and that is on purpose:
-        # build_aggregate_query() emits exactly one labeled column per
-        # entry in `aggregates`, so the two lengths are equal by
-        # construction. Kept as a claim about that, not as a guard.
-        return {name: _plain(value) for name, value in zip(aggregates, row, strict=True)}
+        query = self.build_aggregate_query(start, hops, aggregates, group_by=group_by, pins=pins)
+        if group_by is None:
+            row = session.execute(query).one()
+            # strict= is unobservable here and that is on purpose:
+            # build_aggregate_query() emits exactly one labeled column per
+            # entry in `aggregates`, so the two lengths are equal by
+            # construction. Kept as a claim about that, not as a guard.
+            return {name: _plain(value) for name, value in zip(aggregates, row, strict=True)}
+        # Grouped: one row per distinct group value, the group's own
+        # value first (build_aggregate_query() puts it there), then one
+        # value per aggregate in the same order `aggregates` iterates --
+        # zip(..., strict=True) makes that positional coupling a
+        # visible AssertionError instead of a silently misaligned dict
+        # the moment either side adds or drops a column.
+        return [
+            {group_by: _plain(row[0]),
+             **{name: _plain(value) for name, value in zip(aggregates, row[1:], strict=True)}}
+            for row in session.execute(query).all()
+        ]
 
-    def aggregate(self, start: Start, *hops: Hop, aggregates: dict) -> dict:
+    def aggregate(self, start: Start, *hops: Hop, aggregates: dict,
+                  group_by: Optional[str] = None) -> Union[dict, list]:
         """Aggregate over the nodes a traversal matches, without
         hydrating them. `start` and the hops mean exactly what they mean
         in traverse(); the aggregates run over the distinct nodes the
@@ -2120,6 +2168,28 @@ class Graph:
         number (0 when nothing matched), avg/min/max -> a number or None
         when nothing matched. One statement, one round trip.
 
+        `group_by="<property>"` runs every aggregate once per distinct
+        value of that property, read off the SAME last-hop nodes the
+        aggregates already run over -- Cypher's `RETURN b.city,
+        count(b)`. The result becomes a LIST of dicts instead of one,
+        each carrying the group's value under `group_by`'s own name
+        alongside that group's aggregates:
+
+            graph.aggregate(
+                Start(where={"type": "person"}),
+                aggregates={"n": Count()}, group_by="city",
+            )
+            # -> [{"city": "Berlin", "n": 2}, {"city": None, "n": 1}, ...]
+
+        A node missing the property groups with every other node that
+        is also missing it, under `None` -- it is not dropped, matching
+        Count(property)'s own "missing counts as absent, not as an
+        error" judgement rather than a stricter one for the grouping
+        key. With group_by, an EMPTY match returns `[]` -- there are no
+        groups to report -- unlike the single row of zeros/Nones a plain
+        aggregate reports over an empty match, since GROUP BY produces
+        no rows at all when there is nothing to group.
+
         With a `rerank=` anywhere in the chain the aggregates run over
         the reranked SURVIVORS -- still "the nodes the last hop
         matched", because pinning narrows exactly what `keep=` narrows,
@@ -2128,7 +2198,8 @@ class Graph:
         plan = rerank_plan(start, hops)
         pins = self._rerank_pins(start, hops, plan) if plan else None
         with Session(self.engine) as session:
-            return self._aggregate_with_session(session, start, hops, aggregates, pins=pins)
+            return self._aggregate_with_session(session, start, hops, aggregates,
+                                                group_by=group_by, pins=pins)
 
     # -- step-wise reranking --------------------------------------------
     #

@@ -717,6 +717,56 @@ class TestAggregations:
             graph.aggregate(Start(where={"type": "leaf"}), Hop(optional=True),
                             aggregates={"n": Count()})
 
+    def test_group_by_runs_one_aggregate_per_distinct_value(self, graph):
+        """Every node in the fixture, grouped by `type`: four leaves,
+        one hub, and m1/m2 (which carry no `type` at all) forming their
+        own None group -- proving a missing key groups together rather
+        than being dropped, matching Count(property)'s own judgement."""
+        result = graph.aggregate(Start(), aggregates={"n": Count()}, group_by="type")
+        assert sorted(result, key=lambda row: (row["type"] is None, row["type"])) == [
+            {"type": "hub", "n": 1},
+            {"type": "leaf", "n": 4},
+            {"type": None, "n": 2},
+        ]
+
+    def test_group_by_runs_over_the_last_hop_not_the_seed(self, graph):
+        """Grouping is scoped to the SAME final-step nodes the aggregate
+        already runs over -- m1 and m2 both carry flag=1, so this proves
+        the grouping key is read from the reached nodes (m1, m2), not
+        from the leaf seeds that have no `flag` property at all."""
+        result = graph.aggregate(
+            Start(where={"type": "leaf"}), Hop(via={"kind": "knows"}),
+            aggregates={"reached": Count()}, group_by="flag",
+        )
+        assert result == [{"flag": "1", "reached": 2}]
+
+    def test_group_by_on_empty_match_returns_empty_list(self, graph):
+        """GROUP BY produces no rows when there is nothing to group --
+        unlike the single row of zeros/Nones a plain (ungrouped)
+        aggregate reports over an empty match."""
+        result = graph.aggregate(Start(where={"type": "no_such_type"}),
+                                 aggregates={"n": Count()}, group_by="type")
+        assert result == []
+
+    def test_group_by_colliding_with_an_aggregate_name_refused(self, graph):
+        with pytest.raises(ValueError, match="collides"):
+            graph.aggregate(Start(where={"type": "leaf"}),
+                            aggregates={"type": Count()}, group_by="type")
+
+    def test_group_by_must_be_a_string(self, graph):
+        with pytest.raises(TypeError, match="group_by must be a string"):
+            graph.aggregate(Start(where={"type": "leaf"}), aggregates={"n": Count()},
+                            group_by=5)
+
+    def test_aggregate_json_group_by_matches_python_api(self, graph):
+        json_result = aggregate_json(graph, {
+            "start": {},
+            "aggregates": {"n": {"fn": "count"}},
+            "group_by": "type",
+        })
+        python_result = graph.aggregate(Start(), aggregates={"n": Count()}, group_by="type")
+        assert json_result == python_result
+
 
 # ---------------------------------------------------------------------
 # Result object

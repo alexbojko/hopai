@@ -2572,6 +2572,19 @@ class TestWriteToolsLive:
         assert named(fresh_graph)["aggregate_graph"].call(
             start={"where": {"type": "person"}}, aggregates={"n": {"fn": "count"}}) == {"n": 1}
 
+    def test_aggregate_group_by_reaches_the_handler(self, fresh_graph):
+        named(fresh_graph)["ingest_graph"].call(nodes=[
+            {"id": 1, "type": "person", "city": "Berlin"},
+            {"id": 2, "type": "person", "city": "Berlin"},
+            {"id": 3, "type": "person", "city": "Lisbon"},
+        ])
+        result = named(fresh_graph)["aggregate_graph"].call(
+            start={"where": {"type": "person"}}, aggregates={"n": {"fn": "count"}},
+            group_by="city")
+        assert sorted(result, key=lambda row: row["city"]) == [
+            {"city": "Berlin", "n": 2}, {"city": "Lisbon", "n": 1},
+        ]
+
     def test_merge_keys_make_the_second_run_an_update(self, fresh_graph):
         """Without merge_nodes_on a model can only insert, and an agent
         re-running its own ingestion silently doubles the graph."""

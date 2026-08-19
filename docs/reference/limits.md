@@ -4,10 +4,13 @@
   joined on shared variables) — one linear chain of hops only.
 - `OPTIONAL` only on the last hop, not mid-chain.
 - Aggregation covers `count`/`sum`/`avg`/`min`/`max` over the last
-  step's matched nodes, numeric properties only. No grouping
-  (`RETURN b.city, count(b)`), no edge-property aggregates, no
-  `stddev`/percentiles, no lexicographic `min`/`max` on strings — each
-  refuses with a message rather than approximating.
+  step's matched nodes, numeric properties only, optionally grouped by
+  a single property on those same nodes (`group_by=` /
+  `RETURN b.city, count(b)` — see [Aggregation](aggregation.md)). No
+  edge-property aggregates, no `stddev`/percentiles, no lexicographic
+  `min`/`max` on strings, and grouping by more than one property or by
+  anything but the last step's nodes — each refuses with a message
+  rather than approximating.
 - A relation with its own identity, or one spanning more than two
   participants — a "link table", in relational terms — has no single-edge
   equivalent: every edge here connects exactly two nodes and carries no

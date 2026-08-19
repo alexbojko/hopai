@@ -135,6 +135,31 @@ class TestSameAnswerAsSync:
         async_result = run(async_graph.aggregate(start, aggregates={"n": Count()}))
         assert async_result == sync_result
 
+    def test_aggregate_group_by(self, graph, async_graph):
+        start = Start()
+        sync_result = graph.aggregate(start, aggregates={"n": Count()}, group_by="type")
+        async_result = run(async_graph.aggregate(start, aggregates={"n": Count()},
+                                                  group_by="type"))
+        assert async_result == sync_result
+
+    def test_aggregate_group_by_colliding_with_an_aggregate_name_refused(self, async_graph):
+        """AsyncGraph.aggregate() validates group_by BEFORE resolving the
+        chain (validate_aggregate_spec(), same as validate_optional_positions()
+        above) -- a passing group_by="type" only proves the value REACHES
+        the query, not that an invalid one is still caught before running
+        one. group_by=group_by dropped from that call would silently skip
+        this refusal while leaving every valid call (including the test
+        above) unaffected, since the query itself is built from a second,
+        separate group_by=group_by a few lines down."""
+        with pytest.raises(ValueError, match="collides"):
+            run(async_graph.aggregate(Start(where={"type": "leaf"}),
+                                      aggregates={"type": Count()}, group_by="type"))
+
+    def test_aggregate_group_by_must_be_a_string(self, async_graph):
+        with pytest.raises(TypeError, match="group_by must be a string"):
+            run(async_graph.aggregate(Start(where={"type": "leaf"}), aggregates={"n": Count()},
+                                      group_by=5))
+
     def test_a_reranked_traversal_answers_the_same_either_way(
             self, async_fresh_graph, async_admin_graph):
         """AsyncGraph has its OWN rerank driver -- the probes go through
@@ -243,6 +268,16 @@ class TestSameAnswerAsSync:
         sync_result = graph.cypher(query)
         async_result = run(async_graph.cypher(query))
         assert async_result == sync_result
+
+    def test_cypher_grouped_aggregate(self, graph, async_graph):
+        """AsyncGraph.cypher()'s own dispatch unpacks cypher_to_aggregation's
+        group_by too -- dropped there, this would run the ungrouped
+        aggregate instead and return a dict where a list was asked for."""
+        query = "MATCH (a) RETURN a.type, count(a)"
+        sync_result = graph.cypher(query)
+        async_result = run(async_graph.cypher(query))
+        key = lambda row: (row["type"] is None, row["type"])
+        assert sorted(async_result, key=key) == sorted(sync_result, key=key)
 
     def test_cypher_aggregate_carries_its_hops(self, graph, async_graph):
         """The case above has no hops, so it cannot see cypher()'s
@@ -1076,6 +1111,50 @@ class TestValidationRunsBeforeEmbedding:
                 Start(near=Near("summary", text="q"), keep=1), aggregates={})
 
         with pytest.raises(ValueError, match="aggregates must be a non-empty dict"):
+            run(body())
+        assert calls == []
+
+    def test_a_bad_group_by_is_refused_before_embedding(self, async_fresh_graph):
+        """build_aggregate_query() validates group_by a second time, deep
+        inside the session, so a bad one is refused either way and the
+        RAISE alone proves nothing about the early check. What the early
+        `validate_aggregate_spec(..., group_by=group_by)` in
+        AsyncGraph.aggregate() buys is the refusal arriving before the
+        provider round trip -- drop group_by from it and the mistake
+        costs an embedding call first, exactly what this class exists to
+        prevent. Only `calls == []` pins that."""
+        calls = []
+
+        def embed(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=embed)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.aggregate(
+                Start(near=Near("summary", text="q"), keep=1),
+                aggregates={"type": Count()}, group_by="type")
+
+        with pytest.raises(ValueError, match="collides with the aggregate result"):
+            run(body())
+        assert calls == []
+
+    def test_a_non_string_group_by_is_refused_before_embedding(self, async_fresh_graph):
+        calls = []
+
+        def embed(texts):
+            calls.append(list(texts))
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        async def body():
+            async_fresh_graph.define_vectors(nodes=[Vector("summary", 3, embed=embed)])
+            await async_fresh_graph.migrate_vectors()
+            await async_fresh_graph.aggregate(
+                Start(near=Near("summary", text="q"), keep=1),
+                aggregates={"n": Count()}, group_by=5)
+
+        with pytest.raises(TypeError, match="group_by must be a string"):
             run(body())
         assert calls == []
 

@@ -88,7 +88,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from . import jqsafe
 from .aggregates import parse_aggregate
@@ -585,22 +585,30 @@ def traverse_json(graph: Graph, spec: dict, allow_vectors: bool = False,
 
 
 def spec_to_aggregation(spec: dict, rerank: Optional[RerankPolicy] = None) -> tuple:
-    """Convert a JSON spec into (Start, [Hop, ...], {name: aggregate}).
-    The traversal half is exactly spec_to_traversal(); `aggregates` maps
-    result names to JSON-form aggregates for hopai.aggregates.parse_aggregate()."""
+    """Convert a JSON spec into (Start, [Hop, ...], {name: aggregate},
+    group_by). The traversal half is exactly spec_to_traversal();
+    `aggregates` maps result names to JSON-form aggregates for
+    hopai.aggregates.parse_aggregate(). `group_by`, when the spec
+    carries one, is a property name (a string) read off the SAME
+    last-hop nodes the aggregates already run over -- see
+    Graph.aggregate()'s own docstring for exactly what it means; `None`
+    when the spec has no "group_by" key."""
     if not spec.get("aggregates"):
         raise ValueError(
             'spec must have a non-empty "aggregates" object, e.g. '
             '{"aggregates": {"n": {"fn": "count"}}}'
         )
-    start, hops = spec_to_traversal({k: v for k, v in spec.items() if k != "aggregates"},
-                                    rerank)
+    group_by = spec.get("group_by")
+    if group_by is not None and not isinstance(group_by, str):
+        raise ValueError(f'"group_by" must be a property name string -- got {group_by!r}')
+    start, hops = spec_to_traversal(
+        {k: v for k, v in spec.items() if k not in ("aggregates", "group_by")}, rerank)
     aggregates = {name: parse_aggregate(a) for name, a in spec["aggregates"].items()}
-    return start, hops, aggregates
+    return start, hops, aggregates, group_by
 
 
 def aggregate_json(graph: Graph, spec: dict, allow_vectors: bool = False,
-                   rerank: Optional[RerankPolicy] = None) -> dict:
+                   rerank: Optional[RerankPolicy] = None) -> Union[dict, list]:
     """Run an aggregation described entirely in JSON and return a
     JSON-serializable dict of the named results -- the aggregation
     counterpart of traverse_json(), and the call behind
@@ -614,13 +622,24 @@ def aggregate_json(graph: Graph, spec: dict, allow_vectors: bool = False,
         })
         # -> {"friends": 42, "avg_age": 31.5}
 
+    `"group_by": "<property>"` groups every aggregate by that property
+    on the same nodes, and the result becomes a LIST of per-group dicts
+    instead of one -- see Graph.aggregate()'s own docstring:
+
+        aggregate_json(graph, {
+            "start": {"where": {"type": "person"}},
+            "aggregates": {"n": {"fn": "count"}},
+            "group_by": "city",
+        })
+        # -> [{"city": "Berlin", "n": 2}, {"city": None, "n": 1}, ...]
+
     Refuses similarity keys unless allow_vectors=True, for the reason
     traverse_json() gives.
     """
     if not allow_vectors:
         refuse_vectors(spec, "aggregate_json()")
-    start, hops, aggregates = spec_to_aggregation(spec, rerank)
-    return graph.aggregate(start, *hops, aggregates=aggregates)
+    start, hops, aggregates, group_by = spec_to_aggregation(spec, rerank)
+    return graph.aggregate(start, *hops, aggregates=aggregates, group_by=group_by)
 
 
 def vector_search_json(graph: Graph, spec: dict, allow_vectors: bool = False,
@@ -986,7 +1005,10 @@ AGGREGATE_TOOL_SCHEMA: dict = {
         "start/hops traversal spec as traverse_graph. Aggregates run over the "
         "distinct nodes matched by the LAST hop (the starting set when there are "
         "no hops), each node counted once however many paths reach it. "
-        "`where`/`via` are EXACT property matches; `near` selects by meaning."
+        "`where`/`via` are EXACT property matches; `near` selects by meaning. "
+        "Add `group_by` to compute the aggregates once per distinct value of a "
+        "property on those same nodes -- the result becomes a list of one object "
+        "per group instead of a single object."
     ),
     "parameters": {
         "type": "object",
@@ -1099,6 +1121,17 @@ AGGREGATE_TOOL_SCHEMA: dict = {
                     },
                     "required": ["fn"],
                 },
+            },
+            "group_by": {
+                "type": "string",
+                "description": (
+                    "Property name to group by, read off the same nodes the "
+                    "aggregates run over. When given, every aggregate is computed "
+                    "once per distinct value of this property (a node missing the "
+                    "property forms its own group), and the result is a list of "
+                    "objects -- each carrying the group's value under this same "
+                    "property name -- instead of a single object."
+                ),
             },
         },
         "required": ["start", "aggregates"],
