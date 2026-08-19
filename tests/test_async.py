@@ -142,6 +142,24 @@ class TestSameAnswerAsSync:
                                                   group_by="type"))
         assert async_result == sync_result
 
+    def test_aggregate_group_by_colliding_with_an_aggregate_name_refused(self, async_graph):
+        """AsyncGraph.aggregate() validates group_by BEFORE resolving the
+        chain (validate_aggregate_spec(), same as validate_optional_positions()
+        above) -- a passing group_by="type" only proves the value REACHES
+        the query, not that an invalid one is still caught before running
+        one. group_by=group_by dropped from that call would silently skip
+        this refusal while leaving every valid call (including the test
+        above) unaffected, since the query itself is built from a second,
+        separate group_by=group_by a few lines down."""
+        with pytest.raises(ValueError, match="collides"):
+            run(async_graph.aggregate(Start(where={"type": "leaf"}),
+                                      aggregates={"type": Count()}, group_by="type"))
+
+    def test_aggregate_group_by_must_be_a_string(self, async_graph):
+        with pytest.raises(TypeError, match="group_by must be a string"):
+            run(async_graph.aggregate(Start(where={"type": "leaf"}), aggregates={"n": Count()},
+                                      group_by=5))
+
     def test_a_reranked_traversal_answers_the_same_either_way(
             self, async_fresh_graph, async_admin_graph):
         """AsyncGraph has its OWN rerank driver -- the probes go through
