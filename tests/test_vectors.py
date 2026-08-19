@@ -4282,6 +4282,24 @@ class TestPgvectorRefusesRankingsAnIndexCannotServe:
         assert "does not support boost=" in message
         assert "apply the boost to the returned hits yourself" in message
 
+    def test_boost_is_refused_on_the_batch_path_too_not_quietly_dropped(self, pgvg):
+        """vector_search_many() must refuse a boost for the same reason
+        vector_search() does -- and the batch path is where getting it
+        wrong is WORSE, because that builder never adds a boost column.
+        Left unrefused, a caller asking for hybrid ranking would get
+        pure similarity back with nothing to say the boost was ignored:
+        a silently different answer, which is the one thing this library
+        refuses to produce.
+
+        A surviving mutant (`refuse_unsupported(one, None, ...)`) is
+        exactly that failure, and no test objected to it."""
+        with pytest.raises(ValueError) as exc:
+            build_search_many_query(pgvg, [Near("pgsummary", [1.0, 0.0, 0.0])], k=3,
+                                    boost=Boost("priority"))
+        message = str(exc.value)
+        assert "does not support boost=" in message
+        assert "apply the boost to the returned hits yourself" in message
+
     def test_a_negative_weight_is_refused_because_hnsw_has_one_direction(self, pgvg):
         """A negative weight asks for the LEAST similar rows first.
         There is no 'farthest' scan to fall back on, so serving it would
