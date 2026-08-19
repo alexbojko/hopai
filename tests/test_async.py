@@ -1557,10 +1557,42 @@ class TestDocumentBuildingStaysOffTheLoop:
     #: magnitude to spare either side.
     MAX_BYTES_HANDED = 1000
 
-    #: Seconds of THIS PROCESS's CPU the whole build may spend. Measured:
-    #: 0.7ms with the fix, ~120ms without it, so 25ms sits ~35x above one
-    #: and ~5x below the other.
-    MAX_CPU_SECONDS = 0.025
+    #: How many times cheaper the pruned build must be than the SAME
+    #: build handed the whole properties bag, measured back to back in
+    #: this process. Measured: 0.6ms against 300ms, so ~480x -- 20x
+    #: leaves a factor of 24 of headroom and still fails loudly at the
+    #: regression, where the two costs converge on each other.
+    #:
+    #: A RATIO, replacing an absolute 25ms budget that could no longer
+    #: tell the two apart. The docstring above says why
+    #: `time.process_time` was believed immune to a loaded box:
+    #: descheduling cannot inflate it. True, and not the whole story --
+    #: cache and memory-bandwidth contention from a CO-TENANT makes
+    #: identical work burn more cycles, and process_time counts those.
+    #: This repository's CI supplies the co-tenant: `coverage +
+    #: mutation` runs on pull requests only (.github/workflows/ci.yml's
+    #: `if: github.event_name == 'pull_request'`), saturating the runner
+    #: beside the test matrix. Measured there: 83ms and 127ms on 3.10 in
+    #: consecutive runs, against 1ms locally on the same commit and the
+    #: same interpreter. 127ms is ABOVE the ~120ms regression the budget
+    #: existed to catch, so the two populations overlapped and no
+    #: absolute number separated them any more. A ratio has no such
+    #: failure mode: contention scales both sides at once. (Issue #100.)
+    MIN_SPEEDUP = 20
+
+    #: The control the ratio is taken against: the shape the bug had,
+    #: reading the whole bag rather than one key out of it. `tostring`
+    #: because a document_from must evaluate to a string -- `.properties`
+    #: alone is refused, by the rule that makes this a text-in contract.
+    WHOLE_BAG = ".properties | tostring"
+
+    #: What the step-wise probe may hand over, in bytes for all
+    #: ROWS candidates together. Measured: 1,980 -- about 50 bytes a
+    #: candidate, because `_rerank_probe` projects in SQL and the fat
+    #: rows never reach Python at all. The flat path's candidates are
+    #: 4,064,860 bytes for the same nodes, which is the difference this
+    #: number pins.
+    MAX_CANDIDATE_BYTES = 100_000
 
     def _embed(self, texts):
         return [[1.0] + [0.0] * (self.DIMS - 1) for _ in texts]
@@ -1600,8 +1632,15 @@ class TestDocumentBuildingStaysOffTheLoop:
 
         monkeypatch.setattr(rerankers_module, "_evaluate", spy)
 
+        seen = []
+
         class Watched(Rerank):
             def build_documents(self, candidates, **options):
+                # By REFERENCE, like the views above and for the same
+                # reason: the control build needs the very candidates
+                # this call site was given, and copying them here would
+                # be CPU inside the window being measured.
+                seen.append(candidates)
                 started = time.process_time()
                 try:
                     return super().build_documents(candidates, **options)
@@ -1610,10 +1649,13 @@ class TestDocumentBuildingStaysOffTheLoop:
 
         rerank = Watched(lambda query, documents: [0.0] * len(documents),
                          document_from=".properties.title", candidates=self.ROWS)
-        rerank.handed, rerank.cost = handed, cost
+        rerank.handed, rerank.cost, rerank.seen = handed, cost, seen
         return rerank
 
-    def _assert_cheap(self, rerank):
+    def _assert_pruned_view(self, rerank):
+        """What jq was handed, in bytes. Exact, and true of both call
+        sites -- the one fact neither a slow machine nor a busy one can
+        move."""
         import json
 
         assert rerank.handed, "build_documents() never ran"
@@ -1623,12 +1665,59 @@ class TestDocumentBuildingStaysOffTheLoop:
             f"jq was handed {biggest} bytes for one candidate -- the filter reads a "
             f"title, so it is being handed the row again and the cost is back to being "
             f"proportional to the payload")
+
+    def _assert_cheaper_than_the_whole_bag(self, rerank):
+        """The flat path's half: candidates arrive FAT (4MB for these 40
+        nodes), so what has to be proved is that building a document out
+        of one does not cost what reading all of it would.
+
+        Asserted as a ratio against the same build handed the whole bag,
+        measured here rather than recorded as a constant: the number has
+        to come from this machine under its current load, which is the
+        whole point of comparing against it instead of against 25ms.
+        Best-of-three for the control, because the numerator is a single
+        in-flight sample and a control caught mid-hiccup would make a
+        healthy build look good for the wrong reason -- the cheapest
+        control is the strictest one to beat."""
+        from hopai import Rerank
+
+        candidates = rerank.seen[0]
+        control = Rerank(lambda query, documents: [0.0] * len(documents),
+                         document_from=self.WHOLE_BAG, candidates=self.ROWS)
+        control.build_documents(candidates)          # jq compile, once
+        runs = []
+        for _ in range(3):
+            started = time.process_time()
+            control.build_documents(candidates)
+            runs.append(time.process_time() - started)
+        whole_bag = min(runs)
         spent = sum(rerank.cost)
-        assert spent < self.MAX_CPU_SECONDS, (
-            f"document building spent {spent * 1000:.0f}ms of CPU over "
-            f"{len(rerank.handed)} candidate(s), above the {self.MAX_CPU_SECONDS * 1000:.0f}ms "
-            f"budget -- on the async path every millisecond of that is the event loop's "
-            f"own thread")
+        assert spent * self.MIN_SPEEDUP < whole_bag, (
+            f"document building spent {spent * 1000:.1f}ms of CPU over "
+            f"{len(rerank.handed)} candidate(s), against {whole_bag * 1000:.1f}ms for the "
+            f"same build handed the whole bag -- only {whole_bag / spent:.1f}x cheaper, "
+            f"under the {self.MIN_SPEEDUP}x asserted. The pruning is not doing its job, "
+            f"and on the async path every millisecond of it is the event loop's own "
+            f"thread")
+
+    def _assert_candidates_arrived_lean(self, rerank):
+        """The step-wise path's half, and deliberately NOT the ratio.
+
+        `_rerank_probe` projects in SQL, so the fat rows never reach
+        Python here at all: these 40 candidates weigh 1,980 bytes where
+        the flat path's weigh 4,064,860. There is nothing for pruning to
+        save, which means a ratio would be comparing two equally cheap
+        builds and asserting nothing -- the absolute budget this
+        replaces did exactly that, passing on every run because it could
+        not fail. What IS load-bearing here is upstream: if the probe
+        ever starts selecting whole rows, this is where it shows."""
+        import json
+
+        payload = len(json.dumps(rerank.seen[0]))
+        assert payload <= self.MAX_CANDIDATE_BYTES, (
+            f"the probe handed {payload:,} bytes of candidates to Python -- it is "
+            f"selecting whole rows again, so the projection that kept the fat "
+            f"properties in the database has stopped happening")
 
     def test_the_flat_search_path_hands_jq_only_the_projection(
             self, async_fresh_graph, monkeypatch):
@@ -1646,7 +1735,8 @@ class TestDocumentBuildingStaysOffTheLoop:
 
         assert len(run(body())) == 5
         assert len(rerank.handed) == self.ROWS      # every candidate went through jq
-        self._assert_cheap(rerank)
+        self._assert_pruned_view(rerank)
+        self._assert_cheaper_than_the_whole_bag(rerank)
 
     def test_the_step_wise_path_hands_jq_only_the_projection(
             self, async_fresh_graph, monkeypatch):
@@ -1665,7 +1755,8 @@ class TestDocumentBuildingStaysOffTheLoop:
         result = run(body())
         assert len(result.nodes) == 5
         assert len(rerank.handed) == self.ROWS
-        self._assert_cheap(rerank)
+        self._assert_pruned_view(rerank)
+        self._assert_candidates_arrived_lean(rerank)
 
 
 
