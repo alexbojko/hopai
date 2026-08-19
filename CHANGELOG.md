@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.1.1](https://github.com/alexbojko/hopai/compare/v0.1.0...v0.1.1) (2026-08-19)
+
+
+### Features
+
+* **benchmarks:** compare hopai against Apache AGE across three graph sizes ([ab8608e](https://github.com/alexbojko/hopai/commit/ab8608eabdd55ff60af99778e26075fbcc1b5602))
+* declared edge type as a first-class concept ([#93](https://github.com/alexbojko/hopai/issues/93)) ([b00998e](https://github.com/alexbojko/hopai/commit/b00998e6d4fc45b9e86887ffd60d84c0ea43008b))
+* grouped aggregation over the final step's properties ([#92](https://github.com/alexbojko/hopai/issues/92)) ([cfea68b](https://github.com/alexbojko/hopai/commit/cfea68b206f754dde81f8fee7f1287a543e42a1d))
+* **mcp:** configure a reranker from the command line ([#99](https://github.com/alexbojko/hopai/issues/99)) ([128b83f](https://github.com/alexbojko/hopai/commit/128b83f88ba5a6c01e447e19bfe3a7a224bcca66))
+* name an embedding provider, serve a graph explorer, and run the whole stack with docker compose ([#86](https://github.com/alexbojko/hopai/issues/86)) ([338402b](https://github.com/alexbojko/hopai/commit/338402b41772deea709de23d0846a403eba7cc89))
+* optional graphs registry table (id, name, description) ([#91](https://github.com/alexbojko/hopai/issues/91)) ([627ccfb](https://github.com/alexbojko/hopai/commit/627ccfb24762a5f0a54e006c4ec309aad9dcd762))
+* select rows by id, not only by JSONB properties ([#90](https://github.com/alexbojko/hopai/issues/90)) ([6386845](https://github.com/alexbojko/hopai/commit/63868457358700971af4d52bdf75f6690376fffa))
+* **vectors:** optional pgvector backend for single-field search ([#98](https://github.com/alexbojko/hopai/issues/98)) ([a475715](https://github.com/alexbojko/hopai/commit/a47571545aee5f9e1f4d204f4eabc5f9adab5bb6))
+
+
+### Bug Fixes
+
+* mutation-run reliability + reify-relation docs ([#88](https://github.com/alexbojko/hopai/issues/88)) ([82b7261](https://github.com/alexbojko/hopai/commit/82b7261cd9c9dbafebd2fe524e1b8751754e5368))
+* **tests:** assert what each rerank call site can actually prove ([#101](https://github.com/alexbojko/hopai/issues/101)) ([5e8e69f](https://github.com/alexbojko/hopai/commit/5e8e69fa2be5b7a99788fc03c8926bab7f72e882))
+
+
+### Performance
+
+* **ci:** mutate only changed lines, and stop re-running the suite twice per mutation run ([#94](https://github.com/alexbojko/hopai/issues/94)) ([4d9d2fc](https://github.com/alexbojko/hopai/commit/4d9d2fcfebf6ff3b8f7c28fe479c9329a58bb740))
+* project the rerank probe's fetch to the properties a filter reads ([#89](https://github.com/alexbojko/hopai/issues/89)) ([eb1072f](https://github.com/alexbojko/hopai/commit/eb1072f14197ec31548f9b4278c9c9a6fadaeda7))
+
+
+### Documentation
+
+* **benchmarks:** record the traversal regression check for the feature batch ([#97](https://github.com/alexbojko/hopai/issues/97)) ([6eaca51](https://github.com/alexbojko/hopai/commit/6eaca51dff2a811a10a4dae4a24012c4bc1d76dc))
+
 ## [0.1.0](https://github.com/alexbojko/hopai/compare/v0.0.1...v0.1.0) (2026-08-17)
 
 
