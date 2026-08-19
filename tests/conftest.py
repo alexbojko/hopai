@@ -12,10 +12,11 @@ execution order or leftover state from a previous run.
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.pool import NullPool
 
 DSN = os.environ.get(
@@ -84,6 +85,32 @@ INSERT INTO {SCHEMA}.edges (start_id, end_id, properties) VALUES
 """
 
 
+def _retry_ddl_race(setup):
+    """Run a schema-(re)creation callable, tolerant of a concurrent
+    creator racing the same schema/table name.
+
+    mutmut runs many mutant subprocesses concurrently against the ONE
+    Postgres the suite uses, and every one of them independently runs
+    this same DROP SCHEMA / CREATE SCHEMA / CREATE TABLE sequence
+    against the same schema name. Two of them can both reach CREATE
+    TABLE for the same (typname, namespace) before either commits, and
+    Postgres's own pg_type_typname_nsp_index -- a system catalog
+    constraint, not a hopai one -- raises UniqueViolation. Under
+    mutmut's `-x` stats-collection run that one transient DDL collision
+    is fatal: it aborts the whole run before a single mutant is checked,
+    rather than surfacing as the lock-wait timeout docs/testing.md
+    already documents for the same contention on the write schemas. The
+    DDL is idempotent (DROP ... IF EXISTS first), so retrying once after
+    a short pause is enough for the other creator to get out of the way."""
+    try:
+        setup()
+    except IntegrityError as exc:
+        if "pg_type_typname_nsp_index" not in str(exc.orig):
+            raise
+        time.sleep(0.5)
+        setup()
+
+
 def _engine(schema: str):
     """A test engine that holds no connection between uses.
 
@@ -132,16 +159,19 @@ def engine():
             f"or HOPAI_REQUIRE_DB=1 to make this an error",
             allow_module_level=True,
         )
-    with eng.begin() as conn:
-        for stmt in SETUP_SQL.strip().split(";"):
-            if stmt.strip():
-                conn.execute(text(stmt))
-        for stmt in NODES_SQL.strip().split(";"):
-            if stmt.strip():
-                conn.execute(text(stmt))
-        for stmt in EDGES_SQL.strip().split(";"):
-            if stmt.strip():
-                conn.execute(text(stmt))
+    def _seed():
+        with eng.begin() as conn:
+            for stmt in SETUP_SQL.strip().split(";"):
+                if stmt.strip():
+                    conn.execute(text(stmt))
+            for stmt in NODES_SQL.strip().split(";"):
+                if stmt.strip():
+                    conn.execute(text(stmt))
+            for stmt in EDGES_SQL.strip().split(";"):
+                if stmt.strip():
+                    conn.execute(text(stmt))
+
+    _retry_ddl_race(_seed)
     yield eng
     eng.dispose()
 
@@ -231,11 +261,15 @@ def fresh_graph(write_engine):
     from hopai import Graph
 
     before = _vector_columns()
-    with write_engine.begin() as conn:
-        conn.execute(text(f"DROP SCHEMA IF EXISTS {WRITE_SCHEMA} CASCADE"))
-        conn.execute(text(f"CREATE SCHEMA {WRITE_SCHEMA}"))
     graph = Graph(write_engine)
-    graph.create_schema()
+
+    def _rebuild():
+        with write_engine.begin() as conn:
+            conn.execute(text(f"DROP SCHEMA IF EXISTS {WRITE_SCHEMA} CASCADE"))
+            conn.execute(text(f"CREATE SCHEMA {WRITE_SCHEMA}"))
+        graph.create_schema()
+
+    _retry_ddl_race(_rebuild)
     yield graph
 
     # `_columns.remove()` is SQLAlchemy-private because removing a column
@@ -263,10 +297,14 @@ def async_fresh_graph():
     from hopai.asyncio import AsyncGraph
 
     setup_engine = _engine(ASYNC_WRITE_SCHEMA)
-    with setup_engine.begin() as conn:
-        conn.execute(text(f"DROP SCHEMA IF EXISTS {ASYNC_WRITE_SCHEMA} CASCADE"))
-        conn.execute(text(f"CREATE SCHEMA {ASYNC_WRITE_SCHEMA}"))
-    Graph(setup_engine).create_schema()
+
+    def _rebuild():
+        with setup_engine.begin() as conn:
+            conn.execute(text(f"DROP SCHEMA IF EXISTS {ASYNC_WRITE_SCHEMA} CASCADE"))
+            conn.execute(text(f"CREATE SCHEMA {ASYNC_WRITE_SCHEMA}"))
+        Graph(setup_engine).create_schema()
+
+    _retry_ddl_race(_rebuild)
     setup_engine.dispose()
     return AsyncGraph(_async_engine(ASYNC_WRITE_SCHEMA))
 
@@ -315,12 +353,16 @@ def async_fresh_graph_pool1():
     from sqlalchemy.ext.asyncio import create_async_engine
 
     setup_engine = _engine(POOL1_SCHEMA)
-    with setup_engine.begin() as conn:
-        conn.execute(text(f"DROP SCHEMA IF EXISTS {POOL1_SCHEMA} CASCADE"))
-        conn.execute(text(f"CREATE SCHEMA {POOL1_SCHEMA}"))
     admin = Graph(setup_engine)
-    admin.create_schema()
-    admin.define_constraints(nodes=[Unique("email")], edges=[Unique("tag")])
+
+    def _rebuild():
+        with setup_engine.begin() as conn:
+            conn.execute(text(f"DROP SCHEMA IF EXISTS {POOL1_SCHEMA} CASCADE"))
+            conn.execute(text(f"CREATE SCHEMA {POOL1_SCHEMA}"))
+        admin.create_schema()
+        admin.define_constraints(nodes=[Unique("email")], edges=[Unique("tag")])
+
+    _retry_ddl_race(_rebuild)
     setup_engine.dispose()
 
     async_engine = create_async_engine(
