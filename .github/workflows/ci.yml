@@ -235,6 +235,30 @@ jobs:
 
       - run: pip install -e ".[dev,mutation]"
 
+      # mutmut's test-to-function map, the other fixed cost it pays before
+      # checking anything: it traces the WHOLE suite to build it, which on
+      # this suite is minutes, every run, whatever the scope. It is
+      # designed to be incremental -- `load_stats()` reads this file and
+      # then only re-traces tests that are new -- so carrying it between
+      # runs is the difference between paying that once and paying it
+      # every time. `config_fingerprint()` deliberately excludes
+      # `source_paths`, so the per-PR narrowing below does NOT invalidate
+      # it, and mutmut's own hash-based change detection forces a full
+      # recollection when something it does care about moved.
+      #
+      # Rolling key: the exact key never hits (run_id is unique, so every
+      # run saves a fresh entry), and restore-keys picks up the newest
+      # prefix match. Advisory data for an advisory job -- a cold or stale
+      # cache costs time, never correctness.
+      - name: Restore mutation stats
+        uses: actions/cache@v4
+        with:
+          path: mutants/mutmut-stats.json
+          key: mutmut-stats-${{ hashFiles('pyproject.toml', 'setup.cfg') }}-${{ github.run_id }}
+          restore-keys: |
+            mutmut-stats-${{ hashFiles('pyproject.toml', 'setup.cfg') }}-
+            mutmut-stats-
+
       - name: Measure coverage
         # No --cov-fail-under here on purpose: the threshold is enforced
         # in the LAST step, so a failing PR still gets its comment saying
@@ -243,9 +267,19 @@ jobs:
 
       - name: Resolve mutation scope
         id: scope
-        # Mutate only what this PR touched. A full run over hopai/ is
-        # thousands of mutants; the changed lines are where a missing
-        # assertion was just introduced.
+        # Mutate ONLY the lines this PR's diff changed. A full run over
+        # hopai/ is ~10000 mutants and every one of them reruns the test
+        # suite, so it is not a slower report, it is one that never
+        # finishes -- runs kept hitting the wall-clock budget with
+        # thousands unchecked and had to lead with "no evidence".
+        #
+        # Two narrowings off one diff, applied at different stages:
+        #   changed-lines JSON -> scripts/mutation_run.py, which drives
+        #     mutmut's per-line generation filter so a mutant is only
+        #     ever CREATED on a changed line
+        #   fnmatch patterns   -> `mutmut run`'s MUTANT_NAMES, bounding
+        #     what gets CHECKED, per changed function
+        # See scripts/mutation_scope.py for why the second is coarser.
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -258,44 +292,94 @@ jobs:
           if [ -z "${CHANGED// /}" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "note=No files under \`hopai/\` changed, so there was nothing to mutate." >> "$GITHUB_OUTPUT"
-          else
-            COUNT=$(echo "${CHANGED}" | wc -w | tr -d ' ')
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "note=Scope: ${COUNT} changed file(s) under \`hopai/\`." >> "$GITHUB_OUTPUT"
-            # Narrow source_paths in the checked-out copy. The committed
-            # value covers the whole package for local runs; `hopai` stays
-            # in also_copy, so the package is still whole in the mutants
-            # tree (without it every test dies on an import error).
-            #
-            # The paths MUST be newline-separated (the ini continuation
-            # format also_copy uses): mutmut reads a space-separated line
-            # as ONE path that does not exist, mutates 0 files, and still
-            # exits 0 -- so every multi-file PR silently reported
-            # "not run" instead of any verdict.
-            python - "$CHANGED" <<'PY'
+            exit 0
+          fi
+          PATTERNS=$(python scripts/mutation_scope.py "${BASE_SHA}" HEAD ${CHANGED})
+          python scripts/mutation_scope.py --changed-lines "${BASE_SHA}" HEAD ${CHANGED} \
+            > mutation-changed-lines.json
+          LINE_COUNT=$(python -c "import json;print(sum(len(v) for v in json.load(open('mutation-changed-lines.json')).values()))")
+          if [ -z "${PATTERNS// /}" ] || [ "${LINE_COUNT}" = "0" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "note=Changed lines under \`hopai/\` touched no function body (docstrings, comments or module-level statements only), so there was nothing to mutate." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          FN_COUNT=$(echo "${PATTERNS}" | wc -w | tr -d ' ')
+          FILE_COUNT=$(echo "${CHANGED}" | wc -w | tr -d ' ')
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "note=Scope: ${LINE_COUNT} changed line(s) in ${FN_COUNT} function(s)/method(s) across ${FILE_COUNT} file(s) under \`hopai/\`. Only changed lines are mutated." >> "$GITHUB_OUTPUT"
+          {
+            echo "patterns<<MUTATION_SCOPE_PATTERNS_EOF"
+            echo "${PATTERNS}"
+            echo "MUTATION_SCOPE_PATTERNS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          # Narrow source_paths too. Not needed for correctness any more
+          # (a file absent from the changed-lines map gets no mutants),
+          # but it is what keeps the coverage gather in
+          # store_lines_covered_by_tests() from walking the whole package.
+          # The committed value covers it all for local runs; `hopai`
+          # stays in also_copy, so the package is still whole in the
+          # mutants tree (without it every test dies on an import error).
+          #
+          # The paths MUST be newline-separated (the ini continuation
+          # format also_copy uses): mutmut reads a space-separated line
+          # as ONE path that does not exist, mutates 0 files, and still
+          # exits 0 -- so every multi-file PR silently reported
+          # "not run" instead of any verdict.
+          python - "$CHANGED" <<'PY'
           import re, sys
           paths = "\n    ".join(sys.argv[1].split())
           config = open("setup.cfg").read()
           open("setup.cfg", "w").write(
               re.sub(r"^source_paths = .*$", f"source_paths = {paths}", config, count=1, flags=re.M))
           PY
-          fi
 
       - name: Run mutation testing
         if: steps.scope.outputs.run == 'true'
         # Never fails the job. `timeout` stops a long run and the stats
         # export below still reports what completed.
         continue-on-error: true
+        env:
+          MUTATION_SCOPE_PATTERNS: ${{ steps.scope.outputs.patterns }}
         run: |
           set -uo pipefail
+          # Not `mutmut run`: scripts/mutation_run.py is that same run with
+          # mutation restricted to the changed lines. It refuses loudly if
+          # the mutmut internals it drives have moved, rather than quietly
+          # mutating whole files again.
+          # --coverage-xml is the coverage.xml the `Measure coverage` step
+          # already wrote. Without it mutmut runs the entire suite AGAIN
+          # under coverage to learn the same thing, which was most of what
+          # it spent the budget on before reaching a single mutant.
+          run_mutmut() {
+            timeout "${MUTATION_BUDGET_SECONDS}" \
+              python scripts/mutation_run.py --coverage-xml coverage.xml \
+                mutation-changed-lines.json "$@" 2>&1 | tee mutmut_run.log
+            return "${PIPESTATUS[0]}"
+          }
+          # shellcheck disable=SC2086 -- each line is one fnmatch pattern
+          # with no internal spaces; word-splitting is how they become
+          # separate MUTANT_NAMES args.
+          run_mutmut ${MUTATION_SCOPE_PATTERNS}
+          status=$?
+          if [ "$status" != 0 ] && [ "$status" != 124 ] \
+             && grep -q "Filtered for specific mutants, but nothing matches" mutmut_run.log; then
+            # Every changed line was one mutmut generates nothing for --
+            # uncovered, or not an expression it mutates. mutmut asserts on
+            # an empty filter rather than reporting zero, so re-run without
+            # the MUTANT_NAMES gate to get that honest zero. Still bounded
+            # to the changed lines: generation is restricted either way.
+            echo "::notice::no mutants were generated on the changed lines; re-running unfiltered to report that"
+            run_mutmut
+            status=$?
+          fi
           # 124 is timeout(1) saying it killed the run. Recorded rather
           # than folded into "stopped early": a budget exhausted before
           # the first mutant and a broken mutants tree both report zero
           # checked, and they need opposite fixes.
-          timeout "${MUTATION_BUDGET_SECONDS}" mutmut run || \
-            { status=$?
-              [ "$status" = 124 ] && echo "MUTATION_TIMED_OUT=1" >> "$GITHUB_ENV"
-              echo "::notice::mutmut stopped early (exit $status); reporting partial results"; }
+          if [ "$status" != 0 ]; then
+            [ "$status" = 124 ] && echo "MUTATION_TIMED_OUT=1" >> "$GITHUB_ENV"
+            echo "::notice::mutmut stopped early (exit $status); reporting partial results"
+          fi
           mutmut export-cicd-stats || true
           mutmut results > survivors.txt 2>&1 || true
           # The mutation OF each survivor, for the report's table --
