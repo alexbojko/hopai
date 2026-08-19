@@ -3513,6 +3513,8 @@ class TestEdgeBeamLive:
         from sqlalchemy import BigInteger, Column, MetaData, Table, Text
         from sqlalchemy.dialects.postgresql import JSONB
 
+        from conftest import _retry_ddl_race
+
         engine = fresh_graph.engine
         meta = MetaData(schema="hopai_beam_scope")
         nodes = Table("nodes", meta,
@@ -3525,10 +3527,13 @@ class TestEdgeBeamLive:
                       Column("start_id", BigInteger, nullable=False),
                       Column("end_id", BigInteger, nullable=False),
                       Column("properties", JSONB, nullable=False))
-        with engine.begin() as conn:
-            conn.execute(text("DROP SCHEMA IF EXISTS hopai_beam_scope CASCADE"))
-            conn.execute(text("CREATE SCHEMA hopai_beam_scope"))
-        meta.create_all(engine)
+        def _setup():
+            with engine.begin() as conn:
+                conn.execute(text("DROP SCHEMA IF EXISTS hopai_beam_scope CASCADE"))
+                conn.execute(text("CREATE SCHEMA hopai_beam_scope"))
+            meta.create_all(engine)
+
+        _retry_ddl_race(_setup)
         with engine.begin() as conn:
             conn.execute(nodes.insert(), [
                 {"id": 1, "graph_id": "g1", "properties": {"seed": True}},

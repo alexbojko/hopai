@@ -74,6 +74,27 @@ because of bugs, not taste:
   mutation by hand and run the suite: `hopai.mutate.xǁMutatorǁdelete_edges__mutmut_18`
   came back `timeout` and fails the suite in nine seconds on its own.
 
+- **The same contention can surface as a hard `UniqueViolation` instead of a timeout,
+  and under `-x` that is fatal to the whole run, not one mutant.** Two mutant
+  subprocesses racing `DROP SCHEMA` / `CREATE SCHEMA` / `CREATE TABLE` against the same
+  schema name can both reach `CREATE TABLE` before either commits; Postgres's own
+  `pg_type_typname_nsp_index` (a system catalog constraint, not a hopai one) rejects the
+  loser. mutmut's stats-collection pass runs with `-x`, so one such collision stopped
+  the whole run before checking a single mutant, and the resulting `pr_report.py`
+  comment still printed a percentage as if the run had finished, computed only over the
+  fraction of mutants that got a verdict (`scripts/pr_report.py`'s `render_mutation()`
+  now leads with the "incomplete" warning instead of a score whenever any mutant never
+  reached a verdict). `tests/conftest.py`'s `_retry_ddl_race()` retries the DDL once on
+  that specific error, which is enough for the other side to get out of the way.
+
+- **`mutmut run` must be invoked from the repository root, never from inside
+  `mutants/`.** Run from inside `mutants/`, `walk_source_files()` finds the
+  already-mutated copies and re-mutates them, and mutmut dies with a bare
+  `AssertionError` (`mangle_function_name`'s `assert CLASS_NAME_SEPARATOR not in name`)
+  — the child's real traceback is discarded, and the message names nothing. The obvious
+  reading, that something is wrong with the source, is wrong; the fix is `cd` back to
+  the repo root before rerunning.
+
 - **A `survived` verdict is only as fresh as the last run against that source.** mutmut
   caches per mutant and re-runs one only when its source changed — so adding the test
   that kills a mutant leaves the old verdict in `mutmut results` until that function is
