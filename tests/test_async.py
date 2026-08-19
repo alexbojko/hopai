@@ -886,13 +886,31 @@ class TestTextEmbeddingCorrectness:
         """A chain ranking two DIFFERENT fields by text batches to two
         provider calls (one call per field is unavoidable -- they are
         different embedders), but those two calls must be gathered, not
-        awaited one after the other: the whole resolution should cost
-        roughly ONE round trip's worth of wall-clock, not their sum."""
+        awaited one after the other.
+
+        Asserted as an OVERLAP between the two calls' intervals, not as a
+        wall-clock budget. "Gathered" means both were in flight at the
+        same instant, and two intervals either intersect or they do not
+        -- there is no threshold in that, so no machine can move it. The
+        budget this replaces (`elapsed < delay * 1.7`) allowed 0.7 * delay
+        = 140ms of fixed overhead on top of one sleep; a loaded CI runner
+        spends more than that on thread start-up and loop scheduling
+        alone, so it failed there twice while measuring 240ms locally --
+        against a 340ms limit -- every time. It was reporting the runner's
+        overhead, not the library's concurrency.
+
+        The elapsed check stays as a loose backstop, at the only bound
+        that means anything: a genuinely sequential pair cannot finish in
+        less than two sleeps, so anything under that is not sequential
+        however slow the box is."""
         delay = 0.2
+        spans = []
 
         def slow(vector):
             def embed(texts):
+                started = time.monotonic()
                 time.sleep(delay)
+                spans.append((started, time.monotonic()))
                 return [list(vector) for _ in texts]
             return embed
 
@@ -913,8 +931,17 @@ class TestTextEmbeddingCorrectness:
             return time.monotonic() - t0
 
         elapsed = run(body())
-        # Sequential would be >= 2 * delay; gathered stays close to one.
-        assert elapsed < delay * 1.7, f"took {elapsed:.2f}s -- the two embed calls ran sequentially"
+
+        assert len(spans) == 2, f"expected one provider call per field, got {len(spans)}"
+        (a_start, a_end), (b_start, b_end) = spans
+        assert a_start < b_end and b_start < a_end, (
+            f"the two embed calls did not overlap -- {a_start:.3f}..{a_end:.3f} then "
+            f"{b_start:.3f}..{b_end:.3f} -- so they were awaited one after the other "
+            f"instead of gathered")
+        # Sequential cannot beat two sleeps; this holds on any machine.
+        assert elapsed < delay * 2, (
+            f"took {elapsed:.2f}s, at or past the {delay * 2:.2f}s two calls would cost "
+            f"back to back")
 
 
 class TestValidationRunsBeforeEmbedding:
