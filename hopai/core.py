@@ -121,69 +121,6 @@ def _reads_paths(document_from: str, unknown: bool) -> bool:
     return any(path == "paths" or path.startswith("paths.") for path in read)
 
 
-def _rerank_property_projection(document_from: str) -> Optional[frozenset]:
-    """Which top-level `properties` keys a reranked step's probe may
-    fetch in place of the whole JSONB column, or None to fetch it whole.
-
-    ISSUE #77. `_rerank_properties()` used to SELECT the entire
-    `properties` column for every candidate -- and every node on a
-    route, when paths are read -- only for `Rerank.build_documents()`
-    to throw most of it away moments later via
-    `rerankers._projection_paths()`/`_pruned()`: decoding several MB of
-    JSONB on the greenlet bridge's own thread (hopai/asyncio.py's
-    run_sync()) to read one title. This answers the same question one
-    layer earlier, at the SQL that fetches the row, so Postgres sends
-    and psycopg decodes only what the filter can use.
-
-    `_projection_paths()` is reused rather than restated -- a filter
-    reading `.`, or one `jqsafe` cannot parse at all (every
-    `trusted=True` filter), already answers `_WHOLE_ROW` there, and
-    this defers to the same answer for the same reason.
-
-    Two refusals are ADDED on top, both because this projects the SQL
-    fetch rather than a Python view and so cannot make _pruned()'s
-    per-ROW judgement calls at compile time, before any row exists:
-
-      - a path landing on `properties` itself (the whole bag), or one
-        going past a single level under it (`properties.a.b`), needs
-        the exact non-object-intermediate and ambiguous-dotted-key
-        rulings `_pruned()` makes per row -- this SQL cannot make them,
-        so it defers to fetching the column whole, exactly as before
-        this fix;
-      - a path touching `.paths` projects a DIFFERENT set of node
-        dicts -- every node on every candidate's route, not just the
-        candidate -- and `_rerank_properties()` fetches candidates and
-        route nodes with ONE shared query, so a key this filter needs
-        for a route node could not be told apart from one it does not.
-        (In practice this never narrows anyway: a document_from that
-        reads `.paths` reports a "paths"-rooted path here too, or is
-        unparseable and already hit `_WHOLE_ROW` above -- so wanting
-        path context and staying prunable never both hold.)
-
-    CORRECT AND SLOW BEATS FAST AND WRONG, the same principle
-    `_projection_paths()` states for itself: every case this cannot see
-    through keeps today's whole-column fetch rather than guess."""
-    from .rerankers import _WHOLE_ROW, _projection_paths
-
-    paths = _projection_paths(document_from)
-    if paths is _WHOLE_ROW:
-        return None
-    keys: set = set()
-    for path in paths:
-        if path in ("id", "similarity", "similarities", "boosts"):
-            continue                      # not sourced from `properties` at all
-        if path == "properties":
-            return None                   # the whole bag, verbatim -- _pruned()'s to keep
-        if path.startswith("properties."):
-            rest = path[len("properties."):]
-            if "." in rest:
-                return None               # deeper than one level -- _pruned()'s job, not SQL's
-            keys.add(rest)
-            continue
-        return None                       # ".paths" (or anything else) -- see docstring
-    return frozenset(keys)
-
-
 def _rerank_documents(candidates: list, rerank) -> list:
     """(node id, candidate JSON) per DOCUMENT the provider will see.
 
@@ -2030,8 +1967,7 @@ class Graph:
 
         wanted = set(routes)
         wanted.update(node_id for paths in routes.values() for path in paths for node_id in path)
-        keys = _rerank_property_projection(rerank.document_from)
-        properties = self._rerank_properties(session, node_id_col, wanted, keys=keys)
+        properties = self._rerank_properties(session, node_id_col, wanted)
 
         def hydrate(node_id):
             return {"id": str(node_id), "properties": properties.get(str(node_id), {})}
@@ -2053,33 +1989,13 @@ class Graph:
             candidates.append((node_id, candidate))
         return candidates
 
-    def _rerank_properties(self, session, node_id_col, node_ids: set,
-                           keys: Optional[frozenset] = None) -> dict:
+    def _rerank_properties(self, session, node_id_col, node_ids: set) -> dict:
         """Properties for every node a step's documents mention -- the
         candidates and, when paths are read, the nodes on them -- in ONE
-        statement, keyed by the string id every result already uses.
-
-        `keys=None` fetches the `properties` column whole, exactly as
-        before issue #77. A `keys=` frozenset (from
-        `_rerank_property_projection()`, possibly empty) fetches a
-        JSONB object built from only those top-level keys --
-        `jsonb_build_object('title', properties -> 'title', ...)` --
-        so Postgres sends, and psycopg decodes, only the bytes
-        `document_from` can read instead of the row's own worst case.
-        An empty `keys` still issues one query per candidate id (a
-        filter that reads none of `.properties` still needs to know
-        which candidates matched), just with an empty object back."""
+        statement, keyed by the string id every result already uses."""
         if not node_ids:
             return {}
-        if keys is None:
-            properties_expr = self.nodes_tbl.c.properties
-        else:
-            args = []
-            for key in sorted(keys):
-                args.extend((key, self.nodes_tbl.c.properties[key]))
-            properties_expr = func.jsonb_build_object(*args)
-        query = select(cast(node_id_col, String).label("id"),
-                      properties_expr.label("properties")).where(
+        query = select(cast(node_id_col, String).label("id"), self.nodes_tbl.c.properties).where(
             and_(self._scoped(self.nodes_tbl), node_id_col.in_(sorted(node_ids, key=str))))
         return {row.id: row.properties for row in session.execute(query).all()}
 
