@@ -204,13 +204,14 @@ from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 from sqlalchemy import (
-    Column, and_, case, cast, column as sa_column, func, literal, or_, select, text,
+    Column, Float, and_, case, cast, column as sa_column, func, literal, or_, select, text,
     update, values,
 )
 from sqlalchemy import String as SAString
 from sqlalchemy.dialects.postgresql import ARRAY, DOUBLE_PRECISION, REAL
 from sqlalchemy.exc import IntegrityError, ProgrammingError
 
+from . import pgvector as pg
 from .constraints import ConstraintViolation, _compile_check, _slug, _Target
 from .filters import resolve, resolve_via
 
@@ -775,7 +776,19 @@ def field_names(vectors: Optional[dict], target: Optional[str] = None) -> list:
     return sorted(names)
 
 
-def _attach(table, column_name: str):
+def _column_type(graph, field: Optional[Vector] = None):
+    """The SQLAlchemy type for a vec_* column on this handle.
+
+    `field` is optional because drop_vectors() and load_vectors() reach
+    columns they have no declaration for; without one the pgvector type
+    is left unsized (`vector`, not `vector(d)`), which is enough to
+    compile a reference to the column and never used to emit DDL."""
+    if graph is not None and getattr(graph, "vector_backend", "exact") == "pgvector":
+        return pg.Vector(None if field is None else field.dimensions)
+    return ARRAY(REAL)
+
+
+def _attach(table, column_name: str, type_=None):
     """The vec_* column as SQLAlchemy metadata, adding it if this
     handle never declared it.
 
@@ -793,8 +806,29 @@ def _attach(table, column_name: str):
         # for the reader: vectors are written only by set_vectors()
         # UPDATEing rows that already exist, so NOT NULL here would make
         # every insert impossible.
-        table.append_column(Column(column_name, ARRAY(REAL), nullable=True))
-    return table.c[column_name]
+        table.append_column(
+            Column(column_name, ARRAY(REAL) if type_ is None else type_, nullable=True))
+        return table.c[column_name]
+    existing = table.c[column_name]
+    if type_ is not None and isinstance(existing.type, pg.Vector) != isinstance(type_, pg.Vector):
+        # Table metadata is shared between every Graph handle on these
+        # tables (see attach_columns), and until vector_backend= existed
+        # an extra Column changed no behavior on its own. A backend does:
+        # `vec_x` is real[] under one and vector(d) under the other, and
+        # the type drives how a value BINDS and how a result is read
+        # back. Two handles disagreeing would have one of them writing
+        # arrays into a vector column -- refused here, where the fix is
+        # still nameable, rather than as a driver error later.
+        raise ValueError(
+            f"{table.name}.{column_name} is already declared as "
+            f"{'vector' if isinstance(existing.type, pg.Vector) else 'real[]'} by another "
+            f"Graph handle on these tables, and this handle's "
+            f"vector_backend={'pgvector' if isinstance(type_, pg.Vector) else 'exact'!r} "
+            f"needs it as {'vector' if isinstance(type_, pg.Vector) else 'real[]'} -- one "
+            f"column has one type, so every handle sharing these tables must pass the same "
+            f"vector_backend="
+        )
+    return existing
 
 
 def attach_columns(graph) -> None:
@@ -804,7 +838,7 @@ def attach_columns(graph) -> None:
     behavior on its own -- every use is gated on this handle's registry."""
     for target, table in (("nodes", graph.nodes_tbl), ("edges", graph.edges_tbl)):
         for field in graph._vectors[target].values():
-            _attach(table, field.column_name)
+            _attach(table, field.column_name, _column_type(graph, field))
 
 
 def _defined(graph, target: str, caller: str) -> dict:
@@ -1315,14 +1349,56 @@ def _thresholds(inner, nears: list) -> list:
             for i, one in enumerate(nears) if one.min_similarity is not None]
 
 
+def _pgvector_guards(column, near, distance):
+    """The "this row has a usable vector" predicates shared by every
+    pgvector-backed ranking: a present column, a distance that is not
+    NaN (an all-zero stored vector, which has no direction), and the
+    min_similarity bound expressed as its distance equivalent.
+
+    All three sit beside the ORDER BY rather than outside it, which is
+    what keeps `where=`/`min_similarity` applied BEFORE the limit --
+    the same order the exact backend's `_thresholds()` is applied in."""
+    guards = [column.isnot(None), distance != float("nan")]
+    if near.min_similarity is not None:
+        guards.append(distance <= 1 - near.min_similarity)
+    return guards
+
+
+def _pgvector_near(graph, table, nears: list, boosts: list, caller: str):
+    """(the one Near, its column, its distance expression) for a
+    pgvector-backed ranking, after refusing what an HNSW index cannot
+    serve. Dimensions come from the query vector's own length, which
+    validate_nears() has already matched against the field's
+    declaration -- so this needs no target/registry lookup of its
+    own."""
+    pg.refuse_unsupported(nears, list(boosts), caller)
+    one = nears[0]
+    column = _attach(table, VECTOR_COLUMN_PREFIX + one.field, _column_type(graph))
+    return one, column, pg.distance(column, one.vector, len(one.vector))
+
+
 def ranked_ids(graph, table, id_expr, from_obj, condition, nears: list, k: Optional[int],
-               boosts: list = ()):
+               boosts: list = (), caller: str = "near="):
     """A Select of the ids that survive similarity: the shared shape
     behind a near= seed CTE and a near= match CTE. `condition` is the
     caller's full predicate, graph scope included (None when the scope
     already lives in from_obj's join) -- this function only adds the
     similarity layer."""
     conditions = [] if condition is None else [condition]
+    if graph.vector_backend == "pgvector":
+        # One expression rather than the exact backend's LATERAL and
+        # subquery: `<=>` already yields the ranked value, and keeping
+        # it bare in the ORDER BY is what lets the HNSW index answer
+        # the seed/match CTE the same way it answers a search.
+        one, _, distance = _pgvector_near(graph, table, nears, boosts, caller)
+        query = (select(id_expr.label("node_id"))
+                 .select_from(from_obj)
+                 .where(*conditions, *_pgvector_guards(_attach(
+                     table, VECTOR_COLUMN_PREFIX + one.field, _column_type(graph)),
+                     one, distance)))
+        if k is not None:
+            query = query.order_by(distance, id_expr).limit(k)
+        return query
     laterals, columns, guards = _similarity_terms(table, nears)
     inner = (
         select(id_expr.label("node_id"), *columns, *_boost_columns(table, boosts))
@@ -1364,8 +1440,37 @@ def _result_columns(inner, target: str) -> list:
     return columns
 
 
+def _pgvector_edge_beam(graph, edge_alias, join_expr, anchor_expr, move_col, id_col, via,
+                        nears: list, k: Optional[int], name: str, extra, correlate, caller: str):
+    """edge_beam() under vector_backend='pgvector'.
+
+    Still a per-anchor LATERAL, for the reason edge_beam() gives: "the
+    k most similar edges" only means something relative to where you
+    are standing, and a global top-k would starve every node after the
+    first. What it does NOT get is the index -- an HNSW scan answers
+    one ORDER BY per statement, and this one runs per anchor row inside
+    a recursive walk. It is correct, and it is the exact backend's cost
+    shape; `via_near=` is not where this backend pays off. Said here so
+    the next reader measuring a slow walk finds the reason in the code
+    rather than in a benchmark.
+    """
+    one, column, distance = _pgvector_near(graph, edge_alias, nears, (), caller)
+    beam = (
+        select(id_col.label("edge_id"), move_col.label("move_id"))
+        .select_from(edge_alias)
+        .where(join_expr == anchor_expr, graph._scoped(edge_alias),
+               resolve_via(edge_alias.c.properties, via, graph._edge_type_declared),
+               *_pgvector_guards(column, one, distance), *extra)
+        .correlate(*correlate)
+    )
+    if k is not None:
+        beam = beam.order_by(distance, id_col).limit(k)
+    return beam.lateral(name)
+
+
 def edge_beam(graph, edge_alias, join_expr, anchor_expr, move_col, id_col, via,
-              nears: list, k: Optional[int], name: str, extra: list = (), correlate=()):
+              nears: list, k: Optional[int], name: str, extra: list = (), correlate=(),
+              caller: str = "via_near="):
     """The edges to follow from ONE anchor row, ranked by similarity --
     a LATERAL yielding (edge_id, move_id).
 
@@ -1379,6 +1484,9 @@ def edge_beam(graph, edge_alias, join_expr, anchor_expr, move_col, id_col, via,
     everything that passes, so both forms share one code path -- and
     one set of guards, including the wrong-length and no-direction
     rules that apply to edge vectors exactly as they do to nodes."""
+    if graph.vector_backend == "pgvector":
+        return _pgvector_edge_beam(graph, edge_alias, join_expr, anchor_expr, move_col,
+                                   id_col, via, nears, k, name, extra, correlate, caller)
     laterals, columns, guards = _similarity_terms(edge_alias, nears)
     inner = (
         select(id_col.label("edge_id"), move_col.label("move_id"), *columns)
@@ -1488,6 +1596,9 @@ def _prepare_search_query(graph, near, target: str, k: Optional[int], where: Any
     variable at the call site would make this function's two labels
     invisible to it (a wrapped-and-forwarded label is a bug this
     library refuses to reproduce silently)."""
+    if graph.vector_backend == "pgvector":
+        return _prepare_pgvector_search_query(
+            graph, near, target=target, k=k, where=where, boost=boost, candidates=candidates)
     _check_k(k, "vector_search()")
     nears = validate_nears(graph, target, near, k, "vector_search()")
     boosts = validate_boosts(boost, "vector_search()")
@@ -1512,6 +1623,88 @@ def _prepare_search_query(graph, near, target: str, k: Optional[int], where: Any
     )
     rows = k if candidates is None else candidates
     return nears, boosts, (query if rows is None else query.limit(rows))
+
+
+def _prepare_pgvector_search_query(graph, near, target: str, k: Optional[int], where: Any,
+                                   boost, candidates: Optional[int] = None) -> tuple:
+    """(nears, boosts, query) for vector_search() under
+    vector_backend='pgvector'.
+
+    A different SHAPE from the exact backend's, not a different
+    spelling of it, and the difference is what makes the index usable:
+
+        SELECT id, properties, 1 - d AS similarity
+        FROM (SELECT id, properties, vec_x <=> :q AS d
+              FROM nodes
+              WHERE <scope> AND <where> AND vec_x IS NOT NULL AND ...
+              ORDER BY vec_x <=> :q          -- the index answers this
+              LIMIT k) inner
+        ORDER BY d, _id
+
+    Three things are load-bearing:
+
+      - The ORDER BY holds the bare `<=>` expression. An HNSW index is
+        on the OPERATOR; wrapping it (as `1 - x`, or in the CASE that
+        would turn NaN into NULL) produces the same rows from a
+        sequential scan. So distance is what the inner query ranks by,
+        and similarity is computed outside it.
+      - Every filter sits INSIDE, beside the ORDER BY, so `where=` is
+        applied before `LIMIT k` and still means what it means under
+        the exact backend: k rows that match, not k candidates of which
+        some match. Verified to keep the index scan.
+      - The guards drop a row with no usable vector rather than ranking
+        it: NULL column, and a NaN distance from an all-zero stored
+        vector. `= 'NaN'` and not `d <> d`, because Postgres considers
+        NaN equal to itself -- see pgvector.similarity().
+
+    `min_similarity` becomes a DISTANCE bound in the same inner WHERE
+    (`d <= 1 - min_similarity`), which is what keeps it applied before
+    the limit exactly as `_thresholds()` is on the exact path.
+    """
+    _check_k(k, "vector_search()")
+    nears = validate_nears(graph, target, near, k, "vector_search()")
+    boosts = validate_boosts(boost, "vector_search()")
+    pg.refuse_unsupported(nears, boosts, "vector_search()")
+
+    one = nears[0]
+    field = _field(graph, target, one.field, "vector_search()")
+    table = _table(graph, target)
+    column = _attach(table, field.column_name, _column_type(graph, field))
+    distance = pg.distance(column, one.vector, field.dimensions)
+
+    guards = [column.isnot(None), distance != float("nan")]
+    if one.min_similarity is not None:
+        guards.append(distance <= 1 - one.min_similarity)
+
+    rows = k if candidates is None else candidates
+    inner = (
+        select(*_identity_columns(graph, table, target),
+               table.c.properties.label("properties"), distance.label("distance"))
+        .where(and_(graph._scoped(table), resolve(table.c.properties, where), *guards))
+        .order_by(distance)
+    )
+    if rows is not None:
+        inner = inner.limit(rows)
+    inner = inner.subquery()
+
+    similarity = (literal(1.0, type_=DOUBLE_PRECISION) - inner.c.distance)
+    if one.weight != 1.0:
+        similarity = similarity * one.weight
+    similarity = similarity.label("similarity")
+    # The per-field report is the same number here, never coalesced --
+    # a single Near cannot be missing="zero" (validate_nears() refuses
+    # it), so there is nothing for the two to disagree about, and
+    # `similarities` stays a dict keyed by field name under both
+    # backends.
+    columns = (_result_columns(inner, target) + [inner.c.properties, similarity]
+               + [similarity.self_group().label(f"{_SIM_REPORT_PREFIX}0")])
+    # Ordered by DISTANCE ascending, which is `similarity` descending
+    # with the sign already checked (refuse_unsupported() rejects a
+    # negative weight, whose ordering an HNSW index cannot serve).
+    # Ordering on the inner column rather than re-deriving it keeps
+    # this a sort of the rows the index already returned in order.
+    query = select(*columns).order_by(inner.c.distance, inner.c._id)
+    return nears, boosts, query
 
 
 def build_search_query(graph, near, target: str = "nodes", k: Optional[int] = 10,
@@ -1541,6 +1734,26 @@ def _ensure_lazy_vectors(graph, connection) -> None:
     alone."""
     if graph._vectors is None and getattr(graph, "_vectors_lazy", False):
         load_vectors(graph, connection=connection)
+
+
+def _ensure_pgvector_ready(graph, conn) -> None:
+    """What every pgvector-backed read does before its query: check the
+    server once, then turn on the iterative scan for this connection.
+
+    The version check is cached on the handle because it can only
+    change between processes, and paying a round trip for it before
+    every search would tax the ordinary path to catch a
+    misconfiguration that is fixed once. `apply_scan_settings()` is NOT
+    cached -- it is per connection, and a pooled connection handed back
+    and reissued has been reset in between.
+
+    A no-op under the exact backend, which is what keeps a Graph that
+    never asked for pgvector free of both."""
+    if graph.vector_backend != "pgvector":
+        return
+    if graph._pgvector_version is None:
+        graph._pgvector_version = pg.ensure_available(conn)
+    pg.apply_scan_settings(conn)
 
 
 def _near_field_names(near) -> list:
@@ -1611,6 +1824,7 @@ def search_candidates(graph, near, target: str = "nodes", k: Optional[int] = 10,
     resolves its embeddings before it takes a connection."""
     with _read_connection(graph, connection) as conn:
         _ensure_lazy_vectors(graph, conn)
+        _ensure_pgvector_ready(graph, conn)
         nears, boosts, query = _prepare_search_query(
             graph, near, target=target, k=k, where=where, boost=boost,
             candidates=None if rerank is None else rerank.candidates)
@@ -1672,6 +1886,85 @@ def _as_query_list(queries, caller: str) -> list:
     return [list(one) if isinstance(one, (list, tuple)) else [one] for one in queries]
 
 
+def _prepare_pgvector_search_many_query(graph, queries, target: str, k: Optional[int],
+                                        where: Any, boost,
+                                        candidates: Optional[int] = None) -> tuple:
+    """vector_search_many() under vector_backend='pgvector'.
+
+    The same VALUES-plus-LATERAL shape the exact backend uses, and here
+    it earns more than the round trip it was built for: each LATERAL
+    invocation is its own `ORDER BY vec_x <=> queries.v0 LIMIT k`, so
+    every query in the batch gets its own index scan rather than its
+    own sequential one.
+
+    The query vectors travel as pgvector's text form in the VALUES
+    column, which is what the type's bind_processor() produces -- one
+    bind path with the single-query builder, and the cast that makes
+    `<=>` resolve lives in the column's declared type rather than being
+    repeated per row.
+    """
+    _check_k(k, "vector_search_many()")
+    parsed = _as_query_list(queries, "vector_search_many()")
+    parsed = _resolve_query_texts(graph, target, parsed, "vector_search_many()")
+    validated = [validate_nears(graph, target, one, k, "vector_search_many()")
+                 for one in parsed]
+    for one in validated:
+        pg.refuse_unsupported(one, validate_boosts(boost, "vector_search_many()"),
+                              "vector_search_many()")
+    shapes = {tuple((n.field, n.weight, n.min_similarity, n.missing) for n in one)
+              for one in validated}
+    if len(shapes) > 1:
+        raise ValueError(
+            "vector_search_many() ranks every query with ONE statement, so the queries must "
+            "share a shape -- the same field, with the same weight, min_similarity and "
+            "missing mode. Only the vectors may differ. Group the queries by shape and call "
+            "search_many() once per group"
+        )
+    boosts = validate_boosts(boost, "vector_search_many()")
+    template = validated[0]
+    one = template[0]
+    table = _table(graph, target)
+    column = _attach(table, VECTOR_COLUMN_PREFIX + one.field, _column_type(graph))
+    dimensions = len(one.vector)
+
+    queries_values = values(
+        sa_column("q", SAString),
+        sa_column("v0", pg.Vector(dimensions)),
+        name="queries",
+    ).data([(str(index), list(entry[0].vector)) for index, entry in enumerate(validated)])
+
+    # The cast is not decoration: a VALUES column renders as a bare
+    # bind parameter, which Postgres types as text, and there is no
+    # `vector <=> text` operator. Applied to the correlated column
+    # rather than to each row's literal so the query vector still
+    # travels once per row as a parameter.
+    distance = column.op(pg.COSINE_DISTANCE, return_type=Float)(
+        cast(queries_values.c.v0, pg.Vector(dimensions)))
+    inner = (
+        select(*_identity_columns(graph, table, target),
+               table.c.properties.label("properties"), distance.label("distance"))
+        .where(and_(graph._scoped(table), resolve(table.c.properties, where),
+                    *_pgvector_guards(column, one, distance)))
+        .order_by(distance)
+        .correlate(queries_values)
+    )
+    rows = k if candidates is None else candidates
+    inner = (inner if rows is None else inner.limit(rows)).subquery()
+
+    similarity = (literal(1.0, type_=DOUBLE_PRECISION) - inner.c.distance)
+    if one.weight != 1.0:
+        similarity = similarity * one.weight
+    similarity = similarity.label("similarity")
+    per_query = select(
+        *(_result_columns(inner, target) + [inner.c.properties, similarity]
+          + [similarity.self_group().label(f"{_SIM_REPORT_PREFIX}0")])
+    ).order_by(inner.c.distance, inner.c._id).lateral("hits")
+    query = select(queries_values.c.q.label("q"), *per_query.c).select_from(
+        queries_values.join(per_query, literal(True))
+    )
+    return parsed, template, boosts, query
+
+
 def _prepare_search_many_query(graph, queries, target: str, k: Optional[int], where: Any,
                                boost, candidates: Optional[int] = None) -> tuple:
     """(parsed, template, boosts, query) for vector_search_many()'s
@@ -1701,6 +1994,9 @@ def _prepare_search_many_query(graph, queries, target: str, k: Optional[int], wh
     therefore agree on the SHAPE -- same fields in the same order --
     or they would need different SQL, which one statement cannot be.
     """
+    if graph.vector_backend == "pgvector":
+        return _prepare_pgvector_search_many_query(
+            graph, queries, target=target, k=k, where=where, boost=boost, candidates=candidates)
     _check_k(k, "vector_search_many()")
     parsed = _as_query_list(queries, "vector_search_many()")
     # Every text= across every query, embedded in one call per field --
@@ -1813,6 +2109,7 @@ def search_many_candidates(graph, queries, target: str = "nodes", k: Optional[in
     reason: the provider calls happen with the connection closed."""
     with _read_connection(graph, connection) as conn:
         _ensure_lazy_vectors(graph, conn)
+        _ensure_pgvector_ready(graph, conn)
         parsed, template, boosts, query = _prepare_search_many_query(
             graph, queries, target=target, k=k, where=where, boost=boost,
             candidates=None if rerank is None else rerank.candidates)
@@ -2050,6 +2347,25 @@ def _field_ddl(target: _Target, field: Vector) -> list:
         f'ALTER TABLE {target.qualified} ALTER COLUMN "{field.column_name}" '
         f'SET STORAGE EXTERNAL',
         _compile_check(target.table, name, expression),
+    ]
+
+
+def _pgvector_field_ddl(target: _Target, field: Vector) -> list:
+    """One field's DDL under vector_backend='pgvector'.
+
+    No dimension CHECK twin to _field_ddl()'s, and that is the one real
+    asymmetry between the backends: `vector(d)` fixes d in the TYPE, so
+    the server already enforces what the CHECK exists to enforce. The
+    consequence is worth stating where the DDL is, not only in the
+    docs -- a per-graph CHECK let two graphs store different
+    dimensionalities in ONE shared column, and a typed column cannot.
+    Every graph in these tables must agree on a field's size under this
+    backend, and migrate_vectors() refuses the second graph by name
+    rather than discovering it as a driver error.
+    """
+    return [
+        pg.column_ddl(target.qualified, field.column_name, field.dimensions),
+        pg.index_ddl(target.qualified, target.table.name, field.column_name),
     ]
 
 
@@ -2348,6 +2664,74 @@ _ALL_COLUMNS = text("""
 """)
 
 
+#: The dimension a `vector` column was declared with, from the catalog.
+#: atttypmod carries it, offset by the header pgvector stores alongside
+#: -- the same encoding `format_type()` decodes to render "vector(3)".
+#: Read here rather than parsed out of format_type()'s text so a future
+#: rendering change cannot turn a dimension check into a silent pass.
+_VECTOR_DIMS = text("""
+    SELECT a.atttypmod - 4
+    FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = :table AND a.attname = :column
+      AND n.nspname = COALESCE(:schema, current_schema())
+      AND a.attnum > 0 AND NOT a.attisdropped
+""")
+
+
+def _migrate_pgvector(graph, conn) -> list:
+    """migrate_vectors() under vector_backend='pgvector': the extension,
+    a `vector(d)` column per field, and its HNSW index.
+
+    Runs the same drift refusals the exact path does, against the
+    catalog rather than against a CHECK constraint, because here the
+    TYPE is the constraint. The dimension mismatch message is the one
+    that matters: `vector(d)` is a property of the COLUMN, which every
+    graph in these tables shares, so a second graph declaring the same
+    field at a different size cannot be accommodated the way a
+    per-graph CHECK accommodated it under the exact backend. That is a
+    real capability this backend gives up, and it is said here, at the
+    point of failure, rather than left to the docs.
+    """
+    pg.ensure_available_or_create(conn)
+    graph._pgvector_version = pg.ensure_available(conn)
+    ensured = []
+    for target_name in _TARGETS:
+        table = _table(graph, target_name)
+        target = _target_for(graph, target_name)
+        for field in graph._vectors[target_name].values():
+            existing = conn.execute(_COLUMN_TYPE, {
+                "table": table.name, "column": field.column_name, "schema": table.schema,
+            }).scalar()
+            if existing is not None and existing != "vector":
+                raise ValueError(
+                    f"{target_name}.{field.column_name} already exists with type "
+                    f"{existing!r}, not pgvector's vector -- a column written by the exact "
+                    f"backend (real[]) is converted by pgvector_exit_ddl(), which prints "
+                    f"the ALTER; rename the vector field, or drop the conflicting column"
+                )
+            if existing == "vector":
+                declared = conn.execute(_VECTOR_DIMS, {
+                    "table": table.name, "column": field.column_name,
+                    "schema": table.schema,
+                }).scalar()
+                if declared is not None and declared > 0 and declared != field.dimensions:
+                    raise ValueError(
+                        f"vector field {field.name!r} on {target_name} already exists as "
+                        f"vector({declared}) and this graph declares {field.dimensions} -- "
+                        f"under vector_backend='pgvector' the size lives in the COLUMN's "
+                        f"type, which every graph in these tables shares, so they cannot "
+                        f"differ per graph the way they can under the exact backend. Use "
+                        f"one size for this field, or give this graph a differently named "
+                        f"field"
+                    )
+            for statement in _pgvector_field_ddl(target, field):
+                conn.execute(text(statement))
+            ensured.append(f"{table.name}.{field.column_name}")
+    return ensured
+
+
 def migrate_vectors(graph, connection=None) -> list:
     """Apply the declared vector fields: add each column and its
     per-graph dimension CHECK. Idempotent, one transaction, and it
@@ -2363,6 +2747,8 @@ def migrate_vectors(graph, connection=None) -> list:
                          "call define_vectors(...) first")
     ensured = []
     with one_transaction(graph, connection) as conn:
+        if graph.vector_backend == "pgvector":
+            return _migrate_pgvector(graph, conn)
         for target_name in _TARGETS:
             table = _table(graph, target_name)
             target = _target_for(graph, target_name)
@@ -2370,6 +2756,13 @@ def migrate_vectors(graph, connection=None) -> list:
                 existing = conn.execute(_COLUMN_TYPE, {
                     "table": table.name, "column": field.column_name, "schema": table.schema,
                 }).scalar()
+                if existing == "vector":
+                    raise ValueError(
+                        f"{target_name}.{field.column_name} is a pgvector column, and this "
+                        f"Graph uses the exact backend, which reads it as real[] -- build "
+                        f"the Graph with vector_backend='pgvector' to use it, or drop the "
+                        f"column to go back to exact search"
+                    )
                 if existing is not None and existing not in ("_float4", "_float8"):
                     raise ValueError(
                         f"{target_name}.{field.column_name} already exists with type "
@@ -2731,7 +3124,21 @@ def set_vectors(graph, nodes=None, edges=None, connection=None, plan=None) -> in
                             # The cast is for the all-None case: a VALUES
                             # column holding only NULLs is inferred as
                             # text, and text does not assign to real[].
-                            VECTOR_COLUMN_PREFIX + name: cast(incoming.c[f"v{i}"], ARRAY(REAL))
+                            # Under vector_backend='pgvector' it does a
+                            # second job -- Postgres has a real[] ->
+                            # vector cast, so the rows still travel as
+                            # float arrays (one bind path, unchanged) and
+                            # become vectors on assignment. The VALUES
+                            # column stays ARRAY(REAL) deliberately:
+                            # binding 1536 floats as a vector literal
+                            # would stringify every row for nothing.
+                            # Unsized `vector`, not `vector(d)`: the
+                            # COLUMN's own type carries the size and
+                            # rejects a mismatch on assignment, so
+                            # repeating it here would add a second place
+                            # for the two to disagree.
+                            VECTOR_COLUMN_PREFIX + name: cast(
+                                incoming.c[f"v{i}"], _column_type(graph))
                             for i, name in enumerate(names)
                         })
                         .returning(id_column)

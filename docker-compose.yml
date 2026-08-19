@@ -22,7 +22,22 @@ name: hopai
 
 services:
   db:
-    image: postgres:16-alpine
+    # pgvector's own image rather than plain `postgres:16`: it is the same
+    # PostgreSQL 16 with the pgvector extension FILES installed, which is
+    # what `Graph(dsn, vector_backend="pgvector")` needs before it can run
+    # `CREATE EXTENSION vector`. The default backend still uses plain
+    # `real[]` columns and needs nothing from this image -- having the
+    # extension available costs nothing and is what lets the pgvector tests
+    # run at all instead of skipping.
+    #
+    # Debian-based, where this used to be `-alpine`. Nothing here depended
+    # on alpine: `pg_isready` and the `postgres -c ...` override below are
+    # the upstream entrypoint's, identical in both, and PGDATA is
+    # /var/lib/postgresql/data either way. An EXISTING hopai-data volume
+    # was initialised against musl's collations though, so if a stale one
+    # misbehaves after this change, `docker compose down -v` -- it is a
+    # development database and losing it costs nothing (see below).
+    image: pgvector/pgvector:pg16
     container_name: hopai-db
     environment:
       POSTGRES_USER: postgres

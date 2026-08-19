@@ -30,7 +30,12 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16
+        # pgvector's image, not plain `postgres:16`: same PostgreSQL 16 with
+        # the pgvector extension files present, which is what
+        # `vector_backend="pgvector"` needs before it can `CREATE EXTENSION
+        # vector`. Without it those tests would skip and CI would report
+        # green having exercised one of the two backends.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: testpass
@@ -67,7 +72,9 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16
+        # Same image as the `test` job, for the same reason: a notebook that
+        # demonstrates the pgvector backend needs the extension available.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: testpass
@@ -157,7 +164,10 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16
+        # Same image as the `test` job: coverage runs the same suite, so a
+        # database without pgvector would skip those tests and drop the
+        # measured number below the gate for a reason that isn't the PR's.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: testpass

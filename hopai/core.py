@@ -51,6 +51,7 @@ from .models import (
     DEFAULT_GRAPH, EDGE_IDENTITY_KEYS, GRAPH_IDENTITY_KEYS, NODE_IDENTITY_KEYS, Edge,
     GraphRegistry, Node,
 )
+from .pgvector import DEFAULT_VECTOR_BACKEND, validate_backend
 from .vectors import VECTOR_COLUMN_PREFIX
 
 
@@ -460,6 +461,7 @@ class Graph:
         edge_start_col: str = "start_id",
         edge_end_col: str = "end_id",
         graph_col: Optional[str] = "graph_id",
+        vector_backend: str = DEFAULT_VECTOR_BACKEND,
     ):
         self.engine: Engine = (
             dsn_or_engine if isinstance(dsn_or_engine, Engine) else create_engine(dsn_or_engine)
@@ -476,6 +478,19 @@ class Graph:
         self.graph_col = graph_col
         self._schema = None
         self._vectors = None
+        # Which storage and query shape the vec_* columns use, for the
+        # whole handle. Per-Graph rather than per-Vector, and that is
+        # not tidiness: `CREATE EXTENSION vector` is a property of the
+        # database, and a search combining a pgvector-backed field with
+        # a real[] one would need two scoring strategies stitched into
+        # one ranked SELECT to answer a query neither index can serve.
+        # See hopai.pgvector's module docstring.
+        self.vector_backend = validate_backend(vector_backend)
+        # ensure_available()'s answer, cached per handle: the version
+        # check is a round trip, and repeating it before every search
+        # would tax the ordinary path for a misconfiguration that can
+        # only be fixed between processes.
+        self._pgvector_version = None
         # Set True only by define_edge_type() -- resolve_via() reads it
         # to decide whether an ordinary via={"kind": "..."} filter (not
         # just the via="..." shorthand) may also compile to the ->>
@@ -565,8 +580,17 @@ class Graph:
                        edge_table=self.edges_tbl, graph_table=self.graphs_tbl,
                        node_id_col=self.node_id_col,
                        edge_id_col=self.edge_id_col, edge_start_col=self.edge_start_col,
-                       edge_end_col=self.edge_end_col, graph_col=self.graph_col)
+                       edge_end_col=self.edge_end_col, graph_col=self.graph_col,
+                       # The backend describes the COLUMNS, which the new
+                       # handle shares -- a sibling graph in the same
+                       # tables reading vector(d) storage as real[] would
+                       # compile SQL the column cannot answer.
+                       vector_backend=self.vector_backend)
         handle._vectors_lazy = True
+        # Carried, not re-probed: the version is a property of the
+        # database both handles are pointed at, and in_graph() promises
+        # not to connect.
+        handle._pgvector_version = self._pgvector_version
         return handle
 
     def graphs(self) -> list:
@@ -731,7 +755,8 @@ class Graph:
             from .vectors import validate_boosts
             nears = validate_nears(self, "nodes", start.near, start.keep, "Start", "keep")
             seed = ranked_ids(self, nt, node_id_col, nt, seed_condition, nears, start.keep,
-                              validate_boosts(start.boost, "Start")).cte("seed")
+                              validate_boosts(start.boost, "Start"),
+                              caller="Start").cte("seed")
         else:
             seed = (
                 select(node_id_col.label("node_id"))
@@ -774,7 +799,8 @@ class Graph:
                 base_join, base_move, base_id = _edge_cols(base_alias)
                 base_beam = edge_beam(self, base_alias, base_join, prev_match.c.node_id,
                                       base_move, base_id, hop.via, via_nears, hop.via_keep,
-                                      f"beam_{i}", correlate=(prev_match,))
+                                      f"beam_{i}", correlate=(prev_match,),
+                                      caller=f"hop {i} ({hop.label or 'unlabeled'}) via_near")
                 walk_base = select(
                     prev_match.c.node_id.label("from_id"),
                     base_beam.c.move_id.label("to_id"),
@@ -810,6 +836,7 @@ class Graph:
                     via_nears, hop.via_keep, f"beam_rec_{i}",
                     extra=[sa_not_(rec_move == sa_any_(w.c.local_path))],
                     correlate=(w,),
+                    caller=f"hop {i} ({hop.label or 'unlabeled'}) via_near",
                 )
                 recursive_term = (
                     select(
@@ -868,6 +895,7 @@ class Graph:
                     self, nt, reached.c.node_id, joined,
                     and_(*pinned) if pinned else None, nears, hop.keep,
                     validate_boosts(hop.boost, f"hop {i} ({hop.label or 'unlabeled'})"),
+                    caller=f"hop {i} ({hop.label or 'unlabeled'})",
                 ).cte(f"match_{i}")
             else:
                 match_i = (
@@ -2129,6 +2157,7 @@ class Graph:
         AsyncSession.run_sync() -- one implementation, two callers, so
         sync and async can never disagree about what an aggregate
         answers."""
+        self._prepare_vector_scan(session, start, hops)
         query = self.build_aggregate_query(start, hops, aggregates, group_by=group_by, pins=pins)
         if group_by is None:
             row = session.execute(query).one()
@@ -2377,10 +2406,27 @@ class Graph:
             pins[index] = _rerank_survivors(units, scores, spec.keep)
         return pins
 
+    def _prepare_vector_scan(self, session, start: Start, hops: list) -> None:
+        """Ready this session for a pgvector-backed walk, when it is one.
+
+        Gated on the chain actually carrying a near=/via_near=, not just
+        on the backend: a traversal with no similarity in it compiles
+        the same SQL under either backend and must not pay a round trip
+        for a setting it will never read. See vectors._ensure_pgvector_
+        ready() for what the setting is and why it is not optional."""
+        if self.vector_backend != "pgvector":
+            return
+        if start.near is None and not any(
+                hop.near is not None or hop.via_near is not None for hop in hops):
+            return
+        from .vectors import _ensure_pgvector_ready
+        _ensure_pgvector_ready(self, session.connection())
+
     def _traverse_with_session(self, session, start: Start, hops: list,
                                pins: Optional[dict] = None) -> Subgraph:
         """The traverse work itself, given an OPEN session -- see
         _aggregate_with_session() just above for why this split exists."""
+        self._prepare_vector_scan(session, start, hops)
         query = self.build_query(start, hops, pins=pins)
         t0 = time.perf_counter()
         rows = session.execute(query).all()
