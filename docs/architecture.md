@@ -114,8 +114,11 @@ set plugs into the walk.
   beam would spend slots on edges leading back into the path.
 - Writes go through `set_vectors()` only (UPDATE … FROM VALUES … RETURNING, one
   transaction, missing ids fail the call); ingestion rows never carry vectors.
-  `stale_vectors()` reports what needs re-embedding; `pgvector_exit_ddl()` emits the one-way
-  migration off this engine without importing the extension.
+  `stale_vectors()` reports what needs re-embedding. Two doors lead onto pgvector once
+  exact search is outgrown: `Graph(vector_backend="pgvector")` (`hopai/pgvector.py`) keeps
+  hopai driving over `vector(d)` columns and an HNSW index — approximate, one field per
+  search, pgvector ≥ 0.8 — while `pgvector_exit_ddl()` emits the same migration and leaves
+  the querying to you.
 - The JSON forms exist for the whole family, and only `"vector"` is refused without
   `allow_vectors=True` — `"text"` is the model's way in, since the field embeds it with
   the application's own client, while an invented `"vector"` finds confidently wrong
@@ -620,7 +623,8 @@ bugs actually hit. Read the relevant one before changing behavior.
 | `hopai/ingest.py` | The two row spellings, edge-by-property references, merge semantics |
 | `hopai/mutate.py` | What `where=` selects, why a blank filter refuses, the three update semantics and what `detach` does |
 | `hopai/constraints.py` | What each constraint compiles to, and the SQL semantics that surprise people |
-| `hopai/vectors.py` | Why no pgvector, the storage and cost model, cosine-only, multivector semantics, and why a vector never passes through a tool schema |
+| `hopai/vectors.py` | Why the default needs no pgvector, the storage and cost model, cosine-only, multivector semantics, and why a vector never passes through a tool schema |
+| `hopai/pgvector.py` | Why the optional backend is opt-in, why it requires pgvector ≥ 0.8 (a filtered scan silently under-returns below it), and why an HNSW index cannot serve multivector or hybrid ranking |
 | `hopai/embeddings.py` | Which clients are accepted and how they are recognized without an import, the document/query asymmetry, and what this seam deliberately does not do |
 | `hopai/rerankers.py` | The one-method contract and why it is not split by modality, `document_from` as a rule, why scores are re-paired by index, and why a spent call raises instead of degrading |
 | `hopai/jqsafe.py` | What was measured about jq in a server, the soundness and totality claims the subset rests on, and why each excluded family is excluded |

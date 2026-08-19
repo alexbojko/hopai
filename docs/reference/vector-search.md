@@ -1,7 +1,10 @@
 # Vector search
 
 Exact cosine similarity over nodes and edges, on plain `real[]` columns —
-no pgvector, no extension, no approximate index.
+no pgvector, no extension, no approximate index. That is the default and
+what the rest of this page describes; [an optional pgvector
+backend](#the-pgvector-backend) trades it for an index once the numbers
+below say it is time.
 [`09_vector_search`](../notebooks/09_vector_search.ipynb) is the full,
 worked tour: declaring fields (`define_vectors`/`migrate_vectors`),
 storing (`set_vectors`), searching nodes and edges with `where=` filtering
@@ -48,5 +51,121 @@ things to that bill:
   *after* scoring — unlike an ANN index's search radius, it never skips a
   candidate. See `Near.min_similarity` in `hopai/vectors.py`.
 
-Outgrowing this is a planned move, not a rewrite: `pgvector_exit_ddl()`
-prints the migration onto pgvector whenever the numbers above say it's time.
+Outgrowing this is a planned move, not a rewrite — see below.
+
+## The pgvector backend
+
+`Graph(dsn, vector_backend="pgvector")` stores vectors in pgvector's
+`vector(d)` type behind an HNSW cosine index, and compiles a search to
+`ORDER BY vec_x <=> :query LIMIT k` so the index answers it. Everything
+else — `where=`, traversal seeding, `set_vectors()`, results — keeps its
+shape. The default is `vector_backend="exact"`, and a Graph that never
+asks for pgvector emits byte-identical SQL to the pre-pgvector engine.
+
+```python
+graph = Graph(dsn, vector_backend="pgvector")
+graph.define_vectors(nodes=[Vector("summary", 1536)])
+graph.migrate_vectors()      # vector(1536) + HNSW, and the extension
+```
+
+It is opt-in because it is a real dependency: the `vector` extension
+must be installed in the server. No Python package is added — the type
+is rendered as SQL text and the operator as `<=>`.
+
+**What you give up: recall, and more of it than "approximate" suggests.**
+An HNSW index can miss a true nearest neighbor, and no setting makes that
+absolute. Measured (`benchmarks/bench_pgvector.py`, unfiltered `k=10`,
+uniform random vectors — see `benchmarks/README.md` for the full tables):
+
+| rows × dims | exact | pgvector | speedup | recall@10 |
+| --- | ---: | ---: | ---: | ---: |
+| 2 000 × 384 | 118 ms | 4.1 ms | 29× | 0.73 |
+| 20 000 × 384 | 1 021 ms | 4.2 ms | 240× | **0.25** |
+| 100 000 × 384 | 4 655 ms | 4.8 ms | 979× | **0.06** |
+
+At pgvector's default `ef_search=40`, a 20k-row search returned a quarter of
+the true top ten. Uniform random vectors in 384 dimensions are near the worst
+case an ANN index can be handed — everything is nearly orthogonal, so the top
+k is a near-tie — and real embeddings cluster, which helps. Both levers,
+measured at 20 000 × 384:
+
+| | pgvector | recall@10 | similarity ratio |
+| --- | ---: | ---: | ---: |
+| uniform, `ef_search=40` (default) | 4.2 ms | 0.25 | 0.89 |
+| clustered, `ef_search=40` | 3.5 ms | 0.40 | 0.91 |
+| uniform, `ef_search=200` | 9.4 ms | 0.59 | 0.97 |
+| clustered, `ef_search=200` | 5.0 ms | 0.60 | 0.95 |
+
+The *similarity ratio* — mean cosine of what came back over mean cosine of the
+true top-k — stays at 0.89–0.97 while recall sits at 0.25, which says most of
+what recall counts as a "miss" is a neighbour that was very nearly as close.
+That is a real consolation and not a full one: if you need *the* nearest
+neighbour rather than *a* near one, recall is the number that matters.
+
+**`hnsw.ef_search` is the dial, and hopai does not wrap it.** It is an
+ordinary Postgres GUC — set it on your own connection (`SET hnsw.ef_search =
+200`, or a SQLAlchemy `connect` event listener). Raising it 40 → 200 roughly
+doubled recall here for about 2× the time, still ~99× faster than exact.
+
+Two more costs, both measured: writes run **2–5× slower** (every write
+maintains the index), and building the index on 100 000 × 384 took ~120 s and
+195 MB.
+
+**The planner can decline the index, and did.** At 20 000 × 768 it costed a
+sequential scan at 1122.81 against the HNSW scan's 1193.47 — 6% apart in the
+estimate, 25× apart in reality (138 ms vs 5.6 ms). The answers were exact and
+recall was 1.00, so this is a performance surprise rather than a correctness
+one, but it means "I added the index" is not the same as "the index is being
+used". `EXPLAIN` is the check; `benchmarks/bench_pgvector.py` records
+`pgvector_uses_index` per configuration for exactly this reason.
+
+This is the whole trade, and it is why this is not the default.
+
+**What you keep: `where=` still means `where=`.** That one is not free,
+and it is the most important thing on this page.
+
+A filtered HNSW scan can return *fewer rows than match the filter* —
+not ranked differently, but rows you asked for, missing, with nothing to
+indicate it. Measured:
+
+| rows | rows matching `where=` | `k` | setting | returned |
+| ---: | ---: | ---: | --- | ---: |
+| 20,000 | 2 | 10 | `iterative_scan=off` (pgvector < 0.8) | **1** |
+| 20,000 | 2 | 10 | `strict_order` (≥ 0.8) | 2 |
+| 120,000 | 3 | 10 | `strict_order`, `max_scan_tuples` raised past the table | **0** |
+
+So pgvector 0.8's `hnsw.iterative_scan` *reduces* the problem and does
+not remove it — the graph traversal runs out of reachable candidates
+long before a selective filter is satisfied, and no SQL-level setting
+changes that. hopai therefore does two things: it requires **pgvector ≥
+0.8** (refusing an older server by name) and sets `strict_order`, *and*
+it **completes a short filtered result exactly** — re-asking with an
+ordering the index cannot serve, which is the exact backend's cost and
+the exact backend's answer.
+
+That second query runs only when a filtered search comes back short of
+`k`, so the ordinary path keeps the index's speed and the awkward path
+keeps the right answer. What stays approximate is the *ranking* of an
+unfiltered search — that is what an ANN index buys, and it cannot be
+given back.
+
+**One field per search.** Multivector (`Near` on several fields) and
+`Boost` are refused under this backend rather than served. An HNSW index
+accelerates exactly one ordering — the one it was built for — and a
+weighted sum across two independent distance spaces is not it, so
+Postgres would scan every row and sort the sum: the exact backend's cost,
+having silently become approximate. Rank one field here, or use the exact
+backend, which answers both correctly and needs no extension. A negative
+`Near` weight is refused for the same reason (it asks for the *least*
+similar rows, and HNSW indexes one direction).
+
+**Per Graph, not per field.** `CREATE EXTENSION vector` is a property of
+the database, and `vector(d)` fixes the dimensions in the column's type —
+which every graph in those tables shares. So a field cannot be 1536-dim
+in one graph and 768-dim in another under this backend, the way a
+per-graph CHECK allows under the exact one; `migrate_vectors()` refuses
+that by name.
+
+`pgvector_exit_ddl()` remains, and is now the *other* door: it prints the
+same migration and leaves the querying to you, for the cases this backend
+refuses.

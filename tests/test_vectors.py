@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import json
 import pathlib
+import random
 import re
 
 import pytest
@@ -27,6 +28,7 @@ from hopai import (
     spec_to_traversal, vector_search_json,
 )
 from hopai import Boost, Embedder
+from hopai import pgvector as pg
 from hopai.vectors import (
     build_search_many_query, build_search_query, parse_boost, pgvector_exit_ddl,
 )
@@ -91,6 +93,16 @@ def norm(statement, literal_binds: bool = False) -> str:
 
 def offline() -> Graph:
     return Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline")
+
+
+def offline_pgvector() -> Graph:
+    """offline()'s twin on vector_backend='pgvector'. The backend is a
+    constructor argument and nothing about it connects either, so the
+    whole compile-time surface is testable with no extension and no
+    database -- which is also what proves the choice is inert until a
+    query actually ranks by similarity."""
+    return Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+                 vector_backend="pgvector")
 
 
 @pytest.fixture()
@@ -4022,6 +4034,1409 @@ class TestPgvectorDdl:
         vg.pgvector_exit_ddl()
         assert "pgvector" not in sys.modules
 
+    def test_a_graph_already_on_the_backend_is_refused_not_handed_a_no_op(
+            self, metadata_guard):
+        """This function converts the EXACT backend's real[] columns.
+        On a Graph already built with vector_backend='pgvector' the DDL
+        would convert vector(d) to itself and drop a CHECK this backend
+        never created -- a near no-op that reads, to anyone running it,
+        as a migration that succeeded.
+
+        Pinned because two mutants survived here: flipping the compared
+        literal to 'XXpgvectorXX' or 'PGVECTOR' disables the refusal
+        entirely and no test objected.
+
+        Takes `metadata_guard` as a fixture rather than declaring a
+        vec_* column and leaving it: this attaches a `vector`-typed
+        column to the process-global Node metadata, which _attach()
+        then refuses to share with every later exact-backend test."""
+        graph = offline_pgvector()
+        graph.define_vectors(nodes=[Vector("exitdoc", 3)])
+        with pytest.raises(ValueError) as exc:
+            graph.pgvector_exit_ddl()
+        message = str(exc.value)
+        assert "already built with vector_backend='pgvector'" in message
+        assert "write your own SQL" in message
+
+    def test_the_exact_backend_still_generates_the_migration(self, vg):
+        """The other side of the refusal above: an exact-backend graph
+        is exactly who this function is for, and must still get DDL."""
+        assert any("vector(" in statement for statement in vg.pgvector_exit_ddl())
+
+
+# ---------------------------------------------------------------------
+# The optional pgvector BACKEND -- vector_backend="pgvector"
+#
+# Offline first (nothing here connects), then the live classes. Every
+# offline test that declares a field goes through `metadata_guard`: a
+# vec_* column is attached to the process-global Node/Edge metadata,
+# and under this backend it carries pgvector's `vector` TYPE -- which
+# _attach() now refuses to share with an exact-backend handle. A leak
+# would therefore not be the harmless extra column it used to be; it
+# would fail every later exact test that declares the same name.
+# ---------------------------------------------------------------------
+
+@pytest.fixture()
+def metadata_guard():
+    """Restore the shared vec_* attachment set this test was given --
+    fresh_graph()'s teardown, for the offline tests that have no
+    fixture of their own."""
+    from conftest import _restore_vector_columns, _vector_columns
+    before = _vector_columns()
+    yield
+    _restore_vector_columns(before)
+
+
+@pytest.fixture()
+def pgvg(metadata_guard) -> Graph:      # noqa: ARG001 -- the guard is the point
+    """`vg`'s pgvector twin: an offline graph on the pgvector backend
+    with fields declared on both targets. Field names that no
+    exact-backend test uses, so a leak is visible as a failure here
+    rather than as a confusing one three modules away."""
+    g = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+              vector_backend="pgvector")
+    g.define_vectors(nodes=[Vector("pgsummary", 3), Vector("pgtitle", 3)],
+                     edges=[Vector("pgrel", 3)])
+    return g
+
+
+class TestVectorBackendSelection:
+    """Which storage a Graph uses is chosen once, at construction, and
+    every handle derived from it must agree -- the column is shared, so
+    two handles disagreeing means one of them writing the wrong type."""
+
+    def test_the_default_backend_is_exact(self):
+        """No caller asked for an extension, so no caller gets one."""
+        assert offline().vector_backend == "exact"
+
+    def test_pgvector_is_selected_by_name(self):
+        assert offline_pgvector().vector_backend == "pgvector"
+
+    @pytest.mark.parametrize("bad", ["pg_vector", "hnsw", "PGVECTOR", "", None, 1])
+    def test_an_unknown_backend_names_both_valid_values(self, bad):
+        """A typo must not fall back to a default: 'exact' silently
+        would be an approximate answer the caller asked to avoid, and
+        the other way round is a missing extension surfacing as an
+        undefined-operator error from inside a compiled query."""
+        with pytest.raises(ValueError) as exc:
+            Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+                  vector_backend=bad)
+        assert "exact" in str(exc.value) and "pgvector" in str(exc.value)
+
+    def test_in_graph_carries_the_backend_to_the_child_handle(self):
+        """in_graph() returns a handle on the SAME tables. A child left
+        on the default would read a vector(d) column as real[] and
+        compile SQL the column cannot answer."""
+        child = offline_pgvector().in_graph("other")
+        assert child.vector_backend == "pgvector"
+
+    def test_in_graph_carries_the_cached_version_without_connecting(self):
+        """The version is a property of the database both handles point
+        at, and in_graph() promises not to connect -- so it is carried,
+        never re-probed."""
+        parent = offline_pgvector()
+        parent._pgvector_version = (0, 8, 0)
+        assert parent.in_graph("other")._pgvector_version == (0, 8, 0)
+
+    def test_a_new_handle_starts_with_no_cached_version_so_the_check_runs(self):
+        """_ensure_pgvector_ready() probes only while the cache reads
+        `is None`. Any other empty-ish starting value ("" say) is
+        falsy but not None, so the version check would be SKIPPED for
+        the handle's whole life and a server below the floor would go
+        unrefused -- the silently-lossy filtered search the floor
+        exists to prevent. A surviving mutant on this line said no test
+        objected."""
+        assert offline_pgvector()._pgvector_version is None
+        assert offline().vector_backend == "exact"
+
+    def test_the_first_search_probes_the_version_and_caches_it(self, pgvector_graph):
+        """The other half of the line above: the probe must actually
+        run, once, and then stop running."""
+        pgvector_graph.define_vectors(nodes=[Vector("probever", 3)])
+        pgvector_graph.migrate_vectors()
+        # migrate_vectors() has already probed, so clear it: what this
+        # asserts is that the SEARCH path fills an empty cache too, and
+        # a handle that only ever reads never skips the check.
+        pgvector_graph._pgvector_version = None
+        pgvector_graph.vector_search(Near("probever", [1.0, 0.0, 0.0]), k=1)
+        assert pgvector_graph._pgvector_version >= (0, 8, 0)
+
+
+class TestBackendChoiceIsInvisibleToVectorFreeQueries:
+    """The premise of an OPTIONAL backend: a query with no similarity in
+    it must compile the same way under both, or every existing plan is
+    up for renegotiation the day someone opts in."""
+
+    def test_the_pgvector_backend_changes_no_near_less_query(self, pgvg):
+        """The exact backend's twin of this
+        (test_defining_vectors_changes_no_near_less_query) is the
+        invariant CLAUDE.md names; declaring pgvector fields must be
+        just as free."""
+        start, hops = Start(where={"type": "person"}), [Hop(hops=(1, 3)), Hop(optional=True)]
+        assert norm(offline().build_query(start, hops)) == norm(pgvg.build_query(start, hops))
+
+    def test_the_two_backends_compile_the_same_traversal(
+            self, pgvg, metadata_guard):                  # noqa: ARG002 -- the guard is the point
+        """Not the same as the test above: here BOTH handles have vector
+        fields declared, so the vec_* columns exist in both metadata
+        sets and only the backend differs. The backend may touch
+        vector-ranking SQL and nothing else."""
+        exact = offline()
+        exact.define_vectors(nodes=[Vector("exsummary", 3)], edges=[Vector("exrel", 3)])
+        start, hops = Start(where={"type": "person"}), [Hop(via={"kind": "knows"}), Hop()]
+        assert norm(exact.build_query(start, hops)) == norm(pgvg.build_query(start, hops))
+
+    def test_an_aggregate_with_no_near_is_unchanged_too(self, pgvg):
+        """_prepare_vector_scan() gates on the CHAIN carrying a near=,
+        not on the backend -- a walk with none must not pay a round trip
+        for a setting it never reads, and must not compile differently
+        either."""
+        query = (Start(where={"type": "person"}), [Hop()], {"n": Count()})
+        assert norm(offline().build_aggregate_query(*query)) == \
+            norm(pgvg.build_aggregate_query(*query))
+
+
+class TestPgvectorSearchShape:
+    """What the emitted SQL must look like for the index to serve it.
+    Every assertion here is the difference between an index scan and a
+    sequential one, which is the whole reason this backend exists."""
+
+    def test_both_walk_terms_name_their_beam_lateral(self, pgvg):
+        """The exact backend pins these names (TestEdgeBeamShape), and
+        this path must match: the emitted SQL is meant to be READ -- it
+        is how anything touching the query path gets checked -- and a
+        recursive walk whose two beams come back as anon_1/anon_2 makes
+        the base term and the recursive term indistinguishable to the
+        reader.
+
+        A mutant blanking the alias survived, because nothing here had
+        looked at the pgvector walk's SQL text."""
+        sql = norm(pgvg.build_query(Start(), [Hop(via_near=Near("pgrel", [1.0, 0.0, 0.0]),
+                                                  via_keep=2, hops=(1, 3))]))
+        assert "beam_0" in sql and "beam_rec_0" in sql
+        assert sql.count("JOIN LATERAL") >= 2
+
+    def test_the_order_by_holds_the_bare_distance_operator(self, pgvg):
+        """An HNSW index is on the OPERATOR. Wrapping `<=>` in `1 - x`
+        (or in a CASE mapping NaN to NULL) returns the same rows from a
+        sequential scan -- so distance is what the inner query ranks by
+        and similarity is computed outside it."""
+        sql = norm(build_search_query(pgvg, Near("pgsummary", [1.0, 0.0, 0.0]), k=5))
+        assert "ORDER BY nodes.vec_pgsummary <=> CAST(" in sql
+        assert "unnest" not in sql              # no exact-backend scoring survived
+
+    def test_the_filters_sit_inside_the_ranked_subquery(self, pgvg):
+        """`where=` applied after LIMIT k would mean 'k candidates, some
+        of which match' -- which is what a filtered search must never
+        become. The guards and the limit share one SELECT."""
+        sql = norm(build_search_query(
+            pgvg, Near("pgsummary", [1.0, 0.0, 0.0], min_similarity=0.5),
+            k=5, where={"type": "doc"}))
+        inner = sql[sql.index("FROM (SELECT"):sql.index(") AS anon_1")]
+        assert "properties -> " in inner or "properties @>" in inner
+        assert "IS NOT NULL" in inner and "<= " in inner
+        assert "LIMIT" in inner
+
+    def test_the_query_vector_travels_as_a_parameter(self, pgvg):
+        """A 1536-float literal inlined into every statement defeats
+        Postgres's plan cache and bloats the logs for nothing."""
+        sql = norm(build_search_query(pgvg, Near("pgsummary", [1.0, 0.0, 0.0]), k=5))
+        assert "CAST(%(param_2)s AS vector(3))" in sql
+        assert "[1.0,0.0,0.0]" not in sql
+
+    def test_a_near_seed_ranks_with_the_operator_too(self, pgvg):
+        """The traversal seed is the same shape as a search, deliberately
+        -- otherwise Start(near=) would be the one place the extension
+        was paid for and not used."""
+        sql = norm(pgvg.build_query(
+            Start(near=Near("pgsummary", [1.0, 0.0, 0.0]), keep=3), [Hop()]))
+        seed = sql[sql.index("seed AS ("):sql.index("walk_0")]
+        assert "ORDER BY nodes.vec_pgsummary <=> CAST(" in seed
+        assert "unnest" not in seed and "LATERAL" not in seed
+
+    def test_via_near_is_still_a_per_anchor_lateral(self, pgvg):
+        """'The k most similar edges' only means something relative to
+        where you are standing, so the beam stays per anchor under this
+        backend as well -- it just ranks with `<=>`."""
+        sql = norm(pgvg.build_query(
+            Start(), [Hop(via_near=Near("pgrel", [1.0, 0.0, 0.0]), via_keep=2)]))
+        assert "LATERAL" in sql and "<=>" in sql
+
+    def test_search_many_gives_every_query_its_own_ordered_scan(self, pgvg):
+        """One statement, one LATERAL invocation per query row -- which
+        is what makes each query its own index scan instead of one
+        shared sequential one."""
+        sql = norm(build_search_many_query(
+            pgvg, [Near("pgsummary", [1.0, 0.0, 0.0]), Near("pgsummary", [0.0, 1.0, 0.0])], k=2))
+        assert "JOIN LATERAL" in sql
+        assert "CAST(queries.v0 AS vector(3))" in sql
+        assert sql.count("ORDER BY nodes.vec_pgsummary <=>") == 1
+
+
+class TestPgvectorRefusesRankingsAnIndexCannotServe:
+    """Refusals, not scoped-out features: an HNSW index answers exactly
+    one ORDER BY, so anything else would pay for the extension, get the
+    exact backend's cost, and quietly have become approximate. Each one
+    is asserted on its MESSAGE -- naming the way forward is the point,
+    and a bare ValueError names nothing."""
+
+    def test_multivector_names_both_fields_and_the_way_out(self, pgvg):
+        with pytest.raises(ValueError) as exc:
+            build_search_query(pgvg, [Near("pgsummary", [1.0, 0.0, 0.0]),
+                                      Near("pgtitle", [1.0, 0.0, 0.0])], k=3)
+        message = str(exc.value)
+        assert "'pgsummary', 'pgtitle'" in message
+        assert "ONE field per search" in message
+        assert "without vector_backend='pgvector'" in message
+
+    def test_boost_is_refused_by_name(self, pgvg):
+        with pytest.raises(ValueError) as exc:
+            build_search_query(pgvg, Near("pgsummary", [1.0, 0.0, 0.0]), k=3,
+                               boost=Boost("priority"))
+        message = str(exc.value)
+        assert "does not support boost=" in message
+        assert "apply the boost to the returned hits yourself" in message
+
+    def test_boost_is_refused_on_the_batch_path_too_not_quietly_dropped(self, pgvg):
+        """vector_search_many() must refuse a boost for the same reason
+        vector_search() does -- and the batch path is where getting it
+        wrong is WORSE, because that builder never adds a boost column.
+        Left unrefused, a caller asking for hybrid ranking would get
+        pure similarity back with nothing to say the boost was ignored:
+        a silently different answer, which is the one thing this library
+        refuses to produce.
+
+        A surviving mutant (`refuse_unsupported(one, None, ...)`) is
+        exactly that failure, and no test objected to it."""
+        with pytest.raises(ValueError) as exc:
+            build_search_many_query(pgvg, [Near("pgsummary", [1.0, 0.0, 0.0])], k=3,
+                                    boost=Boost("priority"))
+        message = str(exc.value)
+        assert "does not support boost=" in message
+        assert "apply the boost to the returned hits yourself" in message
+        # The refusal must name the call the caller actually made. A
+        # mutant blanking this label survived on its own, because
+        # asserting only the explanation leaves the reader of a real
+        # failure hunting for which of the two search calls raised.
+        assert message.startswith("vector_search_many():"), message
+
+    def test_a_negative_weight_is_refused_because_hnsw_has_one_direction(self, pgvg):
+        """A negative weight asks for the LEAST similar rows first.
+        There is no 'farthest' scan to fall back on, so serving it would
+        silently be a sequential scan returning the opposite of what the
+        index is for."""
+        with pytest.raises(ValueError) as exc:
+            build_search_query(pgvg, Near("pgsummary", [1.0, 0.0, 0.0], weight=-1.0), k=3)
+        assert "needs a positive Near weight" in str(exc.value)
+        assert "'pgsummary' has weight=-1.0" in str(exc.value)
+
+    def test_the_traversal_seed_refuses_under_its_own_caller_name(self, pgvg):
+        """Every refusal in this library names the call the caller made.
+        Reaching it through Start(near=) must say `Start:`, not
+        `vector_search():` -- the two are different arguments in
+        different places."""
+        with pytest.raises(ValueError, match=r"^Start: vector_backend='pgvector' ranks ONE"):
+            pgvg.build_query(Start(near=[Near("pgsummary", [1.0, 0.0, 0.0]),
+                                         Near("pgtitle", [1.0, 0.0, 0.0])], keep=2), [Hop()])
+
+    def test_a_hop_refuses_under_the_hop_s_own_label(self, pgvg):
+        with pytest.raises(ValueError, match=r"^hop 0 \(rels\) via_near: "):
+            pgvg.build_query(Start(), [Hop(label="rels", via_keep=1,
+                                           via_near=Near("pgrel", [1.0, 0.0, 0.0], weight=-2.0))])
+
+    def test_a_hop_near_refuses_under_the_hop_s_own_label(self, pgvg):
+        with pytest.raises(ValueError, match=r"^hop 0 \(docs\): vector_backend"):
+            pgvg.build_query(Start(), [Hop(label="docs", keep=2, boost=Boost("priority"),
+                                           near=Near("pgsummary", [1.0, 0.0, 0.0]))])
+
+    def test_search_many_refuses_a_mixed_batch_before_the_shape_check(self, pgvg):
+        """Two fields in ONE query is the multivector refusal; two
+        different fields ACROSS queries is search_many's own shape rule.
+        Both must still fire under this backend."""
+        with pytest.raises(ValueError, match="ONE field per search"):
+            build_search_many_query(pgvg, [[Near("pgsummary", [1.0, 0.0, 0.0]),
+                                            Near("pgtitle", [1.0, 0.0, 0.0])]], k=2)
+        with pytest.raises(ValueError, match="must share a shape"):
+            build_search_many_query(pgvg, [Near("pgsummary", [1.0, 0.0, 0.0]),
+                                           Near("pgtitle", [0.0, 1.0, 0.0])], k=2)
+
+
+class TestBackendsMayNotShareOneColumn:
+    """The SQLAlchemy Table metadata is process-global, so two handles
+    on the same tables share every vec_* Column. Until this backend
+    existed an extra attachment changed no behavior; now the TYPE drives
+    how a value binds and how a result is read back, so a disagreement
+    means one handle writing float arrays into a vector column."""
+
+    def test_a_pgvector_handle_refuses_a_column_an_exact_one_declared(
+            self, metadata_guard):                        # noqa: ARG002 -- the guard is the point
+        exact = offline()
+        exact.define_vectors(nodes=[Vector("clashfield", 3)])
+        with pytest.raises(ValueError) as exc:
+            offline_pgvector().define_vectors(nodes=[Vector("clashfield", 3)])
+        assert "already declared as real[]" in str(exc.value)
+        assert "must pass the same vector_backend=" in str(exc.value)
+
+    def test_an_exact_handle_refuses_a_column_a_pgvector_one_declared(
+            self, metadata_guard):                        # noqa: ARG002 -- the guard is the point
+        """The mirror image, and it is not symmetry for its own sake:
+        the refusal reads the EXISTING type and the WANTED one, so a
+        mutant swapping the two would only fail one direction."""
+        offline_pgvector().define_vectors(edges=[Vector("clashedge", 3)])
+        with pytest.raises(ValueError) as exc:
+            offline().define_vectors(edges=[Vector("clashedge", 3)])
+        assert "already declared as vector" in str(exc.value)
+        assert "needs it as real[]" in str(exc.value)
+
+    def test_two_handles_on_the_same_backend_share_it_happily(
+            self, metadata_guard):                        # noqa: ARG002 -- the guard is the point
+        """The check is a type CONFLICT, not a re-declaration ban --
+        in_graph() and a second handle both re-attach the same column
+        every time they are built."""
+        offline_pgvector().define_vectors(nodes=[Vector("sharedfield", 3)])
+        second = offline_pgvector()
+        second.define_vectors(nodes=[Vector("sharedfield", 3)])
+        assert second.vectors["nodes"]["sharedfield"].dimensions == 3
+
+
+class TestPgvectorUnits:
+    """hopai.pgvector's own helpers, with no Graph and no database --
+    the layer that turns a Python list into SQL text and a catalog
+    string back into a version tuple."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("0.8.0", (0, 8, 0)),
+        # A packaged build ('0.8.0-1') and a source build ('0.8.0devel')
+        # must compare as 0.8.0 rather than failing to parse and refusing
+        # a server that is actually fine.
+        ("0.8.0-1", (0, 8, 0)),
+        ("0.8.0devel", (0, 8, 0)),
+        ("0.7.4", (0, 7, 4)),
+        ("1.10.2", (1, 10, 2)),
+    ])
+    def test_parse_version_reads_what_the_catalog_reports(self, raw, expected):
+        assert pg.parse_version(raw) == expected
+
+    def test_the_floor_is_a_comparison_not_a_string_match(self):
+        """0.7.4 is refused and 0.8.0 accepted, and '0.10.0' must sort
+        ABOVE '0.8.0' -- which a string comparison gets backwards."""
+        assert pg.parse_version("0.7.4") < pg.MINIMUM_PGVECTOR
+        assert pg.parse_version("0.8.0") >= pg.MINIMUM_PGVECTOR
+        assert pg.parse_version("0.10.0") >= pg.MINIMUM_PGVECTOR
+
+    def test_an_unparseable_version_refuses_rather_than_passing(self):
+        """Refuse, don't approximate: a version this cannot read must
+        not read as 'new enough'."""
+        assert pg.parse_version("unknown") < pg.MINIMUM_PGVECTOR
+
+    def test_literal_vector_is_pgvector_s_own_text_form(self):
+        assert pg.literal_vector([0.1, 0.2, 0.3]) == "[0.1,0.2,0.3]"
+
+    def test_literal_vector_spells_every_number_as_a_float(self):
+        """repr() would render an int as `1` and a numpy scalar as
+        `np.float32(1.0)` -- embedding a Python repr into SQL. float()
+        first keeps one spelling."""
+        assert pg.literal_vector([1, 0, -2]) == "[1.0,0.0,-2.0]"
+
+    def test_index_name_is_shared_by_every_graph_on_the_column(self):
+        """Not graph-scoped, and not for brevity: the COLUMN is shared,
+        so a second index over it under another graph's name would
+        double every other graph's write cost to buy nothing."""
+        assert pg.index_name("nodes", "vec_summary") == "ix_nodes_vec_summary_hnsw"
+
+    def test_index_name_is_truncated_to_the_identifier_limit(self):
+        """Postgres truncates a >63-character identifier silently, which
+        would make CREATE INDEX and DROP INDEX name different things."""
+        name = pg.index_name("nodes", "vec_" + "x" * 80)
+        assert len(name) == 63
+        assert name.startswith("ix_nodes_vec_")
+
+    def test_the_type_renders_sized_and_unsized(self):
+        """`vector(d)` is what DDL needs; the unsized `vector` is enough
+        to compile a reference to a column drop_vectors()/load_vectors()
+        reach without a declaration."""
+        assert pg.Vector(1536).get_col_spec() == "vector(1536)"
+        assert pg.Vector().get_col_spec() == "vector"
+
+    @pytest.mark.parametrize("value,expected", [
+        ([0.5, 0.25], "[0.5,0.25]"),
+        (None, None),
+        ("[0.5,0.25]", "[0.5,0.25]"),          # already text: passed through
+    ])
+    def test_the_bind_processor_sends_pgvector_text(self, value, expected):
+        """A list binds as a Postgres ARRAY otherwise, and the server
+        refuses that against a `vector` parameter."""
+        assert pg.Vector(2).bind_processor(postgresql.dialect())(value) == expected
+
+    @pytest.mark.parametrize("value,expected", [
+        ("[1,0,-0.5]", [1.0, 0.0, -0.5]),
+        ("[]", []),
+        (None, None),
+        ([1.0, 0.0], [1.0, 0.0]),              # already parsed: passed through
+    ])
+    def test_the_result_processor_returns_floats_not_text(self, value, expected):
+        """get_vectors() promises [floats] | None under BOTH backends --
+        a caller doing arithmetic on the result must not discover that
+        one of them hands back the string '[1,0,0]'."""
+        assert pg.Vector(3).result_processor(postgresql.dialect(), None)(value) == expected
+
+    def test_a_round_trip_through_both_processors_is_the_identity(self):
+        dialect = postgresql.dialect()
+        vector = [0.125, -0.5, 1.0]
+        wire = pg.Vector(3).bind_processor(dialect)(vector)
+        assert pg.Vector(3).result_processor(dialect, None)(wire) == vector
+
+    def test_distance_renders_the_operator_the_index_is_built_on(self, pgvg):
+        column = pgvg.nodes_tbl.c["vec_pgsummary"]
+        assert "<=>" in str(pg.distance(column, [1.0, 0.0, 0.0], 3))
+
+    def test_similarity_is_one_minus_the_distance_and_nothing_else(self, pgvg):
+        """`similarity` has to mean the same number under either
+        backend, so this is the whole conversion -- and it lives OUTSIDE
+        the ranked subquery, because an HNSW index is on the operator
+        and `1 - (a <=> b)` is not an expression it can answer."""
+        distance = pg.distance(pgvg.nodes_tbl.c["vec_pgsummary"], [1.0, 0.0, 0.0], 3)
+        assert norm(pg.similarity(distance), literal_binds=True) == \
+            "1.0 - (nodes.vec_pgsummary <=> CAST('[1.0,0.0,0.0]' AS vector(3)))"
+
+    def test_has_direction_detects_nan_with_a_comparison_not_with_d_ne_d(self, pgvg):
+        """A stored all-zero vector has no direction and pgvector's
+        cosine distance returns NaN for it. Postgres considers NaN equal
+        to itself and GREATER than every real number (unlike IEEE), so
+        `d <> d` does NOT detect it and `d <> 'NaN'` does -- getting
+        that backwards ranks a directionless vector as the WORST match
+        rather than as no match, which is a different answer and not a
+        rounding difference."""
+        distance = pg.distance(pgvg.nodes_tbl.c["vec_pgsummary"], [1.0, 0.0, 0.0], 3)
+        rendered = norm(pg.has_direction(distance), literal_binds=True)
+        assert rendered.endswith("!= nan")
+        assert "<=>" in rendered
+
+    def test_the_ddl_helpers_name_the_column_the_index_and_the_operator_class(self):
+        """Both statements are IF NOT EXISTS, which is what makes
+        migrate_vectors() safe to call on every start-up."""
+        assert pg.column_ddl("public.nodes", "vec_x", 3) == (
+            'ALTER TABLE public.nodes ADD COLUMN IF NOT EXISTS "vec_x" vector(3)')
+        assert pg.index_ddl("public.nodes", "nodes", "vec_x") == (
+            'CREATE INDEX IF NOT EXISTS "ix_nodes_vec_x_hnsw" ON public.nodes '
+            'USING hnsw ("vec_x" vector_cosine_ops)')
+
+    def test_the_create_extension_statement_is_the_one_it_claims_to_be(self):
+        """Nothing read this text at all: every live test runs against a
+        server that already has the extension, so
+        ensure_available_or_create() returns before it is ever executed
+        and _FakeConnection only ever matches on the substring 'CREATE
+        EXTENSION'. IF NOT EXISTS is the half that matters -- without it
+        the second migrate_vectors() on a start-up path raises instead of
+        being the no-op every other statement here is."""
+        assert pg.create_extension_ddl() == "CREATE EXTENSION IF NOT EXISTS vector"
+
+    def test_cosine_is_the_metric_on_both_sides_of_the_backend_choice(self):
+        """`similarity` must mean the same number under either backend,
+        so an L2 operator class here would answer a different question
+        than the code it replaces."""
+        assert pg.HNSW_OPS == "vector_cosine_ops"
+        assert pg.COSINE_DISTANCE == "<=>"
+
+    def test_the_scan_setting_is_strict_order(self):
+        """`relaxed_order` lets pgvector return rows slightly out of
+        distance order to fill k faster -- a caller reading `similarity`
+        down a result list would see it go back UP, which the exact
+        backend cannot produce and so neither may this one."""
+        assert pg.ITERATIVE_SCAN == "strict_order"
+
+
+class _FakeResult:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar(self):
+        return self._value
+
+
+class _FakeConnection:
+    """Enough of a Connection for ensure_available(): the two catalog
+    reads it makes, answered from constructor arguments. A real server
+    below the floor is not something a test can arrange, and the three
+    refusals are the whole point of the function."""
+
+    def __init__(self, installed=None, available=None, fail_create=False,
+                 on_path=True, schema="public"):
+        self.installed, self.available, self.fail_create = installed, available, fail_create
+        self.on_path, self.schema = on_path, schema
+        self.executed, self.rolled_back = [], False
+
+    def execute(self, statement, *args):        # noqa: ARG002
+        sql = str(statement)
+        self.executed.append(sql)
+        if "CREATE EXTENSION" in sql:
+            if self.fail_create:
+                raise RuntimeError("permission denied to create extension \"vector\"")
+            self.installed = self.available
+            return _FakeResult(None)
+        if "pg_available_extensions" in sql:
+            return _FakeResult(self.available)
+        if "current_schemas" in sql:
+            return _FakeResult(self.on_path)
+        if "extnamespace" in sql:
+            return _FakeResult(self.schema)
+        return _FakeResult(self.installed)
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+class TestPgvectorAvailabilityIsNamedNotGuessed:
+    """Three different causes, three different fixes -- a single
+    'pgvector unavailable' would send every reader to the wrong one."""
+
+    def test_a_server_without_the_extension_files_says_install_it(self):
+        with pytest.raises(RuntimeError) as exc:
+            pg.ensure_available(_FakeConnection(installed=None, available=None))
+        message = str(exc.value)
+        assert "does not have it available" in message
+        assert "install it" in message
+        assert "CREATE EXTENSION" not in message
+
+    def test_an_uncreated_extension_says_create_extension(self):
+        """Available but not created is a one-line fix, and naming the
+        upgrade instead would send a superuser hunting for packages."""
+        with pytest.raises(RuntimeError) as exc:
+            pg.ensure_available(_FakeConnection(installed=None, available="0.8.0"))
+        message = str(exc.value)
+        assert "CREATE EXTENSION vector" in message
+        assert "not a superuser" in message
+
+    def test_a_version_below_the_floor_says_what_it_gets_wrong(self):
+        """The floor is measured, not preferred: below 0.8 a selective
+        filter returns far fewer rows than match it. The message has to
+        say so, or the reader downgrades again to save a migration."""
+        with pytest.raises(RuntimeError) as exc:
+            pg.ensure_available(_FakeConnection(installed="0.7.4"))
+        message = str(exc.value)
+        assert ">= 0.8.0" in message and "0.7.4" in message
+        assert "fewer rows than match" in message.lower()
+        assert "hnsw.iterative_scan" in message
+
+    def test_a_good_server_returns_the_parsed_version(self):
+        assert pg.ensure_available(_FakeConnection(installed="0.8.0-1")) == (0, 8, 0)
+
+    def test_an_extension_off_the_search_path_is_named_not_left_to_the_driver(self):
+        """Everything this backend emits names `vector` and `<=>`
+        UNQUALIFIED, so an extension in a schema the search_path does
+        not reach fails as `type "vector" does not exist` -- one line
+        after this same function confirmed it IS installed, which is
+        the most confusing shape an error can take. Routine whenever an
+        application pins search_path to its own schema."""
+        with pytest.raises(RuntimeError) as exc:
+            pg.ensure_available(
+                _FakeConnection(installed="0.8.0", on_path=False, schema="extensions"))
+        message = str(exc.value)
+        assert "'extensions'" in message
+        assert "search_path" in message
+        assert "does not exist" in message
+
+    def test_a_two_component_version_is_not_read_as_older_than_the_floor(self):
+        """Tuple comparison is length-sensitive in the direction that
+        refuses a GOOD server: (0, 8) < (0, 8, 0), so '0.8' would be
+        rejected as below a floor it actually meets. pgvector reports
+        three components today, which is exactly why this would go
+        unnoticed until something else reported two."""
+        assert pg.parse_version("0.8") == (0, 8, 0)
+        assert pg.parse_version("0.8") >= pg.MINIMUM_PGVECTOR
+        assert pg.ensure_available(_FakeConnection(installed="0.8")) == (0, 8, 0)
+
+    def test_creating_the_extension_is_skipped_when_it_already_exists(self):
+        conn = _FakeConnection(installed="0.8.0", available="0.8.0")
+        pg.ensure_available_or_create(conn)
+        assert not any("CREATE EXTENSION" in sql for sql in conn.executed)
+
+    def test_a_role_that_may_not_create_it_is_left_to_ensure_available(self):
+        """Failing the migration on the permission error would hide the
+        real, fixable situation behind it -- so the failure is swallowed
+        here and ensure_available() names the fix next."""
+        conn = _FakeConnection(installed=None, available="0.8.0", fail_create=True)
+        pg.ensure_available_or_create(conn)
+        assert conn.rolled_back
+        with pytest.raises(RuntimeError, match="CREATE EXTENSION vector"):
+            pg.ensure_available(conn)
+
+
+# ---------------------------------------------------------------------
+# Live: the pgvector backend against a server that has the extension
+# ---------------------------------------------------------------------
+
+PG_QUERY = [1.0, 0.0, 0.0]
+
+
+def _pg_migrated(pgvector_graph) -> Graph:
+    pgvector_graph.define_vectors(nodes=[Vector("pgdoc", 3), Vector("pgnote", 3)],
+                                  edges=[Vector("pgedge", 3)])
+    pgvector_graph.migrate_vectors()
+    return pgvector_graph
+
+
+def _pg_corpus(pgvector_graph) -> Graph:
+    """_corpus()'s pgvector twin: the same hand-checkable cosines
+    against (1, 0, 0) -- 1.0, 0.8, 0.6, 0.0, -1.0 -- plus a row with no
+    vector, a row whose vector has no direction, and a row of the wrong
+    `type` for the filter tests."""
+    g = _pg_migrated(pgvector_graph)
+    g.add_nodes([
+        {"id": 1, "type": "doc", "name": "exact"},
+        {"id": 2, "type": "doc", "name": "close"},
+        {"id": 3, "type": "doc", "name": "closer"},
+        {"id": 4, "type": "doc", "name": "orthogonal"},
+        {"id": 5, "type": "doc", "name": "opposite"},
+        {"id": 6, "type": "doc", "name": "no-vector"},
+        {"id": 7, "type": "memo", "name": "wrong-type"},
+        {"id": 8, "type": "doc", "name": "directionless"},
+    ])
+    g.set_vectors(nodes=[
+        {"id": 1, "pgdoc": [1.0, 0.0, 0.0]},
+        {"id": 2, "pgdoc": [0.6, 0.8, 0.0]},
+        {"id": 3, "pgdoc": [0.8, 0.6, 0.0]},
+        {"id": 4, "pgdoc": [0.0, 1.0, 0.0]},
+        {"id": 5, "pgdoc": [-1.0, 0.0, 0.0]},
+        {"id": 7, "pgdoc": [1.0, 0.0, 0.0]},
+        {"id": 8, "pgdoc": [0.0, 0.0, 0.0]},
+    ])
+    return g
+
+
+def _column_type_of(graph, table: str, column: str) -> str:
+    with graph.engine.connect() as conn:
+        return conn.execute(text(
+            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+            "WHERE attrelid = CAST(:table AS regclass) AND attname = :column"
+        ), {"table": table, "column": column}).scalar()
+
+
+class TestPgvectorMigrationLive:
+    def test_the_column_is_a_typed_vector_of_the_declared_size(self, pgvector_graph):
+        """real[] plus a CHECK is the exact backend's shape. Here the
+        size lives in the TYPE, which is what makes the index possible
+        and what the drift refusals below are about."""
+        _pg_migrated(pgvector_graph)
+        assert _column_type_of(pgvector_graph, "nodes", "vec_pgdoc") == "vector(3)"
+        assert _column_type_of(pgvector_graph, "edges", "vec_pgedge") == "vector(3)"
+
+    def test_an_hnsw_cosine_index_is_created_for_every_field(self, pgvector_graph):
+        """The index IS the feature. Without it this backend is the
+        exact backend's cost plus an extension to install."""
+        _pg_migrated(pgvector_graph)
+        with pgvector_graph.engine.connect() as conn:
+            definitions = dict(conn.execute(text(
+                "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema()"
+            )).all())
+        for index in ("ix_nodes_vec_pgdoc_hnsw", "ix_edges_vec_pgedge_hnsw"):
+            assert index in definitions, sorted(definitions)
+            assert "USING hnsw" in definitions[index]
+            assert "vector_cosine_ops" in definitions[index]
+
+    def test_create_schema_emits_the_column_at_its_declared_size(self, pgvector_graph):
+        """define_vectors() attaches vec_* to the SHARED Table metadata,
+        and create_schema() emits every column attached to it -- so that
+        metadata is a second place the dimension has to travel, next to
+        migrate_vectors()' own DDL. Left unsized it creates a plain
+        `vector` column, which compiles, indexes and searches exactly the
+        same and quietly gives up the only guarantee this backend has
+        over the exact one: vector(d) enforces the length in the TYPE,
+        which is precisely why no dimension CHECK is created here. So the
+        NUMBER is what this asserts -- reading back the type name alone
+        would call the unsized column correct."""
+        pgvector_graph.define_vectors(nodes=[Vector("pgfresh", 5)],
+                                      edges=[Vector("pgfreshrel", 7)])
+        with pgvector_graph.engine.begin() as conn:
+            conn.execute(text("DROP TABLE edges"))
+            conn.execute(text("DROP TABLE nodes"))
+        pgvector_graph.create_schema()
+        assert _column_type_of(pgvector_graph, "nodes", "vec_pgfresh") == "vector(5)"
+        assert _column_type_of(pgvector_graph, "edges", "vec_pgfreshrel") == "vector(7)"
+
+    def test_no_dimension_check_constraint_is_created(self, pgvector_graph):
+        """The one real asymmetry between the backends: vector(d) fixes
+        d in the type, so the CHECK the exact backend adds would reject
+        nothing and confuse everyone. Its absence is also what the
+        different-dimension refusal below exists to make up for."""
+        _pg_migrated(pgvector_graph)
+        with pgvector_graph.engine.connect() as conn:
+            checks = {row[0] for row in conn.execute(text(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid = CAST('nodes' AS regclass) AND contype = 'c'"))}
+        assert not any(name.startswith("ck_vec_dims_") for name in checks), checks
+
+    def test_migrate_is_idempotent(self, pgvector_graph):
+        """Every DDL statement is IF NOT EXISTS, so start-up may call
+        this every time -- and a second CREATE INDEX must not build a
+        second index over the same column."""
+        g = _pg_migrated(pgvector_graph)
+        first = g.migrate_vectors()
+        assert first == g.migrate_vectors()
+        assert "nodes.vec_pgdoc" in first and "edges.vec_pgedge" in first
+        with g.engine.connect() as conn:
+            count = conn.execute(text(
+                "SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema() "
+                "AND indexname LIKE '%_hnsw'")).scalar()
+        assert count == 3
+
+    def test_migrating_over_an_exact_backend_column_names_pgvector_exit_ddl(
+            self, pgvector_graph):
+        """A real[] column is not converted behind the caller's back:
+        rewriting a populated column is a long, locking ALTER, and
+        pgvector_exit_ddl() is the call that prints it."""
+        with pgvector_graph.engine.begin() as conn:
+            conn.execute(text("ALTER TABLE nodes ADD COLUMN vec_legacy real[]"))
+        pgvector_graph.define_vectors(nodes=[Vector("legacy", 3)])
+        with pytest.raises(ValueError) as exc:
+            pgvector_graph.migrate_vectors()
+        assert "'_float4'" in str(exc.value)
+        assert "pgvector_exit_ddl()" in str(exc.value)
+
+    def test_an_exact_graph_over_a_vector_column_names_the_backend_to_pass(
+            self, pgvector_graph):
+        """The other direction, and the one a caller hits by forgetting
+        `vector_backend='pgvector'` on a second handle. Its own Table
+        metadata, because the shared one would refuse at
+        define_vectors() and never reach the migration."""
+        _pg_migrated(pgvector_graph)
+        from sqlalchemy import BigInteger, Column, MetaData, Table, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        md = MetaData()
+        nodes = Table("nodes", md, Column("id", BigInteger, primary_key=True),
+                      Column("graph_id", Text), Column("properties", JSONB))
+        edges = Table("edges", md, Column("id", BigInteger, primary_key=True),
+                      Column("graph_id", Text), Column("start_id", BigInteger),
+                      Column("end_id", BigInteger), Column("properties", JSONB))
+        exact = Graph(pgvector_graph.engine, node_table=nodes, edge_table=edges)
+        exact.define_vectors(nodes=[Vector("pgdoc", 3)])
+        with pytest.raises(ValueError) as exc:
+            exact.migrate_vectors()
+        assert "is a pgvector column" in str(exc.value)
+        assert "vector_backend='pgvector'" in str(exc.value)
+
+    def test_a_second_graph_may_not_declare_a_different_dimension(self, pgvector_graph):
+        """The capability this backend GIVES UP, pinned so nobody
+        rediscovers it as a driver error: under the exact backend two
+        graphs may size one field differently, because the rule is a
+        per-graph CHECK. Here the size is the column's type, which every
+        graph in these tables shares."""
+        _pg_migrated(pgvector_graph)
+        other = pgvector_graph.in_graph("other")
+        other.define_vectors(nodes=[Vector("pgdoc", 4)])
+        with pytest.raises(ValueError) as exc:
+            other.migrate_vectors()
+        assert "already exists as vector(3)" in str(exc.value)
+        assert "declares 4" in str(exc.value)
+        assert "give this graph a differently named field" in str(exc.value)
+
+    def test_a_second_graph_at_the_same_dimension_shares_the_column(self, pgvector_graph):
+        """The refusal above is about the SIZE, not about a second graph
+        -- sharing the column is the normal case and must stay free."""
+        a = _pg_migrated(pgvector_graph)
+        b = pgvector_graph.in_graph("other")
+        b.define_vectors(nodes=[Vector("pgdoc", 3)])
+        assert b.migrate_vectors() == ["nodes.vec_pgdoc"]
+        a.add_nodes([{"id": 1, "t": "a"}])
+        b.add_nodes([{"id": 2, "t": "b"}])
+        assert a.set_vectors(nodes=[{"id": 1, "pgdoc": [1.0, 0.0, 0.0]}]) == 1
+        assert b.set_vectors(nodes=[{"id": 2, "pgdoc": [0.0, 1.0, 0.0]}]) == 1
+        assert [h["id"] for h in a.vector_search(Near("pgdoc", PG_QUERY), k=10)] == ["1"]
+
+    def test_the_server_rejects_a_wrong_sized_vector_without_a_check(self, pgvector_graph):
+        """What replaces the dimension CHECK: writes that bypass this
+        library entirely must still be rejected, which is the reason the
+        exact backend compiles a constraint at all."""
+        g = _pg_migrated(pgvector_graph)
+        g.add_nodes([{"id": 1, "type": "doc"}])
+        with pytest.raises(Exception, match="expected 3 dimensions"), \
+                g.engine.begin() as conn:
+            conn.execute(text("UPDATE nodes SET vec_pgdoc = '[1,2]' WHERE id = 1"))
+
+    def test_load_vectors_recovers_the_size_from_the_column_type(self, pgvector_graph):
+        """There is no CHECK to read here, so the recovery reads
+        atttypmod instead -- issue #53's fix has to work under this
+        backend too, or a fresh handle gets a raw UndefinedColumn."""
+        g = _pg_migrated(pgvector_graph)
+        g.add_nodes([{"id": 1, "type": "doc"}])
+        g.set_vectors(nodes=[{"id": 1, "pgdoc": PG_QUERY}])
+        fresh = g.in_graph(g.graph)
+        recovered = fresh.load_vectors()
+        assert recovered["nodes"]["pgdoc"].dimensions == 3
+        assert recovered["edges"]["pgedge"].dimensions == 3
+        assert [h["id"] for h in fresh.vector_search(Near("pgdoc", PG_QUERY), k=5)] == ["1"]
+
+    def test_load_vectors_skips_a_column_the_type_says_is_not_a_sized_vector(
+            self, pgvector_graph):
+        """A real[] column left over from the exact backend carries
+        atttypmod -1, and adopting it at a made-up size is worse than not
+        seeing it: the handle would compile `<=>` against a column that
+        has no such operator. Nothing exercised that skip -- every
+        load_vectors() test here reads columns this backend created
+        itself."""
+        g = _pg_migrated(pgvector_graph)
+        with g.engine.begin() as conn:
+            conn.execute(text("ALTER TABLE nodes ADD COLUMN vec_legacy real[]"))
+        # A real vector field added AFTER the legacy column, so the scan
+        # meets the unusable one FIRST. Without that ordering the skip
+        # is the last thing the loop does and `continue` cannot be told
+        # from `break` -- which is precisely the mutant that survived
+        # the earlier shape of this test. `break` here would abandon
+        # every column behind the legacy one, losing a field that is
+        # migrated and usable.
+        g.define_vectors(nodes=[Vector("pgdoc", 3), Vector("pgnote", 3),
+                                Vector("pglater", 3)],
+                         edges=[Vector("pgedge", 3)])
+        g.migrate_vectors()
+        recovered = g.in_graph(g.graph).load_vectors()
+        assert "legacy" not in recovered["nodes"], recovered["nodes"]
+        assert recovered["nodes"]["pgdoc"].dimensions == 3
+        assert recovered["nodes"]["pglater"].dimensions == 3, (
+            "a field behind the skipped column was lost -- the skip must "
+            "continue the scan, not end it")
+
+    def test_drop_vectors_nulls_this_graph_s_values_and_keeps_the_column(
+            self, pgvector_graph):
+        """The column is shared by every graph in the table, so dropping
+        it is a deliberate manual ALTER -- under this backend as much as
+        under the other one."""
+        g = _pg_migrated(pgvector_graph)
+        g.add_nodes([{"id": 1, "type": "doc"}])
+        g.set_vectors(nodes=[{"id": 1, "pgdoc": PG_QUERY}])
+        assert g.drop_vectors(node_fields=["pgdoc"]) == ["nodes.vec_pgdoc"]
+        assert g.get_vectors(node_ids=[1]) == {"nodes": {"1": {"pgdoc": None, "pgnote": None}},
+                                               "edges": {}}
+        assert _column_type_of(g, "nodes", "vec_pgdoc") == "vector(3)"
+
+
+class TestPgvectorWritesAndReadsLive:
+    def test_set_vectors_writes_into_the_vector_column(self, pgvector_graph):
+        """The rows still travel as float arrays -- binding 1536 floats
+        as a vector literal would stringify every row for nothing -- and
+        Postgres's real[] -> vector cast does the rest on assignment."""
+        g = _pg_migrated(pgvector_graph)
+        g.add_nodes([{"id": 1, "type": "doc"}])
+        assert g.set_vectors(nodes=[{"id": 1, "pgdoc": [1.0, 0.0, 0.5]}]) == 1
+        with g.engine.connect() as conn:
+            assert conn.execute(text("SELECT vec_pgdoc FROM nodes WHERE id = 1")).scalar() \
+                == "[1,0,0.5]"
+
+    def test_get_vectors_returns_lists_of_floats_not_pgvector_text(self, pgvector_graph):
+        """The line above is what the raw column looks like: the string
+        '[1,0,0.5]'. get_vectors() promises `[floats] | None` under both
+        backends, so a caller doing arithmetic on the result must never
+        get that string back."""
+        g = _pg_migrated(pgvector_graph)
+        g.add_nodes([{"id": 1, "type": "doc"}])
+        g.set_vectors(nodes=[{"id": 1, "pgdoc": [1.0, 0.0, 0.5]}])
+        stored = g.get_vectors(node_ids=[1], node_fields=["pgdoc"])["nodes"]["1"]["pgdoc"]
+        assert stored == [1.0, 0.0, 0.5]
+        assert all(isinstance(value, float) for value in stored)
+
+    def test_an_unwritten_field_reads_back_as_none(self, pgvector_graph):
+        g = _pg_migrated(pgvector_graph)
+        g.add_nodes([{"id": 1, "type": "doc"}])
+        assert g.get_vectors(node_ids=[1])["nodes"]["1"] == {"pgdoc": None, "pgnote": None}
+
+    def test_edge_vectors_round_trip_too(self, pgvector_graph):
+        """Every edge-side defect this feature has had was a node path
+        that worked and an edge twin nobody exercised."""
+        g = _pg_migrated(pgvector_graph)
+        g.add_nodes([{"id": 1, "t": "x"}, {"id": 2, "t": "y"}])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "k"}])
+        with g.engine.connect() as conn:
+            edge_id = conn.execute(text("SELECT id FROM edges")).scalar()
+        assert g.set_vectors(edges=[{"id": edge_id, "pgedge": [0.0, 1.0, 0.0]}]) == 1
+        assert g.get_vectors(edge_ids=[edge_id])["edges"][str(edge_id)]["pgedge"] == \
+            [0.0, 1.0, 0.0]
+
+
+class TestPgvectorSearchLive:
+    def test_ranking_and_scores_match_hand_computed_cosine(self, pgvector_graph):
+        """Same numbers as the exact backend's twin of this test:
+        similarity is `1 - (a <=> b)`, so a caller comparing the two
+        backends sees one scale rather than two conventions."""
+        g = _pg_corpus(pgvector_graph)
+        hits = g.vector_search(Near("pgdoc", PG_QUERY), k=10, where={"type": "doc"})
+        assert [h["id"] for h in hits] == ["1", "3", "2", "4", "5"]
+        assert [h["similarity"] for h in hits] == pytest.approx(
+            [1.0, 0.8, 0.6, 0.0, -1.0], abs=1e-6)
+        assert hits[0]["properties"]["name"] == "exact"
+
+    def test_similarities_are_keyed_by_field_name_and_boosts_are_empty(self, pgvector_graph):
+        """`hit["similarities"][field]` must never need to branch on
+        which backend answered -- sim_0 is a SQL label, not an API."""
+        g = _pg_corpus(pgvector_graph)
+        hit = g.vector_search(Near("pgdoc", PG_QUERY), k=1)[0]
+        assert hit["similarities"] == {"pgdoc": pytest.approx(1.0, abs=1e-6)}
+        assert hit["boosts"] == {}
+
+    def test_a_null_vector_and_a_zero_vector_are_both_missing(self, pgvector_graph):
+        """The zero vector is the one that bites: it has no direction,
+        pgvector's cosine distance returns NaN for it, and Postgres
+        sorts NaN ABOVE every real number rather than filtering it out.
+        Reported as missing -- a zero vector matches nothing rather than
+        matching badly -- so it must not appear at all, and certainly
+        not ahead of the row pointing the other way."""
+        g = _pg_corpus(pgvector_graph)
+        ids = [h["id"] for h in g.vector_search(Near("pgdoc", PG_QUERY), k=10)]
+        assert "6" not in ids                  # NULL column
+        assert "8" not in ids                  # all zeros -> NaN distance
+        assert ids[-1] == "5"                  # the opposite vector is still the worst
+
+    def test_k_truncates_and_where_prefilters(self, pgvector_graph):
+        g = _pg_corpus(pgvector_graph)
+        assert len(g.vector_search(Near("pgdoc", PG_QUERY), k=2, where={"type": "doc"})) == 2
+        assert [h["id"] for h in g.vector_search(Near("pgdoc", PG_QUERY), k=10,
+                                                 where={"type": "memo"})] == ["7"]
+
+    def test_a_selective_filter_returns_every_row_that_matches(self, pgvector_graph):
+        """THE reason the backend refuses pgvector below 0.8. An HNSW
+        scan there visits a fixed candidate window and applies where= to
+        what comes back, so a filter matching 2 rows out of hundreds
+        returns ONE and reports success -- a row the caller asked for,
+        missing, with nothing to indicate it. 0.8's
+        hnsw.iterative_scan=strict_order resumes the scan until k rows
+        survive the filter, and this test is what says the backend
+        actually turns it on."""
+        g = _pg_migrated(pgvector_graph)
+        rng = random.Random(20240819)
+        rows, vectors = [], []
+        for node_id in range(1, 601):
+            needle = node_id in (137, 491)
+            rows.append({"id": node_id, "type": "needle" if needle else "hay"})
+            # Random directions, so the two needles are nowhere near the
+            # front of an unfiltered scan -- which is what makes the
+            # window matter.
+            vectors.append({"id": node_id,
+                            "pgdoc": [rng.random(), rng.random(), rng.random()]})
+        g.add_nodes(rows)
+        g.set_vectors(nodes=vectors)
+        hits = g.vector_search(Near("pgdoc", PG_QUERY), k=10, where={"type": "needle"})
+        assert {h["id"] for h in hits} == {"137", "491"}
+
+    def test_only_a_short_filtered_result_pays_for_a_second_query(self, pgvector_graph):
+        """The completion pass is what makes the test above true, and it
+        has to stay conditional to be worth having: re-asking exactly on
+        EVERY search would hand back the speed this backend exists for,
+        and re-asking on none of them is the silent under-return. So a
+        filtered result short of k is completed, and a full one -- or an
+        unfiltered one, which has nothing to be short of that the index
+        would not already have found -- runs once."""
+        g = _pg_migrated(pgvector_graph)
+        rng = random.Random(20240819)
+        g.add_nodes([{"id": i, "type": "needle" if i in (137, 491) else "hay"}
+                     for i in range(1, 601)])
+        g.set_vectors(nodes=[{"id": i, "pgdoc": [rng.random(), rng.random(), rng.random()]}
+                             for i in range(1, 601)])
+        ranked = []
+
+        @event.listens_for(g.engine, "before_cursor_execute")
+        def record(conn, cursor, statement, *args):       # noqa: ARG001
+            if "vec_pgdoc <=>" in statement:
+                ranked.append(statement)
+
+        try:
+            g.vector_search(Near("pgdoc", PG_QUERY), k=10, where={"type": "needle"})
+            short_and_filtered = len(ranked)
+            ranked.clear()
+            g.vector_search(Near("pgdoc", PG_QUERY), k=10)
+            unfiltered = len(ranked)
+            ranked.clear()
+            g.vector_search(Near("pgdoc", PG_QUERY), k=10, where={"type": "hay"})
+            filtered_but_full = len(ranked)
+        finally:
+            event.remove(g.engine, "before_cursor_execute", record)
+        assert (short_and_filtered, unfiltered, filtered_but_full) == (2, 1, 1)
+
+    def test_min_similarity_is_applied_before_the_limit(self, pgvector_graph):
+        """A floor applied after LIMIT k would silently return fewer
+        rows than match, exactly like the window above -- so it travels
+        as a DISTANCE bound in the same inner WHERE."""
+        g = _pg_corpus(pgvector_graph)
+        assert [h["id"] for h in g.vector_search(
+            Near("pgdoc", PG_QUERY, min_similarity=0.7), k=10, where={"type": "doc"})] == \
+            ["1", "3"]
+        # ...and with k SMALLER than the number that clears the floor,
+        # the floor is still what decides membership.
+        assert [h["id"] for h in g.vector_search(
+            Near("pgdoc", PG_QUERY, min_similarity=0.7), k=1, where={"type": "doc"})] == ["1"]
+
+    def test_ties_break_by_id_deterministically(self, pgvector_graph):
+        """Two rows at the same distance must come back in the same
+        order every time, or a paged caller sees a row twice.
+
+        Filtered and short of k, so this is the exactly-completed
+        answer -- which is where the id tiebreak lives. The indexed path
+        orders by distance ALONE on purpose (a second sort key is
+        exactly what an HNSW index cannot supply), so a tie at a FULL
+        k's boundary is the planner's to break, and that is a documented
+        backend difference rather than something to assert here."""
+        g = _pg_corpus(pgvector_graph)
+        assert [h["id"] for h in g.vector_search(
+            Near("pgdoc", PG_QUERY, min_similarity=0.99), k=10)] == ["1", "7"]
+
+    def test_a_weight_scales_the_reported_similarity(self, pgvector_graph):
+        g = _pg_corpus(pgvector_graph)
+        hits = g.vector_search(Near("pgdoc", PG_QUERY, weight=0.5), k=2, where={"type": "doc"})
+        assert [h["similarity"] for h in hits] == pytest.approx([0.5, 0.4], abs=1e-6)
+
+    def test_every_search_turns_on_the_iterative_scan(self, pgvector_graph):
+        """Per CONNECTION, not per handle: a pooled connection handed
+        back and reissued has been reset in between, so caching this the
+        way the version check is cached would leave later searches
+        under-returning."""
+        g = _pg_corpus(pgvector_graph)
+        statements = []
+
+        @event.listens_for(g.engine, "before_cursor_execute")
+        def record(conn, cursor, statement, *args):       # noqa: ARG001
+            statements.append(statement)
+
+        try:
+            g.vector_search(Near("pgdoc", PG_QUERY), k=2)
+            g.vector_search(Near("pgdoc", PG_QUERY), k=2)
+        finally:
+            event.remove(g.engine, "before_cursor_execute", record)
+        assert statements.count("SET hnsw.iterative_scan = strict_order") == 2
+
+    def test_the_version_is_probed_once_per_handle(self, pgvector_graph):
+        """The check is a round trip, and it catches a misconfiguration
+        that can only be fixed between processes -- paying for it before
+        every search would tax the ordinary path forever."""
+        g = _pg_corpus(pgvector_graph)
+        g._pgvector_version = None
+        statements = []
+
+        @event.listens_for(g.engine, "before_cursor_execute")
+        def record(conn, cursor, statement, *args):       # noqa: ARG001
+            statements.append(statement)
+
+        try:
+            g.vector_search(Near("pgdoc", PG_QUERY), k=2)
+            first = sum("pg_extension" in s for s in statements)
+            statements.clear()
+            g.vector_search(Near("pgdoc", PG_QUERY), k=2)
+            second = sum("pg_extension" in s for s in statements)
+        finally:
+            event.remove(g.engine, "before_cursor_execute", record)
+        # ensure_available() reads pg_extension twice -- the installed
+        # version, then whether its schema is on the search_path -- and
+        # what this test pins is that the whole check happens ONCE per
+        # handle, not that it costs one statement. The second search
+        # must pay nothing.
+        assert first > 0
+        assert second == 0
+        assert g._pgvector_version >= (0, 8, 0)
+
+    def test_the_refusals_reach_a_caller_through_vector_search_itself(self, pgvector_graph):
+        """The offline class asserts the messages; this asserts they are
+        raised on the live path too, before any SQL runs -- a refusal
+        that only fires in build_search_query() would be no refusal at
+        all for the caller who never calls it."""
+        g = _pg_corpus(pgvector_graph)
+        with pytest.raises(ValueError, match="ONE field per search"):
+            g.vector_search(Near("pgdoc", PG_QUERY), Near("pgnote", PG_QUERY), k=2)
+        with pytest.raises(ValueError, match="does not support boost="):
+            g.vector_search(Near("pgdoc", PG_QUERY), k=2, boost=Boost("priority"))
+        with pytest.raises(ValueError, match="needs a positive Near weight"):
+            g.vector_search(Near("pgdoc", PG_QUERY, weight=-1.0), k=2)
+
+
+class TestPgvectorSearchManyLive:
+    def test_a_batch_of_one_query_is_still_a_batch(self, pgvector_graph):
+        """Every other test here passes two or three queries, so the
+        builder's `validated[0]` -- the template every column, cast and
+        dimension is read off -- was only ever reached with a spare
+        entry sitting behind it. Reading the SECOND one instead answers
+        identically for a same-shape batch (that is what "share a shape"
+        guarantees) and IndexErrors on a batch of one, which is the
+        shape a loop over a caller's list produces on its last
+        iteration."""
+        g = _pg_corpus(pgvector_graph)
+        results = g.vector_search_many([Near("pgdoc", PG_QUERY)], k=2, where={"type": "doc"})
+        assert [[h["id"] for h in one] for one in results] == [["1", "3"]]
+
+    def test_a_tie_in_the_batch_breaks_by_id_the_same_way_a_single_search_does(
+            self, pgvector_graph):
+        """Two rows at the same distance must come back in the same order
+        every time, or a caller paging the batch sees a row twice and
+        misses another. The LATERAL's OUTER ordering is where that lives
+        here -- and unlike the INNER one it costs nothing to add a second
+        sort key to, because it sorts an already-limited subquery rather
+        than the ordering the HNSW index has to serve. So the tiebreak is
+        safe to rely on in this position, and dropping it is silent: the
+        rows are all there, in an order the planner chose.
+
+        The tied rows are inserted in DESCENDING id order, so heap order
+        -- what an unordered sort of an already-distance-ordered input
+        hands back -- is the reverse of the answer."""
+        g = _pg_migrated(pgvector_graph)
+        g.add_nodes([{"id": node_id, "type": "doc"} for node_id in (5, 4, 3, 2, 1)])
+        g.set_vectors(nodes=[{"id": node_id, "pgdoc": list(PG_QUERY)}
+                             for node_id in (5, 4, 3, 2, 1)])
+        (hits,) = g.vector_search_many([Near("pgdoc", PG_QUERY)], k=5, where={"type": "doc"})
+        assert [h["id"] for h in hits] == ["1", "2", "3", "4", "5"]
+
+    def test_a_weight_scales_the_reported_similarity_in_the_batch_too(self, pgvector_graph):
+        """The batch builder scales `similarity` with its own copy of
+        this line, and only the single-search twin was ever read -- so a
+        weighted batch could report the raw cosine and look right beside
+        every other assertion in this class."""
+        g = _pg_corpus(pgvector_graph)
+        (hits,) = g.vector_search_many([Near("pgdoc", PG_QUERY, weight=0.5)], k=2,
+                                       where={"type": "doc"})
+        assert [h["similarity"] for h in hits] == pytest.approx([0.5, 0.4], abs=1e-6)
+
+    def test_each_query_gets_its_own_result_list(self, pgvector_graph):
+        """One statement, one list per query, in the order they were
+        given -- the grouping is what the batch is for."""
+        g = _pg_corpus(pgvector_graph)
+        results = g.vector_search_many(
+            [Near("pgdoc", [1.0, 0.0, 0.0]), Near("pgdoc", [0.0, 1.0, 0.0])],
+            k=2, where={"type": "doc"})
+        assert [[h["id"] for h in one] for one in results] == [["1", "3"], ["4", "2"]]
+        assert results[0][0]["similarities"] == {"pgdoc": pytest.approx(1.0, abs=1e-6)}
+
+    def test_a_query_matching_nothing_still_gets_its_own_empty_list(self, pgvector_graph):
+        """Positional correspondence is the contract: dropping the empty
+        one would shift every later result onto the wrong query."""
+        g = _pg_corpus(pgvector_graph)
+        results = g.vector_search_many(
+            [Near("pgdoc", [1.0, 0.0, 0.0], min_similarity=0.99),
+             Near("pgdoc", [0.0, 0.0, 1.0], min_similarity=0.99),
+             Near("pgdoc", [0.0, 1.0, 0.0], min_similarity=0.99)],
+            k=5, where={"type": "doc"})
+        assert [[h["id"] for h in one] for one in results] == [["1"], [], ["4"]]
+
+    def test_missing_vectors_are_missing_for_every_query_in_the_batch(self, pgvector_graph):
+        g = _pg_corpus(pgvector_graph)
+        results = g.vector_search_many([Near("pgdoc", PG_QUERY)] * 2, k=10)
+        for one in results:
+            ids = {h["id"] for h in one}
+            assert "6" not in ids and "8" not in ids
+
+    def test_a_reranked_batch_fetches_the_wider_candidate_set(self, pgvector_graph):
+        """`candidates` and `k` are two DIFFERENT bounds -- rows in,
+        rows out -- and the pgvector builder is reached through a
+        delegation that has to carry the first one across. Dropped there,
+        each query's LATERAL limits to `k` instead, so the reranker is
+        handed k documents, reorders the same k the index already picked
+        and cannot pull anything up from behind them: a rerank that
+        returns plausible results and did nothing. Only the DOCUMENT
+        COUNT shows it, which is why that is what this asserts."""
+        needs_jq()
+        from hopai import Rerank
+
+        g = _pg_corpus(pgvector_graph)
+        # Redeclared with an embedder: rerank= needs the query as TEXT,
+        # and the text becomes a vector through the field's own embed=.
+        g.define_vectors(
+            nodes=[Vector("pgdoc", 3, embed=lambda texts: [list(PG_QUERY) for _ in texts]),
+                   Vector("pgnote", 3)],
+            edges=[Vector("pgedge", 3)])
+        calls = []
+        rerank = Rerank(_by_name([], calls), document_from=".properties.name", candidates=5)
+        batch = g.vector_search_many([Near("pgdoc", text="first"), Near("pgdoc", text="second")],
+                                     k=2, where={"type": "doc"}, rerank=rerank)
+        # Five rows match the filter and carry a usable vector; k=2 is
+        # what comes back, candidates=5 is what was fetched and billed.
+        assert [len(documents) for _, documents in calls] == [5, 5]
+        assert [len(one) for one in batch] == [2, 2]
+
+
+class TestPgvectorTraversalLive:
+    def test_start_near_and_keep_rank_the_seed(self, pgvector_graph):
+        g = _pg_corpus(pgvector_graph)
+        g.add_edges([{"start_id": 1, "end_id": 4, "kind": "cites"},
+                     {"start_id": 3, "end_id": 5, "kind": "cites"}])
+        result = g.traverse(Start(where={"type": "doc"}, near=Near("pgdoc", PG_QUERY), keep=2),
+                            Hop(via={"kind": "cites"}))
+        assert sorted(n["id"] for n in result.nodes) == ["1", "3", "4", "5"]
+
+    def test_a_seed_never_ranks_a_row_with_no_usable_vector(self, pgvector_graph):
+        """keep= is a beam, so a NULL or directionless vector taking a
+        slot would push a real match out of the walk entirely."""
+        g = _pg_corpus(pgvector_graph)
+        result = g.traverse(Start(near=Near("pgdoc", PG_QUERY), keep=8), Hop(optional=True))
+        assert sorted(n["id"] for n in result.nodes) == ["1", "2", "3", "4", "5", "7"]
+
+    def test_via_near_and_via_keep_choose_the_edges(self, pgvector_graph):
+        """The beam ranks EDGES, which is a different table, a different
+        alias and a different code path from the node one."""
+        g = _pg_migrated(pgvector_graph)
+        g.add_nodes([{"id": i, "name": f"n{i}"} for i in range(1, 4)])
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "k"},
+                     {"start_id": 1, "end_id": 3, "kind": "k"}])
+        with g.engine.connect() as conn:
+            by_end = dict(conn.execute(text("SELECT end_id, id FROM edges")).all())
+        g.set_vectors(edges=[{"id": by_end[2], "pgedge": [1.0, 0.0, 0.0]},
+                             {"id": by_end[3], "pgedge": [-1.0, 0.0, 0.0]}])
+        result = g.traverse(Start(where={"name": "n1"}),
+                            Hop(via_near=Near("pgedge", PG_QUERY), via_keep=1))
+        assert sorted(n["id"] for n in result.nodes) == ["1", "2"]
+
+    def test_a_walk_with_no_similarity_pays_nothing_for_the_backend(self, pgvector_graph):
+        """The other half of _prepare_vector_scan()'s gate, and the only
+        half no test reached: the OFFLINE twin of this
+        (test_an_aggregate_with_no_near_is_unchanged_too) compares
+        compiled SQL and never opens a session, so the early return was
+        covered by nothing that runs. Without it every vector-free
+        traversal on a pgvector Graph pays a round trip for a setting it
+        will never read -- which is the promise 'the backend is inert
+        until something ranks' actually makes."""
+        g = _pg_corpus(pgvector_graph)
+        g.add_edges([{"start_id": 1, "end_id": 2, "kind": "cites"}])
+        statements = []
+
+        @event.listens_for(g.engine, "before_cursor_execute")
+        def record(conn, cursor, statement, *args):       # noqa: ARG001
+            statements.append(statement)
+
+        try:
+            result = g.traverse(Start(where={"type": "doc"}), Hop(via={"kind": "cites"}))
+        finally:
+            event.remove(g.engine, "before_cursor_execute", record)
+        assert sorted(n["id"] for n in result.nodes) == ["1", "2"]
+        assert not any("hnsw.iterative_scan" in s for s in statements), statements
+
+    def test_an_aggregate_over_a_ranked_start_runs_the_same_way(self, pgvector_graph):
+        """aggregate() has its own session entry point, so the scan
+        setting has to be applied there too -- a walk that ranks
+        correctly under traverse() and silently under-returns under
+        aggregate() would be the worst kind of difference."""
+        g = _pg_corpus(pgvector_graph)
+        totals = g.aggregate(Start(near=Near("pgdoc", PG_QUERY), keep=3),
+                             aggregates={"n": Count()})
+        assert totals == {"n": 3}
+
+    @staticmethod
+    def _ranked_chain(pgvector_graph) -> Graph:
+        """One hub with four ranked ways out, and NOTHING ranked on the
+        Start -- the shape every test below needs.
+
+        The edges are inserted worst-first, so heap order (what an
+        unordered LIMIT gets handed) picks precisely the two the beam is
+        supposed to leave behind."""
+        g = _pg_corpus(pgvector_graph)
+        g.add_edges([{"start_id": 1, "end_id": end, "kind": "cites"}
+                     for end in (5, 4, 2, 3)])
+        with g.engine.connect() as conn:
+            by_end = dict(conn.execute(text("SELECT end_id, id FROM edges")).all())
+        # Each edge carries its own destination's vector, so "the most
+        # similar edges" and "the most similar nodes" name the same two
+        # rows and one expectation serves both rankings.
+        g.set_vectors(edges=[{"id": by_end[5], "pgedge": [-1.0, 0.0, 0.0]},
+                             {"id": by_end[4], "pgedge": [0.0, 1.0, 0.0]},
+                             {"id": by_end[2], "pgedge": [0.6, 0.8, 0.0]},
+                             {"id": by_end[3], "pgedge": [0.8, 0.6, 0.0]}])
+        return g
+
+    def test_via_keep_follows_the_most_similar_edges_not_merely_that_many(
+            self, pgvector_graph):
+        """`beam.order_by(distance)` IS the beam. Dropping it leaves
+        `LIMIT via_keep` following exactly via_keep edges -- so a test
+        that counts them, or one with only two edges to choose between,
+        stays green while the walk follows an ARBITRARY subset. That is
+        the difference between a beam and a truncation, and it is silent:
+        the result is the right SIZE and the wrong rows.
+
+        Four edges, via_keep=2, and the two similar ones inserted LAST so
+        an unordered limit reaches for the wrong pair first."""
+        g = self._ranked_chain(pgvector_graph)
+        result = g.traverse(Start(where={"name": "exact"}),
+                            Hop(via_near=Near("pgedge", PG_QUERY), via_keep=2))
+        assert sorted(n["id"] for n in result.nodes) == ["1", "2", "3"]
+
+    def test_a_hop_near_keeps_the_most_similar_nodes_not_merely_that_many(
+            self, pgvector_graph):
+        """ranked_ids()'s pgvector branch carries the same bare
+        `order_by(distance)` the beam does, and reaching it through a HOP
+        (the match CTE) rather than through Start (the seed CTE) is a
+        second call site -- keep= there narrows which nodes CONTINUE the
+        walk, so an unordered limit hands the next hop the wrong ones."""
+        g = self._ranked_chain(pgvector_graph)
+        result = g.traverse(Start(where={"name": "exact"}),
+                            Hop(via={"kind": "cites"},
+                                near=Near("pgdoc", PG_QUERY), keep=2))
+        assert sorted(n["id"] for n in result.nodes) == ["1", "2", "3"]
+
+    @pytest.mark.parametrize("hop", [
+        Hop(via={"kind": "cites"}, near=Near("pgdoc", PG_QUERY), keep=2),
+        Hop(via_near=Near("pgedge", PG_QUERY), via_keep=2),
+    ], ids=["near", "via_near"])
+    def test_an_aggregate_ranked_only_on_a_hop_still_prepares_the_scan(
+            self, pgvector_graph, hop):
+        """_prepare_vector_scan() returns as soon as Start carries a
+        near=, so the HOPS argument is the only thing that can tell it a
+        walk ranks at all when the similarity lives further down the
+        chain. The test above it ranks the Start and would pass with that
+        argument dropped entirely; this one is what says a hop-only
+        aggregate is prepared too -- otherwise it runs without
+        hnsw.iterative_scan, which is the silently short filtered result
+        the whole backend is built to avoid."""
+        g = self._ranked_chain(pgvector_graph)
+        assert g.aggregate(Start(where={"name": "exact"}), hop,
+                           aggregates={"n": Count()}) == {"n": 2}
+
+
+class TestTheTwoBackendsAgreeLive:
+    """Parity is the claim this backend makes: same data, same query,
+    same answer -- only faster and approximate. Ranking is what a caller
+    consumes, so ranking is what these assert.
+
+    Distinct FIELD NAMES per backend on purpose: the vec_* column is
+    shared process-wide, and one column has one type."""
+
+    @staticmethod
+    def _vectors():
+        # Distinct similarities against the query below -- no ties, so a
+        # float difference between the two backends can never flip the
+        # ORDER and make this test flap.
+        return [[1.0, 0.0, 0.0], [0.8, 0.6, 0.0], [0.0, 1.0, 0.0],
+                [-0.6, 0.8, 0.0], [-1.0, 0.0, 0.0]]
+
+    def _both(self, fresh_graph, pgvector_graph):
+        fresh_graph.define_vectors(nodes=[Vector("exdoc", 3)], edges=[Vector("exedge", 3)])
+        fresh_graph.migrate_vectors()
+        pgvector_graph.define_vectors(nodes=[Vector("pgdoc", 3)], edges=[Vector("pgedge", 3)])
+        pgvector_graph.migrate_vectors()
+        for graph, field in ((fresh_graph, "exdoc"), (pgvector_graph, "pgdoc")):
+            graph.add_nodes([{"id": i, "type": "doc", "name": f"n{i}"}
+                             for i in range(1, len(self._vectors()) + 1)])
+            graph.set_vectors(nodes=[{"id": i + 1, field: vector}
+                                     for i, vector in enumerate(self._vectors())])
+            graph.add_edges([{"start_id": 1, "end_id": 2, "kind": "cites"},
+                             {"start_id": 1, "end_id": 3, "kind": "cites"}])
+        return (fresh_graph, "exdoc"), (pgvector_graph, "pgdoc")
+
+    def test_a_search_ranks_the_same_ids_in_the_same_order(self, fresh_graph, pgvector_graph):
+        (exact, ex_field), (approx, pg_field) = self._both(fresh_graph, pgvector_graph)
+        query = [1.0, 0.0, 0.0]
+        exact_hits = exact.vector_search(Near(ex_field, query), k=5)
+        approx_hits = approx.vector_search(Near(pg_field, query), k=5)
+        assert [h["id"] for h in exact_hits] == [h["id"] for h in approx_hits]
+        assert [h["similarity"] for h in approx_hits] == pytest.approx(
+            [h["similarity"] for h in exact_hits], abs=1e-6)
+
+    def test_a_filtered_and_floored_search_agrees_too(self, fresh_graph, pgvector_graph):
+        (exact, ex_field), (approx, pg_field) = self._both(fresh_graph, pgvector_graph)
+        query = [0.0, 1.0, 0.0]
+        assert [h["id"] for h in exact.vector_search(
+            Near(ex_field, query, min_similarity=0.5), k=5, where={"type": "doc"})] == \
+            [h["id"] for h in approx.vector_search(
+                Near(pg_field, query, min_similarity=0.5), k=5, where={"type": "doc"})]
+
+    def test_a_ranked_traversal_reaches_the_same_nodes(self, fresh_graph, pgvector_graph):
+        (exact, ex_field), (approx, pg_field) = self._both(fresh_graph, pgvector_graph)
+        query = [1.0, 0.0, 0.0]
+        walk = lambda graph, field: sorted(               # noqa: E731
+            node["id"] for node in graph.traverse(
+                Start(near=Near(field, query), keep=2),
+                Hop(via={"kind": "cites"}, optional=True)).nodes)
+        assert walk(exact, ex_field) == walk(approx, pg_field)
+
 
 # ---------------------------------------------------------------------
 # Contracts the mutation run showed nothing was holding
@@ -4178,6 +5593,37 @@ class TestVectorCallerNamesArePinned:
         with pytest.raises(ValueError, match=r"^vector_search_many\(\): two Near specs"):
             vg.build_vector_search_many_query(
                 [[Near("summary", [1.0, 0.0, 0.0]), Near("summary", [0.0, 1.0, 0.0])]], k=2)
+
+    @pytest.mark.parametrize("exception,run", [
+        # _as_query_list
+        (TypeError, lambda g: g.build_vector_search_many_query([])),
+        # _check_k
+        (ValueError, lambda g: g.build_vector_search_many_query(
+            [Near("pgsummary", [1.0, 0.0, 0.0])], k=0)),
+        # _resolve_query_texts -> _field/_embedder
+        (ValueError, lambda g: g.build_vector_search_many_query(
+            [Near("pgsummary", text="q")], k=2)),
+        # validate_nears
+        (ValueError, lambda g: g.build_vector_search_many_query(
+            [[Near("pgsummary", [1.0, 0.0, 0.0]), Near("pgsummary", [0.0, 1.0, 0.0])]], k=2)),
+        # validate_boosts
+        (ValueError, lambda g: g.build_vector_search_many_query(
+            [Near("pgsummary", [1.0, 0.0, 0.0])], k=2, boost=[])),
+    ], ids=["queries", "k", "text", "nears", "boosts"])
+    def test_the_pgvector_batch_path_names_the_call_at_every_site(self, pgvg, exception, run):
+        """vector_backend='pgvector' does not reuse the batch builder --
+        it delegates to a SEPARATE function with its own copy of every
+        one of these labels, so each of the assertions above pins only
+        the exact backend's half of a pair. Five labels were free to be
+        anything at all on the backend a caller opts into, which is the
+        backend whose refusals they most need to trust.
+
+        The text= case is the one that reads oddly and matters most: the
+        label reaches _field()/_embedder() as an ARGUMENT, so dropping it
+        does not fail, it reports `None:` and sends the reader looking
+        for a call they never made."""
+        with pytest.raises(exception, match=r"^vector_search_many\(\)"):
+            run(pgvg)
 
     def test_the_json_search_spec_names_itself_on_an_unknown_key(self, vg):
         """`vector search spec` is the only thing telling a caller WHICH

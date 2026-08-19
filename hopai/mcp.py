@@ -285,6 +285,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any, Optional, get_type_hints
 
 from .core import Graph
+from .pgvector import DEFAULT_VECTOR_BACKEND, VECTOR_BACKENDS
 from .json_api import (
     RERANK_CEILING_SENTENCE, RERANK_FIELDS_SENTENCE, RerankPolicy, aggregate_json,
     refuse_vectors, traverse_json, vector_search_json,
@@ -1765,6 +1766,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dsn", default=os.environ.get("HOPAI_DSN"),
                         help="PostgreSQL DSN. Defaults to $HOPAI_DSN.")
+    parser.add_argument("--vector-backend", default=DEFAULT_VECTOR_BACKEND,
+                        choices=list(VECTOR_BACKENDS),
+                        help="How vector fields are stored and searched. 'exact' (default) "
+                             "computes exact cosine over real[] columns and needs no "
+                             "extension; 'pgvector' uses the pgvector extension's vector(d) "
+                             "type and an approximate HNSW index, and must match how the "
+                             "columns were migrated.")
     parser.add_argument("--graph", action="append", default=[], metavar="NAME",
                         help="RESTRICT the server to this graph. Repeatable. Without it "
                              "every graph in the database is served, which is what the "
@@ -1895,7 +1903,7 @@ def main(argv: Optional[list] = None) -> int:
     # name and then reusing it for that one saved an object and cost a
     # branch that could not be wrong either way; a mutant deleted the
     # scope entirely and nothing could tell, which is what said so.
-    base = Graph(args.dsn)
+    base = Graph(args.dsn, vector_backend=args.vector_backend)
     if args.graph:
         names = args.graph
     else:
