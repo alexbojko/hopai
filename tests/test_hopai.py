@@ -291,6 +291,79 @@ class TestFilterLogic:
 
 
 # ---------------------------------------------------------------------
+# Seeding a traversal by id (#81)
+# ---------------------------------------------------------------------
+
+class TestSeedById:
+    """`ids=` on Start() is the read-side twin of mutate.py's
+    TestAddressingRowsById: `where` filters PROPERTIES, and an id is
+    not one -- `where={"id": 1}` is a JSONB containment test that
+    matches nothing, and hopai.mutate's own docstring names the same
+    trap on the write side."""
+
+    def test_where_id_matches_nothing(self, graph):
+        """The trap ids= exists to close, kept as a test rather than a
+        comment for the same reason mutate.py's twin is."""
+        result = graph.traverse(Start(where={"id": 1}))
+        assert result.nodes == []
+
+    def test_seeding_from_specific_ids(self, graph):
+        result = graph.traverse(Start(ids=[1, 2]))
+        assert {n["id"] for n in result.nodes} == {"1", "2"}
+
+    def test_string_ids_are_the_same_ids(self, graph):
+        """Ids round-trip through JSON/traversal results as strings, so
+        a caller feeding one straight back should not have to int() it
+        first -- the same coercion mutate.py's ids= already applies."""
+        result = graph.traverse(Start(ids=["1", "2"]))
+        assert {n["id"] for n in result.nodes} == {"1", "2"}
+
+    def test_ids_and_where_narrow_together(self, graph):
+        """AND, not OR: both are constraints on the same row, matching
+        mutate.py's ids=/where= composition."""
+        result = graph.traverse(Start(ids=[1, 2, 3], where={"type": "hub"}))
+        assert {n["id"] for n in result.nodes} == set()
+        result = graph.traverse(Start(ids=[1, 7], where={"type": "leaf"}))
+        assert {n["id"] for n in result.nodes} == {"1"}
+
+    def test_ids_seeds_a_hop_chain(self, graph):
+        """ids= only narrows the SEED -- the rest of the chain walks
+        normally from there, same as where= does."""
+        result = graph.traverse(Start(ids=[1]), Hop())
+        ids = {n["id"] for n in result.nodes}
+        assert "1" in ids and len(ids) > 1
+
+    def test_empty_ids_is_an_explicit_empty_selection(self, graph):
+        """Unlike mutate.py's ids=[] (which counts toward the no-filter
+        refusal, since a delete/update with nothing named is dangerous),
+        a read has no such danger: an explicit, empty id list matches
+        nothing rather than being treated as "no id filter given"."""
+        assert graph.traverse(Start(ids=[])).nodes == []
+
+    def test_ids_none_means_no_id_filter(self, graph):
+        """The default: ids=None seeds from `where` alone, same as
+        never having passed ids= at all."""
+        result = graph.traverse(Start(where={"type": "leaf"}))
+        assert result.nodes == graph.traverse(Start(ids=None, where={"type": "leaf"})).nodes
+
+    def test_seeding_by_id_is_scoped_to_the_graph(self, fresh_graph):
+        """`id` is the table-wide primary key on the default tables (one
+        sequence, no graph in it), so a node's id can never collide
+        across graphs -- but naming a valid id from ANOTHER graph must
+        still find nothing, or the discriminator is not being applied.
+        Mirrors mutate.py's TestAddressingRowsById's own scoping test,
+        which uses a caller-supplied composite-key table instead, where
+        a collision is possible; the default tables prove the same rule
+        the other way, by construction."""
+        g = fresh_graph.in_graph("seed_by_id_a")
+        other = fresh_graph.in_graph("seed_by_id_b")
+        other.add_nodes([{"type": "person", "name": "b-one"}])
+        other_id = other.traverse(Start()).nodes[0]["id"]
+        assert g.traverse(Start(ids=[other_id])).nodes == []
+        assert other.traverse(Start(ids=[other_id])).nodes[0]["properties"]["name"] == "b-one"
+
+
+# ---------------------------------------------------------------------
 # Range comparisons
 # ---------------------------------------------------------------------
 
@@ -453,6 +526,17 @@ class TestJsonApi:
         fresh_graph.add_nodes([{"id": i, "type": "leaf"} for i in range(600)])
         result = traverse_json(fresh_graph, {"start": {"where": {"type": "leaf"}}})
         assert len(result["nodes"]) == 600
+
+    def test_json_start_ids(self, graph):
+        """`start.ids` reaches Start(ids=...) unparsed -- it is a list
+        of raw ids, not a filter, so it must not go through
+        parse_filter()."""
+        result = traverse_json(graph, {"start": {"ids": [1, 2]}})
+        assert {n["id"] for n in result["nodes"]} == {"1", "2"}
+
+    def test_json_start_ids_and_where_and(self, graph):
+        result = traverse_json(graph, {"start": {"ids": [1, 7], "where": {"type": "leaf"}}})
+        assert {n["id"] for n in result["nodes"]} == {"1"}
 
     def test_parse_filter_passthrough_for_plain_dict(self):
         assert parse_filter({"type": "leaf"}) == {"type": "leaf"}

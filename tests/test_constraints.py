@@ -461,6 +461,18 @@ class TestSQLAlchemyMetadata:
                                _Target(Node, "nodes", None, "graph_id"))
         assert not any(i.name == "uq_nodes_id_graph" for i in Node.indexes)
 
+    def test_the_edges_id_graph_unique_is_protected_the_same_way(self):
+        """The edges twin of the test above -- uq_edges_id_graph exists
+        so merge_edges(on=[Col('id')]) has a unique index to conflict
+        on (models.py), and it shares the same index namespace a
+        careless Unique(name=...) could otherwise shadow."""
+        from hopai.models import Edge
+
+        with pytest.raises(ValueError, match="hopai did not declare"):
+            compile_constraint(Unique("kind", name="uq_edges_id_graph"),
+                               _Target(Edge, "edges", None, "graph_id"))
+        assert not any(i.name == "uq_edges_id_graph" for i in Edge.indexes)
+
     def test_a_check_may_reuse_a_name_no_index_owns(self, fresh_graph):
         """The mirror of the two above: a CHECK owns no index, so it is
         NOT in the index namespace and a check named after one of this
