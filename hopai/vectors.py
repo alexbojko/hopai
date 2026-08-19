@@ -21,11 +21,11 @@ run -- no pgvector, no extension, no approximate index.
         Hop(via={"kind": "cites"}, hops=(1, 3)),
     )
 
-WHY NOT PGVECTOR: this library's first rule is that Postgres and
-SQLAlchemy are the whole stack -- a feature needing an extension is the
-wrong feature, however popular the extension. So a vector field is an
-ordinary `real[]` column and similarity is computed by Postgres itself,
-once per candidate row, as a LATERAL:
+WHY NOT PGVECTOR BY DEFAULT: this library's first rule is that
+Postgres and SQLAlchemy are the whole stack -- a feature needing an
+extension is the wrong DEFAULT, however popular the extension. So a
+vector field is an ordinary `real[]` column and similarity is computed
+by Postgres itself, once per candidate row, as a LATERAL:
 
     FROM nodes JOIN LATERAL (
         SELECT sum(x*y) / nullif(sqrt(sum(x*x)) * <query norm>, 0) AS s
@@ -50,10 +50,12 @@ with (filter first, rank the survivors) is simply how every search
 here runs.
 
 A few thousand filtered candidates answer interactively;
-tens of thousands per query is the practical ceiling. Past it, this
-feature is the wrong tool: the columns are ordinary Postgres columns,
-and a manual `ALTER TABLE ... USING vec_x::vector(d)` moves them to
-pgvector without this library's involvement.
+tens of thousands per query is the practical ceiling. Past it there
+are two doors, and neither is a rewrite:
+`Graph(vector_backend="pgvector")` keeps hopai driving and swaps the
+storage and the query shape for pgvector's (see hopai.pgvector --
+approximate, single-field, and it needs the extension), while
+pgvector_exit_ddl() hands you the migrated columns to query yourself.
 
 WHY THESE STORAGE CHOICES, each visible in the DDL:
 
@@ -2390,6 +2392,16 @@ def pgvector_exit_ddl(graph, index: Optional[str] = "hnsw") -> list:
     `vector(d)`, drop this graph's dimension CHECK (the type enforces
     it now), and build an approximate index for cosine.
 
+    FIRST, CHECK WHETHER YOU WANT THE OTHER DOOR. This function
+    predates `Graph(vector_backend="pgvector")` and is no longer the
+    only way onto pgvector -- that backend does this migration with
+    hopai still driving the queries, and is what most callers reaching
+    for this actually want. Use this one when you intend to write the
+    SQL yourself afterwards: it hands you pgvector columns and gets out
+    of the way, including the parts the backend refuses to serve
+    (multivector and hybrid ranking, which no HNSW index can answer --
+    see hopai.pgvector).
+
     THREE THINGS TO KNOW BEFORE RUNNING IT, because they are one-way:
 
       - **The column is shared by every graph in the table.** A
@@ -2401,13 +2413,13 @@ def pgvector_exit_ddl(graph, index: Optional[str] = "hnsw") -> list:
       - **The search stops being exact.** The HNSW index this emits is
         approximate: it answers fast and sometimes wrongly, which is
         the trade this library declines to make silently on your
-        behalf. Recall becomes a tuning problem (`ef_search`), and
-        `hopai`'s own search no longer runs on these
-        columns.
-      - **hopai does not drive pgvector.** After this, queries are
-        yours to write (`ORDER BY vec_x <=> $1`). This function exists
-        so outgrowing the library is a documented door rather than a
-        rewrite -- not so hopai can pretend to support both.
+        behalf. Recall becomes a tuning problem (`ef_search`).
+      - **hopai does not drive pgvector THROUGH THIS FUNCTION.** After
+        this, queries are yours to write (`ORDER BY vec_x <=> $1`) --
+        unless you point a `vector_backend="pgvector"` Graph at the
+        migrated columns, which is exactly what that backend expects to
+        find. This function is the door out of the library; the backend
+        is the door across.
 
     `index=None` emits the conversion without an index. HNSW is the
     only method offered, and deliberately: IVFFlat's recall depends on
@@ -2417,6 +2429,19 @@ def pgvector_exit_ddl(graph, index: Optional[str] = "hnsw") -> list:
     if index is not None and index not in PGVECTOR_INDEXES:
         raise ValueError(
             f"index must be None or one of {sorted(PGVECTOR_INDEXES)}, got {index!r}"
+        )
+    if graph.vector_backend == "pgvector":
+        # The DDL would be a near no-op (converting vector(d) to itself
+        # and dropping a CHECK this backend never created), which reads
+        # as "the migration ran" while migrating nothing. This Graph is
+        # already on pgvector; what it might still want is to STOP
+        # having hopai drive, and that is not a schema change.
+        raise ValueError(
+            "pgvector_exit_ddl() migrates the exact backend's real[] columns onto pgvector, "
+            "and this Graph is already built with vector_backend='pgvector' -- its columns "
+            "are vector(d) with an HNSW index already. To query them yourself instead of "
+            "through hopai, just do: nothing here changes, write your own SQL against the "
+            "same columns"
         )
     if graph._vectors is None:
         raise ValueError("pgvector_exit_ddl() needs vector fields and none are defined -- "
@@ -2479,12 +2504,20 @@ def stale_vectors(graph, node_fields=None, edge_fields=None,
             table = _table(graph, target_name)
             id_column = getattr(
                 table.c, graph.node_id_col if target_name == "nodes" else graph.edge_id_col)
-            column = _attach(table, field.column_name)
+            column = _attach(table, field.column_name, _column_type(graph, field))
+            if graph.vector_backend == "pgvector":
+                # No wrong_dimensions half here, and not as a shortcut:
+                # `vector(d)` fixes the size in the COLUMN's type, so a
+                # stored vector of the wrong length cannot exist to be
+                # found. array_length() does not accept a vector either,
+                # so asking would fail rather than return nothing.
+                stale = column.is_(None)
+            else:
+                stale = or_(column.is_(None),
+                            func.array_length(column, 1).is_distinct_from(field.dimensions))
             query = (
                 select(cast(id_column, SAString).label("id"), column.is_(None).label("missing"))
-                .where(graph._scoped(table),
-                       or_(column.is_(None),
-                           func.array_length(column, 1).is_distinct_from(field.dimensions)))
+                .where(graph._scoped(table), stale)
                 .order_by(id_column)
             )
             if after is not None:
@@ -2665,12 +2698,14 @@ _ALL_COLUMNS = text("""
 
 
 #: The dimension a `vector` column was declared with, from the catalog.
-#: atttypmod carries it, offset by the header pgvector stores alongside
-#: -- the same encoding `format_type()` decodes to render "vector(3)".
-#: Read here rather than parsed out of format_type()'s text so a future
-#: rendering change cannot turn a dimension check into a silent pass.
+#: pgvector puts the dimension in atttypmod DIRECTLY -- not offset by
+#: VARHDRSZ the way varchar's length is, which is the natural wrong
+#: guess and makes every dimension read four too small (an unsized
+#: `vector` is -1). Read here rather than parsed out of format_type()'s
+#: text so a future rendering change cannot turn a dimension check into
+#: a silent pass.
 _VECTOR_DIMS = text("""
-    SELECT a.atttypmod - 4
+    SELECT a.atttypmod
     FROM pg_attribute a
     JOIN pg_class c ON c.oid = a.attrelid
     JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -2861,6 +2896,20 @@ def load_vectors(graph, connection=None) -> dict:
                     # A vec_*-prefixed column this library did not name --
                     # someone else's column, not a field it forgot.
                     continue
+                if graph.vector_backend == "pgvector":
+                    # There is no dimension CHECK to read here -- the
+                    # size lives in the column's own type, which is the
+                    # whole reason this backend does not create one. So
+                    # the recovery reads atttypmod instead, and a
+                    # real[] column left over from the exact backend is
+                    # skipped rather than adopted at a made-up size.
+                    declared_dims = conn.execute(_VECTOR_DIMS, {
+                        "table": table.name, "column": column_name, "schema": table.schema,
+                    }).scalar()
+                    if declared_dims is None or declared_dims <= 0:
+                        continue
+                    registry[target_name][name] = Vector(name, int(declared_dims))
+                    continue
                 # dimensions=1 is a placeholder: _constraint_name() only
                 # reads .name off the field, and the real dimensions are
                 # what this lookup exists to recover.
@@ -2920,7 +2969,14 @@ def drop_vectors(graph, node_fields=None, edge_fields=None, connection=None) -> 
                     "table": table.name, "column": field.column_name, "schema": table.schema,
                 }).scalar()
                 if exists is not None:
-                    column = _attach(table, field.column_name)
+                    # Typed from the CATALOG, not from this handle's
+                    # backend: drop_vectors() is the one call that works
+                    # without define_vectors(), so a teardown handle may
+                    # legitimately disagree with the column it is
+                    # clearing -- and _attach() refuses a type conflict.
+                    column = _attach(
+                        table, field.column_name,
+                        pg.Vector() if exists == "vector" else ARRAY(REAL))
                     conn.execute(
                         update(table)
                         .where(graph._scoped(table), column.isnot(None))

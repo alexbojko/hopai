@@ -159,6 +159,7 @@ nav:
       - hopai.constraints: api/constraints.md
       - hopai.schema: api/schema.md
       - hopai.vectors: api/vectors.md
+      - hopai.pgvector: api/pgvector.md
       - hopai.rerankers: api/rerankers.md
       - hopai.embeddings: api/embeddings.md
       - hopai.cypher: api/cypher.md

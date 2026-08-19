@@ -1,7 +1,10 @@
 # Vector search
 
 Exact cosine similarity over nodes and edges, on plain `real[]` columns —
-no pgvector, no extension, no approximate index.
+no pgvector, no extension, no approximate index. That is the default and
+what the rest of this page describes; [an optional pgvector
+backend](#the-pgvector-backend) trades it for an index once the numbers
+below say it is time.
 [`09_vector_search`](../notebooks/09_vector_search.ipynb) is the full,
 worked tour: declaring fields (`define_vectors`/`migrate_vectors`),
 storing (`set_vectors`), searching nodes and edges with `where=` filtering
@@ -48,5 +51,57 @@ things to that bill:
   *after* scoring — unlike an ANN index's search radius, it never skips a
   candidate. See `Near.min_similarity` in `hopai/vectors.py`.
 
-Outgrowing this is a planned move, not a rewrite: `pgvector_exit_ddl()`
-prints the migration onto pgvector whenever the numbers above say it's time.
+Outgrowing this is a planned move, not a rewrite — see below.
+
+## The pgvector backend
+
+`Graph(dsn, vector_backend="pgvector")` stores vectors in pgvector's
+`vector(d)` type behind an HNSW cosine index, and compiles a search to
+`ORDER BY vec_x <=> :query LIMIT k` so the index answers it. Everything
+else — `where=`, traversal seeding, `set_vectors()`, results — keeps its
+shape. The default is `vector_backend="exact"`, and a Graph that never
+asks for pgvector emits byte-identical SQL to the pre-pgvector engine.
+
+```python
+graph = Graph(dsn, vector_backend="pgvector")
+graph.define_vectors(nodes=[Vector("summary", 1536)])
+graph.migrate_vectors()      # vector(1536) + HNSW, and the extension
+```
+
+It is opt-in because it is a real dependency: the `vector` extension
+must be installed in the server. No Python package is added — the type
+is rendered as SQL text and the operator as `<=>`.
+
+**What you give up.** An HNSW index answers *approximately*: it can miss
+a true nearest neighbor, and no setting makes that absolute. That is the
+whole trade, and it is the reason this is not the default.
+
+**What you keep.** `where=` still means `where=`. That is not free —
+it is why the backend requires **pgvector ≥ 0.8** and refuses an older
+server by name. Below 0.8 an HNSW scan applies the filter to a fixed
+candidate window, so a selective filter silently returns fewer rows than
+match it. Measured on 20,000 rows with a filter matching exactly 2 and
+`k=10`: pgvector 0.7 returns **one** of the two and reports success.
+0.8's `hnsw.iterative_scan`, which hopai sets to `strict_order` on every
+search, resumes the scan until `k` rows survive the filter.
+
+**One field per search.** Multivector (`Near` on several fields) and
+`Boost` are refused under this backend rather than served. An HNSW index
+accelerates exactly one ordering — the one it was built for — and a
+weighted sum across two independent distance spaces is not it, so
+Postgres would scan every row and sort the sum: the exact backend's cost,
+having silently become approximate. Rank one field here, or use the exact
+backend, which answers both correctly and needs no extension. A negative
+`Near` weight is refused for the same reason (it asks for the *least*
+similar rows, and HNSW indexes one direction).
+
+**Per Graph, not per field.** `CREATE EXTENSION vector` is a property of
+the database, and `vector(d)` fixes the dimensions in the column's type —
+which every graph in those tables shares. So a field cannot be 1536-dim
+in one graph and 768-dim in another under this backend, the way a
+per-graph CHECK allows under the exact one; `migrate_vectors()` refuses
+that by name.
+
+`pgvector_exit_ddl()` remains, and is now the *other* door: it prints the
+same migration and leaves the querying to you, for the cases this backend
+refuses.

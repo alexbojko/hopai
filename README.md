@@ -131,7 +131,8 @@ full reference lives.
 ## ✨ Highlights
 
 - 🐘 **Plain PostgreSQL** — two tables, a recursive CTE, no extension, no
-  new operational dependency.
+  new operational dependency. (One opt-in exception, off by default:
+  `vector_backend="pgvector"`.)
 - 🧭 **Real multi-hop traversal** — bounded and unbounded hops, per-hop
   direction, `OPTIONAL`, rich JSONB filtering, one round trip.
 - ✏️ **Update and delete by filter** — `SET` / `REMOVE` / `DETACH DELETE`
@@ -151,8 +152,10 @@ full reference lives.
   composite, partial, existence, type and CHECK constraints on JSONB.
 - 🧲 **Similarity-seeded traversal** — find the nodes closest in meaning to
   some text, then walk the graph from there, in one call. Exact cosine
-  similarity on plain `real[]` columns, no pgvector, multivector queries,
-  and a field-level `embed=` so you can hand it text instead of floats.
+  similarity on plain `real[]` columns by default — no pgvector, multivector
+  queries, and a field-level `embed=` so you can hand it text instead of
+  floats — plus an opt-in `vector_backend="pgvector"` for when the row
+  counts outgrow exact search.
 - 🎯 **Reranking, including inside the walk** — `Rerank(client,
   document_from='<jq>')` adds a third retrieval stage to a search *and* to
   a traversal step, where a candidate is a node plus how it was reached. A
