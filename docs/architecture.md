@@ -490,6 +490,29 @@ One pair of tables holds every graph, discriminated by `graph_id`.
   not graph data. It is never on the query path, traversal and ingestion do not know it
   exists, it is created lazily on first save (never by `create_schema()`), and its one
   row per `graph_id` is the same per-graph discipline as everything above.
+- The optional **`graphs` registry** (`models.GraphRegistry`, issue #85) sits
+  **alongside** `hopai_schema`, not merged into it — one answers "what is this graph
+  called and what is it for" (`id`/`name`/`description`, meant to be listed and
+  skimmed), the other "what is the declared node/edge contract for it" (one JSON
+  document); genuinely different questions. It follows `node_table=`/`edge_table=`'s
+  PATTERN (a real `Table`, swappable via `Graph(graph_table=...)`, extended past
+  `id`/`name`/`description` the same way `node_extra_cols`/`edge_extra_cols` work) but
+  `hopai_schema`'s TIMING — created lazily by `Graph.create_graph()` on first use, never
+  by `create_schema()`, so an existing caller who never opts in sees no schema change.
+  `create_graph()` upserts the calling handle's own graph id, so calling it again to
+  rename a graph is the normal way to use it. **No foreign key** ties
+  `nodes.graph_id`/`edges.graph_id` to it — deliberately, since a hard FK would need
+  every `graph_id` an existing database already has to gain a row here before the
+  constraint could be added (a migration this feature is not allowed to require), and
+  would turn `Graph(engine, graph="anything")` into a write that can fail for a caller
+  who never registered anything. So the registry stays purely descriptive: a graph with
+  rows and no registry entry is not an error anywhere, it is simply unnamed, and
+  `Graph.graph_info()` answers `None` rather than guessing. `list_graphs`
+  (`hopai/mcp.py`) reads it opt-in, via `registry=True` — off by default, since that
+  tool is otherwise the one call that answers with no database connection at all
+  (`Served.pick()`'s docstring calls this out: a graph created after start-up is not
+  silently in scope either way, but a registry entry added after start-up is exactly
+  the kind of thing the next call should see).
 
 ## The MCP server
 

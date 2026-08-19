@@ -4,4 +4,4 @@ The DDL, the typed-columns / JSONB split, the composite FK. See [Schema](../refe
 
 ::: hopai.models
     options:
-      members: [Node, Edge]
+      members: [Node, Edge, GraphRegistry]

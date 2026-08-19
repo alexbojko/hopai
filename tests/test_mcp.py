@@ -312,7 +312,10 @@ class TestManyGraphs:
         assert specs, "expected the usual inventory"
         for spec in specs:
             if spec.name == "list_graphs":
-                assert spec.parameters["properties"] == {}, "the way IN cannot need a name"
+                # No `graph` -- the way IN cannot need a name -- but it
+                # may take its own unrelated `registry` opt-in, the same
+                # as describe_graph's `counts`.
+                assert "graph" not in spec.parameters["properties"], "the way IN cannot need a name"
                 continue
             key = spec.parameters["properties"].get("graph")
             assert key and key["enum"] == ["docs", "crm"], spec.name
@@ -337,6 +340,16 @@ class TestManyGraphs:
         # the reminder rides in the RESULT too, where a model is looking
         # when it picks a name -- a renamed key would drop it silently
         assert "graph` argument" in named(graphs)["list_graphs"].call()["note"]
+
+    def test_list_graphs_never_connects_by_default(self):
+        """registry=False (the default) costs no database round trip --
+        the offline DSN would raise on any real connection attempt, so
+        reaching these assertions at all is the proof, matching the
+        module docstring's "It is never a live query" for the base
+        call."""
+        listed = named(self.two())["list_graphs"].call()["graphs"]
+        assert [entry["name"] for entry in listed] == [None, None]
+        assert [entry["description"] for entry in listed] == [None, None]
 
     def test_an_unnamed_call_is_refused_rather_than_guessed(self):
         with pytest.raises(ValueError, match="every call names one -- pass graph="):
@@ -2742,6 +2755,26 @@ class TestManyGraphsLive:
         assert specs["describe_graph"].call(graph="crm")["schema"] is None
         with pytest.raises(ValueError, match="no saved schema for graph 'crm'"):
             fresh_graph.in_graph("crm").load_schema()
+
+    def test_list_graphs_reads_the_registry_only_when_asked(self, fresh_graph):
+        """registry=False (the default) never connects for name/
+        description -- both come back None even though `docs` IS
+        registered -- and registry=True reads it, per graph, falling
+        back to None for `crm`, which never called create_graph()."""
+        graphs = {"docs": fresh_graph, "crm": fresh_graph.in_graph("crm")}
+        fresh_graph.create_graph(name="Docs", description="Paper knowledge base")
+        specs = named(graphs)
+
+        by_default = specs["list_graphs"].call()["graphs"]
+        assert [g["name"] for g in by_default] == [None, None]
+
+        with_registry = specs["list_graphs"].call(registry=True)["graphs"]
+        assert with_registry[0] == {
+            "graph": "docs", "name": "Docs", "description": "Paper knowledge base",
+            "schema_declared": False, "node_types": None,
+            "vector_fields": {"nodes": [], "edges": []},
+        }
+        assert with_registry[1]["name"] is None and with_registry[1]["description"] is None
 
 
 class TestSearchLive:

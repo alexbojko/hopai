@@ -188,7 +188,7 @@ from .json_api import (
     traverse_json, vector_search_json,
 )
 from .embeddings import Embedder, EmbeddingError
-from .models import Edge, Node
+from .models import Edge, GraphRegistry, Node
 from .mutate import MUTATE_TOOL_SCHEMA, MutationResult, spec_to_mutations
 # Rerank imports no provider package and no jq binding at module scope --
 # both are resolved lazily on first use -- so naming it here costs an
@@ -234,5 +234,5 @@ __all__ = [
     # already here.
     "Rerank", "RerankError", "RerankPolicy", "parse_rerank",
     "IngestResult", "INGEST_TOOL_SCHEMA",
-    "Node", "Edge",
+    "Node", "Edge", "GraphRegistry",
 ]
