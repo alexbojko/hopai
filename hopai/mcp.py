@@ -1783,6 +1783,44 @@ def _max_nodes(value: str) -> Optional[int]:
     return int(value)
 
 
+#: "no --max-candidates was passed", distinct from both a number and the
+#: None that `--max-candidates none` means. See the flag's own comment.
+_UNSET = object()
+
+
+def _rerank_field(value: str) -> str:
+    """One --rerank-field, rejected empty rather than published as one.
+
+    An empty path in the allowlist is not a narrower allowlist, it is a
+    path nothing can match plus a list that LOOKS configured -- and
+    `--rerank-field ""` is what a shell produces from an unset variable
+    in an entrypoint script, which is exactly where nobody is reading
+    the output."""
+    cleaned = value.strip()
+    if not cleaned:
+        raise argparse.ArgumentTypeError(
+            "--rerank-field takes a property path like properties.title, got an empty "
+            "string -- an unset variable in a startup script looks like this")
+    return cleaned
+
+
+def _fields_from_env() -> list:
+    """$HOPAI_RERANK_FIELDS, comma-separated, as the default allowlist.
+
+    Every other flag here has an environment spelling and this one had
+    none, which broke the case providers.py exists for: a container
+    handed its configuration by an orchestrator could set the provider,
+    the model and the filter, then still have to pass a command-line
+    argument for the allowlist alone.
+
+    Comma-separated rather than repeated, because an environment
+    variable cannot repeat. Blank entries are dropped rather than
+    published -- `properties.title,` is a trailing comma, not a request
+    to allow the empty path."""
+    raw = os.environ.get("HOPAI_RERANK_FIELDS") or ""
+    return [field.strip() for field in raw.split(",") if field.strip()]
+
+
 def _max_candidates(value: str) -> Optional[int]:
     """--max-candidates 200, or 'none' to remove the ceiling -- the
     twin of _max_nodes(), for the bill rather than the response size.
@@ -1895,7 +1933,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "Required with a reranker: there is no sensible default "
                              "for what a document IS. A tool call may override it, "
                              "within --rerank-field.")
-    parser.add_argument("--rerank-field", action="append", default=[], metavar="PATH",
+    # default=None, not the environment's list: `action="append"` APPENDS
+    # to whatever default it is given, so seeding it would make a flag
+    # ADD to $HOPAI_RERANK_FIELDS instead of replacing it -- the opposite
+    # of the rule every other pair here follows, where the flag beats the
+    # variable. main() reads the variable only when no flag was passed.
+    parser.add_argument("--rerank-field", action="append", type=_rerank_field,
+                        default=None, metavar="PATH",
                         help="A property path a model-written document_from may read, "
                              "e.g. properties.title. Repeat for each. Required with a "
                              "reranker and deliberately has no 'everything' spelling: "
@@ -1903,8 +1947,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "properties.ssn is one accepted filter away unless the "
                              "paths are named. Pass --rerank-field properties if the "
                              "whole bag really is the decision.")
+    # _UNSET, not the ceiling itself: 'none' resolves to None and so does
+    # a plain default, so a default-valued argument could not be told
+    # from `--max-candidates none` -- and the inert-flag guard below
+    # would either miss an explicit value or fire on every server that
+    # never mentioned reranking. main() resolves the sentinel.
     parser.add_argument("--max-candidates", type=_max_candidates,
-                        default=DEFAULT_MAX_CANDIDATES, metavar="N|none",
+                        default=_UNSET, metavar="N|none",
                         help="The ceiling on how many candidates one tool call may send "
                              f"to the reranker (default {DEFAULT_MAX_CANDIDATES}). "
                              "Rerankers bill per document. 'none' removes the ceiling.")
@@ -1977,6 +2026,19 @@ def _resolve_rerank(parser, args) -> Optional[Any]:
     --rerank-provider this returns None and no tool advertises a rerank
     parameter at all -- the permission is which surface exists, which is
     the same rule the Python path follows."""
+    # The flag beats the variable, and does not add to it: a passed
+    # --rerank-field means argparse built a list, so the environment is
+    # read only when it did not. Written back onto args so the serve()
+    # call downstream reads one resolved allowlist rather than repeating
+    # this.
+    if args.rerank_field is None:
+        args.rerank_field = _fields_from_env()
+    # Resolved unconditionally, and BEFORE the early return below, so no
+    # caller ever reads the sentinel off args -- `passed` is what the
+    # inert-flag guard needs, not the sentinel itself surviving.
+    passed_ceiling = args.max_candidates is not _UNSET
+    if not passed_ceiling:
+        args.max_candidates = DEFAULT_MAX_CANDIDATES
     if args.rerank and args.rerank_provider:
         parser.error("--rerank and --rerank-provider both say where reranking comes "
                      "from -- pass one. --rerank points at your own function; "
@@ -1987,7 +2049,11 @@ def _resolve_rerank(parser, args) -> Optional[Any]:
         # when the tools do not even advertise it.
         for flag, value in (("--rerank-model", args.rerank_model),
                             ("--rerank-document-from", args.rerank_document_from),
-                            ("--rerank-field", args.rerank_field or None)):
+                            ("--rerank-field", args.rerank_field or None),
+                            # `is not _UNSET`, not truthiness: `--max-candidates
+                            # none` resolves to None, which is a deliberate
+                            # choice and has to refuse here like any other.
+                            ("--max-candidates", passed_ceiling or None)):
             if value:
                 parser.error(f"{flag} needs a reranker to configure -- pass --rerank or "
                              f"--rerank-provider, or drop {flag}")

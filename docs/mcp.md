@@ -296,6 +296,20 @@ serve(graph,
 and have no defaults — the CLI saying out loud what the Python path already
 refuses to guess. Everything below applies to both spellings.
 
+Every one of these has an environment spelling, so a container handed its
+configuration by an orchestrator needs no command line at all:
+
+```bash
+HOPAI_RERANK_PROVIDER=sentence-transformers
+HOPAI_RERANK_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+HOPAI_RERANK_DOCUMENT_FROM='.properties.title + ": " + (.properties.summary // "")'
+HOPAI_RERANK_FIELDS=properties.title,properties.summary
+```
+
+`$HOPAI_RERANK_FIELDS` is comma-separated because a variable cannot repeat the
+way `--rerank-field` can; passing the flag **replaces** the variable rather than
+adding to it, like every other flag/variable pair here.
+
 What a model supplies is never the client. It is `document_from` — a jq filter
 projecting one candidate into the one string the reranker reads — and
 `candidates`, how many to spend. Both are retrieval decisions a model is well
@@ -374,7 +388,7 @@ nodes come back — never a score you can read. `rerank_score` exists on
 | `--rerank-provider` | none | Build the reranking client from the environment: `cohere`, `voyage`, `sentence-transformers`. |
 | `--rerank-model` | none | The reranking model — on `sentence-transformers`, the CrossEncoder to load. |
 | `--rerank-document-from` | none | jq filter projecting one candidate into the string the reranker reads. **Required** with a reranker. |
-| `--rerank-field` | none | A property path that filter may read. Repeatable. **Required** with a reranker — there is no "everything" spelling. |
+| `--rerank-field` | `$HOPAI_RERANK_FIELDS` | A property path that filter may read. Repeatable. **Required** with a reranker — there is no "everything" spelling. The variable is comma-separated, since an environment variable cannot repeat; a flag replaces it rather than adding to it. |
 | `--max-candidates N\|none` | `100` | Ceiling on candidates one call may send to the reranker. Rerankers bill per document. |
 
 ## From Python

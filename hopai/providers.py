@@ -430,14 +430,15 @@ def rerank_client_from_env(provider: str, model: Optional[str] = None,
         Rerank(client, model=model, document_from=".properties.title")
 
     NOT a Rerank, and the name says so. Every sibling here returns the
-    finished object -- embedder_from_env() returns an Embedder -- but a
-    Rerank cannot be finished from the environment alone: it requires
-    `document_from`, a jq filter over the candidate shape, and there is
-    no environment variable that could sensibly hold one. Returning a
-    half-built Rerank with a placeholder filter, or inventing
-    $HOPAI_RERANK_DOCUMENT_FROM to keep the symmetry, would both be
-    worse than a function whose name is honest about handing back
-    parts.
+    finished object -- embedder_from_env() returns an Embedder -- but
+    this module builds CLIENTS from credentials, and a Rerank is a
+    client plus a retrieval decision: `document_from`, the jq filter
+    naming what a document IS. That decision belongs to whoever is
+    configuring the search, not to the code that reads $COHERE_API_KEY,
+    and hopai-mcp supplies it from --rerank-document-from (or
+    $HOPAI_RERANK_DOCUMENT_FROM) one layer up. Returning a half-built
+    Rerank carrying a placeholder filter would be worse than a function
+    whose name is honest about handing back parts.
 
     `model` is None for a cross-encoder, which already IS the model --
     pass it through to Rerank(model=...) as it comes back, since Rerank
