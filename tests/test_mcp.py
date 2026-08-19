@@ -1652,6 +1652,18 @@ class TestDescribeGraph:
             "edges": {"rel": {"dimensions": 3, "source": "rel", "embedder": False}},
         }
 
+    def test_it_reports_whether_the_edge_type_is_declared(self):
+        """An in-memory flag (Graph.edge_type_declared), so this needs
+        no database round trip -- checkable offline, like every other
+        describe_graph field that is not itself a live count."""
+        without = named(offline())["describe_graph"].call()
+        assert without["edge_type_declared"] is False
+
+        g = offline()
+        g._edge_type_declared = True   # define_edge_type() issues real DDL; see core.py
+        with_one = named(g)["describe_graph"].call()
+        assert with_one["edge_type_declared"] is True
+
     def test_searching_and_seeding_are_reported_as_the_two_things_they_are(self):
         """Edge-only vectors can be SEARCHED but cannot SEED a
         traversal, which ranks node vectors. Reported as one flag, that

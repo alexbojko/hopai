@@ -1788,6 +1788,13 @@ class TestOutOfScope:
                 f"Graph.{name}() opens its own connection -- on AsyncGraph that is a "
                 f"MissingGreenlet, not an AttributeError naming the fix")
 
+    def test_edge_type_declared_still_passes_through(self, async_graph):
+        """The IN-MEMORY flag, unlike define_edge_type() itself, opens
+        no connection -- so it falls through __getattr__ to the wrapped
+        sync Graph exactly like `.vectors`/`.schema` already do, rather
+        than needing a place on _NEEDS_SYNC_GRAPH."""
+        assert async_graph.edge_type_declared is False
+
     def test_graphs_refuses_rather_than_raising_missing_greenlet(self, async_graph):
         """The specific hole: `await`-free `async_graph.graphs()` used to
         reach Graph.graphs()' own `self.engine.connect()` on the sync

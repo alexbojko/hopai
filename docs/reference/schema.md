@@ -32,6 +32,48 @@ may change without a migration path — `drop_schema()` and
 
 Different table or column names? `Graph(engine, node_table=..., edge_table=..., node_id_col=..., ...)`.
 
+## Declared edge type
+
+An edge's relationship type ordinarily lives as an ordinary key inside
+`properties` — `{"kind": "knows"}` — filtered through the same JSONB
+containment (`@>`) every other property uses, served by the whole-table
+GIN index above. That is fine until one property carries most of the
+traversal's own filtering load: a dozen named relationship types sharing
+one general-purpose index with every other property, re-tested on every
+hop of a recursive walk.
+
+```python
+graph.define_edge_type()   # idempotent -- safe next to create_schema()
+```
+
+creates a narrow, **guaranteed btree** index instead:
+
+```sql
+CREATE INDEX ix_edges_kind ON edges (graph_id, (properties ->> 'kind'));
+```
+
+and, from then on, an ordinary `via={"kind": "..."}` filter — a single
+key, a plain string, nothing merged with it — compiles to the text
+equality that index serves (`properties ->> 'kind' = '...'`) instead of
+the containment test. This is opt-in and additive: a graph that never
+calls `define_edge_type()` keeps emitting exactly the SQL it always has.
+`graph.edge_type_declared` reads the declaration back (in memory, no
+database round trip — the same existence-check `.schema`/`.vectors`
+already are).
+
+The **STORED_IN shorthand** — `via=<name>`, a bare string in place of
+`via={"kind": <name>}` — compiles to the same fast SQL either way,
+declared or not (see [Filters](filters.md#the-stored_in-shorthand-for-via)).
+Cypher's `[:TYPE]` pattern needs no separate treatment: it already
+compiles to exactly `{"kind": "TYPE"}` (`edge_type_key`, default
+`"kind"`), so it benefits from `define_edge_type()` with no change on
+its side.
+
+`ANALYZE edges` after calling this against a table that already holds
+rows — a fresh index carries no planner statistics of its own until
+then, and a plan chosen from stale stats can pick a *worse* join order
+than the one it replaced.
+
 **Extending the model** — a field no JSONB property can give you, like a
 foreign key to a `users` table, is an ordinary `Column()` on your own
 table:
