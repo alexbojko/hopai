@@ -4299,6 +4299,11 @@ class TestPgvectorRefusesRankingsAnIndexCannotServe:
         message = str(exc.value)
         assert "does not support boost=" in message
         assert "apply the boost to the returned hits yourself" in message
+        # The refusal must name the call the caller actually made. A
+        # mutant blanking this label survived on its own, because
+        # asserting only the explanation leaves the reader of a real
+        # failure hunting for which of the two search calls raised.
+        assert message.startswith("vector_search_many():"), message
 
     def test_a_negative_weight_is_refused_because_hnsw_has_one_direction(self, pgvg):
         """A negative weight asks for the LEAST similar rows first.
@@ -4858,9 +4863,23 @@ class TestPgvectorMigrationLive:
         g = _pg_migrated(pgvector_graph)
         with g.engine.begin() as conn:
             conn.execute(text("ALTER TABLE nodes ADD COLUMN vec_legacy real[]"))
+        # A real vector field added AFTER the legacy column, so the scan
+        # meets the unusable one FIRST. Without that ordering the skip
+        # is the last thing the loop does and `continue` cannot be told
+        # from `break` -- which is precisely the mutant that survived
+        # the earlier shape of this test. `break` here would abandon
+        # every column behind the legacy one, losing a field that is
+        # migrated and usable.
+        g.define_vectors(nodes=[Vector("pgdoc", 3), Vector("pgnote", 3),
+                                Vector("pglater", 3)],
+                         edges=[Vector("pgedge", 3)])
+        g.migrate_vectors()
         recovered = g.in_graph(g.graph).load_vectors()
         assert "legacy" not in recovered["nodes"], recovered["nodes"]
         assert recovered["nodes"]["pgdoc"].dimensions == 3
+        assert recovered["nodes"]["pglater"].dimensions == 3, (
+            "a field behind the skipped column was lost -- the skip must "
+            "continue the scan, not end it")
 
     def test_drop_vectors_nulls_this_graph_s_values_and_keeps_the_column(
             self, pgvector_graph):
