@@ -4201,6 +4201,21 @@ class TestPgvectorSearchShape:
     Every assertion here is the difference between an index scan and a
     sequential one, which is the whole reason this backend exists."""
 
+    def test_both_walk_terms_name_their_beam_lateral(self, pgvg):
+        """The exact backend pins these names (TestEdgeBeamShape), and
+        this path must match: the emitted SQL is meant to be READ -- it
+        is how anything touching the query path gets checked -- and a
+        recursive walk whose two beams come back as anon_1/anon_2 makes
+        the base term and the recursive term indistinguishable to the
+        reader.
+
+        A mutant blanking the alias survived, because nothing here had
+        looked at the pgvector walk's SQL text."""
+        sql = norm(pgvg.build_query(Start(), [Hop(via_near=Near("pgrel", [1.0, 0.0, 0.0]),
+                                                  via_keep=2, hops=(1, 3))]))
+        assert "beam_0" in sql and "beam_rec_0" in sql
+        assert sql.count("JOIN LATERAL") >= 2
+
     def test_the_order_by_holds_the_bare_distance_operator(self, pgvg):
         """An HNSW index is on the OPERATOR. Wrapping `<=>` in `1 - x`
         (or in a CASE mapping NaN to NULL) returns the same rows from a
