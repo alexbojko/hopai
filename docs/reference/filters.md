@@ -62,3 +62,36 @@ The shorthand compiles to the fast shape whether or not
 no single property this could universally name the way `kind` names an
 edge's relationship type.
 
+## Addressing a row by id
+
+`where=`/`via=` compile against the JSONB `properties` bag — `id` is a
+real column, not a property, so `where={"id": 7}` is a containment test
+that matches nothing and says nothing while doing it. Naming a row you
+already hold (a UI with a node selected, a traversal result fed back
+in, an agent's own previous write) is a separate, deliberate parameter
+instead:
+
+```python
+graph.delete_nodes(ids=[7])                       # not where={"id": 7}
+graph.update_nodes(ids=[7], set={"reviewed": True})
+graph.traverse(Start(ids=[7]))                     # seed a traversal by id
+```
+
+`ids=` combines with `where=`/endpoint filters as **AND** — both are
+constraints on the same row, never an OR across two ways of naming one.
+It works the same way on `delete_edges`/`update_edges`, against the
+edge's own `id`. On the mutating side an empty `ids=[]` counts toward
+the "no filter" refusal the same way an empty `where={}` does — see
+[Mutations](mutations.md#naming-one-specific-row). On `Start(ids=...)`,
+a read with no such danger, an empty list is instead an explicit
+selection that matches nothing, exactly like an empty
+`where={"key": []}` already does for a property.
+
+`merge_nodes`/`merge_edges`' `on=` reaches `id` too, spelled
+`Col("id")` (`hopai.constraints.Col`) rather than the bare string
+`"id"` — a bare string always names a property, so it is refused as a
+column-name collision the same way `Unique("id")` would be. The JSON
+document form (`graph.ingest(doc, merge_nodes_on=[...])`, and the
+`ingest_graph` MCP tool) accepts the plain string `"id"` directly and
+translates it for you, since JSON has no way to spell `Col(...)`.
+

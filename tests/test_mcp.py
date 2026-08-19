@@ -312,7 +312,10 @@ class TestManyGraphs:
         assert specs, "expected the usual inventory"
         for spec in specs:
             if spec.name == "list_graphs":
-                assert spec.parameters["properties"] == {}, "the way IN cannot need a name"
+                # No `graph` -- the way IN cannot need a name -- but it
+                # may take its own unrelated `registry` opt-in, the same
+                # as describe_graph's `counts`.
+                assert "graph" not in spec.parameters["properties"], "the way IN cannot need a name"
                 continue
             key = spec.parameters["properties"].get("graph")
             assert key and key["enum"] == ["docs", "crm"], spec.name
@@ -337,6 +340,16 @@ class TestManyGraphs:
         # the reminder rides in the RESULT too, where a model is looking
         # when it picks a name -- a renamed key would drop it silently
         assert "graph` argument" in named(graphs)["list_graphs"].call()["note"]
+
+    def test_list_graphs_never_connects_by_default(self):
+        """registry=False (the default) costs no database round trip --
+        the offline DSN would raise on any real connection attempt, so
+        reaching these assertions at all is the proof, matching the
+        module docstring's "It is never a live query" for the base
+        call."""
+        listed = named(self.two())["list_graphs"].call()["graphs"]
+        assert [entry["name"] for entry in listed] == [None, None]
+        assert [entry["description"] for entry in listed] == [None, None]
 
     def test_an_unnamed_call_is_refused_rather_than_guessed(self):
         with pytest.raises(ValueError, match="every call names one -- pass graph="):
@@ -2585,6 +2598,19 @@ class TestWriteToolsLive:
         assert len(found["nodes"]) == 1
         assert found["nodes"][0]["properties"]["name"] == "Alicia"
 
+    def test_merge_nodes_on_id_is_reachable_from_a_tool_call(self, fresh_graph):
+        """#81: a bare "id" is the only spelling JSON can send -- Col("id")
+        cannot travel through a tool call -- so merge_nodes_on=["id"]
+        has to reach the node's own id column, not a JSONB property
+        called "id" (which merge_nodes(on=["id"]) refuses outright as a
+        column collision)."""
+        spec = named(fresh_graph)["ingest_graph"]
+        spec.call(nodes=[{"id": 1, "type": "person", "name": "Alice"}])
+        spec.call(nodes=[{"id": 1, "type": "person", "name": "Alicia"}], merge_nodes_on=["id"])
+        found = named(fresh_graph)["traverse_graph"].call(start={"ids": [1]})
+        assert len(found["nodes"]) == 1
+        assert found["nodes"][0]["properties"]["name"] == "Alicia"
+
     def test_mutate_updates_and_deletes_in_one_ordered_transaction(self, fresh_graph):
         """The tool is a translation into Graph.mutate() and nothing
         else -- so what this pins is that the model's `operations` list
@@ -2606,6 +2632,19 @@ class TestWriteToolsLive:
         assert (result["deleted_edges"], result["deleted_nodes"]) == (1, 1)
         left = named(fresh_graph)["traverse_graph"].call(start={"where": {"type": "draft"}})
         assert [n["properties"]["status"] for n in left["nodes"]] == ["archived"]
+
+    def test_mutate_by_id_reaches_the_model(self, fresh_graph):
+        """#81: `ids` on delete_nodes/update_nodes travels through the
+        MCP tool exactly like `where` does."""
+        named(fresh_graph)["ingest_graph"].call(
+            nodes=[{"id": 1, "type": "draft"}, {"id": 2, "type": "draft"}])
+        result = named(fresh_graph, allow_mutations=True)["mutate_graph"].call(operations=[
+            {"op": "update_nodes", "ids": [1], "set": {"status": "archived"}},
+            {"op": "delete_nodes", "ids": [2]},
+        ])
+        assert (result["updated_nodes"], result["deleted_nodes"]) == (1, 1)
+        left = named(fresh_graph)["traverse_graph"].call(start={"ids": [1]})
+        assert left["nodes"][0]["properties"]["status"] == "archived"
 
     def test_a_filterless_delete_refuses_rather_than_emptying_the_graph(self, fresh_graph):
         """The library's own refusal, reaching the model through the
@@ -2729,6 +2768,26 @@ class TestManyGraphsLive:
         assert specs["describe_graph"].call(graph="crm")["schema"] is None
         with pytest.raises(ValueError, match="no saved schema for graph 'crm'"):
             fresh_graph.in_graph("crm").load_schema()
+
+    def test_list_graphs_reads_the_registry_only_when_asked(self, fresh_graph):
+        """registry=False (the default) never connects for name/
+        description -- both come back None even though `docs` IS
+        registered -- and registry=True reads it, per graph, falling
+        back to None for `crm`, which never called create_graph()."""
+        graphs = {"docs": fresh_graph, "crm": fresh_graph.in_graph("crm")}
+        fresh_graph.create_graph(name="Docs", description="Paper knowledge base")
+        specs = named(graphs)
+
+        by_default = specs["list_graphs"].call()["graphs"]
+        assert [g["name"] for g in by_default] == [None, None]
+
+        with_registry = specs["list_graphs"].call(registry=True)["graphs"]
+        assert with_registry[0] == {
+            "graph": "docs", "name": "Docs", "description": "Paper knowledge base",
+            "schema_declared": False, "node_types": None,
+            "vector_fields": {"nodes": [], "edges": []},
+        }
+        assert with_registry[1]["name"] is None and with_registry[1]["description"] is None
 
 
 class TestSearchLive:

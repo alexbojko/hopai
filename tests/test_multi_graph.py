@@ -15,8 +15,9 @@ composite foreign key.
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import text
 
-from hopai import Col, ConstraintViolation, Hop, Required, Start, Unique
+from hopai import Col, ConstraintViolation, Graph, Hop, Required, Start, Unique
 
 
 @pytest.fixture()
@@ -279,6 +280,11 @@ class TestCypherAndDefaults:
         other = fresh_graph.in_graph("other")
         assert other.engine is fresh_graph.engine
         assert other.nodes_tbl is fresh_graph.nodes_tbl
+        # The registry is not graph-scoped -- one row per graph id,
+        # shared by the whole database -- so it has to travel across
+        # in_graph() the same way nodes_tbl/edges_tbl do, or a second
+        # handle would silently start using its own, unconfigured copy.
+        assert other.graphs_tbl is fresh_graph.graphs_tbl
 
     @pytest.mark.parametrize("bad", ["", None, 3])
     def test_a_graph_name_must_be_a_non_empty_string(self, fresh_graph, bad):
@@ -287,3 +293,83 @@ class TestCypherAndDefaults:
 
     def test_repr_says_which_graph(self, fresh_graph):
         assert "graph='default'" in repr(fresh_graph)
+
+
+class TestGraphsRegistry:
+    """The optional `graphs(id, name, description)` registry (issue #85):
+    a human-readable name and description for a graph_id that would
+    otherwise only ever be an opaque string. Purely descriptive -- no
+    foreign key ties nodes/edges.graph_id to it -- so nothing here may
+    ever make a graph_id that was never registered stop working; every
+    test that proves a fallback also proves ordinary reads/writes on
+    that same, unregistered graph still succeed."""
+
+    def test_the_default_table_has_id_name_description(self, fresh_graph):
+        assert set(fresh_graph.graphs_tbl.c.keys()) == {"id", "name", "description"}
+        assert fresh_graph.graph_extra_cols == ()
+
+    def test_a_custom_table_missing_a_required_column_refuses(self):
+        """Caught in Graph.__init__, with no connection -- the same
+        offline-safe validation graph_col's own table check gets, and
+        for the same reason: a table missing what create_graph() writes
+        to should fail by name here, not as a driver error the first
+        time someone calls it."""
+        from sqlalchemy import Column, MetaData, Table, Text
+
+        md = MetaData()
+        bad = Table("graphs", md, Column("id", Text, primary_key=True),
+                    Column("name", Text))   # no description
+        with pytest.raises(ValueError, match="no 'description' column"):
+            Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline",
+                 graph_table=bad)
+
+    def test_create_schema_does_not_touch_the_registry_table(self, fresh_graph):
+        """The registry follows hopai_schema's lazy timing, not nodes/
+        edges' eager one -- create_schema() must leave an existing
+        caller who never opts in with no schema change at all. Without
+        this, a caller who never calls create_graph() would still get a
+        new empty table on every start-up."""
+        with fresh_graph.engine.connect() as connection:
+            assert connection.execute(text("SELECT to_regclass('graphs')")).scalar() is None
+
+    def test_a_graph_with_no_registry_table_yet_is_unnamed(self, fresh_graph):
+        assert fresh_graph.graph_info() is None
+
+    def test_create_graph_upserts_by_id(self, fresh_graph):
+        """Calling this again to rename a graph is the normal way to use
+        it, not a conflict -- unlike add_nodes(), which refuses a repeat
+        id, there is exactly one row a graph could ever want here."""
+        fresh_graph.create_graph(name="Marketing", description="v1")
+        assert fresh_graph.graph_info() == {"name": "Marketing", "description": "v1"}
+        fresh_graph.create_graph(name="Marketing", description="v2")
+        assert fresh_graph.graph_info() == {"name": "Marketing", "description": "v2"}
+
+    def test_a_graph_with_rows_and_no_row_here_is_unnamed_not_an_error(self, fresh_graph):
+        """The registry is purely descriptive: registering ONE graph
+        must not disturb reads or writes on another, unregistered one --
+        the same isolation proof TestIsolation runs for graph_id itself,
+        one layer up."""
+        other = fresh_graph.in_graph("unregistered")
+        other.add_nodes([{"n": 1}])
+        fresh_graph.create_graph(name="Default graph")
+        assert other.graph_info() is None
+        assert len(other.traverse(Start()).nodes) == 1
+
+    def test_an_unknown_extra_column_refuses(self, fresh_graph):
+        with pytest.raises(ValueError, match="unexpected column"):
+            fresh_graph.create_graph(name="x", owner="nope")
+
+    def test_extra_columns_on_a_custom_graph_table(self, fresh_graph):
+        """graph_table= is customizable the same way node_table=/
+        edge_table= are: an extra column beyond id/name/description is
+        discovered automatically and create_graph() writes to it."""
+        from sqlalchemy import Column, MetaData, Table, Text
+
+        md = MetaData()
+        custom = Table("graphs", md, Column("id", Text, primary_key=True),
+                       Column("name", Text), Column("description", Text),
+                       Column("owner", Text))
+        graph = Graph(fresh_graph.engine, graph_table=custom)
+        assert graph.graph_extra_cols == ("owner",)
+        graph.create_graph(name="Ops", description="d", owner="alice")
+        assert graph.graph_info() == {"name": "Ops", "description": "d", "owner": "alice"}

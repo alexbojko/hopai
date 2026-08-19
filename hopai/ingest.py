@@ -60,6 +60,21 @@ new properties are merged over the existing ones (`||`), leaving
 properties you did not mention alone, which is what Cypher's
 `ON MATCH SET` does. Pass replace=True to overwrite the whole bag.
 
+MERGE ON THE ROW'S OWN ID, not just a property -- `on=[Col("id")]`
+(hopai.constraints.Col), since `id` is a real column and `on=["id"]`
+(a bare string) is refused as the collision constraints.py names:
+a bare string always means a JSONB property, and `id` already is a
+column, written and read by name everywhere else in this module.
+`id` (and, for edges, `start_id`/`end_id`) is already unique per graph
+-- see models.py -- so no separate Unique() declaration is needed
+first, unlike a property key. graph.ingest()'s merge_nodes_on/
+merge_edges_on -- the JSON-safe document form -- accept the bare
+string 'id' (or any other real column name) directly and translate it
+to Col(...) themselves (see parse_on() below): JSON has no way to
+spell Col(...), so the string has to mean the column there, exactly
+the opposite default from the Python API's on=, which already has an
+unambiguous spelling and treats the same bare string as a mistake.
+
 ONE THING TO KNOW ABOUT MERGE AND CHECK CONSTRAINTS, because it surprises
 everyone once: PostgreSQL evaluates CHECK constraints on the row being
 inserted BEFORE it looks for a conflict. So a merge row must satisfy
@@ -522,12 +537,14 @@ class Ingestor:
         # document would leave a retry hitting unique violations on rows
         # the caller was told had failed.
         with self._transaction(connection) as connection:
-            written_nodes = (self.merge_nodes(nodes, on=merge_nodes_on, connection=connection)
-                             if merge_nodes_on
-                             else self.add_nodes(nodes, connection=connection))
-            written_edges = (self.merge_edges(edges, on=merge_edges_on, connection=connection)
-                             if merge_edges_on
-                             else self.add_edges(edges, connection=connection))
+            written_nodes = (
+                self.merge_nodes(nodes, on=parse_on(self.g.nodes_tbl, merge_nodes_on),
+                                 connection=connection)
+                if merge_nodes_on else self.add_nodes(nodes, connection=connection))
+            written_edges = (
+                self.merge_edges(edges, on=parse_on(self.g.edges_tbl, merge_edges_on),
+                                 connection=connection)
+                if merge_edges_on else self.add_edges(edges, connection=connection))
         return IngestResult(nodes=written_nodes, edges=written_edges,
                             elapsed_ms=(time.perf_counter() - started) * 1000)
 
@@ -663,6 +680,32 @@ def _refuse_vector_property(properties: dict, vector_fields: dict, method: str,
             f"text to embed -- writing it as a property would store the embedding in "
             f"JSONB, where similarity never reads it. {set_vectors_hint}{text_hint}"
         )
+
+
+def parse_on(table, on: Optional[list]) -> Optional[list]:
+    """The JSON front end for merge_nodes()/merge_edges()'s `on=`, used
+    by ingest()'s merge_nodes_on/merge_edges_on -- the document form a
+    tool call or an HTTP body can actually send.
+
+    A string naming one of `table`'s own real columns ('id', or for
+    edges 'start_id'/'end_id', or an EXTRA COLUMN -- models.py's
+    "EXTENDING THE MODEL") becomes Col(name); every other string is
+    left alone, still a JSONB property key. This is the mirror image of
+    constraints.py's _reject_column_collision(), which treats that
+    exact same bare string as a Python caller's mistake: a Python
+    caller already has an unambiguous way to say "the column"
+    (Col(...)), so a bare 'id' can only be an accident, but JSON cannot
+    spell Col(...) at all -- without this translation an id-keyed merge
+    would be reachable from Python and unreachable from a tool call,
+    the one asymmetry #81 exists to close. merge_nodes()/merge_edges()
+    themselves are NOT changed: the Python API keeps refusing a bare
+    'id' by name, exactly as constraints.py documents, since Col(...)
+    remains the escape hatch there and two spellings for one string
+    would be a worse asymmetry than this one."""
+    if not on:
+        return on
+    from .constraints import Col
+    return [Col(key) if isinstance(key, str) and key in table.c else key for key in on]
 
 
 def _reference_key(reference: dict) -> tuple:

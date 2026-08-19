@@ -36,6 +36,19 @@ alone (Cypher's `ON MATCH SET`); `replace=True` overwrites the bag.
 Merging is idempotent, which is what makes it the right call for an
 agent that might retry.
 
+Merging on the row's own `id` — every loader that upserts on its
+records' own identifier, not a property — needs no `Unique` first,
+since `id` is already unique: `on=[Col("id")]`
+(`from hopai import Col`), never a bare `"id"` string, which
+`merge_nodes`/`merge_edges` refuse as a real-column collision, the same
+as `Unique("id")` would be:
+
+```python
+from hopai import Col
+
+graph.merge_nodes([{"id": 7, "name": "Alice"}], on=[Col("id")])
+```
+
 For agents and HTTP handlers, one document, and one schema to hand a
 model:
 
@@ -45,7 +58,10 @@ from hopai import INGEST_TOOL_SCHEMA
 graph.ingest({
     "nodes": [{"id": 1, "type": "person"}],
     "edges": [{"start_id": 1, "end_id": 2, "kind": "knows"}],
-})
+}, merge_nodes_on=["id"])   # the bare string here IS the id column --
+                            # JSON can't spell Col(...), so this document
+                            # form (and the ingest_graph MCP tool) accept
+                            # "id" directly and translate it for you.
 ```
 
 Nodes are written before edges, so a single document can create a node

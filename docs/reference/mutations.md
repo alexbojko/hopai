@@ -51,12 +51,18 @@ was added to prevent.
 `where=` filters properties, and **an id is not a property** — it is a
 column. `where={"id": 7}` is a containment test against the JSONB bag,
 so it matches nothing and says nothing about why. `ids=` is how a caller
-already holding a row names it:
+already holding a row names it, on every mutating call — `delete_nodes`,
+`delete_edges`, `update_nodes`, `update_edges`:
 
 ```python
 graph.delete_nodes(ids=[12, 13], detach=True)
 graph.delete_edges(ids=[7])
+graph.update_nodes(ids=[12], set={"reviewed": True})
 ```
+
+`Start(ids=...)` is the read-side counterpart, seeding a traversal from
+specific ids instead of (or alongside) `where=` — see
+[Traversal](traversal.md).
 
 An empty list refuses exactly as an empty filter does — it is what an
 empty selection looks like, and `all=True` stays the only opt-in. Given

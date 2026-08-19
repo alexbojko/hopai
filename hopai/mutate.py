@@ -29,6 +29,19 @@ caller's empty variable looks like, and the cost of being wrong is the
 data. Saying it on purpose is `all=True` -- or `graph.clear()`, which is
 the same thing with a name you cannot type by accident.
 
+TARGETING A ROW BY ITS ID, not just its properties: `ids=[...]` selects
+rows by the real id column, ANDed with `where` when both are given.
+`where` compiles through hopai.filters.resolve() against `properties`,
+and an id is not a property -- `where={"id": 7}` is a JSONB containment
+test that matches nothing and says nothing while doing it. `ids=` is
+the deliberate second parameter that closes that trap, the same way
+Start(ids=...) does for a traversal's seed set (hopai/hop.py). An empty
+`ids=[]` is treated exactly like an empty `where`: it is what a
+caller's empty variable looks like, so it counts toward the no-filter
+refusal above rather than silently matching nothing (contrast
+Start(ids=[]), a read with no such danger, where an explicit empty
+selection matches nothing instead).
+
 DELETING A NODE THAT STILL HAS EDGES fails on the foreign key, and that
 failure is translated into a message naming `detach=True` (Cypher's
 DETACH DELETE, which deletes the incident edges with the node). The
@@ -104,10 +117,10 @@ set_ = set
 #: the Cypher translator -- emit these and nothing else, so there is one
 #: executor to trust rather than one per notation.
 _OP_KEYS = {
-    "delete_nodes": {"where", "detach", "all"},
-    "delete_edges": {"where", "start", "end", "all"},
-    "update_nodes": {"where", "set", "remove", "replace", "all"},
-    "update_edges": {"where", "start", "end", "set", "remove", "replace", "all"},
+    "delete_nodes": {"where", "detach", "all", "ids"},
+    "delete_edges": {"where", "start", "end", "all", "ids"},
+    "update_nodes": {"where", "set", "remove", "replace", "all", "ids"},
+    "update_edges": {"where", "start", "end", "set", "remove", "replace", "all", "ids"},
 }
 MUTATION_OPS = frozenset(_OP_KEYS)
 
@@ -321,17 +334,18 @@ class Mutator:
             *self._edge_conditions(where, start, end, ids))
 
     def update_nodes_statement(self, where=None, set=None, remove=None,
-                               replace: bool = False, all: bool = False):
-        self._guard([where], "update_nodes", "node", all)
+                               replace: bool = False, all: bool = False, ids=None):
+        self._guard([where, ids], "update_nodes", "node", all)
         nt = self.g.nodes_tbl
-        return update(nt).where(*self._node_conditions(where)).values(
+        return update(nt).where(*self._node_conditions(where, ids)).values(
             properties=_new_properties(nt.c.properties, set, remove, replace, "update_nodes"))
 
     def update_edges_statement(self, where=None, start=None, end=None, set=None,
-                               remove=None, replace: bool = False, all: bool = False):
-        self._guard([where, start, end], "update_edges", "edge", all)
+                               remove=None, replace: bool = False, all: bool = False,
+                               ids=None):
+        self._guard([where, start, end, ids], "update_edges", "edge", all)
         et = self.g.edges_tbl
-        return update(et).where(*self._edge_conditions(where, start, end)).values(
+        return update(et).where(*self._edge_conditions(where, start, end, ids)).values(
             properties=_new_properties(et.c.properties, set, remove, replace, "update_edges"))
 
     # -- execution ------------------------------------------------------
@@ -408,9 +422,9 @@ class Mutator:
                               elapsed_ms=(time.perf_counter() - started) * 1000)
 
     def update_nodes(self, where=None, set=None, remove=None, replace: bool = False,
-                     all: bool = False, connection=None) -> MutationResult:
+                     all: bool = False, connection=None, ids=None) -> MutationResult:
         started = time.perf_counter()
-        statement = self.update_nodes_statement(where, set, remove, replace, all)
+        statement = self.update_nodes_statement(where, set, remove, replace, all, ids)
         with one_transaction(self.g, connection) as conn:
             try:
                 updated = conn.execute(statement).rowcount
@@ -425,9 +439,9 @@ class Mutator:
 
     def update_edges(self, where=None, start=None, end=None, set=None, remove=None,
                      replace: bool = False, all: bool = False,
-                     connection=None) -> MutationResult:
+                     connection=None, ids=None) -> MutationResult:
         started = time.perf_counter()
-        statement = self.update_edges_statement(where, start, end, set, remove, replace, all)
+        statement = self.update_edges_statement(where, start, end, set, remove, replace, all, ids)
         with one_transaction(self.g, connection) as conn:
             try:
                 updated = conn.execute(statement).rowcount
@@ -626,6 +640,15 @@ _ARGUMENT_SCHEMA = {
     "where": {"type": "object",
               "description": "Filter on the properties of the rows to change. "
                              + _FILTER_GRAMMAR},
+    "ids": {"type": "array",
+            "items": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+            "description": "Target specific rows by their id column directly -- node ids "
+                           "for delete_nodes/update_nodes, edge ids for "
+                           "delete_edges/update_edges. `where` filters PROPERTIES, and an "
+                           "id is not one: where={\"id\": 7} matches nothing. Combines "
+                           "with `where` as AND, so both must match. An empty list is "
+                           "what an empty variable looks like, same as an empty `where` -- "
+                           "it raises unless all=True says every row is really meant."},
     "start": {"type": "object",
               "description": "Filter on the properties of the node the edge starts at. "
                              + _ENDPOINT + _FILTER_GRAMMAR},

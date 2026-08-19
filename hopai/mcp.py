@@ -56,8 +56,12 @@ So an agent that must not see `crm` gets `--graph docs` -- a server that
 does not serve it, rather than one that declines to admit it exists.
 
 `list_graphs` still reports what this server SERVES, discovered or
-named. It is never a live query, so a graph created after start-up is
-not silently in scope.
+named. The list itself is never a live query, so a graph created after
+start-up is not silently in scope; `registry=True` is the one opt-in
+exception, reading each graph's registered name/description (see
+Graph.create_graph()) at call time, since a registry entry is exactly
+the kind of thing an operator adds after start-up and expects the next
+call to see.
 
 What one server cannot do is give two graphs DIFFERENT permissions:
 read_only, allow_mutations and allow_ddl are properties of the server,
@@ -67,7 +71,9 @@ is the honest boundary -- a per-call argument was never one.
 
 THE TOOLS, and the call each one is:
 
-    list_graphs       the graphs this server serves (only when >1)
+    list_graphs       the graphs this server serves (only when >1),
+                      plus each one's registered name/description
+                      with registry=True
     describe_graph    what exists: the declared schema, the vector
                       fields, what this server will and will not do
     traverse_graph    traverse_json()      -- multi-hop, filtered
@@ -865,21 +871,30 @@ def _with_rerank(schema: dict, policy: Optional[RerankPolicy]) -> dict:
 # ---------------------------------------------------------------------
 
 def _list_graphs_tool(served: Served) -> ToolSpec:
-    def list_graphs() -> dict:
+    def list_graphs(registry: bool = False) -> dict:
+        entries = []
+        for name, graph in served.graphs.items():
+            # None -> no connection at all, matching this tool's own
+            # documented invariant (module docstring: "It is never a
+            # live query"). registry=True is the one opt-in exception,
+            # the same shape describe_graph's counts=True already is --
+            # a caller who wants names/descriptions pays one query per
+            # graph for them, a caller who does not pays nothing.
+            info = graph.graph_info() if registry else None
+            entries.append({
+                "graph": name,
+                "name": info["name"] if info else None,
+                "description": info["description"] if info else None,
+                "schema_declared": graph.schema is not None,
+                "node_types": sorted(nt.name for nt in graph.schema.node_types)
+                              if graph.schema is not None else None,
+                "vector_fields": {
+                    target: sorted(_vector_fields(graph, target))
+                    for target in ("nodes", "edges")
+                },
+            })
         return {
-            "graphs": [
-                {
-                    "graph": name,
-                    "schema_declared": graph.schema is not None,
-                    "node_types": sorted(nt.name for nt in graph.schema.node_types)
-                                  if graph.schema is not None else None,
-                    "vector_fields": {
-                        target: sorted(_vector_fields(graph, target))
-                        for target in ("nodes", "edges")
-                    },
-                }
-                for name, graph in served.graphs.items()
-            ],
+            "graphs": entries,
             "note": "Every other tool takes a `graph` argument naming one of these. "
                     "They are separate graphs: nothing in one is visible from another, "
                     "and there is no default.",
@@ -891,10 +906,21 @@ def _list_graphs_tool(served: Served) -> ToolSpec:
             "List the graphs this server exposes, with the node types and vector fields "
             "each one declares. Call this first: every other tool requires a `graph` "
             "argument naming one of them, and the graphs are separate -- a question asked "
-            "of the wrong one is answered, emptily, rather than refused. describe_graph "
-            "returns one graph's full schema."
+            "of the wrong one is answered, emptily, rather than refused. "
+            "registry=true also reads each graph's registered name/description, when the "
+            "operator populated one with Graph.create_graph() -- off by default, since "
+            "otherwise this is the one tool that answers with no database connection at "
+            "all. describe_graph returns one graph's full schema."
         ),
-        parameters=_object({}),
+        parameters=_object({
+            "registry": {
+                "type": "boolean",
+                "description": "Also read each graph's registered name/description from "
+                               "the graphs table, when the operator populated one. Costs "
+                               "one query per graph; off by default, and silently None "
+                               "for a graph never registered with create_graph().",
+            },
+        }),
         call=list_graphs,
     )
 
@@ -1227,15 +1253,18 @@ def _ingest_tool(served: Served, schema: dict) -> ToolSpec:
         "type": "array",
         "items": {"type": "string"},
         "description": (
-            "UPDATE instead of insert: property keys identifying an existing node. A node "
-            "matching on these keys has the new properties merged over its old ones; one "
-            "that matches nothing is created. Needs a unique index on exactly these keys."
+            "UPDATE instead of insert: keys identifying an existing node. A node matching "
+            "on these keys has the new properties merged over its old ones; one that "
+            "matches nothing is created. Most keys are property names and need a unique "
+            "index declared on exactly those keys first -- 'id' is the exception: it "
+            "targets the node's own id column directly (already unique per graph, no "
+            "index to declare) rather than a JSONB property called 'id'."
         ),
     }
     schema["parameters"]["properties"]["merge_edges_on"] = {
         "type": "array",
         "items": {"type": "string"},
-        "description": "The same for edges.",
+        "description": "The same for edges. 'id' targets the edge's own id column.",
     }
     return ToolSpec(schema["name"], schema["description"], schema["parameters"], ingest_graph)
 

@@ -700,6 +700,17 @@ class TestJsonDocument:
         with pytest.raises((ValueError, TypeError), match=message):
             spec_to_mutations(spec)
 
+    def test_ids_travel_through_a_document_unparsed(self, people):
+        """`ids` is not a filter key, so spec_to_mutations() must leave
+        the raw id list alone rather than routing it through
+        parse_filter() -- an id list has no `and`/`gt`/... grammar."""
+        found = people.traverse(Start(), Hop(hops=1, optional=True))
+        carol_id = next(n["id"] for n in found.nodes if n["properties"].get("name") == "Carol")
+        result = people.mutate({"operations": [
+            {"op": "delete_nodes", "ids": [carol_id], "detach": True}]})
+        assert result.deleted_nodes == 1
+        assert names(people) == {"Alice", "Bob", "Acme"}
+
     def test_the_executor_refuses_an_operation_it_does_not_know(self, people):
         """spec_to_mutations() is not the only way to reach it -- a
         hand-built plan gets the same check."""
@@ -743,7 +754,7 @@ class TestToolSchema:
         for op, branch in branches().items():
             values = {"where": {"type": "x"}, "start": {"type": "x"}, "end": {"type": "x"},
                       "set": {"a": 1}, "remove": ["b"], "replace": False,
-                      "detach": True, "all": False}
+                      "detach": True, "all": False, "ids": [1, 2]}
             operation = {"op": op, **{k: values[k] for k in branch["properties"] if k != "op"}}
             assert spec_to_mutations({"operations": [operation]})[0]["op"] == op
 
@@ -760,6 +771,13 @@ class TestToolSchema:
     def test_the_all_flag_documents_both_halves_of_its_rule(self):
         described = branches()["delete_nodes"]["properties"]["all"]["description"]
         assert "neither a filter nor this flag" in described and "with both" in described
+
+    def test_the_ids_argument_documents_that_where_is_not_it(self):
+        """#81: the trap `ids=` exists to close, said in the description
+        a model actually reads -- not just in a docstring."""
+        for branch in branches().values():
+            described = branch["properties"]["ids"]["description"]
+            assert 'where={"id": 7}' in described and "matches nothing" in described
 
     def test_a_document_shaped_like_the_schema_runs(self, people):
         assert people.mutate({"operations": [
@@ -1294,6 +1312,53 @@ class TestAddressingRowsById:
         thing stopping `ids=` from reaching across graphs."""
         sql = norm(Mutator(offline_graph.in_graph("marketing"))
                    .delete_nodes_statement(ids=[7, 8]))
+        assert "graph_id = 'marketing'" in sql
+        assert "IN (7, 8)" in sql
+
+    def test_updating_by_id_touches_exactly_that_row(self, people):
+        """update_nodes()/update_edges() had no `ids=` at all until #81 --
+        delete grew it first (this class predates the hop.py/mutate.py
+        parity pass), so this is the part that would break without it."""
+        ids = self._ids(people)
+        result = people.update_nodes(ids=[ids["Carol"]], set={"active": True})
+        assert result.updated_nodes == 1
+        assert properties_of(people, name="Carol")[0]["active"] is True
+        # Everyone else is untouched.
+        assert "active" not in properties_of(people, name="Alice")[0]
+
+    def test_updating_an_edge_by_id(self, people):
+        found = people.traverse(Start(), Hop(hops=1, optional=True))
+        edge = next(e for e in found.edges if e["properties"].get("kind") == "works_at")
+        result = people.update_edges(ids=[edge["id"]], set={"since": 2020})
+        assert result.updated_edges == 1
+        updated = next(e for e in people.traverse(Start(), Hop()).edges
+                       if e["id"] == edge["id"])
+        assert updated["properties"]["since"] == 2020
+
+    def test_updating_by_id_is_not_a_property_either(self, people):
+        """The update-side twin of test_an_id_is_not_a_property: `where`
+        still means properties, never the id column, however the row is
+        addressed."""
+        result = people.update_nodes(where={"id": self._ids(people)["Carol"]},
+                                     set={"active": True})
+        assert result.updated_nodes == 0
+
+    def test_an_empty_update_ids_list_refuses_like_an_empty_filter(self, people):
+        with pytest.raises(ValueError, match="all=True"):
+            people.update_nodes(ids=[], set={"active": True})
+        with pytest.raises(ValueError, match="all=True"):
+            people.update_edges(ids=[], set={"since": 2020})
+
+    def test_update_ids_and_a_filter_narrow_together(self, people):
+        """AND, not OR -- same composition as the delete-side test above."""
+        ids = self._ids(people)
+        result = people.update_nodes(ids=[ids["Carol"]], where={"type": "company"},
+                                     set={"active": True})
+        assert result.updated_nodes == 0
+
+    def test_the_update_id_predicate_is_scoped_to_the_graph(self, offline_graph):
+        sql = norm(Mutator(offline_graph.in_graph("marketing"))
+                   .update_nodes_statement(ids=[7, 8], set={"active": True}))
         assert "graph_id = 'marketing'" in sql
         assert "IN (7, 8)" in sql
 

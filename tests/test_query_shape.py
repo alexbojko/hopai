@@ -1586,6 +1586,13 @@ class TestToolSchema:
         assert set(properties["hops"]["items"]["properties"]) == _HOP_KEYS - {"label"}
         assert set(properties["start"]["properties"]) == _START_KEYS - {"label"}
 
+    def test_start_ids_names_the_where_trap(self):
+        """#81: `ids` exists because `where` filters properties, and the
+        description a model reads has to say so, not just the docstring."""
+        described = TRAVERSE_TOOL_SCHEMA["parameters"]["properties"]["start"][
+            "properties"]["ids"]["description"]
+        assert '{"id": 7}' in described and "matches nothing" in described
+
     def test_the_search_schema_advertises_the_keys_its_parser_reads(self):
         """The same derivation test_advertises_the_keys_the_parser_reads
         makes for a traversal, for the flat search -- which had none, so

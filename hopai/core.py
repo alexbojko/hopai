@@ -47,7 +47,10 @@ from sqlalchemy.schema import CreateIndex
 
 from .filters import resolve, resolve_via
 from .hop import Hop, Start
-from .models import DEFAULT_GRAPH, EDGE_IDENTITY_KEYS, NODE_IDENTITY_KEYS, Edge, Node
+from .models import (
+    DEFAULT_GRAPH, EDGE_IDENTITY_KEYS, GRAPH_IDENTITY_KEYS, NODE_IDENTITY_KEYS, Edge,
+    GraphRegistry, Node,
+)
 from .vectors import VECTOR_COLUMN_PREFIX
 
 
@@ -73,6 +76,21 @@ def _pinned(id_expr, pins: Optional[dict], index: int) -> tuple:
     if not pins or index not in pins:
         return ()
     return (id_expr.in_(pins[index]),)
+
+
+def _ided(id_expr, ids: Optional[list]) -> tuple:
+    """`(id IN (...),)` for Start(ids=...), or `()` when ids=None.
+
+    Same splat trick as _pinned above, for the same reason: a Start
+    with no ids= emits the exact seed condition it always has. `None`
+    means "no id filter" (like where=None); an explicit `[]` compiles
+    to `.in_([])`, which SQLAlchemy renders as an always-false clause --
+    an explicit empty selection matches nothing, the same as
+    `where={"some_key": []}` already does for an empty OR-of-values."""
+    if ids is None:
+        return ()
+    from .vectors import _coerce_id
+    return (id_expr.in_([_coerce_id(one) for one in ids]),)
 
 
 def _rerank_steps(start: Start, hops: list) -> list:
@@ -436,6 +454,7 @@ class Graph:
         graph: str = DEFAULT_GRAPH,
         node_table=None,
         edge_table=None,
+        graph_table=None,
         node_id_col: str = "id",
         edge_id_col: str = "id",
         edge_start_col: str = "start_id",
@@ -486,6 +505,23 @@ class Graph:
             EDGE_IDENTITY_KEYS | {self.edge_id_col, self.edge_start_col, self.edge_end_col},
             graph_col)
 
+        # The registry table is not graph-scoped -- one row per graph
+        # id, shared by the whole database -- so it carries no graph_col
+        # check of its own; id/name/description are required by name,
+        # mirroring the graph_col check above, because create_graph()
+        # writes to all three and a table missing one would fail there
+        # instead of here, with a driver error instead of a name.
+        self.graphs_tbl = graph_table if graph_table is not None else GraphRegistry
+        for required in sorted(GRAPH_IDENTITY_KEYS):
+            if required not in self.graphs_tbl.c:
+                raise ValueError(
+                    f"table {self.graphs_tbl.name!r} has no {required!r} column -- the "
+                    f"graphs registry needs id, name and description at minimum (see "
+                    f"models.GraphRegistry). Add the column, or drop graph_table= to use "
+                    f"the default"
+                )
+        self.graph_extra_cols = _extra_columns(self.graphs_tbl, GRAPH_IDENTITY_KEYS, None)
+
     def __repr__(self) -> str:
         return f"Graph({self.engine.url!r}, graph={self.graph!r})"
 
@@ -526,7 +562,8 @@ class Graph:
         for the READ side this issue was filed about, not as a blanket
         auto-declare."""
         handle = Graph(self.engine, graph=graph, node_table=self.nodes_tbl,
-                       edge_table=self.edges_tbl, node_id_col=self.node_id_col,
+                       edge_table=self.edges_tbl, graph_table=self.graphs_tbl,
+                       node_id_col=self.node_id_col,
                        edge_id_col=self.edge_id_col, edge_start_col=self.edge_start_col,
                        edge_end_col=self.edge_end_col, graph_col=self.graph_col)
         handle._vectors_lazy = True
@@ -557,6 +594,77 @@ class Graph:
         with self.engine.connect() as connection:
             return [row[0] for row in connection.execute(
                 select(column).distinct().order_by(column))]
+
+    def _registry_qualified(self) -> str:
+        """The graphs table's name, quoted and schema-qualified like
+        `_schema_store()` renders `hopai_schema` -- for to_regclass(),
+        which needs the same quoting to find a table outside the search
+        path."""
+        table = self.graphs_tbl
+        return f'"{table.schema}"."{table.name}"' if table.schema else f'"{table.name}"'
+
+    def create_graph(self, name: Optional[str] = None, description: Optional[str] = None,
+                     **extra) -> None:
+        """Register THIS handle's graph in the registry -- id/name/
+        description plus any column `graph_extra_cols` names (see
+        models.py's "THE GRAPHS REGISTRY").
+
+            graph.create_graph(name="Marketing", description="Campaign data")
+
+        Upserts on the graph id, so calling this again to update the
+        name/description is the normal way to use this, not a conflict
+        -- unlike add_nodes()/add_edges(), which refuse a repeat id,
+        there is exactly one row a graph could ever want here and
+        nothing else to disambiguate it by.
+
+        Creates the table on first use (CREATE TABLE IF NOT EXISTS,
+        through this Table object, so a customized graph_table='s own
+        extra columns come along) rather than in create_schema() --
+        the same lazy timing save_schema() uses for hopai_schema, and
+        for the same reason: this is metadata about a graph, not graph
+        data, and an existing caller who never calls this method should
+        see no schema change at all."""
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        table = self.graphs_tbl
+        unknown = set(extra) - set(self.graph_extra_cols)
+        if unknown:
+            raise ValueError(
+                f"create_graph() got unexpected column(s) {sorted(unknown)} -- this "
+                f"graphs table only has extra column(s) {list(self.graph_extra_cols)} "
+                f"beyond id/name/description. Pass graph_table=<your Table> to Graph() "
+                f"to add more"
+            )
+        values = {"id": self.graph, "name": name, "description": description, **extra}
+        stmt = pg_insert(table).values(**values)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[table.c.id],
+            set_={col: stmt.excluded[col] for col in values if col != "id"},
+        )
+        with self.engine.begin() as connection:
+            table.create(connection, checkfirst=True)
+            connection.execute(stmt)
+
+    def graph_info(self) -> Optional[dict]:
+        """THIS graph's row in the registry -- {"name": ..., "description":
+        ..., <any extra column>: ...} -- or None when the table does not
+        exist yet (create_graph() was never called for ANY graph on
+        this database) or holds no row for THIS graph id.
+
+        The registry is purely descriptive (models.py): a graph with
+        nodes/edges and no row here is not an error, it is simply
+        unnamed -- hopai.mcp's list_graphs falls back to the bare id in
+        that case, exactly the way Graph.graphs() has always worked."""
+        table = self.graphs_tbl
+        with self.engine.connect() as connection:
+            exists = connection.execute(
+                text("SELECT to_regclass(:name)"),
+                {"name": self._registry_qualified()}).scalar()
+            if exists is None:
+                return None
+            row = connection.execute(
+                select(table).where(table.c.id == self.graph)).mappings().first()
+        return {k: v for k, v in row.items() if k != "id"} if row is not None else None
 
     def _scoped(self, table):
         """`graph_id = <this graph>` for one table, or an alias of it.
@@ -611,6 +719,7 @@ class Graph:
         node_id_col = getattr(nt.c, self.node_id_col)
 
         seed_condition = and_(self._scoped(nt), resolve(nt.c.properties, start.where),
+                              *_ided(node_id_col, start.ids),
                               *_pinned(node_id_col, pins, -1))
         if start.near is not None:
             # Similarity-seeded: the seed CTE becomes "the k most
@@ -1818,11 +1927,17 @@ class Graph:
 
     def merge_nodes(self, rows: list, on: list, replace: bool = False) -> int:
         """Insert nodes, updating any that already match on `on`.
-        Requires a unique index over those keys -- see Unique()."""
+        Requires a unique index over those keys -- see Unique(). `on`
+        may include Col("id") to merge on the node's own id column
+        (already unique per graph, no index needed) instead of a
+        property; a bare "id" string refuses, naming Col("id") -- see
+        hopai.constraints for why a bare string colliding with a real
+        column is always treated as a mistake."""
         return self._ingestor.merge_nodes(rows, on=on, replace=replace)
 
     def merge_edges(self, rows: list, on: list, replace: bool = False) -> int:
-        """Insert edges, updating any that already match on `on`."""
+        """Insert edges, updating any that already match on `on`. Same
+        Col("id") support as merge_nodes()."""
         return self._ingestor.merge_edges(rows, on=on, replace=replace)
 
     def ingest(self, document: dict, merge_nodes_on: Optional[list] = None,
@@ -1831,7 +1946,11 @@ class Graph:
 
         Nodes are written before edges, so an edge in the same document
         may reference a node created by it. This is the call an agent
-        makes -- see INGEST_TOOL_SCHEMA."""
+        makes -- see INGEST_TOOL_SCHEMA. Unlike merge_nodes()/
+        merge_edges()'s own `on=`, the bare string "id" here (or any
+        other real column name) targets that column directly: JSON has
+        no way to spell Col("id"), so this JSON-safe document form
+        translates it for you (see hopai.ingest.parse_on())."""
         return self._ingestor.ingest(document, merge_nodes_on, merge_edges_on)
 
     def write_cypher(self, query: str, **options):
@@ -1902,7 +2021,8 @@ class Graph:
         A node that still has edges cannot be deleted: pass detach=True
         to delete its edges with it (Cypher's DETACH DELETE). A call with
         no filter raises rather than emptying the graph -- say it on
-        purpose with all=True, or call clear()."""
+        purpose with all=True, or call clear(). `ids=` targets specific
+        rows by their id column instead of (or alongside) `where`."""
         return self._mutator.delete_nodes(where, detach=detach, all=all, ids=ids)
 
     def repoint_edge(self, edge_id, start_id=None, end_id=None):
@@ -1936,25 +2056,28 @@ class Graph:
                                           ids=ids)
 
     def update_nodes(self, where=None, set=None, remove=None, replace: bool = False,
-                     all: bool = False):
+                     all: bool = False, ids=None):
         """Update every node matching `where`. `set` is merged over the
         existing properties, leaving anything it does not mention alone;
         `remove` drops keys; `replace=True` makes `set` the whole
         property bag. Returns a MutationResult.
 
             graph.update_nodes(where={"type": "person"}, set={"active": False})
-        """
+
+        `ids=` targets specific rows by their id column instead of (or
+        alongside) `where`, with the same rules as delete_nodes()."""
         return self._mutator.update_nodes(where, set=set, remove=remove,
-                                          replace=replace, all=all)
+                                          replace=replace, all=all, ids=ids)
 
     def update_edges(self, where=None, start=None, end=None, set=None, remove=None,
-                     replace: bool = False, all: bool = False):
+                     replace: bool = False, all: bool = False, ids=None):
         """Update every edge matching `where`, with the same set/remove/
         replace semantics as update_nodes() and the same endpoint
         filters as delete_edges() -- including that they are filters
-        rather than references. Returns a MutationResult."""
+        rather than references. `ids=` names specific edges instead,
+        with the same rules as delete_edges(). Returns a MutationResult."""
         return self._mutator.update_edges(where, start=start, end=end, set=set,
-                                          remove=remove, replace=replace, all=all)
+                                          remove=remove, replace=replace, all=all, ids=ids)
 
     def clear(self):
         """Delete every node and edge in THIS graph, in one transaction.
