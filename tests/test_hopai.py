@@ -38,6 +38,7 @@ class TestCoreTraversal:
         from sqlalchemy import BigInteger, Column, MetaData, Table, Text, text as sa_text
         from sqlalchemy.dialects.postgresql import JSONB
 
+        from conftest import _retry_ddl_race
         from hopai import Graph
 
         meta = MetaData(schema="hopai_shared_ids")
@@ -51,10 +52,13 @@ class TestCoreTraversal:
                       Column("start_id", BigInteger, nullable=False),
                       Column("end_id", BigInteger, nullable=False),
                       Column("properties", JSONB, nullable=False))
-        with write_engine.begin() as conn:
-            conn.execute(sa_text("DROP SCHEMA IF EXISTS hopai_shared_ids CASCADE"))
-            conn.execute(sa_text("CREATE SCHEMA hopai_shared_ids"))
-        meta.create_all(write_engine)
+        def _setup():
+            with write_engine.begin() as conn:
+                conn.execute(sa_text("DROP SCHEMA IF EXISTS hopai_shared_ids CASCADE"))
+                conn.execute(sa_text("CREATE SCHEMA hopai_shared_ids"))
+            meta.create_all(write_engine)
+
+        _retry_ddl_race(_setup)
         with write_engine.begin() as conn:
             conn.execute(nodes.insert(), [
                 {"id": 1, "graph_id": "g1", "properties": {"t": 1, "m": "one"}},

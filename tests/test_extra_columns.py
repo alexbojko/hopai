@@ -17,6 +17,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
+from conftest import _retry_ddl_race
 from hopai import ConstraintViolation, Graph, Hop, Start, Unique, Vector
 from hopai.constraints import Col
 
@@ -30,12 +31,6 @@ def extra_graph(write_engine):
     foreign key into a `users` table -- the exact case this feature
     exists for -- and `note`, an optional plain column on edges, so both
     a required and an optional extra column are covered."""
-    with write_engine.begin() as conn:
-        conn.execute(text(f"DROP SCHEMA IF EXISTS {WRITE_SCHEMA} CASCADE"))
-        conn.execute(text(f"CREATE SCHEMA {WRITE_SCHEMA}"))
-        conn.execute(text("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)"))
-        conn.execute(text("INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')"))
-
     md = MetaData()
     # A Table object purely so ForeignKey("users.id") below can resolve
     # at DDL-compile time -- the real `users` table was already created
@@ -61,7 +56,16 @@ def extra_graph(write_engine):
         ForeignKeyConstraint(["end_id", "graph_id"], ["nodes.id", "nodes.graph_id"]),
     )
     graph = Graph(write_engine, node_table=nodes, edge_table=edges)
-    graph.create_schema()
+
+    def _setup():
+        with write_engine.begin() as conn:
+            conn.execute(text(f"DROP SCHEMA IF EXISTS {WRITE_SCHEMA} CASCADE"))
+            conn.execute(text(f"CREATE SCHEMA {WRITE_SCHEMA}"))
+            conn.execute(text("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)"))
+            conn.execute(text("INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')"))
+        graph.create_schema()
+
+    _retry_ddl_race(_setup)
     return graph
 
 

@@ -94,8 +94,24 @@ class TestSurvivorParsing:
 
 class TestMutationSection:
     def test_score_and_counts(self):
-        body = render_mutation({"total": 13, "killed": 12, "survived": 1}, [], "scope")
+        body = render_mutation({"total": 13, "killed": 12, "survived": 1},
+                               [("m1", "survived")], "scope")
         assert "92%" in body and "(12/13 killed)" in body
+
+    def test_an_incomplete_run_does_not_lead_with_a_score(self):
+        """#87: the header used to read '63% (4084/6477 killed)' with the
+        warning about 2121 unreached mutants buried below it -- a
+        percentage that reads as trustworthy even though a third of the
+        scope never ran. A run this incomplete must lead with the warning
+        instead of a number that invites a skim past it."""
+        found = [(f"m{i}", "survived") for i in range(270)]
+        body = render_mutation({"total": 6477, "killed": 4084, "timeout": 2}, found, "scope")
+        assert body.startswith("### ⚠️ Mutation testing incomplete")
+        assert "2121 of 6477 mutant(s) never reached a verdict" in body
+        assert "Mutation score" not in body
+        assert "63%" not in body
+        # the real numbers are still in the body, just not as a headline score
+        assert "4084/6477 killed" in body
 
     def test_always_says_it_is_advisory(self):
         """The one thing a reader must not conclude is that a red

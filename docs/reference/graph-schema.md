@@ -26,3 +26,21 @@ Two things that notebook doesn't cover:
   to propose dropping.
 
 See [hopai.schema](../api/schema.md) for every type's exact fields.
+
+## Relations with their own identity
+
+Every edge here still connects exactly two nodes and carries no identity of
+its own beyond its properties — a property-graph limit, not a hopai one; the
+same restriction holds in Neo4j and in every `MATCH (a)-[r]->(b)` Cypher
+dialect. A relational "link table" recording who referred whom, with a bonus
+amount and a date on the referral itself, has no single-edge equivalent here
+for the same reason it wouldn't fit a two-column foreign-key pair either: the
+relation has its own data, and a third participant that isn't one of the two
+endpoints being connected.
+
+The property-graph answer is to **reify the relation as a node** — give it
+its own type, put its properties on it, and connect it to every participant
+with a plain edge naming that participant's role. See the "Relations with
+their own identity" section of
+[06 · Graph schema](../notebooks/06_graph_schema.ipynb) for the worked
+example: no new API, because there is nothing hopai-specific to reify.
