@@ -16,12 +16,20 @@
   dialect); the standard answer is to reify the relation as its own node —
   see [Graph schema](graph-schema.md#relations-with-their-own-identity) for
   the worked example.
-- Deletes and updates select rows by their properties, not by where a
-  traversal arrived: `MATCH (a)-[:knows]->(b) DELETE b` refuses rather
-  than guessing which of the two readings you meant. There is no way to
-  target a row by its `id` column either — `where=` filters the JSONB
-  properties, so give the rows you care about a property you can name
-  (and a `Unique` on it).
+- Deletes and updates select rows by their properties (`where=`) or by
+  where a traversal arrived is still refused: `MATCH (a)-[:knows]->(b)
+  DELETE b` refuses rather than guessing which of the two readings you
+  meant. Targeting a row by its `id` column is `ids=` (`delete_nodes`,
+  `delete_edges`, `update_nodes`, `update_edges`, and `Start(ids=...)`
+  for a traversal's seed) — `where=` still only reaches JSONB
+  properties, so `where={"id": 7}` compiles a containment test that
+  matches nothing; see [Filters](filters.md#addressing-a-row-by-id).
+  `merge_nodes`/`merge_edges`' `on=` reaches `id` too, via
+  `Col("id")` (`on=["id"]`, a bare string, refuses the same way any
+  other real-column name does — see `hopai/ingest.py`); the JSON
+  document form (`ingest()`'s `merge_nodes_on=`/`merge_edges_on=`, and
+  the `ingest_graph` MCP tool) accepts the plain string `"id"` directly,
+  since JSON has no way to spell `Col(...)`.
 - `enforce_schema(endpoints=True)` polices endpoint types with a trigger
   on the *edges* table, so retyping a node with `update_nodes` (or
   `merge_nodes(replace=True)`, which could always do it) can leave a

@@ -350,6 +350,31 @@ class TestMerge:
                                     on=["email"])
         assert "merge_nodes()" in str(excinfo.value)
 
+    def test_merging_nodes_by_id(self, fresh_graph):
+        """Col('id') needs no Unique() declaration first -- id is already
+        the primary key, unlike a property, which needs one defined."""
+        from hopai import Col
+        fresh_graph.add_nodes([{"id": 1, "name": "Alice"}])
+        fresh_graph.merge_nodes([{"id": 1, "name": "Alicia"}], on=[Col("id")])
+        assert count(fresh_graph) == 1
+        assert properties_of(fresh_graph)[0]["name"] == "Alicia"
+
+    def test_merging_edges_by_id(self, fresh_graph):
+        """#81: the edges table lacked a UNIQUE(id, graph_id) index
+        (models.py), so ON CONFLICT (graph_id, id) had nothing to infer
+        from and this raised InvalidColumnReference -- the same
+        capability merge_nodes(on=[Col('id')]) already had, since nodes
+        has always declared that composite unique constraint."""
+        from hopai import Col
+        fresh_graph.add_nodes([{"id": 1}, {"id": 2}])
+        fresh_graph.add_edges([{"id": 100, "start_id": 1, "end_id": 2, "kind": "knows"}])
+        fresh_graph.merge_edges([{"id": 100, "start_id": 1, "end_id": 2, "weight": 9}],
+                                on=[Col("id")])
+        assert count(fresh_graph, "edges") == 1
+        with fresh_graph.engine.connect() as conn:
+            props = conn.execute(text("SELECT properties FROM edges")).scalar()
+        assert props == {"kind": "knows", "weight": 9}
+
     def test_a_declared_vector_fields_floats_are_refused_on_merge_edges(self, fresh_graph):
         from hopai import Col
         fresh_graph.define_vectors(edges=[Vector("relvec", 3)])
@@ -365,6 +390,45 @@ class TestMerge:
 # ---------------------------------------------------------------------
 # Documents and interchange
 # ---------------------------------------------------------------------
+
+class TestParseOn:
+    """The pure function ingest()'s merge_*_on= runs through, needing no
+    database: a real column name becomes Col(name), everything else is
+    left as a property key."""
+
+    def test_id_becomes_a_column(self):
+        from hopai import Col
+        from hopai.ingest import parse_on
+        from hopai.models import Node
+        assert parse_on(Node, ["id"]) == [Col("id")]
+
+    def test_a_property_key_is_left_alone(self):
+        from hopai.ingest import parse_on
+        from hopai.models import Node
+        assert parse_on(Node, ["email"]) == ["email"]
+
+    def test_mixed_keys(self):
+        from hopai import Col
+        from hopai.ingest import parse_on
+        from hopai.models import Edge
+        assert parse_on(Edge, ["kind", "start_id", "end_id"]) == [
+            "kind", Col("start_id"), Col("end_id")]
+
+    def test_none_and_empty_pass_through(self):
+        from hopai.ingest import parse_on
+        from hopai.models import Node
+        assert parse_on(Node, None) is None
+        assert parse_on(Node, []) == []
+
+    def test_an_existing_col_entry_is_left_alone(self):
+        """A caller of Ingestor.ingest() straight from Python (not
+        through JSON) may already pass Col(...) -- parse_on() must not
+        double-wrap it."""
+        from hopai import Col
+        from hopai.ingest import parse_on
+        from hopai.models import Node
+        assert parse_on(Node, [Col("id")]) == [Col("id")]
+
 
 class TestDocuments:
     def test_nodes_are_written_before_edges(self, fresh_graph):
@@ -387,6 +451,27 @@ class TestDocuments:
         fresh_graph.ingest(document, merge_nodes_on=["email"])
         fresh_graph.ingest(document, merge_nodes_on=["email"])
         assert count(fresh_graph) == 1
+
+    def test_merge_mode_on_id_is_json_safe(self, fresh_graph):
+        """#81: JSON cannot spell Col("id") -- merge_nodes(on=["id"])
+        directly would refuse it as a bare-string column collision (see
+        test_on_refuses_a_bare_string_naming_a_real_column above), but
+        ingest()'s merge_nodes_on/merge_edges_on are the document form a
+        tool call actually sends, so the plain string "id" has to work
+        there or an id-keyed re-import is unreachable from JSON."""
+        fresh_graph.add_nodes([{"id": 1, "name": "Alice"}])
+        fresh_graph.ingest({"nodes": [{"id": 1, "name": "Alicia"}]}, merge_nodes_on=["id"])
+        assert count(fresh_graph) == 1
+        assert properties_of(fresh_graph)[0]["name"] == "Alicia"
+
+        fresh_graph.add_nodes([{"id": 2}])
+        fresh_graph.add_edges([{"id": 100, "start_id": 1, "end_id": 2, "kind": "knows"}])
+        fresh_graph.ingest({"edges": [{"id": 100, "start_id": 1, "end_id": 2, "weight": 5}]},
+                           merge_edges_on=["id"])
+        assert count(fresh_graph, "edges") == 1
+        with fresh_graph.engine.connect() as conn:
+            props = conn.execute(text("SELECT properties FROM edges")).scalar()
+        assert props == {"kind": "knows", "weight": 5}
 
     @pytest.mark.parametrize("bad,message", [
         ({"nodes": [], "extra": []}, "unknown keys"),

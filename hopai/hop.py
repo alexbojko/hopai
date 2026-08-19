@@ -238,6 +238,21 @@ def _validate_rerank(owner: str, near, keep, rerank, k_name: str = "keep",
 class Start:
     """The seed set a traversal begins from.
 
+    ids: seed from specific node ids directly, instead of (or as well
+    as) a property filter. `where` filters PROPERTIES -- `where={"id":
+    7}` is a containment test against the JSONB bag, matches nothing,
+    and says nothing while doing it (mutate.py's TestAddressingRowsById
+    has the same trap on the write side). `ids` is the one way to name
+    a row you are already holding -- a UI with a node selected, a
+    traversal result fed back in. Combines with `where` as AND: both
+    are constraints on the same row, matching mutate.py's `ids=`.
+    `None` means no id filter, same as `where=None`; `[]` is an
+    explicit empty selection and matches nothing, the same as
+    `where={"some_key": []}` does for a property. Always scoped to
+    this graph -- see Graph._scoped() -- since a node id is a global
+    primary key and an id from another graph would otherwise be a
+    perfectly valid (wrong) match.
+
     near/keep: seed from vector similarity instead of (or as well as)
     a property filter -- Near(field, vector) specs to rank by, and
     `keep` for how many of the most similar nodes to keep. `where`
@@ -265,6 +280,7 @@ class Start:
     hopai/vectors.py.
     """
     where: Optional[Any] = None
+    ids: Optional[list] = None
     label: Optional[str] = None
     near: Optional[Any] = None
     keep: Optional[int] = None

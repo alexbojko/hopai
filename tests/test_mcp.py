@@ -2585,6 +2585,19 @@ class TestWriteToolsLive:
         assert len(found["nodes"]) == 1
         assert found["nodes"][0]["properties"]["name"] == "Alicia"
 
+    def test_merge_nodes_on_id_is_reachable_from_a_tool_call(self, fresh_graph):
+        """#81: a bare "id" is the only spelling JSON can send -- Col("id")
+        cannot travel through a tool call -- so merge_nodes_on=["id"]
+        has to reach the node's own id column, not a JSONB property
+        called "id" (which merge_nodes(on=["id"]) refuses outright as a
+        column collision)."""
+        spec = named(fresh_graph)["ingest_graph"]
+        spec.call(nodes=[{"id": 1, "type": "person", "name": "Alice"}])
+        spec.call(nodes=[{"id": 1, "type": "person", "name": "Alicia"}], merge_nodes_on=["id"])
+        found = named(fresh_graph)["traverse_graph"].call(start={"ids": [1]})
+        assert len(found["nodes"]) == 1
+        assert found["nodes"][0]["properties"]["name"] == "Alicia"
+
     def test_mutate_updates_and_deletes_in_one_ordered_transaction(self, fresh_graph):
         """The tool is a translation into Graph.mutate() and nothing
         else -- so what this pins is that the model's `operations` list
@@ -2606,6 +2619,19 @@ class TestWriteToolsLive:
         assert (result["deleted_edges"], result["deleted_nodes"]) == (1, 1)
         left = named(fresh_graph)["traverse_graph"].call(start={"where": {"type": "draft"}})
         assert [n["properties"]["status"] for n in left["nodes"]] == ["archived"]
+
+    def test_mutate_by_id_reaches_the_model(self, fresh_graph):
+        """#81: `ids` on delete_nodes/update_nodes travels through the
+        MCP tool exactly like `where` does."""
+        named(fresh_graph)["ingest_graph"].call(
+            nodes=[{"id": 1, "type": "draft"}, {"id": 2, "type": "draft"}])
+        result = named(fresh_graph, allow_mutations=True)["mutate_graph"].call(operations=[
+            {"op": "update_nodes", "ids": [1], "set": {"status": "archived"}},
+            {"op": "delete_nodes", "ids": [2]},
+        ])
+        assert (result["updated_nodes"], result["deleted_nodes"]) == (1, 1)
+        left = named(fresh_graph)["traverse_graph"].call(start={"ids": [1]})
+        assert left["nodes"][0]["properties"]["status"] == "archived"
 
     def test_a_filterless_delete_refuses_rather_than_emptying_the_graph(self, fresh_graph):
         """The library's own refusal, reaching the model through the
