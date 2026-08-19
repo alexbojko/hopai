@@ -155,6 +155,62 @@ refuses above **`MAX_DOCUMENTS` (5000)**. `candidates=` bounds the
 — `candidates=500` over nodes reached 200 ways measured **4.64 s** of
 document building before a single provider call.
 
+## Regression check: the traversal path across a batch of features
+
+`bench_hopai.py`'s twelve queries exist to answer one question when a
+batch of work lands: did any of it slow the walk down. Run once against
+the commit a batch started from and once against the commit it ended at,
+same graph, same machine, and the queries that never touch the new
+feature should not move.
+
+Recorded for the batch adding `ids=` selection, grouped aggregation,
+declared edge types, the graphs registry, and the rerank-probe
+projection (`338402b` → `cfea68b`). 210k nodes / 170k edges, five runs
+per version, medians of the warm timings:
+
+| query | before (ms) | after (ms) | |
+| --- | ---: | ---: | ---: |
+| `forward_1hop` | 56.1 | 57.7 | +2.9% |
+| `backward_1hop` | 56.4 | 55.0 | -2.5% |
+| `forward_bounded_4hop` | 528.2 | 525.8 | -0.5% |
+| `backward_bounded_3hop` | 60.5 | 61.1 | +1.0% |
+| `compound_2segment` | 553.5 | 545.9 | -1.4% |
+| `edge_or_tag` | 434.1 | 425.1 | -2.1% |
+| `not_filter` | 61.0 | 59.2 | -3.0% |
+| `range_gt` | 80.2 | 76.2 | -5.0% |
+| `optional_last_hop` | 56.2 | 53.1 | -5.5% |
+| `agg_count_4hop` | 197.3 | 190.6 | -3.4% |
+| `agg_stats_backward_4hop` | 64.1 | 64.7 | +0.9% |
+| `agg_range_count` | 27.6 | 25.0 | -9.4% |
+| **total** | **2175** | **2139** | **-1.6%** |
+
+Every query returned identical rows on both versions — the timings are
+only worth reading because the answers did not change.
+
+The spread is noise in both directions and the batch is not responsible
+for either end of it: **the compiled SQL for these shapes is
+byte-identical across the two commits**. That is the check worth
+running, and the one to run first — timings on a shared machine move by
+a few percent on their own, so a table like the one above can only ever
+fail to show a regression, while a diff of the emitted statement either
+is empty or is not. It needs no database:
+
+```python
+from sqlalchemy.dialects import postgresql
+from hopai import Graph, Start, Hop
+g = Graph("postgresql+psycopg2://u:p@localhost/db")   # never connects
+print(g.build_query(Start(where={"type": "node"}),
+                    [Hop(hops=(1, 4))]).compile(dialect=postgresql.dialect()))
+```
+
+Compiled that way on both commits across eight shapes — 1-hop each
+direction, bounded, compound, `OR`, `NOT`, range, and `optional` — the
+output differs nowhere. `ids=` adds a predicate only when a caller
+passes it, `group_by=` only reaches `build_aggregate_query`, and a
+declared edge type changes which index Postgres can use, not the
+statement. This is the "no performance regression" rule in CLAUDE.md
+being a measurement rather than an assurance.
+
 ## Comparing against Apache AGE
 
 Covered live in `benchmarks.ipynb` now, alongside Neo4j and the raw CTE,
