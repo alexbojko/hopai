@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from mutation_run import narrow, restrict_to  # noqa: E402
+from mutation_run import covered_lines_from_coverage_xml, narrow, restrict_to  # noqa: E402
 from mutation_scope import changed_lines_by_file, resolve_scope  # noqa: E402
 
 
@@ -201,6 +201,53 @@ class TestCoveredLinesNarrowing:
         key = next(iter(restrict_to({"hopai/core.py": [1]})))
 
         assert key == str((Path("mutants") / "hopai/core.py").absolute())
+
+
+class TestCoverageXmlReuse:
+    """Reading covered lines off the job's own coverage.xml is what saves a
+    second full-suite run under coverage. Getting the path rejoin wrong
+    yields no rows, hence no mutants, hence a report that reads clean."""
+
+    def _write(self, tmp_path, source: str) -> Path:
+        xml = tmp_path / "coverage.xml"
+        xml.write_text(
+            '<?xml version="1.0" ?>\n'
+            "<coverage><sources><source>" + source + "</source></sources>\n"
+            "<packages><package><classes>\n"
+            '  <class filename="core.py"><lines>\n'
+            '    <line number="1" hits="1"/><line number="2" hits="0"/>\n'
+            '    <line number="3" hits="4"/>\n'
+            "  </lines></class>\n"
+            "</classes></package></packages></coverage>\n"
+        )
+        return xml
+
+    def test_a_filename_is_rejoined_with_its_source_root(self, tmp_path, monkeypatch):
+        """coverage.xml says filename="core.py" under <source>.../hopai; the
+        caller asks about "hopai/core.py". Those have to meet."""
+        monkeypatch.chdir(tmp_path)
+        xml = self._write(tmp_path, str(tmp_path / "hopai"))
+
+        assert covered_lines_from_coverage_xml(str(xml), ["hopai/core.py"]) == {"hopai/core.py": {1, 3}}
+
+    def test_an_unexecuted_line_is_not_covered(self, tmp_path, monkeypatch):
+        """hits="0" is a line the suite never ran -- a mutant there could
+        only ever survive, which is noise, not a finding."""
+        monkeypatch.chdir(tmp_path)
+        xml = self._write(tmp_path, str(tmp_path / "hopai"))
+
+        assert 2 not in covered_lines_from_coverage_xml(str(xml), ["hopai/core.py"])["hopai/core.py"]
+
+    def test_a_file_with_no_coverage_rows_is_reported_not_silently_empty(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.chdir(tmp_path)
+        xml = self._write(tmp_path, str(tmp_path / "hopai"))
+
+        result = covered_lines_from_coverage_xml(str(xml), ["hopai/absent.py"])
+
+        assert result == {}
+        assert "hopai/absent.py" in capsys.readouterr().err
 
 
 class TestMutmutInternalsStillMatch:

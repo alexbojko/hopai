@@ -235,6 +235,30 @@ jobs:
 
       - run: pip install -e ".[dev,mutation]"
 
+      # mutmut's test-to-function map, the other fixed cost it pays before
+      # checking anything: it traces the WHOLE suite to build it, which on
+      # this suite is minutes, every run, whatever the scope. It is
+      # designed to be incremental -- `load_stats()` reads this file and
+      # then only re-traces tests that are new -- so carrying it between
+      # runs is the difference between paying that once and paying it
+      # every time. `config_fingerprint()` deliberately excludes
+      # `source_paths`, so the per-PR narrowing below does NOT invalidate
+      # it, and mutmut's own hash-based change detection forces a full
+      # recollection when something it does care about moved.
+      #
+      # Rolling key: the exact key never hits (run_id is unique, so every
+      # run saves a fresh entry), and restore-keys picks up the newest
+      # prefix match. Advisory data for an advisory job -- a cold or stale
+      # cache costs time, never correctness.
+      - name: Restore mutation stats
+        uses: actions/cache@v4
+        with:
+          path: mutants/mutmut-stats.json
+          key: mutmut-stats-${{ hashFiles('pyproject.toml', 'setup.cfg') }}-${{ github.run_id }}
+          restore-keys: |
+            mutmut-stats-${{ hashFiles('pyproject.toml', 'setup.cfg') }}-
+            mutmut-stats-
+
       - name: Measure coverage
         # No --cov-fail-under here on purpose: the threshold is enforced
         # in the LAST step, so a failing PR still gets its comment saying
@@ -322,9 +346,14 @@ jobs:
           # mutation restricted to the changed lines. It refuses loudly if
           # the mutmut internals it drives have moved, rather than quietly
           # mutating whole files again.
+          # --coverage-xml is the coverage.xml the `Measure coverage` step
+          # already wrote. Without it mutmut runs the entire suite AGAIN
+          # under coverage to learn the same thing, which was most of what
+          # it spent the budget on before reaching a single mutant.
           run_mutmut() {
             timeout "${MUTATION_BUDGET_SECONDS}" \
-              python scripts/mutation_run.py mutation-changed-lines.json "$@" 2>&1 | tee mutmut_run.log
+              python scripts/mutation_run.py --coverage-xml coverage.xml \
+                mutation-changed-lines.json "$@" 2>&1 | tee mutmut_run.log
             return "${PIPESTATUS[0]}"
           }
           # shellcheck disable=SC2086 -- each line is one fnmatch pattern
