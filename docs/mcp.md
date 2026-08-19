@@ -229,8 +229,55 @@ advertised; `near` still works for any field that can embed its own text.
 Retrieval that works is three stages, not two: retrieve wide and cheap, **rerank**
 a bounded top-N by *reading* each candidate against the query, then keep what
 survives. Stage two is a call to a reranking model — accurate, expensive, and
-billed per document — so the client is the **operator's**, exactly as `embed` is,
-and it is configured in Python:
+billed per document — so the client is the **operator's**, exactly as `embed` is.
+
+From a command line, in the same three spellings `--embed` has:
+
+```bash
+hopai-mcp --dsn ... --vector nodes:summary:384 \
+  --rerank-provider sentence-transformers \
+  --rerank-model cross-encoder/ms-marco-MiniLM-L-6-v2 \
+  --rerank-document-from '.properties.title + ": " + (.properties.summary // "")' \
+  --rerank-field properties.title --rerank-field properties.summary
+```
+
+That one runs **locally and needs no credentials** — any cross-encoder on the
+Hugging Face hub works, since the name is passed straight to `CrossEncoder()`.
+For a hosted reranker, name the provider and export its key:
+
+```bash
+export COHERE_API_KEY=...
+hopai-mcp --dsn ... --rerank-provider cohere --rerank-model rerank-v3.5 \
+  --rerank-document-from '.properties.title + ": " + (.properties.summary // "")' \
+  --rerank-field properties.title --rerank-field properties.summary
+```
+
+**Give the filter something to read.** `document_from` looks like a formatting
+detail and is not: a cross-encoder scores the string it is handed, so a document
+too thin to judge produces a *flat* ranking rather than an obviously broken one.
+Measured on `ms-marco-MiniLM-L-6-v2`, query *"how do distributed nodes agree?"*
+over three nodes:
+
+| `document_from` | Paxos | Raft | Banana bread |
+| --- | ---: | ---: | ---: |
+| `.properties.title` | −11.03 | −11.21 | −11.27 |
+| `.properties.title + ": " + (.properties.summary // "")` | **−2.81** | **−8.85** | −11.35 |
+
+Titles alone put banana bread within 0.24 of Raft — noise wearing a ranking's
+clothes. The same nodes with their summaries separate by 8.5. MS MARCO models
+are trained on passage-shaped text; hand them a passage. `//  ""` keeps a node
+whose summary is missing scoreable instead of dropping it.
+
+`--rerank-provider` accepts **fewer names than `--embed-provider`** —
+`cohere`, `voyage`, `sentence-transformers`. A reranker reads a query and a
+document *together*, which is a different model from the one that embeds, and
+only some vendors sell both; naming one that only embeds refuses saying exactly
+that rather than reporting an unknown name. The model variables are separate for
+the same reason (`$COHERE_RERANK_MODEL`, not `$COHERE_EMBEDDING_MODEL`), and
+`hopai-mcp --rerank-provider-help` prints the table.
+
+Or in Python, which stays the better answer when the client itself needs
+configuring — a timeout, a proxy, credential rotation:
 
 ```python
 import cohere
@@ -244,6 +291,10 @@ serve(graph,
       rerank_fields=["properties.title", "properties.summary"],
       max_candidates=100)
 ```
+
+**`--rerank-document-from` and `--rerank-field` are required** with a reranker
+and have no defaults — the CLI saying out loud what the Python path already
+refuses to guess. Everything below applies to both spellings.
 
 What a model supplies is never the client. It is `document_from` — a jq filter
 projecting one candidate into the one string the reranker reads — and
@@ -319,8 +370,12 @@ nodes come back — never a score you can read. `rerank_score` exists on
 | `--embed` | none | `MODULE:FUNCTION` returning a vector for text. |
 | `--no-load-schema` | loads | Skip adopting the schema saved in the database. |
 | `--max-nodes N\|none` | `500` | Refuse a `traverse_graph` call or Cypher `MATCH` whose result would exceed this many nodes — naming the real count, rather than letting the client silently truncate the subgraph. `none` disables the ceiling. |
-
-There is no `--rerank`: see [From Python](#from-python) below.
+| `--rerank` | none | `MODULE:FUNCTION` scoring `(query, documents)`. |
+| `--rerank-provider` | none | Build the reranking client from the environment: `cohere`, `voyage`, `sentence-transformers`. |
+| `--rerank-model` | none | The reranking model — on `sentence-transformers`, the CrossEncoder to load. |
+| `--rerank-document-from` | none | jq filter projecting one candidate into the string the reranker reads. **Required** with a reranker. |
+| `--rerank-field` | none | A property path that filter may read. Repeatable. **Required** with a reranker — there is no "everything" spelling. |
+| `--max-candidates N\|none` | `100` | Ceiling on candidates one call may send to the reranker. Rerankers bill per document. |
 
 ## From Python
 
@@ -344,15 +399,14 @@ specs = tools(graph)           # just the tool definitions, no SDK needed
 ```
 
 `serve()` takes every flag that is not about *building* the graph — `read_only`,
-`allow_mutations`, `allow_ddl`, `strict_schema`, `embed`, `max_nodes`, `name` —
-and three options that have no flag at all: **`rerank`, `rerank_fields` and
-`max_candidates`**. Those are Python-only because a `Rerank` is a constructed
-object, not a name: it carries the provider client, a model name, a jq filter and
-a candidate budget, and a shell has nowhere to put one. `--embed
-MODULE:FUNCTION` is as far as the command line goes, and it works only because an
-embedder can be a bare module-level callable — which is also why `embed=` is the
-option people end up setting in Python whenever the client needs configuring.
-`build_server()` takes the same set.
+`allow_mutations`, `allow_ddl`, `strict_schema`, `embed`, `max_nodes`, `name`,
+`rerank`, `rerank_fields` and `max_candidates`. `build_server()` takes the same
+set. All of them have a flag; reranking's are [below](#reranking).
+
+Python is still the better answer when the client needs configuring — a timeout,
+a proxy, a base URL, credential rotation — for exactly the reason `Vector(...,
+embed=client)` is: a flag can name a provider, but only your code can hand hopai
+a client it already built.
 
 ## Try it
 
@@ -388,8 +442,9 @@ deliberate: `mutate_graph` needs `--allow-mutations`, `enforce_schema` needs
 
 **The model cannot find `rerank`.** No reranker is configured, so the parameter
 is not advertised anywhere — that is the same gate the tools themselves are
-behind. It is `serve(rerank=…, rerank_fields=[…])` in Python; there is no flag.
-`describe_graph` answers `rerank_available: false` for exactly this question.
+behind. Configure one with `--rerank-provider` (or `serve(rerank=…,
+rerank_fields=[…])`) and it appears. `describe_graph` answers
+`rerank_available: false` for exactly this question.
 
 **A write says the server is read-only.** `--read-only` was passed. Note that it cannot
 be combined with `--allow-mutations` or `--allow-ddl`; that combination refuses at

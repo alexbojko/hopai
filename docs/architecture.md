@@ -538,8 +538,10 @@ the outside:
   `json_api.refuse_vectors()` runs on what the model sent *before* the embedding is
   injected, which is why that function lost its underscore.
 - **The reranker is the operator's, and so is its budget.** `serve(rerank=…)` takes a
-  built `Rerank` — Python-only, since a client object has no command-line spelling —
-  and `tools()` wraps it in a `json_api.RerankPolicy` so the JSON and MCP front ends
+  built `Rerank`, which `hopai-mcp` also assembles from `--rerank-provider` and its
+  siblings (`providers.RERANK_PROVIDERS` — a second registry, because for a vendor
+  selling both, the reranking model and its environment variable are not the
+  embedding ones), and `tools()` wraps it in a `json_api.RerankPolicy` so the JSON and MCP front ends
   enforce one set of rules. What a tool call may supply is `document_from` and
   `candidates`; `rerank_fields` (required beside `rerank`) is the allowlist that filter
   may read, and `max_candidates` the ceiling it may spend, both refusing rather than

@@ -1,10 +1,22 @@
 """
 hopai.providers
 
-Turn a PROVIDER NAME plus the environment into an Embedder, for callers
-that configure a process rather than write Python: `hopai-mcp
---embed-provider azure-openai`, `hopai-api`, a container handed its
-secrets by an orchestrator.
+Turn a PROVIDER NAME plus the environment into an Embedder -- or into
+the client half of a Rerank -- for callers that configure a process
+rather than write Python: `hopai-mcp --embed-provider azure-openai
+--rerank-provider sentence-transformers`, `hopai-api`, a container
+handed its secrets by an orchestrator.
+
+TWO REGISTRIES, because they are two different models. A bi-encoder
+turns one text into a vector to store; a cross-encoder reads a (query,
+document) pair and scores it, and cannot produce a vector at all. For
+the vendors that sell both, the model names are different and so are
+the environment variables -- $COHERE_EMBEDDING_MODEL and
+$COHERE_RERANK_MODEL -- because sharing one would mean POSTing an
+embedding model's name to a rerank endpoint. PROVIDERS and
+RERANK_PROVIDERS are that difference, and RERANK_PROVIDERS is the
+smaller set: openai, azure-openai and google have no reranking
+endpoint here, so naming one refuses and says which list to look at.
 
 The Python API does not need this and is still the better answer where
 it applies. `Vector("summary", 1536, embed=openai.OpenAI())` hands hopai
@@ -80,27 +92,60 @@ class _Provider:
     note: str = ""
 
 
-def _need(env: dict, name: str, provider: str, extra_help: str = "") -> str:
+@dataclass(frozen=True)
+class _Kind:
+    """Which pair of flags an error should name, and why that role never
+    guesses a model.
+
+    Embedding and reranking read the same shaped registry and build
+    clients the same way, but an operator reading a failure is looking
+    at ONE of two flags and the message has to name theirs. Threaded
+    rather than formatted in at the end: `--embed-provider cohere needs
+    $COHERE_API_KEY` and `--rerank-provider cohere needs
+    $COHERE_API_KEY` are the same sentence about different commands, and
+    a reader who exports the variable for the flag they were not using
+    is back where they started."""
+    provider_flag: str
+    model_flag: str
+    why: str
+
+
+EMBEDDING = _Kind(
+    "--embed-provider", "--embed-model",
+    "the model that answers a query has to be the model that wrote the stored "
+    "vectors, and only you know which that was",
+)
+
+RERANKING = _Kind(
+    "--rerank-provider", "--rerank-model",
+    "a reranker's score is only meaningful against the model that produced it, and a "
+    "silently chosen one is a silently different ranking",
+)
+
+
+def _need(env: dict, name: str, provider: str, extra_help: str = "",
+          kind: _Kind = EMBEDDING) -> str:
     value = (env.get(name) or "").strip()
     if not value:
         raise ProviderError(
-            f"--embed-provider {provider} needs ${name} and it is unset or empty. "
+            f"{kind.provider_flag} {provider} needs ${name} and it is unset or empty. "
             f"Export it before starting.{extra_help}"
         )
     return value
 
 
-def _import(module: str, extra: str, provider: str):
+def _import(module: str, extra: str, provider: str, kind: _Kind = EMBEDDING):
     try:
         return __import__(module, fromlist=["_"])
     except ImportError as exc:
         raise ProviderError(
-            f"--embed-provider {provider} needs the {module!r} package and it is not "
+            f"{kind.provider_flag} {provider} needs the {module!r} package and it is not "
             f'installed -- pip install "hopai[{extra}]"'
         ) from exc
 
 
-def _model_for(env: dict, spec: _Provider, provider: str, model: Optional[str]) -> str:
+def _model_for(env: dict, spec: _Provider, provider: str, model: Optional[str],
+               kind: _Kind = EMBEDDING) -> str:
     """The model name, from the flag or the environment, or a refusal.
 
     Never a default. See the module docstring: a guessed model is a
@@ -108,11 +153,10 @@ def _model_for(env: dict, spec: _Provider, provider: str, model: Optional[str]) 
     chosen = (model or env.get(spec.model_var or "") or "").strip()
     if not chosen:
         raise ProviderError(
-            f"--embed-provider {provider} needs a model and none was given. Pass "
-            f"--embed-model {spec.model_example} or export "
+            f"{kind.provider_flag} {provider} needs a model and none was given. Pass "
+            f"{kind.model_flag} {spec.model_example} or export "
             f"${spec.model_var}={spec.model_example}. hopai will not pick one for "
-            f"you: the model that answers a query has to be the model that wrote the "
-            f"stored vectors, and only you know which that was.{spec.note}"
+            f"you: {kind.why}.{spec.note}"
         )
     return chosen
 
@@ -240,14 +284,111 @@ PROVIDERS: dict = {
 }
 
 
+# ---------------------------------------------------------------------
+# Reranking: the same idea, a smaller set of names
+# ---------------------------------------------------------------------
+#
+# A SEPARATE REGISTRY, and not a flag on the one above, because for
+# every vendor that does both the two are different models reached a
+# different way. Sharing the entry would mean sharing $COHERE_EMBEDDING_MODEL
+# with the rerank endpoint -- an embedding model name POSTed to
+# /rerank, which is a start-up failure at best and a nonsense ranking at
+# worst. So each role names its own variable, and only the line that
+# constructs the client is the same.
+#
+# THREE NAMES, NOT SIX. openai, azure-openai and google are absent
+# because they have no reranking endpoint to call -- naming one refuses
+# and says so, rather than reporting "unknown provider" about a name
+# that is perfectly good for --embed-provider.
+
+def _build_cohere_reranker(env: dict, model: Optional[str]):
+    cohere = _import("cohere", "cohere", "cohere", RERANKING)
+    return (cohere.ClientV2(api_key=_need(env, "COHERE_API_KEY", "cohere",
+                                          kind=RERANKING)),
+            _model_for(env, RERANK_PROVIDERS["cohere"], "cohere", model, RERANKING))
+
+
+def _build_voyage_reranker(env: dict, model: Optional[str]):
+    voyageai = _import("voyageai", "voyageai", "voyage", RERANKING)
+    return (voyageai.Client(api_key=_need(env, "VOYAGE_API_KEY", "voyage",
+                                          kind=RERANKING)),
+            _model_for(env, RERANK_PROVIDERS["voyage"], "voyage", model, RERANKING))
+
+
+def _build_cross_encoder(env: dict, model: Optional[str]):
+    module = _import("sentence_transformers", "sentence-transformers",
+                     "sentence-transformers", RERANKING)
+    name = _model_for(env, RERANK_PROVIDERS["sentence-transformers"],
+                      "sentence-transformers", model, RERANKING)
+    # CrossEncoder, not SentenceTransformer: the whole difference between
+    # the two roles, in one constructor. A bi-encoder turns ONE text into
+    # a vector; a cross-encoder reads a (query, document) PAIR and scores
+    # it, which is why it can be more accurate and why it can never
+    # produce something to store in a column.
+    #
+    # None as the model for the same reason the embedding twin returns
+    # None: the name is baked into the loaded object, and Rerank REFUSES
+    # model= for a CrossEncoder ("a CrossEncoder already IS the model")
+    # rather than accept a second, ignorable copy of it.
+    return module.CrossEncoder(name), None
+
+
+#: What `--rerank-provider` accepts. Same shape as PROVIDERS, read by
+#: the same helpers; see the comment above for why it is a second dict.
+RERANK_PROVIDERS: dict = {
+    "cohere": _Provider(
+        package="cohere", extra="cohere",
+        credentials=("COHERE_API_KEY",),
+        model_var="COHERE_RERANK_MODEL",
+        model_example="rerank-v3.5",
+        build=_build_cohere_reranker,
+    ),
+    "voyage": _Provider(
+        package="voyageai", extra="voyageai",
+        credentials=("VOYAGE_API_KEY",),
+        model_var="VOYAGE_RERANK_MODEL",
+        model_example="rerank-2",
+        build=_build_voyage_reranker,
+    ),
+    "sentence-transformers": _Provider(
+        package="sentence_transformers", extra="sentence-transformers",
+        credentials=(),
+        model_var="SENTENCE_TRANSFORMERS_RERANK_MODEL",
+        model_example="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        build=_build_cross_encoder,
+        note=(" Runs locally and needs no credentials. Any cross-encoder on the "
+              "Hugging Face hub works -- the name is passed straight to "
+              "CrossEncoder()."),
+    ),
+}
+
+
 def provider_names() -> list:
     """Every accepted name, for `--help` and for error messages."""
     return sorted(PROVIDERS)
 
 
+def rerank_provider_names() -> list:
+    """Every accepted `--rerank-provider`, for `--help` and errors."""
+    return sorted(RERANK_PROVIDERS)
+
+
 def describe(provider: str) -> str:
     """One line of "what this provider reads", for --help and for docs."""
-    spec = PROVIDERS[provider]
+    return _describe(provider, PROVIDERS)
+
+
+def describe_rerank(provider: str) -> str:
+    """describe(), for the reranking registry. A separate function
+    rather than a `registry=` argument because it is what a caller
+    writes at a call site -- `describe_rerank(name)` says which list is
+    being printed, where `describe(name, RERANK_PROVIDERS)` needs the
+    reader to know what the second argument does."""
+    return _describe(provider, RERANK_PROVIDERS)
+
+
+def _describe(provider: str, registry: dict) -> str:
+    spec = registry[provider]
     reads = list(spec.credentials) + ([spec.model_var] if spec.model_var else [])
     return f"{provider}: {', '.join('$' + name for name in reads)}"
 
@@ -278,3 +419,45 @@ def embedder_from_env(provider: str, model: Optional[str] = None,
     env = dict(os.environ if env is None else env)
     client, resolved = spec.build(env, model)
     return Embedder(client, model=resolved, dimensions=dimensions, **options)
+
+
+def rerank_client_from_env(provider: str, model: Optional[str] = None,
+                           env: Optional[dict] = None) -> tuple:
+    """The (client, model) a Rerank takes, built from the environment.
+
+        client, model = rerank_client_from_env("sentence-transformers",
+                                               "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        Rerank(client, model=model, document_from=".properties.title")
+
+    NOT a Rerank, and the name says so. Every sibling here returns the
+    finished object -- embedder_from_env() returns an Embedder -- but a
+    Rerank cannot be finished from the environment alone: it requires
+    `document_from`, a jq filter over the candidate shape, and there is
+    no environment variable that could sensibly hold one. Returning a
+    half-built Rerank with a placeholder filter, or inventing
+    $HOPAI_RERANK_DOCUMENT_FROM to keep the symmetry, would both be
+    worse than a function whose name is honest about handing back
+    parts.
+
+    `model` is None for a cross-encoder, which already IS the model --
+    pass it through to Rerank(model=...) as it comes back, since Rerank
+    refuses a model= for that family rather than ignoring it.
+
+    Raises ProviderError, naming what is missing, exactly as
+    embedder_from_env() does."""
+    if provider not in RERANK_PROVIDERS:
+        # Named apart from "unknown", because the likeliest way to land
+        # here is a name that IS a provider -- for the other role. "openai
+        # is not one of the rerank providers" sends the reader to the
+        # list; "unknown provider openai" sends them to check their
+        # spelling of a word they spelled correctly.
+        known = provider in PROVIDERS
+        raise ProviderError(
+            f"{provider!r} has no reranking endpoint in hopai -- "
+            f"--rerank-provider accepts: {', '.join(rerank_provider_names())}."
+            + (f" ({provider!r} IS an --embed-provider; embedding and reranking are "
+               f"different models and only some vendors offer both.)" if known else "")
+        )
+    spec = RERANK_PROVIDERS[provider]
+    env = dict(os.environ if env is None else env)
+    return spec.build(env, model)

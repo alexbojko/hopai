@@ -29,6 +29,7 @@ from hopai import (
 )
 from hopai.mcp import DEFAULT_KEEP, SERVER_INSTRUCTIONS, ToolSpec, _seed, build_parser
 from hopai.mcp import build_server, main, tools
+from hopai.mcp import DEFAULT_MAX_CANDIDATES, _resolve_rerank
 
 try:                                    # the extra is optional, and so is testing against it
     import mcp as _sdk
@@ -3058,3 +3059,384 @@ class TestEmbedProvider:
         main(["--dsn", self.OFFLINE, "--graph", "default", "--no-load-schema",
               "--vector", "nodes:summary:3"])
         assert seen["graphs"]["default"].vectors["nodes"]["summary"].embed is None
+
+
+class TestRerankProvider:
+    """`--rerank-provider NAME` and its four companions -- reranking
+    configured from a command line rather than from Python.
+
+    The twin of TestEmbedProvider above, and it exists for the same
+    reason: a reranker was serve()-only, so a Hugging Face cross-encoder
+    was a Python-entrypoint feature while a bi-encoder from the same hub
+    was a flag. Everything here resolves BEFORE the database is touched,
+    and everything refuses at start-up rather than at the first query --
+    a container whose reranker is misconfigured must fail its health
+    check, not somebody's search.
+
+    The two flags with no embedding equivalent carry the weight:
+    --rerank-document-from decides what the document IS, and
+    --rerank-field decides which properties may leave the building.
+    Neither has a default, and a server that started without them would
+    either rank on nothing or publish `properties.ssn` to a vendor."""
+
+    OFFLINE = "postgresql+psycopg2://offline:offline@127.0.0.1:1/offline"
+    MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+    @pytest.fixture(autouse=True)
+    def _no_ambient_configuration(self, monkeypatch):
+        """build_parser() reads $HOPAI_RERANK_* for its defaults, so a
+        shell that exports one would configure a reranker in a test that
+        asserts there is none."""
+        for name in ("HOPAI_RERANK_PROVIDER", "HOPAI_RERANK_MODEL",
+                     "HOPAI_RERANK_DOCUMENT_FROM", "HOPAI_EMBED_PROVIDER",
+                     "HOPAI_EMBED_MODEL"):
+            monkeypatch.delenv(name, raising=False)
+
+    @staticmethod
+    def cross_encoder_module(monkeypatch) -> dict:
+        """A fake `sentence_transformers` in sys.modules, exposing BOTH
+        constructors.
+
+        A CrossEncoder is `predict`+`tokenizer` -- which is the pair
+        rerankers._bind() reads -- and a SentenceTransformer is
+        `encode`+`tokenize`. Both are present so "it built the right
+        one" is a real assertion rather than the only one available:
+        a builder reaching for SentenceTransformer would produce a
+        client Rerank cannot call at all.
+
+        Injected rather than pip-installed for the reason
+        tests/test_providers.py gives: the point of hopai.providers is
+        that hopai imports no provider package, and a suite that
+        installed torch to check it would be testing torch."""
+        import sys
+        import types
+
+        loaded: dict = {}
+
+        class CrossEncoder:
+            def __init__(self, name):
+                loaded["CrossEncoder"] = name
+                self.name = name
+                self.tokenizer = object()
+
+            def predict(self, pairs):
+                loaded.setdefault("scored", []).extend(pairs)
+                return [float(len(document)) for _, document in pairs]
+
+        class SentenceTransformer:
+            def __init__(self, name):
+                loaded["SentenceTransformer"] = name
+
+            def encode(self, texts):
+                return [[0.0] for _ in texts]
+
+            def tokenize(self, texts):
+                return texts
+
+        module = types.ModuleType("sentence_transformers")
+        module.CrossEncoder = CrossEncoder
+        module.SentenceTransformer = SentenceTransformer
+        monkeypatch.setitem(sys.modules, "sentence_transformers", module)
+        return loaded
+
+    def resolved(self, argv: list):
+        """parse_args + _resolve_rerank, which is what main() does."""
+        parser = build_parser()
+        return parser, _resolve_rerank(parser, parser.parse_args(argv))
+
+    # -- a reranker actually gets built ------------------------------
+
+    def test_a_hugging_face_cross_encoder_becomes_a_rerank(self, monkeypatch):
+        """The whole feature: four flags and a local cross-encoder is
+        serving. Nothing here touches a network or a database."""
+        from hopai import Rerank
+
+        loaded = self.cross_encoder_module(monkeypatch)
+        _, rerank = self.resolved([
+            "--rerank-provider", "sentence-transformers",
+            "--rerank-model", self.MODEL,
+            "--rerank-document-from", ".properties.title",
+            "--rerank-field", "properties.title"])
+        assert isinstance(rerank, Rerank)
+        assert loaded["CrossEncoder"] == self.MODEL
+        assert "SentenceTransformer" not in loaded          # the other role's constructor
+        assert rerank.document_from == ".properties.title"
+        # model= is None because a CrossEncoder already IS the model, and
+        # Rerank refuses a second copy. If _resolve_rerank forwarded the
+        # resolved name instead, every --rerank-provider
+        # sentence-transformers server would refuse to start.
+        assert rerank.model is None
+        # And the client is bound as a cross-encoder rather than merely
+        # stored: a SentenceTransformer would have landed on "not a
+        # reranker client hopai recognizes" -- or worse, on .score.
+        assert rerank.score("a query", ["four", "seven!!"]) == [4.0, 7.0]
+
+    def test_the_model_can_come_from_the_provider_variable(self, monkeypatch):
+        """Which is what lets a container be configured entirely by
+        environment, and it is the RERANK variable -- setting the
+        embedding one would POST an embedding model to a reranker."""
+        loaded = self.cross_encoder_module(monkeypatch)
+        monkeypatch.setenv("SENTENCE_TRANSFORMERS_RERANK_MODEL", self.MODEL)
+        monkeypatch.setenv("SENTENCE_TRANSFORMERS_MODEL", "all-MiniLM-L6-v2")
+        _, rerank = self.resolved([
+            "--rerank-provider", "sentence-transformers",
+            "--rerank-document-from", ".properties.title",
+            "--rerank-field", "properties.title"])
+        assert rerank is not None
+        assert loaded["CrossEncoder"] == self.MODEL
+
+    def test_a_provider_failure_is_the_operators_message_not_a_traceback(
+            self, monkeypatch, capsys):
+        """A ProviderError must reach stderr through parser.error() --
+        an operator's sentence -- rather than climbing out of main() as
+        a traceback.
+
+        The package is hidden rather than assumed absent:
+        sentence-transformers is a hopai extra, and on a machine that
+        has it this would reach a live Hugging Face download instead of
+        the refusal. `sys.modules[name] = None` is Python's own "this
+        import fails" marker."""
+        import sys
+
+        monkeypatch.setitem(sys.modules, "sentence_transformers", None)
+        with pytest.raises(SystemExit):
+            self.resolved(["--rerank-provider", "sentence-transformers",
+                           "--rerank-model", self.MODEL,
+                           "--rerank-document-from", ".properties.title",
+                           "--rerank-field", "properties.title"])
+        # The MESSAGE, not the whole stream: argparse prints its usage
+        # banner first, and that banner lists every flag this parser has
+        # -- including --embed-provider. Asserting over the raw stderr
+        # would be asserting that the banner is short, which is not the
+        # property under test.
+        printed = capsys.readouterr().err.split("error: ", 1)[1]
+        assert "--rerank-provider sentence-transformers needs the " in printed
+        assert 'pip install "hopai[sentence-transformers]"' in printed
+        assert "--embed-provider" not in printed
+
+    def test_an_unknown_rerank_provider_names_the_three(self, capsys):
+        with pytest.raises(SystemExit):
+            self.resolved(["--rerank-provider", "openai",
+                           "--rerank-document-from", ".properties.title",
+                           "--rerank-field", "properties.title"])
+        printed = capsys.readouterr().err
+        assert "'openai' has no reranking endpoint in hopai" in printed
+        assert "--rerank-provider accepts: cohere, sentence-transformers, voyage." in printed
+
+    # -- off by default ----------------------------------------------
+
+    def test_no_flags_means_no_reranker_and_no_advertised_parameter(self):
+        """The permission is which SURFACE EXISTS, not a check inside a
+        handler: a tool that never mentions `rerank` is a tool a model
+        cannot be talked into reranking with."""
+        _, rerank = self.resolved([])
+        assert rerank is None
+        for spec in tools(offline()):
+            assert "rerank" not in parameter_names(spec.parameters), spec.name
+            assert "rerank" not in spec.parameters.get("$defs", {}), spec.name
+
+    # -- the two spellings, and the inert flags ----------------------
+
+    def test_the_two_spellings_refuse_together(self, capsys):
+        """Both say where reranking comes from, and honouring one would
+        silently ignore the other -- the same rule --embed/--embed-provider
+        follows."""
+        with pytest.raises(SystemExit):
+            self.resolved(["--rerank", "os.path:join",
+                           "--rerank-provider", "sentence-transformers",
+                           "--rerank-document-from", ".properties.title",
+                           "--rerank-field", "properties.title"])
+        assert ("--rerank and --rerank-provider both say where reranking comes from -- "
+                "pass one.") in capsys.readouterr().err
+
+    def test_a_rerank_model_with_your_own_function_refuses(self, capsys):
+        """--rerank-model selects a model at a vendor; a function you
+        wrote chooses its own, so honouring the flag is impossible and
+        ignoring it is worse."""
+        with pytest.raises(SystemExit):
+            self.resolved(["--rerank", "os.path:join", "--rerank-model", self.MODEL,
+                           "--rerank-document-from", ".properties.title",
+                           "--rerank-field", "properties.title"])
+        assert "--rerank-model only means something with --rerank-provider" in \
+            capsys.readouterr().err
+
+    @pytest.mark.parametrize("flag, value", [
+        ("--rerank-model", MODEL),
+        ("--rerank-document-from", ".properties.title"),
+        ("--rerank-field", "properties.title"),
+    ])
+    def test_a_rerank_flag_without_a_reranker_refuses_naming_itself(
+            self, capsys, flag, value):
+        """Silence here is the dangerous outcome, not an inconvenience:
+        an operator who passed --rerank-field and no reranker believes
+        reranking is configured and allowlisted, while the tools do not
+        advertise it at all. Each flag names ITSELF so the fix is the
+        sentence."""
+        with pytest.raises(SystemExit):
+            self.resolved([flag, value])
+        printed = capsys.readouterr().err
+        assert (f"{flag} needs a reranker to configure -- pass --rerank or "
+                f"--rerank-provider, or drop {flag}") in printed
+
+    # -- the two flags with no embedding equivalent -------------------
+
+    def test_a_reranker_without_a_document_rule_refuses(self, capsys):
+        """There is no default for what the document IS. Guessing a
+        property would rank against the wrong words and report nothing
+        -- the silently-different-answer this library is written
+        against."""
+        with pytest.raises(SystemExit):
+            self.resolved(["--rerank-provider", "sentence-transformers",
+                           "--rerank-model", self.MODEL,
+                           "--rerank-field", "properties.title"])
+        printed = capsys.readouterr().err
+        assert ("a reranker needs --rerank-document-from: a jq filter turning one "
+                "candidate into the one string it reads, e.g. --rerank-document-from "
+                "'.properties.title'.") in printed
+        assert "what counts as the document is the whole retrieval decision" in printed
+
+    def test_a_reranker_without_an_allowlist_refuses_and_says_why(self, capsys):
+        """The security half. `--rerank-field` has no "everything"
+        spelling on purpose: whatever the filter produces is POSTed to a
+        third party, so an unbounded document_from is `.properties.ssn`
+        away from exfiltration by tool call. The refusal has to say that
+        -- an operator who reads "required" without the reason reaches
+        for the widest value that makes it stop."""
+        with pytest.raises(SystemExit):
+            self.resolved(["--rerank-provider", "sentence-transformers",
+                           "--rerank-model", self.MODEL,
+                           "--rerank-document-from", ".properties.title"])
+        printed = capsys.readouterr().err
+        assert ("a reranker needs --rerank-field: the property paths a model-written "
+                "document_from may read, e.g. --rerank-field properties.title.") in printed
+        assert "the filter's output is POSTed to the reranker, so --rerank-field " \
+               "properties.ssn is one accepted filter away unless the paths are " \
+               "named." in printed
+        assert "Pass --rerank-field properties if the whole bag really is the " \
+               "decision" in printed
+
+    def test_the_allowlist_accumulates(self, monkeypatch):
+        """`action="append"`, so each --rerank-field adds one path. A
+        `store` would keep the last and silently un-publish the rest."""
+        self.cross_encoder_module(monkeypatch)
+        parser = build_parser()
+        args = parser.parse_args([
+            "--rerank-provider", "sentence-transformers", "--rerank-model", self.MODEL,
+            "--rerank-document-from", ".properties.title",
+            "--rerank-field", "properties.title", "--rerank-field", "properties.body"])
+        assert _resolve_rerank(parser, args) is not None
+        assert args.rerank_field == ["properties.title", "properties.body"]
+
+    # -- the ceiling --------------------------------------------------
+
+    def test_max_candidates_defaults_to_the_servers_own_ceiling(self):
+        assert build_parser().parse_args([]).max_candidates == DEFAULT_MAX_CANDIDATES
+
+    def test_none_removes_the_ceiling(self):
+        """`None` is a real value here -- "no ceiling" -- so it needs a
+        spelling. Without it an operator whose specs are their own could
+        only raise the number, never remove it."""
+        for spelling in ("none", "NONE", "unlimited", " none "):
+            assert build_parser().parse_args(
+                ["--max-candidates", spelling]).max_candidates is None
+
+    @pytest.mark.parametrize("value", ["0", "-5", "abc", "12.5", ""])
+    def test_a_non_positive_or_non_numeric_ceiling_refuses(self, capsys, value):
+        """A ceiling of 0 would refuse every rerank spec, and a
+        `int()`-style coercion would turn `--max-candidates 12.5` into a
+        traceback out of argparse instead of a sentence."""
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--max-candidates", value])
+        assert ("--max-candidates must be a positive integer or 'none', got "
+                f"{value!r}") in capsys.readouterr().err
+
+    # -- what the model finally sees ----------------------------------
+
+    @staticmethod
+    def _served(monkeypatch) -> dict:
+        """main() far enough to see what reached serve(), with no
+        database: --graph skips the lookup and --no-load-schema the read."""
+        import hopai.mcp as mcp
+
+        seen: dict = {}
+        monkeypatch.setattr(mcp, "serve", lambda graphs, **options: seen.update(options))
+        return seen
+
+    def test_the_reranker_and_its_policy_reach_serve(self, monkeypatch):
+        from hopai import Rerank
+
+        self.cross_encoder_module(monkeypatch)
+        seen = self._served(monkeypatch)
+        main(["--dsn", self.OFFLINE, "--graph", "default", "--no-load-schema",
+              "--rerank-provider", "sentence-transformers", "--rerank-model", self.MODEL,
+              "--rerank-document-from", ".properties.title",
+              "--rerank-field", "properties.title", "--max-candidates", "200"])
+        assert isinstance(seen["rerank"], Rerank)
+        assert seen["rerank_fields"] == ["properties.title"]
+        assert seen["max_candidates"] == 200
+
+    def test_without_a_reranker_serve_is_told_nothing_about_reranking(self, monkeypatch):
+        """tools() REFUSES rerank_fields= with no reranker, so passing
+        argparse's default of [] would turn "no reranking configured"
+        into a start-up failure for every server that never asked for
+        it. The keys must be absent, not None."""
+        seen = self._served(monkeypatch)
+        main(["--dsn", self.OFFLINE, "--graph", "default", "--no-load-schema"])
+        assert "rerank" not in seen
+        assert "rerank_fields" not in seen and "max_candidates" not in seen
+
+    def test_a_cli_built_reranker_publishes_its_allowlist_and_ceiling(self, monkeypatch):
+        """End to end: the flags become a policy, and the policy becomes
+        the sentences the model reads. A model picking from a published
+        list is both safer and easier to get right than one guessing --
+        and the numbers in the schema have to be THIS server's, not the
+        abstract wording the static schema carries."""
+        self.cross_encoder_module(monkeypatch)
+        seen = self._served(monkeypatch)
+        main(["--dsn", self.OFFLINE, "--graph", "default", "--no-load-schema",
+              "--rerank-provider", "sentence-transformers", "--rerank-model", self.MODEL,
+              "--rerank-document-from", ".properties.title",
+              "--rerank-field", "properties.title", "--rerank-field", "properties.body",
+              "--max-candidates", "200"])
+
+        specs = named(offline(), rerank=seen["rerank"],
+                      rerank_fields=seen["rerank_fields"],
+                      max_candidates=seen["max_candidates"])
+        for name in ("traverse_graph", "aggregate_graph"):
+            parameters = specs[name].parameters
+            assert "rerank" in parameters["properties"]["start"]["properties"], name
+            assert "rerank" in parameters["properties"]["hops"]["items"]["properties"], name
+            spec = parameters["$defs"]["rerank"]
+            # Only what a tool call may DECIDE. The client, the model,
+            # the batch size and the retry budget stay the operator's,
+            # and no schema anywhere offers a place to put them.
+            assert set(spec["properties"]) == {"document_from", "candidates"}
+            for forbidden in ("client", "model", "batch_size", "retries"):
+                assert forbidden not in parameter_names(parameters), (name, forbidden)
+
+            document_from = spec["properties"]["document_from"]["description"]
+            assert ("the only properties this server will send are "
+                    "`.properties.title`, `.properties.body`") in document_from
+            assert "posted to a third-party reranking service" in document_from
+
+            candidates = spec["properties"]["candidates"]["description"]
+            assert ("This server allows at most 200, and asking for more refuses rather "
+                    "than being quietly lowered.") in candidates
+            assert "Leave it out to use this server's default of 50." in candidates
+
+    def test_the_help_lists_every_reranking_provider_and_its_variables(self, capsys):
+        """`--rerank-provider-help` answers before anything is
+        configured -- no --dsn, no credentials -- because it is what an
+        operator runs to find out what to export."""
+        assert main(["--rerank-provider-help"]) == 0
+        printed = capsys.readouterr().out
+        for name in ("cohere", "voyage", "sentence-transformers"):
+            assert name in printed
+        assert "$COHERE_RERANK_MODEL" in printed
+        assert "$VOYAGE_RERANK_MODEL" in printed
+        assert "$SENTENCE_TRANSFORMERS_RERANK_MODEL" in printed
+        # The embedding variables belong to the other listing; printing
+        # one here is how an operator ends up exporting the wrong name.
+        assert "$COHERE_EMBEDDING_MODEL" not in printed
+        # And the names that are NOT reranking providers stay out of it.
+        assert "azure-openai" not in printed
