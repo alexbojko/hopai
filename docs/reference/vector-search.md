@@ -76,14 +76,33 @@ is rendered as SQL text and the operator as `<=>`.
 a true nearest neighbor, and no setting makes that absolute. That is the
 whole trade, and it is the reason this is not the default.
 
-**What you keep.** `where=` still means `where=`. That is not free —
-it is why the backend requires **pgvector ≥ 0.8** and refuses an older
-server by name. Below 0.8 an HNSW scan applies the filter to a fixed
-candidate window, so a selective filter silently returns fewer rows than
-match it. Measured on 20,000 rows with a filter matching exactly 2 and
-`k=10`: pgvector 0.7 returns **one** of the two and reports success.
-0.8's `hnsw.iterative_scan`, which hopai sets to `strict_order` on every
-search, resumes the scan until `k` rows survive the filter.
+**What you keep: `where=` still means `where=`.** That one is not free,
+and it is the most important thing on this page.
+
+A filtered HNSW scan can return *fewer rows than match the filter* —
+not ranked differently, but rows you asked for, missing, with nothing to
+indicate it. Measured:
+
+| rows | rows matching `where=` | `k` | setting | returned |
+| ---: | ---: | ---: | --- | ---: |
+| 20,000 | 2 | 10 | `iterative_scan=off` (pgvector < 0.8) | **1** |
+| 20,000 | 2 | 10 | `strict_order` (≥ 0.8) | 2 |
+| 120,000 | 3 | 10 | `strict_order`, `max_scan_tuples` raised past the table | **0** |
+
+So pgvector 0.8's `hnsw.iterative_scan` *reduces* the problem and does
+not remove it — the graph traversal runs out of reachable candidates
+long before a selective filter is satisfied, and no SQL-level setting
+changes that. hopai therefore does two things: it requires **pgvector ≥
+0.8** (refusing an older server by name) and sets `strict_order`, *and*
+it **completes a short filtered result exactly** — re-asking with an
+ordering the index cannot serve, which is the exact backend's cost and
+the exact backend's answer.
+
+That second query runs only when a filtered search comes back short of
+`k`, so the ordinary path keeps the index's speed and the awkward path
+keeps the right answer. What stays approximate is the *ranking* of an
+unfiltered search — that is what an ANN index buys, and it cannot be
+given back.
 
 **One field per search.** Multivector (`Near` on several fields) and
 `Boost` are refused under this backend rather than served. An HNSW index

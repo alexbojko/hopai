@@ -39,20 +39,35 @@ guarantee absolute. Opting into this backend is opting into that. The
 library's job is to make sure it is the only thing you gave up --
 which is what the next paragraph is about.
 
-WHY pgvector >= 0.8 IS REQUIRED, and it is not a version-currency
-preference. Below 0.8 an HNSW scan visits a fixed candidate window
-(`ef_search`) and any WHERE filter is applied to what comes back. With
-a selective filter that silently returns FEWER ROWS THAN EXIST:
-measured on 20,000 rows, a filter matching exactly 2 of them, k=10 --
-`iterative_scan = off` returns ONE of the two matching rows, and
-reports success. Not "approximately ranked": a row that matched the
-filter, that the caller asked for, missing, with nothing to indicate
-it. pgvector 0.8's `hnsw.iterative_scan` fixes it by resuming the scan
-until k rows survive the filter, and this backend sets
-`strict_order` on every search for exactly that reason. So the version
-floor buys the one guarantee this library will not trade away: `where=`
-still means `where=`. A server below it is refused by name at
-migrate/search time rather than served a quietly lossy answer.
+FILTERED SEARCH UNDER-RETURNS, AND THAT IS THE HARD PART. An HNSW scan
+walks a graph of candidates and applies WHERE to what it reaches. With
+a selective filter it can return FEWER ROWS THAN MATCH -- not
+"approximately ranked", but rows the caller asked for, missing, with
+nothing to indicate it. Two measurements, because the second is the
+one that decided this module's design:
+
+  - 20,000 rows, a filter matching exactly 2, k=10:
+    `hnsw.iterative_scan = off` returns ONE. `strict_order` returns
+    both.
+  - 120,000 rows, a filter matching exactly 3, k=10: `strict_order`
+    returns ZERO -- with `max_scan_tuples` raised past the table size.
+    The graph traversal exhausts its reachable candidates long before
+    the filter is satisfied.
+
+So `hnsw.iterative_scan` (pgvector 0.8) REDUCES this and does not
+remove it, and nothing available in SQL does. That is why the version
+floor is 0.8 AND why the floor alone is not the answer: this backend
+also COMPLETES a short filtered result exactly, re-asking with an
+ordering the index cannot serve, which is the exact backend's cost and
+the exact backend's answer. See vectors._pgvector_needs_completion().
+The second query runs only when a filtered search comes back short of
+k, so the ordinary path keeps the index's speed and the awkward path
+keeps the right answer rather than a quietly short one.
+
+`where=` therefore still means `where=` -- by completion, not by
+configuration. What stays approximate is the RANKING of an unfiltered
+search, which is what opting into an ANN index buys and cannot be
+given back.
 
 SINGLE-FIELD SEARCH ONLY, and the refusal is not a scoping shortcut.
 An HNSW index accelerates one query shape: `ORDER BY column <op> query
@@ -90,7 +105,8 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from sqlalchemy import Float, cast, func, literal, text
+from sqlalchemy import Float, cast, literal, text
+from sqlalchemy.dialects.postgresql import DOUBLE_PRECISION
 from sqlalchemy.types import UserDefinedType
 
 #: The two values `Graph(vector_backend=)` accepts. "exact" is the
@@ -99,10 +115,10 @@ VECTOR_BACKENDS = ("exact", "pgvector")
 
 DEFAULT_VECTOR_BACKEND = "exact"
 
-#: See the module docstring: below this, a filtered search silently
-#: returns fewer rows than match. Measured, not inferred from a
-#: changelog -- `hnsw.iterative_scan` is the 0.8 feature that makes
-#: `where=` mean `where=`, and there is no way to emulate it from SQL.
+#: See the module docstring: below this, a filtered search under-returns
+#: far worse. `hnsw.iterative_scan` is the 0.8 feature that reduces it,
+#: measured rather than inferred from a changelog -- and because it only
+#: reduces it, the completion pass is what actually closes the gap.
 MINIMUM_PGVECTOR = (0, 8, 0)
 
 #: What this backend sets before every search it runs. `strict_order`
@@ -212,26 +228,30 @@ def distance(column, vector, dimensions: Optional[int] = None):
     return column.op(COSINE_DISTANCE, return_type=Float)(bind_vector(vector, dimensions))
 
 
+def has_direction(distance_expr):
+    """The predicate for "this row has a usable vector to rank".
+
+    False for a NaN distance, which is what pgvector returns when the
+    STORED vector is all zeros and so has no direction. Postgres
+    considers NaN equal to itself and GREATER than every real number
+    (unlike IEEE), so `d <> d` does NOT detect it and `d <> 'NaN'`
+    does. Getting that backwards would rank a directionless vector as
+    the worst match rather than as no match at all -- a different
+    answer, not a rounding difference, and the exact backend reports
+    such a row as missing.
+
+    A NULL column needs no clause here (NULL propagates and the row
+    fails the comparison anyway) but callers pair this with an explicit
+    IS NOT NULL, which is also the cheap prefilter that keeps
+    vector-less rows out of the arithmetic entirely."""
+    return distance_expr != float("nan")
+
+
 def similarity(distance_expr):
-    """Cosine similarity from cosine distance, as the caller's `1 - d`.
-
-    NaN -- an all-zero stored vector, which has no direction -- becomes
-    NULL, which is what every other part of this library means by
-    "missing". Postgres considers NaN equal to itself and greater than
-    every real number (unlike IEEE), so `d <> d` does NOT detect it and
-    a plain `d = 'NaN'` does; getting this backwards would rank a
-    directionless vector as the WORST match rather than as no match,
-    which is a different answer, not a rounding difference.
-    """
-    return func.nullif(distance_expr, float("nan"))
-
-
-def is_missing(distance_expr):
-    """The predicate for "this row has no usable vector": NULL column,
-    or NaN distance from a zero-length stored vector. Used to drop such
-    rows from a ranked result, matching the exact backend, where a NULL
-    similarity never survives `combined IS NOT NULL`."""
-    return distance_expr.is_(None) | (distance_expr == float("nan"))
+    """Cosine similarity from cosine distance: the caller's `1 - d`, on
+    the same scale the exact backend reports, so a hit's `similarity`
+    means one thing under either backend."""
+    return literal(1.0, type_=DOUBLE_PRECISION) - distance_expr
 
 
 def index_name(table_name: str, column_name: str) -> str:
@@ -268,14 +288,6 @@ def index_ddl(qualified: str, table_name: str, column_name: str) -> str:
             f'ON {qualified} USING hnsw ("{column_name}" {HNSW_OPS})')
 
 
-def drop_index_ddl(qualified: str, table_name: str, column_name: str) -> str:
-    """The index alone. drop_vectors() NULLs a graph's values and leaves
-    the shared column in place, so it leaves the shared index too --
-    this exists for the caller dropping the column itself."""
-    del qualified
-    return f'DROP INDEX IF EXISTS "{index_name(table_name, column_name)}"'
-
-
 #: Reads the installed extension's version. `extversion` rather than
 #: `pg_available_extensions`: what matters is what is installed IN THIS
 #: DATABASE, not what could be.
@@ -291,18 +303,44 @@ _EXTENSION_AVAILABLE = text(
     "SELECT default_version FROM pg_available_extensions WHERE name = 'vector'"
 )
 
+#: Whether the schema holding the extension is on this connection's
+#: search_path. Every reference this backend emits -- the `vector` type
+#: in its DDL, the `<=>` operator in its queries -- is UNQUALIFIED, so
+#: an extension installed somewhere the search_path does not reach
+#: fails as `type "vector" does not exist` from the driver, AFTER the
+#: installed-version check has just said it is there. Routine whenever
+#: an application pins `search_path=its_own_schema`.
+_EXTENSION_ON_PATH = text("""
+    SELECT n.nspname = ANY (current_schemas(true))
+    FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+    WHERE e.extname = 'vector'
+""")
+
+#: Where it actually lives, for the message.
+_EXTENSION_SCHEMA = text("""
+    SELECT n.nspname FROM pg_extension e
+    JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'vector'
+""")
+
 
 def parse_version(raw: str) -> tuple:
     """'0.8.0' -> (0, 8, 0). Trailing non-numeric parts are dropped, so
     a packaged '0.8.0-1' or '0.8.0devel' compares as 0.8.0 rather than
-    failing to parse and refusing a server that is actually fine."""
+    failing to parse and refusing a server that is actually fine.
+
+    Padded to three components, because tuple comparison is
+    length-sensitive in the direction that refuses a good server:
+    ('0.8' -> (0, 8)) < (0, 8, 0), so a two-component version string
+    would read as older than the floor it actually meets. pgvector
+    always reports three today, which is exactly why this would have
+    gone unnoticed."""
     parts = []
     for chunk in str(raw).split("."):
         match = re.match(r"\d+", chunk.strip())
         if match is None:
             break
         parts.append(int(match.group()))
-    return tuple(parts)
+    return tuple(parts + [0] * (3 - len(parts))) if parts else ()
 
 
 def _version_text(version: tuple) -> str:
@@ -349,10 +387,27 @@ def ensure_available(conn) -> tuple:
             f"vector_backend='pgvector' needs pgvector "
             f">= {_version_text(MINIMUM_PGVECTOR)} and this database has {installed} -- "
             f"below that, an HNSW scan applies where= to a fixed candidate window, so a "
-            f"selective filter silently returns FEWER rows than match it (measured: 2 rows "
+            f"selective filter returns far fewer rows than match it (measured: 2 rows "
             f"matching, k=10, one returned). {_version_text(MINIMUM_PGVECTOR)}'s "
-            f"hnsw.iterative_scan is what makes where= mean where= here. Upgrade pgvector, "
-            f"or drop vector_backend='pgvector' to use hopai's exact search"
+            f"hnsw.iterative_scan cuts that down, and hopai completes what is still short. "
+            f"Upgrade pgvector, or drop vector_backend='pgvector' to use hopai's exact search"
+        )
+    if conn.execute(_EXTENSION_ON_PATH).scalar() is False:
+        # Named here rather than left to the driver: everything this
+        # backend emits names `vector` and `<=>` unqualified, so an
+        # extension off the search_path fails as `type "vector" does
+        # not exist` -- one line after this check confirmed it IS
+        # installed, which is the most confusing shape an error can
+        # take. Common with an application that pins search_path to its
+        # own schema.
+        where = conn.execute(_EXTENSION_SCHEMA).scalar()
+        raise RuntimeError(
+            f"vector_backend='pgvector': the pgvector extension is installed in schema "
+            f"{where!r}, which is not on this connection's search_path -- hopai names the "
+            f"`vector` type and the `<=>` operator unqualified, so they would fail as "
+            f"\"type \\\"vector\\\" does not exist\" despite being present. Add {where!r} to "
+            f"the search_path (e.g. connect_args={{'options': '-csearch_path=<yours>,{where}'}}), "
+            f"or move the extension into a schema already on it"
         )
     return version
 

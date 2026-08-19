@@ -1426,6 +1426,23 @@ class Graph:
         if names:
             search = keep(VECTOR_SEARCH_TOOL_SCHEMA)
             search["parameters"]["$defs"]["near"]["properties"]["field"]["enum"] = names
+            if self.vector_backend == "pgvector":
+                # A tool must not offer a parameter its handler always
+                # refuses (CLAUDE.md). Under this backend a list of
+                # `near` and any `boost` are rejected by name every
+                # time -- no HNSW index can serve the ordering either
+                # asks for -- so the schema this graph advertises drops
+                # them rather than inviting a call that cannot succeed.
+                # Narrowed on the COPY, per graph, because the static
+                # constant still describes the exact backend, which most
+                # graphs use.
+                params = search["parameters"]
+                params["properties"]["near"] = {
+                    **params["properties"]["near"],
+                    "anyOf": [{"$ref": "#/$defs/near"}],
+                }
+                params["properties"].pop("boost", None)
+                params["$defs"].pop("boost", None)
             tools.append(search)
         if self._schema is not None:
             from .schema import tool_summary

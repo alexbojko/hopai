@@ -19,10 +19,25 @@ everything is a suite that passes having tested nothing.
 | `graph` | The seeded 7-node read fixture (dead end, fan-in, a real cycle) |
 | `fresh_graph` | An empty graph in its own schema, rebuilt per test |
 | `offline_graph` | No database at all — for query-shape and translation tests |
+| `pgvector_graph` | An empty `vector_backend="pgvector"` graph in its own schema |
 
 `fresh_graph` drops and recreates the schema rather than truncating: constraints are
 schema-level and outlive a `TRUNCATE`, so one test's `Unique()` would leak into the
 next.
+
+`pgvector_graph` **skips** when the server has no usable pgvector — the extension is
+opt-in and a contributor on a plain `postgres:16` should still get a useful run — and
+`HOPAI_REQUIRE_DB=1` turns that skip into an error, which is why CI runs the
+`pgvector/pgvector` image. Its engine puts the extension's own schema on the
+`search_path` after the test schema: hopai emits `vector(d)` and `<=>` unqualified (it
+renders SQL text rather than importing pgvector's Python package), so both have to be
+reachable by name.
+
+Both fixtures restore the `vec_*` columns the test attached to the process-global
+Node/Edge metadata. Under the pgvector backend that is load-bearing rather than
+hygienic: a `vec_*` column is `vector(d)` there and `real[]` under the exact backend,
+one column has one type, and `_attach()` refuses the conflict — so a leaked column
+fails every later test that declares the same field name.
 
 Most of the suite needs no database. Query shape, filter compilation, the JSON/Python
 grammar equivalence and the whole Cypher translator are tested against compiled SQL,

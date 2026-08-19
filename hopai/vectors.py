@@ -821,13 +821,17 @@ def _attach(table, column_name: str, type_=None):
         # back. Two handles disagreeing would have one of them writing
         # arrays into a vector column -- refused here, where the fix is
         # still nameable, rather than as a driver error later.
+        # Named separately rather than inline: `{a if c else b!r}` binds
+        # !r to the whole conditional, which happens to render correctly
+        # here and would stop doing so the moment either branch changed.
+        wanted_backend = "pgvector" if isinstance(type_, pg.Vector) else "exact"
+        wanted_column = "vector" if isinstance(type_, pg.Vector) else "real[]"
+        found_column = "vector" if isinstance(existing.type, pg.Vector) else "real[]"
         raise ValueError(
-            f"{table.name}.{column_name} is already declared as "
-            f"{'vector' if isinstance(existing.type, pg.Vector) else 'real[]'} by another "
+            f"{table.name}.{column_name} is already declared as {found_column} by another "
             f"Graph handle on these tables, and this handle's "
-            f"vector_backend={'pgvector' if isinstance(type_, pg.Vector) else 'exact'!r} "
-            f"needs it as {'vector' if isinstance(type_, pg.Vector) else 'real[]'} -- one "
-            f"column has one type, so every handle sharing these tables must pass the same "
+            f"vector_backend={wanted_backend!r} needs it as {wanted_column} -- one column "
+            f"has one type, so every handle sharing these tables must pass the same "
             f"vector_backend="
         )
     return existing
@@ -1360,7 +1364,7 @@ def _pgvector_guards(column, near, distance):
     All three sit beside the ORDER BY rather than outside it, which is
     what keeps `where=`/`min_similarity` applied BEFORE the limit --
     the same order the exact backend's `_thresholds()` is applied in."""
-    guards = [column.isnot(None), distance != float("nan")]
+    guards = [column.isnot(None), pg.has_direction(distance)]
     if near.min_similarity is not None:
         guards.append(distance <= 1 - near.min_similarity)
     return guards
@@ -1399,7 +1403,19 @@ def ranked_ids(graph, table, id_expr, from_obj, condition, nears: list, k: Optio
                      table, VECTOR_COLUMN_PREFIX + one.field, _column_type(graph)),
                      one, distance)))
         if k is not None:
-            query = query.order_by(distance, id_expr).limit(k)
+            # ORDER BY the distance ALONE. The id tiebreak the exact
+            # path adds for determinism is exactly what stops an HNSW
+            # index answering this: measured on 20k rows, `ORDER BY d`
+            # is an index scan at 1.1ms and `ORDER BY d, id` is a
+            # sequential scan at 9.7ms -- 100x at 120k, and linear in
+            # table size from there. The cost is that a tie at the k
+            # boundary is broken by the planner rather than by id, so
+            # which of two equidistant nodes seeds the walk is not
+            # guaranteed stable here the way it is under the exact
+            # backend. That is a documented backend difference; a
+            # sequential scan in the one place this backend exists to
+            # make fast is not.
+            query = query.order_by(distance).limit(k)
         return query
     laterals, columns, guards = _similarity_terms(table, nears)
     inner = (
@@ -1466,7 +1482,11 @@ def _pgvector_edge_beam(graph, edge_alias, join_expr, anchor_expr, move_col, id_
         .correlate(*correlate)
     )
     if k is not None:
-        beam = beam.order_by(distance, id_col).limit(k)
+        # Distance alone, for the reason ranked_ids() gives: an id
+        # tiebreak turns the index scan into a sequential one. A beam
+        # runs per anchor row, so paying that here multiplies it by the
+        # walk's width.
+        beam = beam.order_by(distance).limit(k)
     return beam.lateral(name)
 
 
@@ -1627,8 +1647,36 @@ def _prepare_search_query(graph, near, target: str, k: Optional[int], where: Any
     return nears, boosts, (query if rows is None else query.limit(rows))
 
 
+def _pgvector_needs_completion(rows, nears: list, k, where) -> bool:
+    """Whether an ANN result may be SHORT rather than simply small.
+
+    A filtered HNSW scan can return fewer rows than match the filter --
+    not "ranked slightly differently", but rows the caller asked for,
+    missing. Measured: 120,000 rows, a `where=` matching 3 of them,
+    k=10, `hnsw.iterative_scan = strict_order` and max_scan_tuples
+    raised past the table size -- ZERO of the three came back. The
+    graph traversal exhausts its reachable candidates long before the
+    filter is satisfied, and no setting removes that; 0.8's iterative
+    scan reduces it (which is why the floor is still 0.8) but does not
+    close it.
+
+    hopai cannot tell "only two rows matched" from "the index gave up
+    at two" by looking at the rows, and that ambiguity is the silent
+    part. So a short, filtered result is completed exactly rather than
+    returned as if it were the whole answer.
+
+    Only when a filter is in play: an unfiltered top-k has nothing to
+    be short of that the index would not already have found, and
+    re-running every unfiltered search would hand back the speed this
+    backend exists for."""
+    if k is None or len(rows) >= k:
+        return False
+    return where is not None or any(one.min_similarity is not None for one in nears)
+
+
 def _prepare_pgvector_search_query(graph, near, target: str, k: Optional[int], where: Any,
-                                   boost, candidates: Optional[int] = None) -> tuple:
+                                   boost, candidates: Optional[int] = None,
+                                   exact: bool = False) -> tuple:
     """(nears, boosts, query) for vector_search() under
     vector_backend='pgvector'.
 
@@ -1683,13 +1731,23 @@ def _prepare_pgvector_search_query(graph, near, target: str, k: Optional[int], w
         select(*_identity_columns(graph, table, target),
                table.c.properties.label("properties"), distance.label("distance"))
         .where(and_(graph._scoped(table), resolve(table.c.properties, where), *guards))
-        .order_by(distance)
+        # `exact` adds the id tiebreak, and adding it is precisely what
+        # makes this query exact: an HNSW index can only supply an
+        # ordering by distance ALONE, so a second sort key leaves
+        # Postgres no way to answer but to scan and sort -- the exact
+        # backend's cost and the exact backend's answer. That is a
+        # structural property of what the index provides, not a planner
+        # heuristic to be surprised by later. The tiebreak also makes
+        # ties deterministic here, matching the exact backend, which the
+        # indexed path cannot promise. See _pgvector_needs_completion().
+        .order_by(*( (distance, _identity_columns(graph, table, target)[0])
+                     if exact else (distance,) ))
     )
     if rows is not None:
         inner = inner.limit(rows)
     inner = inner.subquery()
 
-    similarity = (literal(1.0, type_=DOUBLE_PRECISION) - inner.c.distance)
+    similarity = pg.similarity(inner.c.distance)
     if one.weight != 1.0:
         similarity = similarity * one.weight
     similarity = similarity.label("similarity")
@@ -1832,6 +1890,19 @@ def search_candidates(graph, near, target: str = "nodes", k: Optional[int] = 10,
             candidates=None if rerank is None else rerank.candidates)
         try:
             rows = conn.execute(query).mappings().all()
+            if graph.vector_backend == "pgvector" \
+                    and _pgvector_needs_completion(rows, nears, k, where):
+                # The ANN path came back short of a filtered k, which
+                # may mean the index gave up rather than that the graph
+                # ran out of matches -- and the two are indistinguishable
+                # from the rows. Re-ask exactly. Costs a second query
+                # only in that case, and only ever the exact backend's
+                # own cost, which is what a caller without this backend
+                # would have paid for every search.
+                _, _, exact_query = _prepare_pgvector_search_query(
+                    graph, near, target=target, k=k, where=where, boost=boost,
+                    candidates=None if rerank is None else rerank.candidates, exact=True)
+                rows = conn.execute(exact_query).mappings().all()
         except ProgrammingError as exc:
             _raise_if_unmigrated(graph, target, _near_field_names(near), conn, exc,
                                  "vector_search()")
@@ -1953,7 +2024,7 @@ def _prepare_pgvector_search_many_query(graph, queries, target: str, k: Optional
     rows = k if candidates is None else candidates
     inner = (inner if rows is None else inner.limit(rows)).subquery()
 
-    similarity = (literal(1.0, type_=DOUBLE_PRECISION) - inner.c.distance)
+    similarity = pg.similarity(inner.c.distance)
     if one.weight != 1.0:
         similarity = similarity * one.weight
     similarity = similarity.label("similarity")

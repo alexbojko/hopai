@@ -230,6 +230,21 @@ def _vector_columns():
             for table in (Node, Edge)}
 
 
+def _restore_vector_columns(before) -> None:
+    """Put the shared Node/Edge metadata back to the vec_* attachment
+    set `before` recorded -- see fresh_graph() for why that matters.
+
+    `_columns.remove()` is SQLAlchemy-private because removing a column
+    from a live Table is not a thing an application does -- but a test
+    process that reuses the metadata is not an application, and there
+    is no public inverse of append_column()."""
+    from hopai.vectors import VECTOR_COLUMN_PREFIX
+    for table, kept in before.items():
+        for name, column in list(table.c.items()):
+            if name.startswith(VECTOR_COLUMN_PREFIX) and name not in kept:
+                table._columns.remove(column)
+
+
 @pytest.fixture()
 def fresh_graph(write_engine):
     """An empty graph with hopai's own schema, rebuilt for every test.
@@ -271,15 +286,117 @@ def fresh_graph(write_engine):
 
     _retry_ddl_race(_rebuild)
     yield graph
+    _restore_vector_columns(before)
 
-    # `_columns.remove()` is SQLAlchemy-private because removing a column
-    # from a live Table is not a thing an application does -- but a test
-    # process that reuses the metadata is not an application, and there
-    # is no public inverse of append_column().
-    for table, kept in before.items():
-        for name, column in list(table.c.items()):
-            if name.startswith("vec_") and name not in kept:
-                table._columns.remove(column)
+
+PGVECTOR_SCHEMA = "hopai_pgvector"
+
+#: The two tables, in the shape create_schema() would build them.
+#: Raw DDL rather than Graph.create_schema() for one reason: the
+#: pgvector engine's search_path has to carry the schema the `vector`
+#: TYPE lives in as well as the test schema, and create_schema()'s
+#: checkfirst=True finds any `nodes` reachable through that path and
+#: then quietly creates nothing -- after which every unqualified
+#: reference in the test would read somebody else's table.
+PGVECTOR_SETUP_SQL = SETUP_SQL.replace(SCHEMA, PGVECTOR_SCHEMA)
+
+
+def _pgvector_extension(eng):
+    """(schema the `vector` type lives in, its version), creating the
+    extension when the server has the files and this role may.
+
+    None when pgvector is not usable here at all -- which is a skip and
+    not a failure outside CI, exactly as an unreachable Postgres is."""
+    with eng.connect() as conn:
+        where = text("SELECT n.nspname, e.extversion FROM pg_extension e "
+                     "JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'vector'")
+        found = conn.execute(where).first()
+        if found is None:
+            available = conn.execute(text(
+                "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'")).scalar()
+            if available is None:
+                return None
+            try:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                conn.commit()
+            except Exception:                          # noqa: BLE001 -- reported as a skip
+                conn.rollback()
+                return None
+            found = conn.execute(where).first()
+    return None if found is None else (found[0], found[1])
+
+
+@pytest.fixture(scope="session")
+def pgvector_engine(engine):
+    """An engine for the schema the pgvector-backend tests own.
+
+    Skips the whole lot when the extension is missing or older than the
+    backend's floor -- same courtesy (and same HOPAI_REQUIRE_DB escape
+    hatch) the `engine` fixture extends for a missing database, because
+    `vector_backend="pgvector"` is opt-in and a contributor on a plain
+    postgres:16 should still get a useful run. CI sets HOPAI_REQUIRE_DB=1
+    and runs pgvector/pgvector:pg16, so a skip there is an error.
+
+    The search_path carries the extension's schema after the test one:
+    hopai emits `vector(d)` and `<=>` unqualified (it renders SQL text
+    rather than importing pgvector's Python package), so the type and
+    the operator have to be reachable by name."""
+    from hopai.pgvector import MINIMUM_PGVECTOR, parse_version
+
+    probe = create_engine(DSN, poolclass=NullPool, connect_args={"gssencmode": "disable"})
+    try:
+        found = _pgvector_extension(probe)
+    finally:
+        probe.dispose()
+    reason = None
+    if found is None:
+        reason = f"no usable pgvector extension at {DSN}"
+    elif parse_version(found[1]) < MINIMUM_PGVECTOR:
+        reason = (f"pgvector {found[1]} at {DSN}, and the backend needs "
+                  f">= {'.'.join(str(p) for p in MINIMUM_PGVECTOR)}")
+    if reason is not None:
+        if os.environ.get("HOPAI_REQUIRE_DB"):
+            raise RuntimeError(f"{reason} -- run the pgvector/pgvector image, or unset "
+                               f"HOPAI_REQUIRE_DB to skip these tests")
+        pytest.skip(f"{reason} -- run the pgvector/pgvector image, or set HOPAI_REQUIRE_DB=1 "
+                    f"to make this an error")
+    eng = create_engine(
+        DSN, poolclass=NullPool,
+        connect_args={"options": f"-c search_path={PGVECTOR_SCHEMA},{found[0]}",
+                      "gssencmode": "disable"})
+    yield eng
+    eng.dispose()
+
+
+@pytest.fixture()
+def pgvector_graph(pgvector_engine):
+    """An empty `vector_backend="pgvector"` graph, rebuilt per test.
+
+    Its own schema, for fresh_graph()'s reason (migrations are DDL and
+    outlive a TRUNCATE) plus one this backend adds: a vec_* column here
+    is a `vector(d)`, and every graph on a table shares its columns --
+    so an exact-backend test finding one would refuse rather than run.
+
+    It restores the shared Node/Edge metadata for the same reason
+    fresh_graph() does, and here it is load-bearing rather than
+    hygienic: `_attach()` REFUSES a vec_* column whose declared type
+    disagrees with this handle's backend, so a `vector`-typed column
+    left attached would fail every later exact-backend test that
+    declares that field name."""
+    from hopai import Graph
+
+    before = _vector_columns()
+    graph = Graph(pgvector_engine, vector_backend="pgvector")
+
+    def _rebuild():
+        with pgvector_engine.begin() as conn:
+            for stmt in PGVECTOR_SETUP_SQL.strip().split(";"):
+                if stmt.strip():
+                    conn.execute(text(stmt))
+
+    _retry_ddl_race(_rebuild)
+    yield graph
+    _restore_vector_columns(before)
 
 
 @pytest.fixture()
