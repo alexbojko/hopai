@@ -126,6 +126,7 @@ from .core import Graph, Subgraph
 from .hop import Hop, Start
 from .ingest import IngestResult
 from .models import DEFAULT_GRAPH
+from .pgvector import DEFAULT_VECTOR_BACKEND
 from .mutate import MutationResult
 
 #: Setup/admin calls that touch the database directly and have no async
@@ -201,6 +202,7 @@ class AsyncGraph:
         edge_start_col: str = "start_id",
         edge_end_col: str = "end_id",
         graph_col: Optional[str] = "graph_id",
+        vector_backend: str = DEFAULT_VECTOR_BACKEND,
     ):
         if isinstance(dsn_or_engine, _SyncEngine):
             raise TypeError(
@@ -221,7 +223,7 @@ class AsyncGraph:
         self._sync = Graph(self._async_engine.sync_engine, graph=graph, node_table=node_table,
                            edge_table=edge_table, node_id_col=node_id_col, edge_id_col=edge_id_col,
                            edge_start_col=edge_start_col, edge_end_col=edge_end_col,
-                           graph_col=graph_col)
+                           graph_col=graph_col, vector_backend=vector_backend)
 
     def __repr__(self) -> str:
         return f"AsyncGraph({self._async_engine.url!r}, graph={self._sync.graph!r})"

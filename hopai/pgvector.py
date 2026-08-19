@@ -384,12 +384,17 @@ def ensure_available_or_create(conn) -> None:
 def apply_scan_settings(conn) -> None:
     """Turn on the iterative scan for this connection.
 
-    SET (session), not SET LOCAL (transaction): searches here run on a
-    plain connection with no explicit transaction of their own, where
-    SET LOCAL applies to the implicit single-statement transaction and
-    is gone before the SELECT it was meant for. Scoped to the
-    connection hopai opened, and pooled connections are reset on
-    return, so this does not leak into a caller's own session.
+    SET, not SET LOCAL, and the two were measured rather than reasoned
+    about: both do reach the SELECT here (SQLAlchemy 2.0 keeps an
+    implicit transaction open on a Connection, so SET LOCAL survives to
+    it), and plain SET does NOT leak to the next pooled checkout --
+    verified, it reads back `off`. What decides it is the FAILURE mode.
+    Outside a transaction block SET LOCAL is a WARNING and a silent
+    no-op, which would put the filtered search back to under-returning
+    with nothing to show for it; plain SET applied where it was not
+    needed is at worst a setting that makes another query more correct.
+    Between a silent wrong answer and a harmless one, this library
+    picks the harmless one every time.
 
     See the module docstring for why this is not optional: without it a
     filtered search under-returns silently.
