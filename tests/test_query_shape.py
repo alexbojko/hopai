@@ -154,6 +154,63 @@ class TestQueryStructure:
         sql = norm(offline_graph.build_query(Start(), [Hop(via={"kind": "knows"}, hops=(1, 3))]))
         assert sql.count("properties @> CAST") >= 2
 
+    def test_undeclared_dict_via_stays_byte_identical(self, offline_graph):
+        """A Graph that never called define_edge_type() must keep
+        emitting exactly the containment SQL it always has for the
+        ordinary {"kind": ...} dict form -- CLAUDE.md's no-regression
+        rule for a feature nothing opted into. offline_graph is a fresh,
+        never-declared handle, so this is the control for
+        test_declared_edge_type_upgrades_the_single_kind_dict below."""
+        sql = norm(offline_graph.build_query(Start(), [Hop(via={"kind": "knows"})]))
+        assert "properties ->> 'kind'" not in sql
+        assert sql.count("properties @> CAST") >= 1
+
+    def test_via_stored_in_shorthand_uses_text_equality_on_both_walk_terms(self, offline_graph):
+        """via=<name> (STORED_IN) compiles to `properties ->> 'kind' =
+        ...`, not the `@>` containment the dict form uses -- the shape a
+        declared edge type's functional btree index can serve. This is
+        new syntax with no prior behavior, so it takes the fast shape
+        with or without define_edge_type() -- the index only changes
+        how fast it runs, never whether the query is correct."""
+        sql = norm(offline_graph.build_query(Start(), [Hop(via="knows", hops=(1, 3))]),
+                  literal_binds=True)
+        assert sql.count("properties ->> 'kind') = 'knows'") >= 2
+        assert "@>" not in sql
+
+    def test_via_stored_in_shorthand_rejects_an_empty_string(self, offline_graph):
+        with pytest.raises(ValueError, match="via='' is empty"):
+            offline_graph.build_query(Start(), [Hop(via="")])
+
+    def test_declared_edge_type_upgrades_the_single_kind_dict(self):
+        """Once define_edge_type() has run, the ORDINARY dict form
+        {"kind": "..."} switches to the same ->> equality the STORED_IN
+        shorthand uses -- which is what lets Cypher's [:TYPE] (already
+        compiling to exactly this dict, see cypher.py's _add_rel)
+        benefit with no change to cypher.py. Set directly rather than
+        through define_edge_type(), which issues real DDL: the flag is
+        the only thing build_query() reads, and a fresh (non-session-
+        scoped) handle keeps this from leaking into other tests."""
+        graph = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline")
+        graph._edge_type_declared = True
+        sql = norm(graph.build_query(Start(), [Hop(via={"kind": "knows"}, hops=(1, 3))]),
+                  literal_binds=True)
+        assert sql.count("properties ->> 'kind') = 'knows'") >= 2
+        assert "@>" not in sql
+
+    def test_declared_edge_type_leaves_multi_key_or_list_filters_alone(self):
+        """The upgrade only fires on an UNAMBIGUOUS exact match on
+        'kind' alone -- a second key (AND) or a list value (OR) is
+        something `->>` equality cannot express, so both keep using
+        `@>` even on a Graph that declared its edge type."""
+        graph = Graph("postgresql+psycopg2://offline:offline@127.0.0.1:1/offline")
+        graph._edge_type_declared = True
+        combined = norm(graph.build_query(
+            Start(), [Hop(via={"kind": "knows", "since": 2020})]), literal_binds=True)
+        assert "@>" in combined
+        listed = norm(graph.build_query(
+            Start(), [Hop(via={"kind": ["knows", "likes"]})]), literal_binds=True)
+        assert "@>" in listed
+
     def test_no_pins_emits_byte_identical_sql(self, offline_graph):
         """Step-wise reranking threads an optional `pins` through the
         whole walk. A traversal with no rerank= passes None, and None
@@ -657,6 +714,68 @@ class TestFilterCompilation:
     def test_unsupported_filter_types_are_rejected(self, bad):
         with pytest.raises(TypeError, match="filter must be"):
             filter_sql(bad)
+
+
+class TestResolveVia:
+    """filters.resolve_via() -- the STORED_IN shorthand and the
+    declared-edge-type upgrade of the ordinary {"kind": ...} dict form.
+    See TestQueryStructure for the same behavior exercised through a
+    full Hop/build_query()."""
+
+    def _sql(self, via, edge_type_declared=False, literal_binds=True):
+        from hopai.filters import resolve_via
+        return norm(select(Node.c.id).where(
+            resolve_via(Node.c.properties, via, edge_type_declared)), literal_binds)
+
+    def test_bare_string_is_text_equality_not_containment(self):
+        sql = self._sql("knows")
+        assert "properties ->> 'kind') = 'knows'" in sql
+        assert "@>" not in sql
+
+    def test_bare_string_ignores_the_declared_flag(self):
+        """New syntax, no prior behavior to regress -- it takes the fast
+        shape whether or not define_edge_type() ever ran."""
+        assert self._sql("knows", edge_type_declared=False) == self._sql(
+            "knows", edge_type_declared=True)
+
+    def test_empty_string_is_refused_by_name(self):
+        with pytest.raises(ValueError) as exc:
+            self._sql("")
+        assert str(exc.value) == (
+            "via='' is empty -- via=<name> is shorthand for \"this edge's declared type "
+            "(its 'kind' property) equals <name>\", so an empty string names no type. Pass "
+            "via={'kind': '...'} or drop via= to match any edge"
+        )
+
+    def test_dict_form_undeclared_keeps_containment(self):
+        sql = self._sql({"kind": "knows"}, edge_type_declared=False)
+        assert "@>" in sql
+        assert "->>" not in sql
+
+    def test_dict_form_declared_switches_to_text_equality(self):
+        sql = self._sql({"kind": "knows"}, edge_type_declared=True)
+        assert "properties ->> 'kind') = 'knows'" in sql
+        assert "@>" not in sql
+
+    @pytest.mark.parametrize("via", [
+        {"kind": "knows", "since": 2020},   # a second key -- an AND, not expressible as ->>
+        {"kind": ["knows", "likes"]},       # a list value -- an OR, not expressible as ->>
+        {"other": "knows"},                 # not "kind" at all
+    ])
+    def test_dict_form_declared_only_upgrades_an_unambiguous_kind_match(self, via):
+        sql = self._sql(via, edge_type_declared=True)
+        assert "@>" in sql
+
+    def test_non_string_kind_value_is_not_upgraded(self):
+        """`->>` renders a JSON scalar of ANY type as text, so a non-
+        string kind (never how this library's own conventions store it,
+        but not something resolve() itself refuses) would silently
+        widen what matches -- e.g. the number 5 and the string "5" both
+        read as text "5" through `->>`, while `@>` tells them apart.
+        Declaring an edge type must not change that for data it was
+        never meant to describe."""
+        sql = self._sql({"kind": 5}, edge_type_declared=True)
+        assert "@>" in sql
 
 
 class TestFilterSafety:
@@ -1357,6 +1476,22 @@ class TestJsonSpecTranslation:
             "hops": [{"where": {"between": ["age", 18, 65]}}],
         })
         assert repr(hops[0].where) == repr(BETWEEN("age", 18, 65))
+
+    def test_via_stored_in_shorthand_passes_through_as_a_bare_string(self):
+        """via= is the one place a bare JSON string is legal -- unlike
+        where=, which reuses parse_filter()'s dict-only grammar and so
+        keeps refusing a string. See json_api.py's _parse_via()."""
+        _, hops = spec_to_traversal({
+            "start": {"where": {"a": 1}}, "hops": [{"via": "knows"}]})
+        assert hops[0].via == "knows"
+
+    def test_where_still_refuses_a_bare_string(self):
+        """The STORED_IN shorthand is a via= concept only -- a node has
+        no single "kind"-like property it could universally name, so
+        where= keeps parse_filter()'s ordinary refusal instead of
+        silently widening to accept it too."""
+        with pytest.raises(TypeError, match="must be an object"):
+            spec_to_traversal({"start": {"where": "person"}})
 
     def test_an_empty_hop_object_gets_every_documented_default(self):
         """{} is a legal hop, and each default is part of the JSON

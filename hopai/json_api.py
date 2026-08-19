@@ -23,6 +23,11 @@ Spec shape:
 hopai.filters.parse_filter(): plain objects for equality/AND, plus
 {"and": [...]}, {"or": [...]}, {"not": ...}, {"gt": [key, value]},
 {"gte": [...]}, {"lt": [...]}, {"lte": [...]}, {"between": [key, lo, hi]}.
+`via` additionally accepts a bare string -- the STORED_IN shorthand,
+e.g. "via": "friend" in place of "via": {"kind": "friend"} -- compiled
+by filters.resolve_via() to the SQL a declared edge type's index can
+serve (Graph.define_edge_type()); `where` has no equivalent, since a
+node has no single universal "kind"-like property this could name.
 
 `hops` accepts either an integer (exact hop count) or a two-element
 array [min, max].
@@ -125,6 +130,20 @@ def _check_keys(spec: dict, allowed: set, what: str) -> None:
 
 def _near_of(spec: dict, key: str = "near"):
     return parse_near(spec[key]) if key in spec else None
+
+
+def _parse_via(via_spec):
+    """via= accepts everything parse_filter() does, PLUS a bare string --
+    the STORED_IN shorthand (Hop.via="KIND"), which parse_filter's
+    dict-only JSON form has no other use for. Kept here rather than
+    widened into parse_filter() itself: `where=` reuses parse_filter too,
+    and a bare string means nothing at that position -- it would still
+    need refusing, just one layer later inside resolve() instead of here,
+    for no benefit and a wider (so easier to misuse elsewhere) contract
+    on the shared parser."""
+    if isinstance(via_spec, str):
+        return via_spec
+    return parse_filter(via_spec)
 
 
 def _boost_of(spec: dict):
@@ -468,7 +487,7 @@ def spec_to_traversal(spec: dict, rerank: Optional[RerankPolicy] = None) -> tupl
         hops.append(
             Hop(
                 where=parse_filter(h.get("where")),
-                via=parse_filter(h.get("via")),
+                via=_parse_via(h.get("via")),
                 hops=tuple(h["hops"]) if isinstance(h.get("hops"), list) else h.get("hops", 1),
                 direction=h.get("direction", "forward"),
                 optional=h.get("optional", False),
@@ -853,7 +872,15 @@ TRAVERSE_TOOL_SCHEMA: dict = {
                     "type": "object",
                     "properties": {
                         "where": {"type": "object", "description": "Filter on the node reached by this hop."},
-                        "via": {"type": "object", "description": "Filter on edges traversed during this hop."},
+                        "via": {
+                            "anyOf": [{"type": "object"}, {"type": "string"}],
+                            "description": (
+                                "Filter on edges traversed during this hop. Either an exact-"
+                                "match object, e.g. {\"kind\": \"friend\"}, or a bare string "
+                                "naming the edge's type directly, e.g. \"friend\" -- shorthand "
+                                "for the same filter, on the declared-edge-type fast path."
+                            ),
+                        },
                         "hops": {
                             "description": "Exact hop count (integer) or [min, max] range.",
                             "anyOf": [{"type": "integer"}, {"type": "array", "items": {"type": "integer"}}],
@@ -978,7 +1005,15 @@ AGGREGATE_TOOL_SCHEMA: dict = {
                     "type": "object",
                     "properties": {
                         "where": {"type": "object", "description": "Filter on the node reached by this hop."},
-                        "via": {"type": "object", "description": "Filter on edges traversed during this hop."},
+                        "via": {
+                            "anyOf": [{"type": "object"}, {"type": "string"}],
+                            "description": (
+                                "Filter on edges traversed during this hop. Either an exact-"
+                                "match object, e.g. {\"kind\": \"friend\"}, or a bare string "
+                                "naming the edge's type directly, e.g. \"friend\" -- shorthand "
+                                "for the same filter, on the declared-edge-type fast path."
+                            ),
+                        },
                         "hops": {
                             "description": "Exact hop count (integer) or [min, max] range.",
                             "anyOf": [{"type": "integer"}, {"type": "array", "items": {"type": "integer"}}],

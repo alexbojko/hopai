@@ -137,6 +137,12 @@ _NEEDS_SYNC_GRAPH = frozenset({
     "create_schema", "drop_schema", "define_constraints", "drop_constraints",
     "enforce_schema", "save_schema", "load_schema", "infer_schema",
     "schema_violations", "add_networkx",
+    # define_edge_type() is define_constraints() under its own name (it
+    # calls self.define_constraints() directly) -- same direct
+    # self.engine.begin(), same MissingGreenlet trap through
+    # __getattr__ if it were left off this list. edge_type_declared
+    # stays OFF it: reading the in-memory flag touches no connection.
+    "define_edge_type",
     # load_vectors() (#53) is a database round trip, unlike
     # define_vectors()/vectors/*_ddl(), which is why it is named here
     # rather than left to fall through __getattr__ to the wrapped sync

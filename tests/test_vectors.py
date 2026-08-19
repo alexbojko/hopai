@@ -3209,6 +3209,17 @@ class TestEdgeBeamShape:
                                                 via_keep=3)]), literal_binds=True)
         assert sql.count('{"kind": "cites"}') == 2
 
+    def test_via_stored_in_shorthand_composes_with_via_near_too(self, vg):
+        """edge_beam() resolves `via` through resolve_via(), same as the
+        plain (non-ranked) walk terms in core.py -- so the STORED_IN
+        shorthand filters what the beam ranks, not just what an
+        ordinary via= dict filters."""
+        sql = norm(vg.build_query(Start(), [Hop(via="cites", hops=(1, 2),
+                                                via_near=Near("rel", [1.0, 0.0, 0.0]),
+                                                via_keep=3)]), literal_binds=True)
+        assert sql.count("properties ->> 'kind') = 'cites'") == 2
+        assert "@>" not in sql
+
     def test_edges_without_a_vector_are_filtered_before_the_cosine(self, vg):
         """The same shape the batch path needed, for the same reason.
         Dropping these guards changes no ANSWER -- the beam's own
