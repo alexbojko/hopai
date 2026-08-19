@@ -1380,6 +1380,16 @@ def _pgvector_near(graph, table, nears: list, boosts: list, caller: str):
     pg.refuse_unsupported(nears, list(boosts), caller)
     one = nears[0]
     column = _attach(table, VECTOR_COLUMN_PREFIX + one.field, _column_type(graph))
+    # The length here SIZES the cast (`::vector(3)` rather than
+    # `::vector`) and is documentation, not machinery -- recorded
+    # because a mutation run flags dropping it and the next reader
+    # should not have to re-derive that it is inert. Measured against a
+    # live server: sized and unsized casts return identical distances,
+    # and a mismatched query vector errors either way (`expected 3
+    # dimensions, not 2` at the cast, `different vector dimensions 3 and
+    # 2` at the operator). validate_nears() has already matched the
+    # length to the field's declaration, so neither error is reachable
+    # from here. Kept for the one that is clearer if it ever becomes so.
     return one, column, pg.distance(column, one.vector, len(one.vector))
 
 
