@@ -47,7 +47,10 @@ from sqlalchemy.schema import CreateIndex
 
 from .filters import resolve
 from .hop import Hop, Start
-from .models import DEFAULT_GRAPH, EDGE_IDENTITY_KEYS, NODE_IDENTITY_KEYS, Edge, Node
+from .models import (
+    DEFAULT_GRAPH, EDGE_IDENTITY_KEYS, GRAPH_IDENTITY_KEYS, NODE_IDENTITY_KEYS, Edge,
+    GraphRegistry, Node,
+)
 from .vectors import VECTOR_COLUMN_PREFIX
 
 
@@ -363,6 +366,7 @@ class Graph:
         graph: str = DEFAULT_GRAPH,
         node_table=None,
         edge_table=None,
+        graph_table=None,
         node_id_col: str = "id",
         edge_id_col: str = "id",
         edge_start_col: str = "start_id",
@@ -406,6 +410,23 @@ class Graph:
             EDGE_IDENTITY_KEYS | {self.edge_id_col, self.edge_start_col, self.edge_end_col},
             graph_col)
 
+        # The registry table is not graph-scoped -- one row per graph
+        # id, shared by the whole database -- so it carries no graph_col
+        # check of its own; id/name/description are required by name,
+        # mirroring the graph_col check above, because create_graph()
+        # writes to all three and a table missing one would fail there
+        # instead of here, with a driver error instead of a name.
+        self.graphs_tbl = graph_table if graph_table is not None else GraphRegistry
+        for required in sorted(GRAPH_IDENTITY_KEYS):
+            if required not in self.graphs_tbl.c:
+                raise ValueError(
+                    f"table {self.graphs_tbl.name!r} has no {required!r} column -- the "
+                    f"graphs registry needs id, name and description at minimum (see "
+                    f"models.GraphRegistry). Add the column, or drop graph_table= to use "
+                    f"the default"
+                )
+        self.graph_extra_cols = _extra_columns(self.graphs_tbl, GRAPH_IDENTITY_KEYS, None)
+
     def __repr__(self) -> str:
         return f"Graph({self.engine.url!r}, graph={self.graph!r})"
 
@@ -446,7 +467,8 @@ class Graph:
         for the READ side this issue was filed about, not as a blanket
         auto-declare."""
         handle = Graph(self.engine, graph=graph, node_table=self.nodes_tbl,
-                       edge_table=self.edges_tbl, node_id_col=self.node_id_col,
+                       edge_table=self.edges_tbl, graph_table=self.graphs_tbl,
+                       node_id_col=self.node_id_col,
                        edge_id_col=self.edge_id_col, edge_start_col=self.edge_start_col,
                        edge_end_col=self.edge_end_col, graph_col=self.graph_col)
         handle._vectors_lazy = True
@@ -477,6 +499,77 @@ class Graph:
         with self.engine.connect() as connection:
             return [row[0] for row in connection.execute(
                 select(column).distinct().order_by(column))]
+
+    def _registry_qualified(self) -> str:
+        """The graphs table's name, quoted and schema-qualified like
+        `_schema_store()` renders `hopai_schema` -- for to_regclass(),
+        which needs the same quoting to find a table outside the search
+        path."""
+        table = self.graphs_tbl
+        return f'"{table.schema}"."{table.name}"' if table.schema else f'"{table.name}"'
+
+    def create_graph(self, name: Optional[str] = None, description: Optional[str] = None,
+                     **extra) -> None:
+        """Register THIS handle's graph in the registry -- id/name/
+        description plus any column `graph_extra_cols` names (see
+        models.py's "THE GRAPHS REGISTRY").
+
+            graph.create_graph(name="Marketing", description="Campaign data")
+
+        Upserts on the graph id, so calling this again to update the
+        name/description is the normal way to use this, not a conflict
+        -- unlike add_nodes()/add_edges(), which refuse a repeat id,
+        there is exactly one row a graph could ever want here and
+        nothing else to disambiguate it by.
+
+        Creates the table on first use (CREATE TABLE IF NOT EXISTS,
+        through this Table object, so a customized graph_table='s own
+        extra columns come along) rather than in create_schema() --
+        the same lazy timing save_schema() uses for hopai_schema, and
+        for the same reason: this is metadata about a graph, not graph
+        data, and an existing caller who never calls this method should
+        see no schema change at all."""
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        table = self.graphs_tbl
+        unknown = set(extra) - set(self.graph_extra_cols)
+        if unknown:
+            raise ValueError(
+                f"create_graph() got unexpected column(s) {sorted(unknown)} -- this "
+                f"graphs table only has extra column(s) {list(self.graph_extra_cols)} "
+                f"beyond id/name/description. Pass graph_table=<your Table> to Graph() "
+                f"to add more"
+            )
+        values = {"id": self.graph, "name": name, "description": description, **extra}
+        stmt = pg_insert(table).values(**values)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[table.c.id],
+            set_={col: stmt.excluded[col] for col in values if col != "id"},
+        )
+        with self.engine.begin() as connection:
+            table.create(connection, checkfirst=True)
+            connection.execute(stmt)
+
+    def graph_info(self) -> Optional[dict]:
+        """THIS graph's row in the registry -- {"name": ..., "description":
+        ..., <any extra column>: ...} -- or None when the table does not
+        exist yet (create_graph() was never called for ANY graph on
+        this database) or holds no row for THIS graph id.
+
+        The registry is purely descriptive (models.py): a graph with
+        nodes/edges and no row here is not an error, it is simply
+        unnamed -- hopai.mcp's list_graphs falls back to the bare id in
+        that case, exactly the way Graph.graphs() has always worked."""
+        table = self.graphs_tbl
+        with self.engine.connect() as connection:
+            exists = connection.execute(
+                text("SELECT to_regclass(:name)"),
+                {"name": self._registry_qualified()}).scalar()
+            if exists is None:
+                return None
+            row = connection.execute(
+                select(table).where(table.c.id == self.graph)).mappings().first()
+        return {k: v for k, v in row.items() if k != "id"} if row is not None else None
 
     def _scoped(self, table):
         """`graph_id = <this graph>` for one table, or an alias of it.
