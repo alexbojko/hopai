@@ -10,7 +10,17 @@ Spanning three modules, easier as one flow than file by file:
 2. **`filters.py`** — `resolve(column, filt)` compiles the filter DSL to a SQLAlchemy
    boolean. Equality is JSONB containment (`@>`), not `->>` comparison. `parse_filter()`
    turns the JSON operator form into the same objects, and `cypher.py` produces those
-   objects too, so **all three front ends compile through one `resolve()`**.
+   objects too, so **all three front ends compile through one `resolve()`**. `via=`
+   specifically goes through `resolve_via(column, via, edge_type_declared)` instead,
+   which wraps `resolve()`: a bare string is the STORED_IN shorthand (`via="knows"` for
+   `via={"kind": "knows"}`), compiled to `properties ->> 'kind' = ...` rather than `@>`
+   — the shape `Graph.define_edge_type()`'s guaranteed btree index on
+   `(graph_id, properties ->> 'kind')` can serve, where containment can only ever use
+   the whole-properties GIN index (issue #80). Once declared (`edge_type_declared`),
+   the plain `{"kind": "..."}` dict form upgrades to the same shape too — which is what
+   lets Cypher's `[:TYPE]` (already compiling to exactly that dict) benefit with no
+   change to `cypher.py`. A Graph that never declares an edge type keeps emitting
+   exactly the `@>` SQL it always has.
 3. **`core.py:build_query`** — per hop `i`, a recursive CTE `walk_i` (anchored on `seed`
    for the first hop, `match_{i-1}` after), then `match_i` (distinct reached nodes
    passing `where`) and `hop_edges_i` (every real edge id used). All `hop_edges_*` union
